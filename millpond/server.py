@@ -17,26 +17,41 @@ class _HealthState:
         self._last_poll: float = 0
         self._last_flush: float = 0
         self._started: bool = False
+        self._has_flushed: bool = False
 
     def record_poll(self) -> None:
         self._last_poll = time.monotonic()
 
     def record_flush(self) -> None:
         self._last_flush = time.monotonic()
+        self._has_flushed = True
 
     def mark_started(self) -> None:
         now = time.monotonic()
         self._last_poll = now
-        self._last_flush = now
         self._started = True
 
-    def is_healthy(self) -> bool:
+    def is_alive(self) -> bool:
+        """Liveness: is the process started and actively polling?"""
         if not self._started:
             return False
         now = time.monotonic()
-        poll_ok = (now - self._last_poll) < self.max_poll_age_s
-        flush_ok = (now - self._last_flush) < self.max_flush_age_s
-        return poll_ok and flush_ok
+        return (now - self._last_poll) < self.max_poll_age_s
+
+    def is_ready(self) -> bool:
+        """Readiness: is the process healthy and keeping up?"""
+        if not self.is_alive():
+            return False
+        # Only check flush recency if at least one flush has occurred.
+        # Idle topics with no messages should not fail readiness for not flushing.
+        if self._has_flushed:
+            now = time.monotonic()
+            return (now - self._last_flush) < self.max_flush_age_s
+        return True
+
+    def is_healthy(self) -> bool:
+        """Backward-compatible: same as is_ready()."""
+        return self.is_ready()
 
 
 health = _HealthState()
@@ -53,7 +68,7 @@ def _make_handler():
                 self.end_headers()
                 self.wfile.write(payload)
             elif self.path == "/healthz":
-                if health.is_healthy():
+                if health.is_alive():
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(b"ok\n")
@@ -61,6 +76,15 @@ def _make_handler():
                     self.send_response(503)
                     self.end_headers()
                     self.wfile.write(b"unhealthy\n")
+            elif self.path == "/readyz":
+                if health.is_ready():
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok\n")
+                else:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(b"not ready\n")
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -76,5 +100,5 @@ def start(port: int = 8000) -> HTTPServer:
     server = HTTPServer(("", port), _make_handler())
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    log.info("HTTP server listening on port %d (/metrics, /healthz)", port)
+    log.info("HTTP server listening on port %d (/metrics, /healthz, /readyz)", port)
     return server
