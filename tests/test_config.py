@@ -1,8 +1,7 @@
-import os
 
 import pytest
 
-from millpond.config import Config, _parse_ordinal, load
+from millpond.config import _parse_ordinal, load
 
 
 class TestParseOrdinal:

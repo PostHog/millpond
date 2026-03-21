@@ -58,9 +58,14 @@ def convert(messages: list[bytes]) -> pa.Table | None:
     records = []
     for raw in messages:
         try:
-            records.append(orjson.loads(raw))
+            parsed = orjson.loads(raw)
         except orjson.JSONDecodeError:
             log.warning("Skipping malformed JSON: %s", raw[:200])
+            continue
+        if not isinstance(parsed, dict):
+            log.warning("Skipping non-dict JSON value: %s", type(parsed).__name__)
+            continue
+        records.append(parsed)
 
     if not records:
         return None

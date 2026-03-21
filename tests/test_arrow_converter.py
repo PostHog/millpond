@@ -83,6 +83,18 @@ class TestConvert:
         assert table is not None
         assert table.column("b").to_pylist() == [None]
 
+    def test_non_dict_json_skipped(self):
+        messages = [
+            orjson.dumps({"good": 1}),
+            orjson.dumps("just a string"),
+            orjson.dumps([1, 2, 3]),
+            orjson.dumps(42),
+            orjson.dumps({"also_good": 2}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert len(table) == 2
+
     def test_boolean_not_cast(self):
         messages = [orjson.dumps({"flag": True})]
         table = convert(messages)

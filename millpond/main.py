@@ -134,10 +134,13 @@ def main():
         raise
     finally:
         if pending_records > 0:
-            consolidated = pa.concat_tables(pending)
-            elapsed = time.monotonic() - last_flush
-            log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
-            _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
+            try:
+                consolidated = pa.concat_tables(pending)
+                elapsed = time.monotonic() - last_flush
+                log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
+                _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
+            except Exception:
+                log.exception("Final flush failed — data safe in Kafka, will replay on restart")
 
         log.info("Closing consumer")
         kafka.close()
