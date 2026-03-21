@@ -32,7 +32,7 @@ K8s StatefulSet (N replicas)
        └─ Single loop: consume → convert → accumulate → flush → commit
 ```
 
-- One topic per deployment and one table per deployment
+- One topic and one table per deployment
 - Static partition assignment via pod ordinal — no consumer groups
 - If a pod dies, its partitions stop being consumed until K8s restarts it
 
