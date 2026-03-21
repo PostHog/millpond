@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A standalone Python app that replaces Kafka Connect for writing Kafka topic data to DuckLake. Two threads, one blocking queue, no framework.
+A standalone Python app that replaces Kafka Connect for writing Kafka topic data to DuckLake. Single thread, single loop, no framework.
 
 Replaces: [PostHog/ducklake-kafka-connect](https://github.com/PostHog/ducklake-kafka-connect) (~1100 lines of lock management, scheduled executors, two-lock protocols imposed by the Kafka Connect framework).
 
@@ -24,17 +24,27 @@ The result: the connector reimplements a blocking queue with ~1100 lines of cere
 ```
 K8s StatefulSet (N replicas)
   └─ Pod (ordinal 0..N-1)
-       ├─ Consumer Thread: poll() → JSON→Arrow → queue.put()
-       ├─ Writer Thread:   queue.get(timeout) → accumulate → DuckLake write → commit offsets
-       └─ ByteBoundedQueue (capacity bounded by BUFFER_MAX_BYTES)
+       └─ Single loop: consume() → JSON→Arrow → accumulate → flush → commit
 ```
 
-**Note**: Python's `queue.Queue` only supports item-count capacity. `ByteBoundedQueue` is a custom ~20-line wrapper using `threading.Semaphore` (initialized to `BUFFER_MAX_BYTES`), `collections.deque`, and `threading.Lock`. Acquire `batch.nbytes` on put, release on take. Guard: if a single batch exceeds `BUFFER_MAX_BYTES`, log a warning and allow it through to avoid deadlock.
+```python
+while not shutdown:
+    records = consumer.consume(num_messages=N, timeout=remaining_until_flush)
+    if records:
+        batch = convert_to_arrow(records)
+        pending.append(batch)
+
+    if should_flush(pending):
+        write_to_ducklake(pending)
+        consumer.commit(offsets, asynchronous=False)
+        pending.clear()
+```
 
 - **No consumer groups.** Each pod computes its partitions from its StatefulSet ordinal and total partition count, uses `consumer.assign()`.
-- **Backpressure** is implicit: queue fills → consumer blocks → poll() stops → Kafka waits.
+- **No threads, no queues.** Kafka is the queue. Backpressure is implicit: while flushing to DuckLake, the consumer simply doesn't call `consume()`. Kafka holds the data.
 - **Offset commit** is explicit: only after successful DuckLake write.
 - **If a pod dies**, its partitions stop being consumed until K8s restarts it. No rebalance.
+
 
 ## Key Design Decisions
 
@@ -68,16 +78,9 @@ Alternative considered: both as env vars (`KAFKA_PARTITION_COUNT`, `REPLICA_COUN
 
 Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
 
-### Cross-Thread Offset Commit
+**`auto.offset.reset=earliest`**: required. With `assign()`, if a partition has no committed offset (new partition, or `GROUP_ID` changed), the default `latest` silently drops all existing data. `earliest` replays from the beginning — safe for at-least-once.
 
-The writer thread calls `consumer.commit(offsets, asynchronous=False)` (synchronous) while the consumer thread owns the `Consumer` instance. Synchronous commit is required for at-least-once: the writer must know the commit succeeded before clearing pending state. This is safe because:
-
-- librdkafka's `rd_kafka_t` handle is internally mutex-protected
-- `commit()` sends a request processed on librdkafka's background thread; synchronous mode blocks until the broker responds
-- The consumer thread is either blocked on backpressure (not in `poll()`) or in `poll()` (librdkafka handles concurrent access)
-- `assign()` and `close()` are only called from the consumer thread at startup/shutdown
-
-Fallback if ever needed: queue offsets back to consumer thread via a second queue.
+**`group.id`**: defaults to `dsk2d-{topic}-{table}`. Used only for offset storage in `__consumer_offsets` (no consumer group semantics). Changing `group.id` loses all committed offsets and triggers a full replay from `earliest`.
 
 ### Flush Triggers
 
@@ -85,7 +88,7 @@ Both time-based and size-based:
 - **Size**: accumulated Arrow bytes in pending buffer ≥ `FLUSH_SIZE` (bytes, not records)
 - **Time**: elapsed time since last flush ≥ `FLUSH_INTERVAL_MS`
 
-Writer thread uses `queue.get(timeout=remaining_time_until_flush)` to handle both.
+`consume(timeout=remaining_until_flush)` handles both: it returns early with data (check size), or times out (check time). Single thread, no coordination needed. Synchronous commit (`asynchronous=False`) after each successful write — required for at-least-once correctness.
 
 ### Arrow Conversion
 
@@ -96,6 +99,19 @@ Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 3. v1 types: all numbers → DOUBLE, all strings → VARCHAR, nested objects → JSON. No timestamp detection, no type promotion (see Deferred Complexity)
 
 **Important**: `orjson` parses JSON integers as Python `int`, so `pa.Table.from_pylist()` infers INT64 for integer-only columns. A column that's INT64 in batch N and DOUBLE in batch N+1 (because one value was `1.5`) causes type wobble. v1 must cast all numeric columns to DOUBLE after `from_pylist()` to avoid this.
+
+### DuckLake Initialization
+
+At startup, `ducklake.py` must:
+
+```python
+conn = duckdb.connect(config.ducklake_connection)
+conn.execute("LOAD httpfs")       # must load before ducklake — race condition with S3 access
+conn.execute("LOAD ducklake")
+conn.execute(f"ATTACH 'ducklake:{config.ducklake_metadata_url}' AS lake (DATA_PATH '{config.ducklake_data_path}')")
+```
+
+Extensions are pre-installed in the Docker image at build time (no runtime network dependency). `httpfs` must be loaded before `ducklake` to avoid a race condition where ducklake tries to access S3 before httpfs is available.
 
 ### DuckLake Write
 
@@ -141,14 +157,12 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | `dsk2d_records_consumed_total` | Counter | Records polled (by partition) |
 | `dsk2d_records_written_total` | Counter | Records written to DuckLake |
 | `dsk2d_batches_flushed_total` | Counter | Flush cycles completed |
-| `dsk2d_backpressure_wait_seconds_total` | Counter | Cumulative consumer block time |
 | `dsk2d_records_skipped_total` | Counter | Records skipped (by reason: json_parse, schema) |
 | `dsk2d_errors_total` | Counter | Errors by type (kafka/duckdb/arrow/json) |
 | `dsk2d_flush_duration_seconds` | Histogram | Time per DuckLake write |
 | `dsk2d_flush_size_bytes` | Histogram | Arrow bytes per flush |
 | `dsk2d_flush_size_records` | Histogram | Records per flush |
-| `dsk2d_buffer_bytes` | Gauge | Current pending Arrow bytes |
-| `dsk2d_buffer_utilization` | Gauge | buffer_bytes / buffer_max_bytes |
+| `dsk2d_pending_bytes` | Gauge | Current pending Arrow bytes awaiting flush |
 | `dsk2d_consumer_lag` | Gauge | Highwater - committed (by partition) |
 | `dsk2d_last_committed_offset` | Gauge | Last committed offset (by partition) |
 
@@ -167,7 +181,7 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | Risk | Mitigation |
 |------|------------|
 | Duplicate writes on crash (INSERT succeeds, commitSync doesn't) | At-least-once is the design point. Duplicates bounded by flush interval. Downstream consumers must tolerate duplicates. |
-| Shutdown sequencing must be explicit | Stop consumer → drain queue → final flush → commit → close consumer. `terminationGracePeriodSeconds: 120` covers S3 latency. |
+| Shutdown sequencing must be explicit | SIGTERM sets shutdown flag → exit loop → flush pending → commit → close consumer. `terminationGracePeriodSeconds: 120` covers S3 latency. |
 | Offset tracking must be max-per-partition across accumulated batches | Track `dict[TopicPartition, offset]`, update with max on each batch append. |
 
 ### Medium
@@ -175,7 +189,7 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | Risk | Mitigation |
 |------|------------|
 | Poison records (malformed JSON) | `orjson.loads()` failure skips record, increments `dsk2d_errors_total{type=json}`, logs. Does not kill batch or pod. |
-| Memory limits (256MB buffer + DuckDB + PyArrow + librdkafka) | Profile under load before production. 1Gi limit is a placeholder. |
+| Memory limits (pending batches + DuckDB + PyArrow + librdkafka) | Pending size bounded by `FLUSH_SIZE`. Profile under load before production. 1Gi limit is a placeholder. |
 
 ### What We Lose
 
@@ -260,14 +274,14 @@ dsk2d/
 ├── .flox/                    # Flox environment
 ├── Dockerfile
 ├── k8s/
-│   └── statefulset.yaml
+│   ├── statefulset.yaml
+│   └── service.yaml          # Headless service for StatefulSet
 └── dsk2d/
     ├── __init__.py
-    ├── main.py              # Entry point, config, thread lifecycle, shutdown
+    ├── main.py              # Entry point, main loop, signal handling
     ├── config.py             # Env var → dataclass
-    ├── consumer.py           # Consumer thread
-    ├── writer.py             # Writer thread
-    ├── arrow_converter.py    # JSON → PyArrow Table
+    ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + DOUBLE cast)
     ├── ducklake.py           # DuckDB/DuckLake connection, table mgmt, writes
-    └── metrics.py            # Prometheus metric definitions
+    ├── metrics.py            # Prometheus metric definitions
+    └── server.py             # HTTP server for /metrics and /healthz
 ```

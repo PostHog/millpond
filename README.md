@@ -1,29 +1,26 @@
 # DSK2D — Dead Simple Kafka to DuckLake
 
-A standalone Python app that consumes from a Kafka topic and writes to a DuckLake table. Two threads, one blocking queue, no Kafka Connect.
+A standalone Python app that consumes from a Kafka topic and writes to a DuckLake table. Single thread, single loop, no Kafka Connect.
 
 ## Why
 
 Kafka Connect imposes ~1100 lines of lock management, scheduled executors, and rebalance handling to work around its lack of backpressure and explicit offset control. DSK2D replaces all of that with:
 
 ```
-Consumer thread:
-  poll() → JSON → Arrow → enqueue (blocks when buffer full)
-
-Writer thread:
-  dequeue → accumulate → DuckLake write → commit offsets
+loop:
+  consume() → JSON → Arrow → accumulate
+  when buffer full or time elapsed:
+    write to DuckLake → commit offsets
 ```
 
-Backpressure is implicit. Offset commit is explicit (after successful write only). No data loss window.
+Single thread, single loop. Kafka is the buffer. Offset commit is explicit (after successful write only). No data loss window.
 
 ## Architecture
 
 ```
 K8s StatefulSet (N replicas)
   └─ Pod (ordinal 0..N-1)
-       ├─ Consumer Thread
-       ├─ Writer Thread
-       └─ BlockingQueue (bounded by BUFFER_MAX_BYTES)
+       └─ Single loop: consume → convert → accumulate → flush → commit
 ```
 
 - One topic per deployment, one table per deployment
@@ -68,9 +65,7 @@ All configuration via environment variables:
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
-| `BUFFER_MAX_BYTES` | no | `268435456` | Max Arrow bytes in queue before backpressure (256MB) |
-| `MAX_POLL_INTERVAL_MS` | no | `300000` | Kafka max.poll.interval.ms |
-| `GROUP_ID` | no | `dsk2d-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics |
+| `GROUP_ID` | no | `dsk2d-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
 
 ## Deployment
 

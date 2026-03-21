@@ -43,8 +43,6 @@ spec:
           value: "104857600"  # 100MB
         - name: FLUSH_INTERVAL_MS
           value: "60000"
-        - name: BUFFER_MAX_BYTES
-          value: "268435456"  # 256MB
         resources:
           requests:
             memory: "512Mi"

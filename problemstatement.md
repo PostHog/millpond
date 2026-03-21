@@ -3,25 +3,20 @@
 ## The ideal design
 
 ```
-Consumer thread:
-  loop:
-    poll() from Kafka
-    convert records to Arrow
-    enqueue(batch) — blocks when buffer is full
-
-Writer thread:
-  loop:
-    batch = queue.take() — blocks when empty
-    write batch to DuckLake
-    commit offsets for the records in the batch
-    signal queue to unblock
+loop:
+  consume() from Kafka
+  convert records to Arrow
+  accumulate in pending buffer
+  when buffer full or time elapsed:
+    write to DuckLake
+    commit offsets
 ```
 
-Two threads, one blocking queue, ~80 lines of core logic. Backpressure is
-implicit: when the writer can't keep up, the queue fills, the consumer blocks,
-poll() stops, and Kafka waits. No rebalance because the consumer is still
-alive — it's just not calling poll() fast enough. `max.poll.interval.ms` is
-the only knob.
+Single thread, single loop, ~50 lines of core logic. Kafka is the buffer.
+While flushing, the consumer simply doesn't call `consume()`. With static
+partition assignment (`assign()`, no consumer group), there's no rebalance
+risk from not polling — no heartbeat to maintain, no group coordinator.
+Kafka holds the data indefinitely.
 
 Offset commit is explicit: only after a successful write. No data loss window.
 
@@ -82,22 +77,22 @@ This is where most of the complexity in DucklakeSinkTask lives.
 
 ## What Connect forces you to build
 
-Because Connect doesn't provide a blocking queue with backpressure, the
-connector reimplements one:
+Because Connect owns the consumer, the connector must reimplement buffering,
+backpressure, and offset management — all things Kafka already provides:
 
-| Concept | Blocking queue design | Kafka Connect equivalent |
-|---------|----------------------|--------------------------|
-| Buffer | `BlockingQueue<Batch>` | `TableBuffer` + `tableLock` |
-| Backpressure | Queue blocks producer | None — must accept all records in `put()` |
-| Drain trigger | Consumer thread blocks on `take()` | Scheduled executor checks thresholds every 1s |
-| Write serialization | Single consumer thread | `tableFlushLock` prevents concurrent writes |
+| Concept | DSK2D (standalone) | Kafka Connect equivalent |
+|---------|-------------------|--------------------------|
+| Buffer | Kafka itself (don't call `consume()`) | `TableBuffer` + `tableLock` |
+| Backpressure | Don't consume — Kafka holds data | None — must accept all records in `put()` |
+| Drain trigger | `consume(timeout=remaining)` returns | Scheduled executor checks thresholds every 1s |
+| Write serialization | Single thread (by construction) | `tableFlushLock` prevents concurrent writes |
 | Offset commit | Explicit after successful write | Implicit — Connect commits after `put()` returns |
 | Failure handling | Don't commit offsets | Data loss — offsets already committed, fail task via `schedulerError` |
-| Backpressure signal | Queue full → producer blocks | `max.poll.interval.ms` → rebalance |
+| Backpressure signal | Not needed — no consumer group | `max.poll.interval.ms` → rebalance |
 
 The result: ~1100 lines of lock management, volatile fields, scheduled
 executors, threshold checks in four places, scoped rebalance handling, and
-a two-lock protocol — to do what a `LinkedBlockingQueue` does in 3 lines.
+a two-lock protocol — to do what a single-threaded loop does in ~50 lines.
 
 ## DSK2D: what a standalone app looks like
 
@@ -107,63 +102,54 @@ a two-lock protocol — to do what a `LinkedBlockingQueue` does in 3 lines.
 ┌─────────────────────────────────────────────────┐
 │                   K8s Pod                       │
 │                                                 │
-│  ┌──────────────┐    ┌───────────────────────┐  │
-│  │   Consumer    │    │      Writer           │  │
-│  │   Thread      │───▶│      Thread           │  │
-│  │              │ BB  │                       │  │
-│  │  poll()      │ QQ  │  DuckDB INSERT INTO   │  │
-│  │  convert     │    │  lake.main.<table>    │  │
-│  │  enqueue     │    │  commit offsets       │  │
-│  └──────────────┘    └───────────────────────┘  │
+│  ┌───────────────────────────────────────────┐  │
+│  │              Main Loop                    │  │
+│  │                                           │  │
+│  │  consume() → orjson → PyArrow → accumulate│  │
+│  │  when full/timed: DuckLake write → commit │  │
+│  └───────────────────────────────────────────┘  │
 │                                                 │
 │  Config: topic, table, bootstrap.servers,       │
 │          ducklake connection, S3 credentials    │
 └─────────────────────────────────────────────────┘
 ```
 
-### Core loop (consumer thread)
+### Core loop
 
 ```
-consumer = new KafkaConsumer(config)
+consumer = KafkaConsumer(config)
 partitions = computeAssignment(topic, partitionCount, replicaCount, ordinal)
 consumer.assign(partitions)  // static assignment, no consumer group
 
+pending = []
+last_flush = now()
+
 while (!shutdown):
-    records = consumer.poll(Duration.ofMillis(100))
-    if records.isEmpty(): continue
+    remaining = flush_interval - (now() - last_flush)
+    records = consumer.consume(num_messages=1000, timeout=max(remaining, 0))
 
-    batch = convertToArrow(records)
+    if records:
+        batch = convertToArrow(records)
+        pending.append(batch)
 
-    // Backpressure: blocks when buffer exceeds threshold
-    queue.put(batch)  // LinkedBlockingQueue with capacity limit
+    if shouldFlush(pending, last_flush):
+        consolidated = concat(pending)
+        duckdb.execute("INSERT INTO lake.main.{table} SELECT * FROM arrow_scan(?)", consolidated)
+        consumer.commit(offsetsFor(pending), asynchronous=False)
+        pending.clear()
+        last_flush = now()
 ```
 
-### Core loop (writer thread)
-
-```
-while (!shutdown):
-    batch = queue.take()  // blocks until data available
-
-    // Accumulate batches until flush threshold met
-    pending.add(batch)
-    if !shouldFlush(pending): continue
-
-    // Write to DuckLake
-    consolidated = consolidate(pending)
-    duckdb.execute("INSERT INTO lake.main.{table} SELECT * FROM arrow_scan(?)", consolidated)
-
-    // Only commit after successful write
-    consumer.commit(offsetsFor(pending), asynchronous=False)
-    pending.clear()
-```
+No threads, no queues. `consume(timeout=remaining)` handles both data
+fetching and flush timing. While flushing, Kafka holds the data.
 
 ### What you get
 
 | Property | Kafka Connect | DSK2D |
 |----------|--------------|-------|
-| Backpressure | None (rebalance on timeout) | Blocking queue |
+| Backpressure | None (rebalance on timeout) | Don't call consume() (Kafka holds data) |
 | Offset safety | Data loss window (put → commit gap) | Commit after write |
-| Code complexity | ~1100 lines + framework | ~200 lines |
+| Code complexity | ~1100 lines + framework | ~50 lines |
 | Deployment | Strimzi CRD, Connect worker cluster | Single K8s Deployment |
 | Scaling | tasksMax + consumer group | replicas + static partition assignment |
 | Rebalance handling | Connect framework (complex) | None — static assignment via pod ordinal |
@@ -197,7 +183,7 @@ spec:
         - name: REPLICA_COUNT
           value: "8"
         - name: DUCKLAKE_CONNECTION
-          value: "jdbc:duckdb:"
+          value: ":memory:"  # always in-memory — DuckLake metadata lives in Postgres
         - name: DUCKLAKE_TABLE
           value: "events"
         - name: DUCKLAKE_DATA_PATH
@@ -208,8 +194,6 @@ spec:
           value: "104857600"  # 100MB
         - name: FLUSH_INTERVAL_MS
           value: "60000"
-        - name: BUFFER_MAX_BYTES
-          value: "268435456"  # 256MB — queue blocks above this
 ```
 
 ### What you lose
