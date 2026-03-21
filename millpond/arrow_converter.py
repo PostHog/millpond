@@ -6,12 +6,31 @@ import pyarrow as pa
 log = logging.getLogger(__name__)
 
 
-def _cast_numeric_to_double(table: pa.Table) -> pa.Table:
-    """Cast all integer and float columns to float64 to avoid type wobble across batches."""
+def _normalize_numeric_types(table: pa.Table) -> pa.Table:
+    """Normalize numeric columns: integers→int64, floats→float64.
+
+    Avoids type wobble across batches (e.g. int8 vs int64) while preserving
+    precision for large integers (values > 2^53 are not representable in float64).
+    """
+    new_columns = []
+    new_fields = []
+    changed = False
     for i, field in enumerate(table.schema):
-        if pa.types.is_integer(field.type) or pa.types.is_floating(field.type):
-            table = table.set_column(i, field.name, table.column(i).cast(pa.float64()))
-    return table
+        col = table.column(i)
+        if pa.types.is_integer(field.type) and field.type != pa.int64():
+            new_columns.append(col.cast(pa.int64()))
+            new_fields.append(pa.field(field.name, pa.int64(), nullable=field.nullable))
+            changed = True
+        elif pa.types.is_floating(field.type) and field.type != pa.float64():
+            new_columns.append(col.cast(pa.float64()))
+            new_fields.append(pa.field(field.name, pa.float64(), nullable=field.nullable))
+            changed = True
+        else:
+            new_columns.append(col)
+            new_fields.append(field)
+    if not changed:
+        return table
+    return pa.table(dict(zip([f.name for f in new_fields], new_columns)), schema=pa.schema(new_fields))
 
 
 def _build_schema(records: list[dict]) -> pa.Schema:
@@ -19,29 +38,27 @@ def _build_schema(records: list[dict]) -> pa.Schema:
 
     pa.Table.from_pylist() only uses the first record's keys to infer the schema,
     silently dropping fields that only appear in later records. This function
-    scans all records to build the complete key set, then lets PyArrow infer
-    types from a single-record table per field.
+    scans all records to build the complete key set and collects the first
+    non-null sample for each key in a single pass.
     """
+    # Single pass: collect all keys (ordered) and first non-null sample per key
+    first_non_null: dict[str, object] = {}
     all_keys: dict[str, None] = {}  # ordered set via dict
     for record in records:
-        for key in record:
-            if key not in all_keys:
-                all_keys[key] = None
+        for k, v in record.items():
+            if k not in all_keys:
+                all_keys[k] = None
+            if k not in first_non_null and v is not None:
+                first_non_null[k] = v
 
-    # Build schema by inferring type from first non-null value for each key
     fields = []
     for key in all_keys:
-        sample = None
-        for record in records:
-            if key in record and record[key] is not None:
-                sample = record[key]
-                break
+        sample = first_non_null.get(key)
         if sample is None:
             fields.append(pa.field(key, pa.string(), nullable=True))
         else:
-            # Let PyArrow infer the type from a single-element table
-            inferred = pa.Table.from_pylist([{key: sample}]).schema.field(key)
-            fields.append(pa.field(key, inferred.type, nullable=True))
+            inferred_type = pa.array([sample]).type
+            fields.append(pa.field(key, inferred_type, nullable=True))
 
     return pa.schema(fields)
 
@@ -72,5 +89,5 @@ def convert(messages: list[bytes]) -> pa.Table | None:
 
     schema = _build_schema(records)
     table = pa.Table.from_pylist(records, schema=schema)
-    table = _cast_numeric_to_double(table)
+    table = _normalize_numeric_types(table)
     return table

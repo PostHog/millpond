@@ -15,18 +15,18 @@ class TestConvert:
         assert len(table) == 2
         assert table.column("name").to_pylist() == ["alice", "bob"]
 
-    def test_numeric_cast_to_double(self):
+    def test_numeric_type_normalization(self):
         messages = [orjson.dumps({"x": 42, "y": 3.14})]
         table = convert(messages)
         assert table is not None
-        assert table.schema.field("x").type == pa.float64()
+        assert table.schema.field("x").type == pa.int64()
         assert table.schema.field("y").type == pa.float64()
 
-    def test_integer_only_still_double(self):
+    def test_integer_normalized_to_int64(self):
         messages = [orjson.dumps({"count": 100})]
         table = convert(messages)
         assert table is not None
-        assert table.schema.field("count").type == pa.float64()
+        assert table.schema.field("count").type == pa.int64()
 
     def test_heterogeneous_schemas(self):
         # Field "b" only appears in the second record — must still be included
@@ -100,6 +100,29 @@ class TestConvert:
         table = convert(messages)
         assert table is not None
         assert table.schema.field("flag").type == pa.bool_()
+
+    def test_large_integer_precision_preserved(self):
+        """Integers > 2^53 must not lose precision via float64 cast."""
+        large_id = 2**53 + 1  # 9007199254740993 — not representable in float64
+        messages = [orjson.dumps({"id": large_id})]
+        table = convert(messages)
+        assert table is not None
+        assert table.column("id").to_pylist() == [large_id]
+        assert table.schema.field("id").type == pa.int64()
+
+    def test_integers_cast_to_int64(self):
+        """Pure integer columns should be int64, not float64."""
+        messages = [orjson.dumps({"count": 42})]
+        table = convert(messages)
+        assert table is not None
+        assert table.schema.field("count").type == pa.int64()
+
+    def test_floats_cast_to_float64(self):
+        """Float columns should remain float64."""
+        messages = [orjson.dumps({"price": 3.14})]
+        table = convert(messages)
+        assert table is not None
+        assert table.schema.field("price").type == pa.float64()
 
     def test_cross_batch_concat_with_promote(self):
         """Tables from separate convert() calls may have different schemas.
