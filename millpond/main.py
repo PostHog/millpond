@@ -4,10 +4,45 @@ import sys
 import time
 
 import pyarrow as pa
+from confluent_kafka import TopicPartition
 
-from millpond import arrow_converter, config, consumer, logging_config, metrics, server
+from millpond import arrow_converter, config, consumer, ducklake, logging_config, metrics, schema, server
 
 log = logging.getLogger(__name__)
+
+
+def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr):
+    """Write to DuckLake, commit offsets, update metrics."""
+    t0 = time.monotonic()
+    ducklake.write(db, cfg.ducklake_table, consolidated, schema_mgr)
+    write_duration = time.monotonic() - t0
+
+    # Commit offsets synchronously — at-least-once requires knowing commit succeeded
+    tp_offsets = [
+        TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
+        for (topic, partition), offset in offsets.items()
+    ]
+    kafka.commit(offsets=tp_offsets, asynchronous=False)
+
+    log.info(
+        "Flush: %d records, %d bytes, %d columns, write=%.2fs, elapsed=%.1fs",
+        len(consolidated),
+        pending_bytes,
+        len(consolidated.schema),
+        write_duration,
+        elapsed,
+    )
+
+    metrics.flush_duration_seconds.observe(write_duration)
+    metrics.flush_size_bytes.observe(pending_bytes)
+    metrics.flush_size_records.observe(pending_records)
+    metrics.records_written_total.inc(pending_records)
+    metrics.batches_flushed_total.inc()
+    server.health.record_flush()
+
+    # Update per-partition offset metrics
+    for tp in tp_offsets:
+        metrics.last_committed_offset.labels(partition=str(tp.partition)).set(tp.offset)
 
 
 def main():
@@ -17,6 +52,8 @@ def main():
     cfg = config.load()
     http = server.start()
 
+    db = ducklake.connect(cfg)
+    schema_mgr = schema.SchemaManager(db, cfg.ducklake_table)
     kafka = consumer.create(cfg)
     server.health.mark_started()
 
@@ -79,22 +116,7 @@ def main():
 
             if should_flush:
                 consolidated = pa.concat_tables(pending)
-                log.info(
-                    "Flush: %d records, %d bytes, %d columns, %.1fs elapsed",
-                    len(consolidated),
-                    pending_bytes,
-                    len(consolidated.schema),
-                    elapsed,
-                )
-
-                # TODO: write to DuckLake, commit offsets
-                metrics.flush_size_bytes.observe(pending_bytes)
-                metrics.flush_size_records.observe(pending_records)
-                metrics.flush_duration_seconds.observe(0)  # TODO: time the actual write
-                metrics.records_written_total.inc(pending_records)
-                metrics.batches_flushed_total.inc()
-                server.health.record_flush()
-
+                _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
                 pending.clear()
                 pending_bytes = 0
                 pending_records = 0
@@ -106,19 +128,15 @@ def main():
         log.exception("Fatal error in main loop")
         raise
     finally:
-        # Graceful shutdown: flush remaining, close consumer
         if pending_records > 0:
             consolidated = pa.concat_tables(pending)
+            elapsed = time.monotonic() - last_flush
             log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
-            # TODO: write to DuckLake, commit offsets
-            metrics.flush_size_bytes.observe(pending_bytes)
-            metrics.flush_size_records.observe(pending_records)
-            metrics.records_written_total.inc(pending_records)
-            metrics.batches_flushed_total.inc()
-            server.health.record_flush()
+            _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
 
         log.info("Closing consumer")
         kafka.close()
+        db.close()
         http.shutdown()
         log.info("millpond shutdown complete")
 

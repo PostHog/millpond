@@ -19,6 +19,6 @@ ENV PATH="/app/.venv/bin:$PATH"
 # Pre-install DuckDB extensions at build time to avoid runtime network dependency.
 # httpfs must be installed before ducklake — there's a race condition with S3 access
 # if ducklake loads first and tries to use httpfs before it's available.
-RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake')"
+RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres')"
 
 ENTRYPOINT ["millpond"]

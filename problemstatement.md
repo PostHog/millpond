@@ -100,7 +100,9 @@ backpressure, and offset management — all things Kafka already provides:
 
 The result: ~1100 lines of lock management, volatile fields, scheduled
 executors, threshold checks in four places, scoped rebalance handling, and
-a two-lock protocol — to do what a single-threaded loop does in ~50 lines.
+a two-lock protocol — plus a 170-line `BatchConsolidator` that manually
+groups and appends Arrow vectors because Java Arrow has no `concat_tables()`
+— to do what a single-threaded loop does in ~50 lines.
 
 ## Millpond: what a standalone app looks like
 

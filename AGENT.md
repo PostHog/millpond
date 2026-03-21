@@ -136,6 +136,8 @@ The ducklake-kafka-connect connector has two custom layers for schema evolution:
 
 **Millpond simplifies this.** The connector's `ArrowSchemaMerge` exists because Kafka Connect can deliver heterogeneous records in the same `put()` call. In Millpond, `pa.Table.from_pylist()` handles intra-batch schema unification implicitly — PyArrow infers the superset schema across all dicts in the list.
 
+**Batch consolidation is also free.** The connector has a 170-line `BatchConsolidator.java` that groups contiguous batches by schema compatibility and does vector-by-vector in-place append — because Java Arrow has no `concat_tables()` equivalent. In Python, `pa.concat_tables(pending)` does schema unification, type promotion, and concatenation in one call. Hundreds of lines of manual memory management and vector arithmetic replaced by a single function call.
+
 Millpond schema evolution approach:
 
 1. `pa.Table.from_pylist()` infers superset schema across all records in the batch
