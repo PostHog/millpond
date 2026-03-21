@@ -40,9 +40,14 @@ def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets
     metrics.batches_flushed_total.inc()
     server.health.record_flush()
 
-    # Update per-partition offset metrics
+    # Update per-partition offset and lag metrics
     for tp in tp_offsets:
         metrics.last_committed_offset.labels(partition=str(tp.partition)).set(tp.offset)
+        try:
+            lo, hi = kafka.get_watermark_offsets(tp, timeout=5)
+            metrics.consumer_lag.labels(partition=str(tp.partition)).set(hi - tp.offset)
+        except Exception:
+            pass  # best-effort lag tracking
 
 
 def main():

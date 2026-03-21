@@ -102,6 +102,8 @@ Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 
 **Important**: `orjson` parses JSON integers as Python `int`, so `pa.Table.from_pylist()` infers INT64 for integer-only columns. A column that's INT64 in batch N and DOUBLE in batch N+1 (because one value was `1.5`) causes type wobble. v1 must cast all numeric columns to DOUBLE after `from_pylist()` to avoid this.
 
+**Caveat**: `pa.Table.from_pylist()` infers the schema from the first record's keys. Fields that only appear in later records within the same batch are silently dropped. New fields are picked up across batches (via schema evolution in `schema.py`), but within a single `consume()` batch, the first record's key set wins.
+
 ### DuckLake Initialization
 
 At startup, `ducklake.py` must:
@@ -226,14 +228,11 @@ Even [Confluent's own docs](https://www.confluent.io/learn/kafka-dead-letter-que
 | Type promotion (int8→int16→int32→int64→float) | v1: all numbers are DOUBLE, all strings are VARCHAR, nested objects are JSON. Add promotion later if storage costs justify it. |
 | Timestamp detection heuristic | v1: store as VARCHAR. Let query engine cast. The ISO8601 regex will misfire on non-timestamp strings that happen to match the pattern. Add opt-in timestamp columns later. |
 
-## DuckDB Native Log Routing
+## DuckDB Logging
 
-DuckDB's internal logs are routed into Python's `logging` module via the log storage callback API. Same pattern as `duckdb-jvm`'s `NativeLogRouter.kt` in `~/src/duckdb-jvm`.
+Unlike the JVM client (which supports custom log storage callbacks — see `duckdb-jvm`'s `NativeLogRouter.kt`), the Python client only supports `memory`, `stdout`, and `file` log storage. No way to route DuckDB internal logs into Python's `logging` module.
 
-- Logger: `millpond.duckdb`
-- DuckDB levels mapped: debug/trace→DEBUG, info→INFO, warn→WARNING, error/fatal→ERROR
-- Messages prefixed with `[log_type]` (e.g. `[CATALOG]`, `[EXECUTE]`)
-- Enabled via `CALL enable_logging(storage='millpond')` + `SET logging_level='info'`
+For now, DuckDB logging is left at defaults. If needed, enable with `CALL enable_logging(storage='stdout')` and DuckDB will write to stderr in CSV format alongside Python's structured logs.
 
 ## Deployment Strategy
 

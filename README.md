@@ -4,6 +4,8 @@ A standalone Python app that consumes from a Kafka topic and writes to a DuckLak
 
 ## Naming
 
+<img src="millpond.jpg" alt="A mill pond" width="300" align="right">
+
 > **millpond** (noun): a pond created by damming a stream to produce a head of water for operating a mill.
 > — [Merriam-Webster](https://www.merriam-webster.com/dictionary/millpond)
 
@@ -83,6 +85,7 @@ All configuration via environment variables:
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `GROUP_ID` | no | `millpond-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
+| `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
 
 ## Deployment
 
@@ -141,3 +144,7 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 - [ ] Add Kafka broker metrics to Prometheus/Grafana (JMX Exporter sidecar on Kafka)
 - [ ] Add Postgres metrics to Prometheus/Grafana (postgres_exporter for DuckLake metadata DB)
 - [ ] Add librdkafka consumer metrics (confluent-kafka exposes internal stats via `statistics.interval.ms`)
+
+---
+
+Photo: Public Domain, [Wikimedia Commons](https://commons.wikimedia.org/w/index.php?curid=695982)
