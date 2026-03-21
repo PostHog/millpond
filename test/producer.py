@@ -42,14 +42,19 @@ def main():
 
     producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
 
-    print(f"Producing {TOTAL_RECORDS} records to {TOPIC} ({PARTITION_COUNT} partitions)")
+    infinite = TOTAL_RECORDS == -1
+    if infinite:
+        print(f"Producing indefinitely to {TOPIC} ({PARTITION_COUNT} partitions)")
+    else:
+        print(f"Producing {TOTAL_RECORDS} records to {TOPIC} ({PARTITION_COUNT} partitions)")
     print(f"Rate: {RECORDS_PER_SECOND} records/sec")
 
     sent = 0
     batch_start = time.monotonic()
     batch_size = max(1, RECORDS_PER_SECOND // 10)
+    i = 0
 
-    for i in range(TOTAL_RECORDS):
+    while infinite or i < TOTAL_RECORDS:
         event = make_event(i)
         partition = i % PARTITION_COUNT
         producer.produce(
@@ -59,6 +64,7 @@ def main():
             partition=partition,
         )
         sent += 1
+        i += 1
 
         if sent % batch_size == 0:
             producer.flush()
@@ -68,7 +74,10 @@ def main():
                 time.sleep(expected - elapsed)
 
         if sent % 1000 == 0:
-            print(f"  sent {sent}/{TOTAL_RECORDS}")
+            if infinite:
+                print(f"  sent {sent}")
+            else:
+                print(f"  sent {sent}/{TOTAL_RECORDS}")
 
     producer.flush()
     print(f"Done. Produced {sent} records.")

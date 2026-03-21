@@ -84,12 +84,14 @@ services:
         condition: service_completed_successfully
     entrypoint: python
     command: /app/test/producer.py
+    deploy:
+      replicas: ${PRODUCER_REPLICAS:-2}
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9094
       KAFKA_TOPIC: test-events
       KAFKA_PARTITION_COUNT: 8
       RECORDS_PER_SECOND: 1000
-      TOTAL_RECORDS: 10000
+      TOTAL_RECORDS: -1
     volumes:
       - ./test:/app/test:ro
 
