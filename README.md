@@ -4,7 +4,7 @@ A standalone Python app that consumes from a Kafka topic and writes to a DuckLak
 
 ## Naming
 
-<img src="millpond.jpg" alt="A mill pond" width="300" align="right">
+<img src="imgs/500px-Hagley_mill_race.jpeg" alt="A mill pond" width="300" align="right">
 
 > **millpond** (noun): a pond created by damming a stream to produce a head of water for operating a mill.
 > — [Merriam-Webster](https://www.merriam-webster.com/dictionary/millpond)
