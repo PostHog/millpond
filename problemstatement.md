@@ -1,4 +1,4 @@
-# Dead Simple Kafka to DuckLake (DSK2D)
+# Dead Simple Kafka to DuckLake (Millpond)
 
 ## The ideal design
 
@@ -80,21 +80,21 @@ This is where most of the complexity in DucklakeSinkTask lives.
 Because Connect owns the consumer, the connector must reimplement buffering,
 backpressure, and offset management — all things Kafka already provides:
 
-| Concept | DSK2D (standalone) | Kafka Connect equivalent |
-|---------|-------------------|--------------------------|
-| Buffer | Kafka itself (don't call `consume()`) | `TableBuffer` + `tableLock` |
-| Backpressure | Don't consume — Kafka holds data | None — must accept all records in `put()` |
-| Drain trigger | `consume(timeout=remaining)` returns | Scheduled executor checks thresholds every 1s |
-| Write serialization | Single thread (by construction) | `tableFlushLock` prevents concurrent writes |
-| Offset commit | Explicit after successful write | Implicit — Connect commits after `put()` returns |
-| Failure handling | Don't commit offsets | Data loss — offsets already committed, fail task via `schedulerError` |
-| Backpressure signal | Not needed — no consumer group | `max.poll.interval.ms` → rebalance |
+| Concept | Kafka Connect | Millpond |
+|---------|--------------|-------|
+| Buffer | `TableBuffer` + `tableLock` | Kafka itself (don't call `consume()`) |
+| Backpressure | None — must accept all records in `put()` | Don't consume — Kafka holds data |
+| Drain trigger | Scheduled executor checks thresholds every 1s | `consume(timeout=remaining)` returns |
+| Write serialization | `tableFlushLock` prevents concurrent writes | Single thread (by construction) |
+| Offset commit | Implicit — Connect commits after `put()` returns | Explicit after successful write |
+| Failure handling | Data loss — offsets already committed, fail task via `schedulerError` | Don't commit offsets |
+| Backpressure signal | `max.poll.interval.ms` → rebalance | Not needed — no consumer group |
 
 The result: ~1100 lines of lock management, volatile fields, scheduled
 executors, threshold checks in four places, scoped rebalance handling, and
 a two-lock protocol — to do what a single-threaded loop does in ~50 lines.
 
-## DSK2D: what a standalone app looks like
+## Millpond: what a standalone app looks like
 
 ### Architecture
 
@@ -145,11 +145,12 @@ fetching and flush timing. While flushing, Kafka holds the data.
 
 ### What you get
 
-| Property | Kafka Connect | DSK2D |
+| Property | Kafka Connect | Millpond |
 |----------|--------------|-------|
 | Backpressure | None (rebalance on timeout) | Don't call consume() (Kafka holds data) |
 | Offset safety | Data loss window (put → commit gap) | Commit after write |
 | Code complexity | ~1100 lines + framework | ~50 lines |
+| Memory per pod | 4-16Gi (JVM + framework + GC headroom) | 256-512Mi (no JVM, no GC) |
 | Deployment | Strimzi CRD, Connect worker cluster | Single K8s Deployment |
 | Scaling | tasksMax + consumer group | replicas + static partition assignment |
 | Rebalance handling | Connect framework (complex) | None — static assignment via pod ordinal |
@@ -168,13 +169,13 @@ no KafkaConnect CRD, no connector plugins.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: dsk2d-events
+  name: millpond-events
 spec:
   replicas: 8  # 8 pods, partitions distributed by ordinal
   template:
     spec:
       containers:
-      - name: dsk2d
+      - name: millpond
         env:
         - name: KAFKA_BOOTSTRAP_SERVERS
           value: "broker:9094"

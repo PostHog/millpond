@@ -1,17 +1,17 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: dsk2d-events  # change per topic
+  name: millpond-events  # change per topic
 spec:
   replicas: 8
-  serviceName: dsk2d-events
+  serviceName: millpond-events
   selector:
     matchLabels:
-      app: dsk2d-events
+      app: millpond-events
   template:
     metadata:
       labels:
-        app: dsk2d-events
+        app: millpond-events
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8000"
@@ -19,8 +19,8 @@ spec:
     spec:
       terminationGracePeriodSeconds: 120  # time to flush pending writes
       containers:
-      - name: dsk2d
-        image: dsk2d:latest
+      - name: millpond
+        image: millpond:latest
         ports:
         - name: metrics
           containerPort: 8000
@@ -45,10 +45,10 @@ spec:
           value: "60000"
         resources:
           requests:
-            memory: "512Mi"
+            memory: "256Mi"
             cpu: "500m"
           limits:
-            memory: "1Gi"
+            memory: "512Mi"
         livenessProbe:
           httpGet:
             path: /healthz

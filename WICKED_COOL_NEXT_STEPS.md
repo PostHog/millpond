@@ -4,7 +4,7 @@ None of this is suggested or implemented for v1. Just for fun.
 
 ## Eliminating the JSON→Arrow Penalty
 
-The only CPU-bound work in DSK2D is the JSON parse + columnarize step: `orjson.loads()` per record → Python dicts → `pa.Table.from_pylist()`.
+The only CPU-bound work in Millpond is the JSON parse + columnarize step: `orjson.loads()` per record → Python dicts → `pa.Table.from_pylist()`.
 
 ### Near-term: simdjson → Arrow (no Python objects)
 

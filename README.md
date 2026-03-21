@@ -1,10 +1,17 @@
-# DSK2D — Dead Simple Kafka to DuckLake
+# Millpond — Kafka to DuckLake
 
 A standalone Python app that consumes from a Kafka topic and writes to a DuckLake table. Single thread, single loop, no Kafka Connect.
 
+## Naming
+
+> **millpond** (noun): a pond created by damming a stream to produce a head of water for operating a mill.
+> — [Merriam-Webster](https://www.merriam-webster.com/dictionary/millpond)
+
+Millpond accumulates a stream of Kafka records until a threshold is reached, then releases them into the [DuckLake](https://github.com/duckdb/ducklake). Like a [mill pond](https://en.wikipedia.org/wiki/Mill_pond) feeding a lake.
+
 ## Why
 
-Kafka Connect imposes ~1100 lines of lock management, scheduled executors, and rebalance handling to work around its lack of backpressure and explicit offset control. DSK2D replaces all of that with:
+Kafka Connect imposes ~1100 lines of lock management, scheduled executors, and rebalance handling to work around its lack of backpressure and explicit offset control. Millpond replaces all of that with:
 
 ```
 loop:
@@ -30,6 +37,16 @@ K8s StatefulSet (N replicas)
 ## Performance
 
 The hot path is all C/C++: librdkafka → orjson → PyArrow → DuckDB (zero-copy Arrow scan). Python is glue.
+
+## Resource Footprint
+
+| | Kafka Connect worker | Millpond pod |
+|-|---------------------|-----------|
+| Memory request | 4-8Gi (JVM heap) | 256Mi |
+| Memory limit | 8-16Gi | 512Mi |
+| Steady-state | ~4GB (JVM + framework + GC headroom) | ~250-300MB |
+
+No JVM, no framework, no GC heap overhead. ~16x less memory per pod. The entire runtime is C/C++ libraries with a Python glue layer.
 
 ## Setup
 
@@ -65,7 +82,7 @@ All configuration via environment variables:
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
-| `GROUP_ID` | no | `dsk2d-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
+| `GROUP_ID` | no | `millpond-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
 
 ## Deployment
 

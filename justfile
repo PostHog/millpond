@@ -1,4 +1,4 @@
-# DSK2D — Dead Simple Kafka to DuckLake
+# Millpond — Kafka to DuckLake
 
 # Default recipe: list all available recipes
 default:
@@ -14,27 +14,27 @@ sync:
 # Run the application
 [group('dev')]
 run:
-    uv run dsk2d
+    uv run millpond
 
 # Format code
 [group('dev')]
 fmt:
-    uv run ruff format dsk2d/
+    uv run ruff format millpond/
 
 # Check formatting
 [group('dev')]
 fmt-check:
-    uv run ruff format --check dsk2d/
+    uv run ruff format --check millpond/
 
 # Lint code
 [group('dev')]
 lint:
-    uv run ruff check dsk2d/
+    uv run ruff check millpond/
 
 # Lint and fix
 [group('dev')]
 lint-fix:
-    uv run ruff check --fix dsk2d/
+    uv run ruff check --fix millpond/
 
 # === Test ===
 
@@ -57,9 +57,9 @@ ci: fmt-check lint test
 # Build Docker image
 [group('build')]
 build:
-    docker build -t dsk2d .
+    docker build -t millpond .
 
 # Clean build artifacts
 [group('build')]
 clean:
-    rm -rf .venv dist *.egg-info __pycache__ dsk2d/__pycache__
+    rm -rf .venv dist *.egg-info __pycache__ millpond/__pycache__

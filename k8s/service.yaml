@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: dsk2d-events  # must match statefulset.yaml serviceName
+  name: millpond-events  # must match statefulset.yaml serviceName
 spec:
   clusterIP: None  # headless — required for StatefulSet
   selector:
-    app: dsk2d-events
+    app: millpond-events
   ports:
   - name: metrics
     port: 8000

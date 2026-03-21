@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "dsk2d"
+name = "millpond"
 version = "0.1.0"
-description = "Dead Simple Kafka to DuckLake"
+description = "Kafka to DuckLake"
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-dsk2d = "dsk2d.main:main"
+millpond = "millpond.main:main"
 
 [dependency-groups]
 dev = [

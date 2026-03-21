@@ -6,13 +6,13 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY dsk2d/ dsk2d/
+COPY millpond/ millpond/
 RUN uv sync --frozen --no-dev
 
 FROM python:3.12-slim
 
 COPY --from=builder /app/.venv /app/.venv
-COPY --from=builder /app/dsk2d /app/dsk2d
+COPY --from=builder /app/millpond /app/millpond
 
 ENV PATH="/app/.venv/bin:$PATH"
 
@@ -21,4 +21,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 # if ducklake loads first and tries to use httpfs before it's available.
 RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake')"
 
-ENTRYPOINT ["dsk2d"]
+ENTRYPOINT ["millpond"]

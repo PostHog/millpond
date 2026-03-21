@@ -2,7 +2,7 @@ import sys
 
 
 def main():
-    print("dsk2d — Dead Simple Kafka to DuckLake")
+    print("millpond — Kafka to DuckLake")
     print(f"Python {sys.version}")
     return 0
 

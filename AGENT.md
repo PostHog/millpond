@@ -1,4 +1,4 @@
-# DSK2D — Dead Simple Kafka to DuckLake
+# Millpond — Dead Simple Kafka to DuckLake
 
 ## What This Is
 
@@ -64,7 +64,7 @@ Two critical tuning knobs for confluent-kafka-python:
 
 ### Static Partition Assignment
 
-Pod ordinal from StatefulSet hostname (e.g. `dsk2d-events-3` → ordinal `3`).
+Pod ordinal from StatefulSet hostname (e.g. `millpond-events-3` → ordinal `3`).
 
 ```python
 my_partitions = [p for p in range(partition_count) if p % replica_count == ordinal]
@@ -80,7 +80,7 @@ Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
 
 **`auto.offset.reset=earliest`**: required. With `assign()`, if a partition has no committed offset (new partition, or `GROUP_ID` changed), the default `latest` silently drops all existing data. `earliest` replays from the beginning — safe for at-least-once.
 
-**`group.id`**: defaults to `dsk2d-{topic}-{table}`. Used only for offset storage in `__consumer_offsets` (no consumer group semantics). Changing `group.id` loses all committed offsets and triggers a full replay from `earliest`.
+**`group.id`**: defaults to `millpond-{topic}-{table}`. Used only for offset storage in `__consumer_offsets` (no consumer group semantics). Changing `group.id` loses all committed offsets and triggers a full replay from `earliest`.
 
 ### Flush Triggers
 
@@ -132,9 +132,9 @@ The ducklake-kafka-connect connector has two custom layers for schema evolution:
 
 **DuckLake handles all the DDL natively.** The extension supports `ADD COLUMN`, `DROP COLUMN`, `ALTER COLUMN SET DATA TYPE` with widening-only enforcement (TINYINT→SMALLINT→INTEGER→BIGINT, FLOAT→DOUBLE, TIMESTAMP→TIMESTAMPTZ). Invalid promotions are rejected by the extension itself.
 
-**DSK2D simplifies this.** The connector's `ArrowSchemaMerge` exists because Kafka Connect can deliver heterogeneous records in the same `put()` call. In DSK2D, `pa.Table.from_pylist()` handles intra-batch schema unification implicitly — PyArrow infers the superset schema across all dicts in the list.
+**Millpond simplifies this.** The connector's `ArrowSchemaMerge` exists because Kafka Connect can deliver heterogeneous records in the same `put()` call. In Millpond, `pa.Table.from_pylist()` handles intra-batch schema unification implicitly — PyArrow infers the superset schema across all dicts in the list.
 
-DSK2D schema evolution approach:
+Millpond schema evolution approach:
 
 1. `pa.Table.from_pylist()` infers superset schema across all records in the batch
 2. Before write, compare `table.schema` against cached DuckLake table schema
@@ -154,17 +154,17 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `dsk2d_records_consumed_total` | Counter | Records polled (by partition) |
-| `dsk2d_records_written_total` | Counter | Records written to DuckLake |
-| `dsk2d_batches_flushed_total` | Counter | Flush cycles completed |
-| `dsk2d_records_skipped_total` | Counter | Records skipped (by reason: json_parse, schema) |
-| `dsk2d_errors_total` | Counter | Errors by type (kafka/duckdb/arrow/json) |
-| `dsk2d_flush_duration_seconds` | Histogram | Time per DuckLake write |
-| `dsk2d_flush_size_bytes` | Histogram | Arrow bytes per flush |
-| `dsk2d_flush_size_records` | Histogram | Records per flush |
-| `dsk2d_pending_bytes` | Gauge | Current pending Arrow bytes awaiting flush |
-| `dsk2d_consumer_lag` | Gauge | Highwater - committed (by partition) |
-| `dsk2d_last_committed_offset` | Gauge | Last committed offset (by partition) |
+| `millpond_records_consumed_total` | Counter | Records polled (by partition) |
+| `millpond_records_written_total` | Counter | Records written to DuckLake |
+| `millpond_batches_flushed_total` | Counter | Flush cycles completed |
+| `millpond_records_skipped_total` | Counter | Records skipped (by reason: json_parse, schema) |
+| `millpond_errors_total` | Counter | Errors by type (kafka/duckdb/arrow/json) |
+| `millpond_flush_duration_seconds` | Histogram | Time per DuckLake write |
+| `millpond_flush_size_bytes` | Histogram | Arrow bytes per flush |
+| `millpond_flush_size_records` | Histogram | Records per flush |
+| `millpond_pending_bytes` | Gauge | Current pending Arrow bytes awaiting flush |
+| `millpond_consumer_lag` | Gauge | Highwater - committed (by partition) |
+| `millpond_last_committed_offset` | Gauge | Last committed offset (by partition) |
 
 ## Known Risks and Mitigations (Architect Review)
 
@@ -173,7 +173,7 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | Risk | Mitigation |
 |------|------------|
 | Partition count desync | Partition count discovered via `consumer.list_topics()` at startup — no env var. `REPLICA_COUNT` env var must match `spec.replicas`; desync causes uneven assignment but not data loss (some partitions double-assigned, some unassigned). |
-| Concurrent DDL from multiple pods (two pods both ALTER TABLE simultaneously) | `ADD COLUMN IF NOT EXISTS` is idempotent — multiple pods racing is harmless. `ALTER COLUMN SET DATA TYPE` widening to the same target is also idempotent. Postgres advisory locks (`pg_advisory_lock(hashtext('dsk2d-schema-' || table))`) available if contention materializes, but unlikely. Cannot designate a single schema-owner pod because schema discovery is distributed (new fields can appear in any partition). In practice, schema changes are rare — the primary use case (events) uses a stable schema that relies on maps/dictionaries for extensibility rather than adding columns. |
+| Concurrent DDL from multiple pods (two pods both ALTER TABLE simultaneously) | `ADD COLUMN IF NOT EXISTS` is idempotent — multiple pods racing is harmless. `ALTER COLUMN SET DATA TYPE` widening to the same target is also idempotent. Postgres advisory locks (`pg_advisory_lock(hashtext('millpond-schema-' || table))`) available if contention materializes, but unlikely. Cannot designate a single schema-owner pod because schema discovery is distributed (new fields can appear in any partition). In practice, schema changes are rare — the primary use case (events) uses a stable schema that relies on maps/dictionaries for extensibility rather than adding columns. |
 | Liveness probe only checks prometheus HTTP, not app health | Add `/healthz` endpoint that checks last-poll and last-flush recency. Pod is unhealthy if either exceeds a threshold. |
 
 ### High
@@ -188,8 +188,8 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 
 | Risk | Mitigation |
 |------|------------|
-| Poison records (malformed JSON) | `orjson.loads()` failure skips record, increments `dsk2d_errors_total{type=json}`, logs. Does not kill batch or pod. |
-| Memory limits (pending batches + DuckDB + PyArrow + librdkafka) | Pending size bounded by `FLUSH_SIZE`. Profile under load before production. 1Gi limit is a placeholder. |
+| Poison records (malformed JSON) | `orjson.loads()` failure skips record, increments `millpond_errors_total{type=json}`, logs. Does not kill batch or pod. |
+| Memory limits (pending batches + DuckDB + PyArrow + librdkafka) | Pending size bounded by `FLUSH_SIZE`. Steady-state ~250-300MB (Python ~30MB, librdkafka ~50-100MB, pending Arrow ~100-128MB, DuckDB ~20-30MB). 512Mi limit with 256Mi request. |
 
 ### What We Lose
 
@@ -213,7 +213,7 @@ Kafka Connect provides DLQ [for free](https://www.confluent.io/blog/kafka-connec
 
 Even [Confluent's own docs](https://www.confluent.io/learn/kafka-dead-letter-queue/) admit the feature is "currently limited in scope," and Confluent's Kai Waehner [explicitly calls out](https://www.kai-waehner.de/blog/2022/05/30/error-handling-via-dead-letter-queue-in-apache-kafka/) using DLQ for backpressure as an anti-pattern.
 
-**DSK2D approach:** Poison records get logged, metricked (`dsk2d_records_skipped_total`), and skipped. If the skip rate spikes, fix the root cause and replay from committed offsets.
+**Millpond approach:** Poison records get logged, metricked (`millpond_records_skipped_total`), and skipped. If the skip rate spikes, fix the root cause and replay from committed offsets.
 
 ### Deferred Complexity (not for v1)
 
@@ -226,10 +226,10 @@ Even [Confluent's own docs](https://www.confluent.io/learn/kafka-dead-letter-que
 
 DuckDB's internal logs are routed into Python's `logging` module via the log storage callback API. Same pattern as `duckdb-jvm`'s `NativeLogRouter.kt` in `~/src/duckdb-jvm`.
 
-- Logger: `dsk2d.duckdb`
+- Logger: `millpond.duckdb`
 - DuckDB levels mapped: debug/trace→DEBUG, info→INFO, warn→WARNING, error/fatal→ERROR
 - Messages prefixed with `[log_type]` (e.g. `[CATALOG]`, `[EXECUTE]`)
-- Enabled via `CALL enable_logging(storage='dsk2d')` + `SET logging_level='info'`
+- Enabled via `CALL enable_logging(storage='millpond')` + `SET logging_level='info'`
 
 ## Deployment Strategy
 
@@ -245,7 +245,7 @@ Downtime = time to drain + time to start new pods. With `terminationGracePeriodS
 
 ## HTTP Server
 
-Both Prometheus metrics (`/metrics`) and health checks (`/healthz`) run on port 8000. `prometheus_client.start_http_server()` does not support custom routes, so DSK2D uses a custom `http.server.HTTPServer` that serves both:
+Both Prometheus metrics (`/metrics`) and health checks (`/healthz`) run on port 8000. `prometheus_client.start_http_server()` does not support custom routes, so Millpond uses a custom `http.server.HTTPServer` that serves both:
 
 - `GET /metrics` → Prometheus exposition format (via `prometheus_client.generate_latest()`)
 - `GET /healthz` → 200 if last poll and last flush are within thresholds, 503 otherwise
@@ -268,7 +268,7 @@ Both Prometheus metrics (`/metrics`) and health checks (`/healthz`) run on port 
 ## Project Structure
 
 ```
-dsk2d/
+millpond/
 ├── pyproject.toml            # Dependencies and metadata (uv source of truth)
 ├── uv.lock                   # Resolved dependency lock (committed)
 ├── .flox/                    # Flox environment
@@ -276,7 +276,7 @@ dsk2d/
 ├── k8s/
 │   ├── statefulset.yaml
 │   └── service.yaml          # Headless service for StatefulSet
-└── dsk2d/
+└── millpond/
     ├── __init__.py
     ├── main.py              # Entry point, main loop, signal handling
     ├── config.py             # Env var → dataclass
