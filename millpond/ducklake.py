@@ -43,14 +43,17 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     conn.execute("LOAD ducklake")
     conn.execute("LOAD postgres")
 
-    # Parse the PG URL into a libpq connection string for DuckLake
+    # Parse the PG URL into a libpq connection string for DuckLake.
+    # The 'postgres:' prefix tells DuckLake to use the Postgres extension
+    # for metadata storage rather than a local DuckDB file.
+    # See: https://ducklake.select/docs/stable/duckdb/usage/connecting
     parsed = urlparse(cfg.ducklake_metadata_url)
     pg_connstr = (
         f"host={parsed.hostname} port={parsed.port or 5432} "
         f"dbname={parsed.path.lstrip('/')} user={parsed.username} password={parsed.password}"
     )
     conn.execute(f"""
-        ATTACH 'ducklake:{pg_connstr}' AS lake (
+        ATTACH 'ducklake:postgres:{pg_connstr}' AS lake (
             DATA_PATH '{cfg.ducklake_data_path}'
         )
     """)
