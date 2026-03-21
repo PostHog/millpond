@@ -71,7 +71,7 @@ All configuration via environment variables:
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `BUFFER_MAX_BYTES` | no | `268435456` | Max Arrow bytes in queue before backpressure (256MB) |
 | `MAX_POLL_INTERVAL_MS` | no | `300000` | Kafka max.poll.interval.ms |
-| `GROUP_ID` | no | `dsk2d-{topic}` | Kafka group.id (used for offset storage only) |
+| `GROUP_ID` | no | `dsk2d-{topic}-{table}` | Kafka group.id (used for offset storage only) |
 
 ## Deployment
 
