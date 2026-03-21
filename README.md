@@ -159,6 +159,9 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 - [ ] Add librdkafka consumer metrics (confluent-kafka exposes internal stats via `statistics.interval.ms`)
 - [ ] Measure intra-batch schema variability (how often do keys differ across records in a single consume batch?)
 
+## NOTE
+This project should absolutely be called TableFowl, but that would be an [SEO](https://www.confluent.io/product/tableflow/) and linguistic palaver.
+
 ---
 
 Photo: Public Domain, [Wikimedia Commons](https://commons.wikimedia.org/w/index.php?curid=695982)
