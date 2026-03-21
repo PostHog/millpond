@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from urllib.parse import urlparse
 
 import duckdb
@@ -9,6 +10,15 @@ from millpond import schema
 from millpond.config import Config
 
 log = logging.getLogger(__name__)
+
+_SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
+
+
+def _sanitize_setting_value(val: str) -> str:
+    """Validate a DuckDB SET value to prevent SQL injection."""
+    if not _SETTING_VALUE_RE.match(val):
+        raise ValueError(f"Illegal character in DuckDB setting value: {val!r}")
+    return val
 
 
 def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
@@ -27,20 +37,23 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
         val = os.environ.get(key)
         if val is not None:
             setting = key.lower().replace("duckdb_", "")
-            conn.execute(f"SET {setting} = '{val}'")
+            conn.execute(f"SET {setting} = '{_sanitize_setting_value(val)}'")
 
     conn.execute("LOAD httpfs")
     conn.execute("LOAD ducklake")
     conn.execute("LOAD postgres")
 
-    # Parse the PG URL into a libpq connection string for DuckLake
+    # Parse the PG URL into a libpq connection string for DuckLake.
+    # The 'postgres:' prefix tells DuckLake to use the Postgres extension
+    # for metadata storage rather than a local DuckDB file.
+    # See: https://ducklake.select/docs/stable/duckdb/usage/connecting
     parsed = urlparse(cfg.ducklake_metadata_url)
     pg_connstr = (
         f"host={parsed.hostname} port={parsed.port or 5432} "
         f"dbname={parsed.path.lstrip('/')} user={parsed.username} password={parsed.password}"
     )
     conn.execute(f"""
-        ATTACH 'ducklake:{pg_connstr}' AS lake (
+        ATTACH 'ducklake:postgres:{pg_connstr}' AS lake (
             DATA_PATH '{cfg.ducklake_data_path}'
         )
     """)
@@ -49,8 +62,13 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     return conn
 
 
+_tables_ensured: set[str] = set()
+
+
 def _ensure_table(conn: duckdb.DuckDBPyConnection, table_name: str, batch: pa.Table) -> None:
-    """Create the DuckLake table from Arrow schema if it doesn't exist."""
+    """Create the DuckLake table from Arrow schema if it doesn't exist. Cached after first call."""
+    if table_name in _tables_ensured:
+        return
     conn.register("_schema_batch", batch.slice(0, 0))  # empty batch, just schema
     try:
         conn.execute(
@@ -59,6 +77,7 @@ def _ensure_table(conn: duckdb.DuckDBPyConnection, table_name: str, batch: pa.Ta
         )
     finally:
         conn.unregister("_schema_batch")
+    _tables_ensured.add(table_name)
 
 
 def write(

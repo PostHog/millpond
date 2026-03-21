@@ -38,7 +38,7 @@ spec:
         - name: DUCKLAKE_DATA_PATH
           value: "s3://posthog-ducklake-prod-us/data"
         - name: DUCKLAKE_METADATA_URL
-          value: "jdbc:postgresql://rds-host/ducklake"
+          value: "postgresql://rds-host/ducklake"
         - name: FLUSH_SIZE
           value: "104857600"  # 100MB
         - name: FLUSH_INTERVAL_MS
@@ -57,7 +57,7 @@ spec:
           periodSeconds: 30
         readinessProbe:
           httpGet:
-            path: /healthz
+            path: /readyz
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 10

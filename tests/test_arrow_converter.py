@@ -15,18 +15,18 @@ class TestConvert:
         assert len(table) == 2
         assert table.column("name").to_pylist() == ["alice", "bob"]
 
-    def test_numeric_cast_to_double(self):
+    def test_numeric_type_normalization(self):
         messages = [orjson.dumps({"x": 42, "y": 3.14})]
         table = convert(messages)
         assert table is not None
-        assert table.schema.field("x").type == pa.float64()
+        assert table.schema.field("x").type == pa.int64()
         assert table.schema.field("y").type == pa.float64()
 
-    def test_integer_only_still_double(self):
+    def test_integer_normalized_to_int64(self):
         messages = [orjson.dumps({"count": 100})]
         table = convert(messages)
         assert table is not None
-        assert table.schema.field("count").type == pa.float64()
+        assert table.schema.field("count").type == pa.int64()
 
     def test_heterogeneous_schemas(self):
         # Field "b" only appears in the second record — must still be included
@@ -100,3 +100,51 @@ class TestConvert:
         table = convert(messages)
         assert table is not None
         assert table.schema.field("flag").type == pa.bool_()
+
+    def test_nested_struct_with_null_inner_field(self):
+        """A struct field where the first sample has a null inner value must not
+        crash. This happens when _build_schema picks a sample like
+        {"referrer": null, "screen_width": 1920} — pa.array infers referrer as
+        null type, which then rejects string values in later records."""
+        messages = [
+            orjson.dumps({"props": {"referrer": None, "width": 1920}}),
+            orjson.dumps({"props": {"referrer": "google", "width": 1440}}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert len(table) == 2
+
+    def test_large_integer_precision_preserved(self):
+        """Integers > 2^53 must not lose precision via float64 cast."""
+        large_id = 2**53 + 1  # 9007199254740993 — not representable in float64
+        messages = [orjson.dumps({"id": large_id})]
+        table = convert(messages)
+        assert table is not None
+        assert table.column("id").to_pylist() == [large_id]
+        assert table.schema.field("id").type == pa.int64()
+
+    def test_integers_cast_to_int64(self):
+        """Pure integer columns should be int64, not float64."""
+        messages = [orjson.dumps({"count": 42})]
+        table = convert(messages)
+        assert table is not None
+        assert table.schema.field("count").type == pa.int64()
+
+    def test_floats_cast_to_float64(self):
+        """Float columns should remain float64."""
+        messages = [orjson.dumps({"price": 3.14})]
+        table = convert(messages)
+        assert table is not None
+        assert table.schema.field("price").type == pa.float64()
+
+    def test_cross_batch_concat_with_promote(self):
+        """Tables from separate convert() calls may have different schemas.
+        pa.concat_tables must use promote_options to handle this."""
+        batch1 = convert([orjson.dumps({"a": 1})])
+        batch2 = convert([orjson.dumps({"a": 2, "b": "new"})])
+        assert batch1 is not None and batch2 is not None
+        # Without promote_options="default", this would raise ArrowInvalid
+        merged = pa.concat_tables([batch1, batch2], promote_options="default")
+        assert len(merged) == 2
+        assert "b" in merged.schema.names
+        assert merged.column("b").to_pylist() == [None, "new"]

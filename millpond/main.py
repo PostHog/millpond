@@ -10,11 +10,36 @@ from millpond import arrow_converter, config, consumer, ducklake, logging_config
 
 log = logging.getLogger(__name__)
 
+_LAG_SAMPLE_INTERVAL_S = 60.0  # how often to query watermark offsets for lag metrics
+_WRITE_MAX_RETRIES = 3
+_WRITE_BASE_DELAY_S = 1.0
+
+
+def _write_with_retry(db, table_name, consolidated, schema_mgr):
+    """Write to DuckLake with exponential backoff on transient failures."""
+    for attempt in range(_WRITE_MAX_RETRIES):
+        try:
+            ducklake.write(db, table_name, consolidated, schema_mgr)
+            return
+        except Exception:
+            if attempt == _WRITE_MAX_RETRIES - 1:
+                raise
+            delay = _WRITE_BASE_DELAY_S * (2**attempt)
+            log.warning(
+                "Write failed (attempt %d/%d), retrying in %.1fs",
+                attempt + 1,
+                _WRITE_MAX_RETRIES,
+                delay,
+                exc_info=True,
+            )
+            metrics.errors_total.labels(type="write_retry").inc()
+            time.sleep(delay)
+
 
 def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr):
     """Write to DuckLake, commit offsets, update metrics."""
     t0 = time.monotonic()
-    ducklake.write(db, cfg.ducklake_table, consolidated, schema_mgr)
+    _write_with_retry(db, cfg.ducklake_table, consolidated, schema_mgr)
     write_duration = time.monotonic() - t0
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded
@@ -40,11 +65,16 @@ def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets
     metrics.batches_flushed_total.inc()
     server.health.record_flush()
 
-    # Update per-partition offset and lag metrics
+    # Always update committed offset metrics (cheap, local)
     for tp in tp_offsets:
         metrics.last_committed_offset.labels(partition=str(tp.partition)).set(tp.offset)
+
+
+def _update_lag_metrics(kafka, tp_offsets):
+    """Sample watermark offsets for lag metrics. Called periodically, not on every flush."""
+    for tp in tp_offsets:
         try:
-            lo, hi = kafka.get_watermark_offsets(tp, timeout=5)
+            _lo, hi = kafka.get_watermark_offsets(tp, timeout=5)
             metrics.consumer_lag.labels(partition=str(tp.partition)).set(hi - tp.offset)
         except Exception:
             pass  # best-effort lag tracking
@@ -79,6 +109,7 @@ def main():
     pending_records = 0
     offsets: dict[tuple[str, int], int] = {}  # (topic, partition) -> max offset
     last_flush = time.monotonic()
+    last_lag_sample = 0.0  # force immediate first sample
 
     try:
         while not shutdown:
@@ -120,8 +151,18 @@ def main():
             should_flush = pending_records > 0 and (pending_bytes >= cfg.flush_size or elapsed >= cfg.flush_interval_s)
 
             if should_flush:
-                consolidated = pa.concat_tables(pending)
+                consolidated = pa.concat_tables(pending, promote_options="default")
                 _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
+
+                # Sample lag metrics periodically, not on every flush
+                now = time.monotonic()
+                if now - last_lag_sample >= _LAG_SAMPLE_INTERVAL_S:
+                    tp_offsets = [
+                        TopicPartition(topic, partition, offset + 1) for (topic, partition), offset in offsets.items()
+                    ]
+                    _update_lag_metrics(kafka, tp_offsets)
+                    last_lag_sample = now
+
                 pending.clear()
                 pending_bytes = 0
                 pending_records = 0
@@ -135,7 +176,7 @@ def main():
     finally:
         if pending_records > 0:
             try:
-                consolidated = pa.concat_tables(pending)
+                consolidated = pa.concat_tables(pending, promote_options="default")
                 elapsed = time.monotonic() - last_flush
                 log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
                 _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)

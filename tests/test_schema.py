@@ -1,6 +1,15 @@
 import pyarrow as pa
 
-from millpond.schema import _arrow_type_to_duckdb
+from millpond.schema import _arrow_type_to_duckdb, _normalize_duckdb_type
+
+
+class TestNormalizeDuckdbType:
+    def test_timestamp_with_time_zone(self):
+        assert _normalize_duckdb_type("TIMESTAMP WITH TIME ZONE") == "TIMESTAMPTZ"
+
+    def test_passthrough(self):
+        for t in ["BIGINT", "DOUBLE", "VARCHAR", "BOOLEAN", "FLOAT", "INTEGER", "TIMESTAMPTZ", "JSON"]:
+            assert _normalize_duckdb_type(t) == t
 
 
 class TestArrowTypeToDuckdb:
