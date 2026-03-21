@@ -100,3 +100,15 @@ class TestConvert:
         table = convert(messages)
         assert table is not None
         assert table.schema.field("flag").type == pa.bool_()
+
+    def test_cross_batch_concat_with_promote(self):
+        """Tables from separate convert() calls may have different schemas.
+        pa.concat_tables must use promote_options to handle this."""
+        batch1 = convert([orjson.dumps({"a": 1})])
+        batch2 = convert([orjson.dumps({"a": 2, "b": "new"})])
+        assert batch1 is not None and batch2 is not None
+        # Without promote_options="default", this would raise ArrowInvalid
+        merged = pa.concat_tables([batch1, batch2], promote_options="default")
+        assert len(merged) == 2
+        assert "b" in merged.schema.names
+        assert merged.column("b").to_pylist() == [None, "new"]

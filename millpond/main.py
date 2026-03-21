@@ -120,7 +120,7 @@ def main():
             should_flush = pending_records > 0 and (pending_bytes >= cfg.flush_size or elapsed >= cfg.flush_interval_s)
 
             if should_flush:
-                consolidated = pa.concat_tables(pending)
+                consolidated = pa.concat_tables(pending, promote_options="default")
                 _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
                 pending.clear()
                 pending_bytes = 0
@@ -135,7 +135,7 @@ def main():
     finally:
         if pending_records > 0:
             try:
-                consolidated = pa.concat_tables(pending)
+                consolidated = pa.concat_tables(pending, promote_options="default")
                 elapsed = time.monotonic() - last_flush
                 log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
                 _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
