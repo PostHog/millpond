@@ -102,7 +102,7 @@ Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 
 **Important**: `orjson` parses JSON integers as Python `int`, so `pa.Table.from_pylist()` infers INT64 for integer-only columns. A column that's INT64 in batch N and DOUBLE in batch N+1 (because one value was `1.5`) causes type wobble. v1 must cast all numeric columns to DOUBLE after `from_pylist()` to avoid this.
 
-**Caveat**: `pa.Table.from_pylist()` infers the schema from the first record's keys. Fields that only appear in later records within the same batch are silently dropped. New fields are picked up across batches (via schema evolution in `schema.py`), but within a single `consume()` batch, the first record's key set wins.
+**Caveat**: `pa.Table.from_pylist()` infers the schema from the first record's keys only. `arrow_converter.py` works around this by pre-scanning all records to build the full key union and passing an explicit schema to `from_pylist()`. The pre-scan is effectively free (pointer iteration over dict keys).
 
 ### DuckLake Initialization
 

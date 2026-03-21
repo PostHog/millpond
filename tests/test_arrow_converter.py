@@ -29,10 +29,9 @@ class TestConvert:
         assert table.schema.field("count").type == pa.float64()
 
     def test_heterogeneous_schemas(self):
-        # PyArrow from_pylist infers schema from superset of keys present in records
-        # Records missing a key get null for that column
+        # Field "b" only appears in the second record — must still be included
         messages = [
-            orjson.dumps({"a": 1, "b": None}),
+            orjson.dumps({"a": 1}),
             orjson.dumps({"a": 2, "b": "new_field"}),
         ]
         table = convert(messages)
@@ -41,6 +40,17 @@ class TestConvert:
         assert "a" in table.schema.names
         assert "b" in table.schema.names
         assert table.column("b").to_pylist() == [None, "new_field"]
+
+    def test_field_only_in_first_record(self):
+        messages = [
+            orjson.dumps({"a": 1, "b": "only_here"}),
+            orjson.dumps({"a": 2}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert len(table) == 2
+        assert "b" in table.schema.names
+        assert table.column("b").to_pylist() == ["only_here", None]
 
     def test_malformed_json_skipped(self):
         messages = [

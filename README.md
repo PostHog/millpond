@@ -144,6 +144,7 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 - [ ] Add Kafka broker metrics to Prometheus/Grafana (JMX Exporter sidecar on Kafka)
 - [ ] Add Postgres metrics to Prometheus/Grafana (postgres_exporter for DuckLake metadata DB)
 - [ ] Add librdkafka consumer metrics (confluent-kafka exposes internal stats via `statistics.interval.ms`)
+- [ ] Measure intra-batch schema variability (how often do keys differ across records in a single consume batch?)
 
 ---
 
