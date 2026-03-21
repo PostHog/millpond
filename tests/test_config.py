@@ -1,4 +1,3 @@
-
 import pytest
 
 from millpond.config import _parse_ordinal, load
@@ -65,3 +64,19 @@ class TestLoad:
         monkeypatch.delenv("KAFKA_TOPIC")
         with pytest.raises(RuntimeError, match="KAFKA_TOPIC"):
             load()
+
+    def test_unsafe_table_name_rejected(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events; DROP TABLE x")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+    def test_table_name_with_sql_injection(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_TABLE", "x--")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+    def test_valid_table_names(self, monkeypatch):
+        for name in ["events", "my_table", "_private", "Events123"]:
+            monkeypatch.setenv("DUCKLAKE_TABLE", name)
+            cfg = load()
+            assert cfg.ducklake_table == name

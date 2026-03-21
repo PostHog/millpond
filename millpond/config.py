@@ -3,6 +3,8 @@ import os
 import re
 from dataclasses import dataclass
 
+_SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
 log = logging.getLogger(__name__)
 
 
@@ -55,6 +57,10 @@ def _require(name: str) -> str:
 def load() -> Config:
     topic = _require("KAFKA_TOPIC")
     ducklake_table = _require("DUCKLAKE_TABLE")
+    if not _SAFE_TABLE_NAME.match(ducklake_table):
+        raise RuntimeError(
+            f"DUCKLAKE_TABLE {ducklake_table!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+        )
 
     pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME", "millpond-0")
     ordinal = _parse_ordinal(pod_name)
