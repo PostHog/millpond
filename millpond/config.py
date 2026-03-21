@@ -1,0 +1,93 @@
+import logging
+import os
+import re
+from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Config:
+    # Kafka
+    bootstrap_servers: str
+    topic: str
+    group_id: str
+
+    # Partition assignment
+    replica_count: int
+    ordinal: int
+
+    # DuckLake
+    ducklake_table: str
+    ducklake_data_path: str
+    ducklake_metadata_url: str
+    ducklake_connection: str
+
+    # Flush triggers
+    flush_size: int  # bytes of accumulated Arrow data
+    flush_interval_ms: int  # ms since last flush
+
+    # Consumer tuning
+    fetch_min_bytes: int
+    fetch_max_wait_ms: int
+    consume_batch_size: int
+
+    @property
+    def flush_interval_s(self) -> float:
+        return self.flush_interval_ms / 1000.0
+
+
+def _parse_ordinal(pod_name: str) -> int:
+    """Extract ordinal from pod name (e.g. 'millpond-events-3' -> 3)."""
+    match = re.search(r"-(\d+)$", pod_name)
+    if not match:
+        raise ValueError(f"Cannot parse ordinal from pod name: {pod_name!r}")
+    return int(match.group(1))
+
+
+def _require(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        raise RuntimeError(f"Required environment variable {name} is not set")
+    return val
+
+
+def load() -> Config:
+    topic = _require("KAFKA_TOPIC")
+    ducklake_table = _require("DUCKLAKE_TABLE")
+
+    pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME", "millpond-0")
+    ordinal = _parse_ordinal(pod_name)
+    replica_count = int(_require("REPLICA_COUNT"))
+
+    if ordinal >= replica_count:
+        raise RuntimeError(f"Ordinal {ordinal} >= REPLICA_COUNT {replica_count}")
+
+    group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{ducklake_table}")
+
+    cfg = Config(
+        bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
+        topic=topic,
+        group_id=group_id,
+        replica_count=replica_count,
+        ordinal=ordinal,
+        ducklake_table=ducklake_table,
+        ducklake_data_path=_require("DUCKLAKE_DATA_PATH"),
+        ducklake_metadata_url=_require("DUCKLAKE_METADATA_URL"),
+        ducklake_connection=_require("DUCKLAKE_CONNECTION"),
+        flush_size=int(os.environ.get("FLUSH_SIZE", "104857600")),
+        flush_interval_ms=int(os.environ.get("FLUSH_INTERVAL_MS", "60000")),
+        fetch_min_bytes=int(os.environ.get("FETCH_MIN_BYTES", "1048576")),
+        fetch_max_wait_ms=int(os.environ.get("FETCH_MAX_WAIT_MS", "500")),
+        consume_batch_size=int(os.environ.get("CONSUME_BATCH_SIZE", "1000")),
+    )
+
+    log.info(
+        "Config: topic=%s table=%s ordinal=%d/%d group_id=%s",
+        topic,
+        ducklake_table,
+        ordinal,
+        replica_count,
+        cfg.group_id,
+    )
+    return cfg
