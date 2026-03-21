@@ -64,6 +64,18 @@ def _arrow_type_to_duckdb(arrow_type: pa.DataType) -> str:
     return "VARCHAR"
 
 
+# DuckDB information_schema may return different type names than our _ARROW_TO_DUCKDB mapping.
+# Normalize to our canonical names to prevent spurious ALTER TABLE on every flush.
+_INFO_SCHEMA_TO_CANONICAL: dict[str, str] = {
+    "TIMESTAMP WITH TIME ZONE": "TIMESTAMPTZ",
+}
+
+
+def _normalize_duckdb_type(type_name: str) -> str:
+    """Normalize a DuckDB type name from information_schema to our canonical form."""
+    return _INFO_SCHEMA_TO_CANONICAL.get(type_name, type_name)
+
+
 class SchemaManager:
     """Tracks the DuckLake table schema and evolves it as needed."""
 
@@ -80,7 +92,7 @@ class SchemaManager:
                 f"SELECT column_name, data_type FROM information_schema.columns "
                 f"WHERE table_catalog = 'lake' AND table_schema = 'main' AND table_name = '{self._table_name}'"
             ).fetchall()
-            self._known_columns = {row[0]: row[1] for row in result}
+            self._known_columns = {row[0]: _normalize_duckdb_type(row[1]) for row in result}
             self._initialized = True
         except duckdb.CatalogException:
             # Table doesn't exist yet
