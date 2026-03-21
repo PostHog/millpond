@@ -29,10 +29,10 @@ spec:
           value: "broker:9094"
         - name: KAFKA_TOPIC
           value: "clickhouse_events_json"
-        - name: KAFKA_PARTITION_COUNT
-          value: "512"
         - name: REPLICA_COUNT
           value: "8"  # must match spec.replicas
+        - name: DUCKLAKE_CONNECTION
+          value: ":memory:"
         - name: DUCKLAKE_TABLE
           value: "events"
         - name: DUCKLAKE_DATA_PATH
@@ -40,7 +40,7 @@ spec:
         - name: DUCKLAKE_METADATA_URL
           value: "jdbc:postgresql://rds-host/ducklake"
         - name: FLUSH_SIZE
-          value: "100000"
+          value: "104857600"  # 100MB
         - name: FLUSH_INTERVAL_MS
           value: "60000"
         - name: BUFFER_MAX_BYTES
@@ -53,13 +53,13 @@ spec:
             memory: "1Gi"
         livenessProbe:
           httpGet:
-            path: /metrics
+            path: /healthz
             port: 8000
           initialDelaySeconds: 10
           periodSeconds: 30
         readinessProbe:
           httpGet:
-            path: /metrics
+            path: /healthz
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 10

@@ -26,8 +26,10 @@ K8s StatefulSet (N replicas)
   └─ Pod (ordinal 0..N-1)
        ├─ Consumer Thread: poll() → JSON→Arrow → queue.put()
        ├─ Writer Thread:   queue.get(timeout) → accumulate → DuckLake write → commit offsets
-       └─ BlockingQueue (capacity bounded by BUFFER_MAX_BYTES)
+       └─ ByteBoundedQueue (capacity bounded by BUFFER_MAX_BYTES)
 ```
+
+**Note**: Python's `queue.Queue` only supports item-count capacity. `ByteBoundedQueue` is a custom ~20-line wrapper using `threading.Semaphore` (initialized to `BUFFER_MAX_BYTES`), `collections.deque`, and `threading.Lock`. Acquire `batch.nbytes` on put, release on take.
 
 - **No consumer groups.** Each pod computes its partitions from its StatefulSet ordinal and total partition count, uses `consumer.assign()`.
 - **Backpressure** is implicit: queue fills → consumer blocks → poll() stops → Kafka waits.
@@ -68,10 +70,10 @@ Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
 
 ### Cross-Thread Offset Commit
 
-The writer thread calls `consumer.commit()` while the consumer thread owns the `Consumer` instance. This is safe because:
+The writer thread calls `consumer.commit(offsets, asynchronous=False)` (synchronous) while the consumer thread owns the `Consumer` instance. Synchronous commit is required for at-least-once: the writer must know the commit succeeded before clearing pending state. This is safe because:
 
 - librdkafka's `rd_kafka_t` handle is internally mutex-protected
-- `commit()` enqueues an async request processed on librdkafka's background thread
+- `commit()` sends a request processed on librdkafka's background thread; synchronous mode blocks until the broker responds
 - The consumer thread is either blocked on backpressure (not in `poll()`) or in `poll()` (librdkafka handles concurrent access)
 - `assign()` and `close()` are only called from the consumer thread at startup/shutdown
 
@@ -80,7 +82,7 @@ Fallback if ever needed: queue offsets back to consumer thread via a second queu
 ### Flush Triggers
 
 Both time-based and size-based:
-- **Size**: accumulated Arrow bytes in pending buffer ≥ `FLUSH_SIZE`
+- **Size**: accumulated Arrow bytes in pending buffer ≥ `FLUSH_SIZE` (bytes, not records)
 - **Time**: elapsed time since last flush ≥ `FLUSH_INTERVAL_MS`
 
 Writer thread uses `queue.get(timeout=remaining_time_until_flush)` to handle both.
@@ -92,6 +94,8 @@ Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 1. Parse JSON via `orjson` (Rust, ~1GB/s)
 2. `pa.Table.from_pylist()` builds the columnar batch — PyArrow infers the superset schema across all dicts
 3. v1 types: all numbers → DOUBLE, all strings → VARCHAR, nested objects → JSON. No timestamp detection, no type promotion (see Deferred Complexity)
+
+**Important**: `orjson` parses JSON integers as Python `int`, so `pa.Table.from_pylist()` infers INT64 for integer-only columns. A column that's INT64 in batch N and DOUBLE in batch N+1 (because one value was `1.5`) causes type wobble. v1 must cast all numeric columns to DOUBLE after `from_pylist()` to avoid this.
 
 ### DuckLake Write
 

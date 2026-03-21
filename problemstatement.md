@@ -153,7 +153,7 @@ while (!shutdown):
     duckdb.execute("INSERT INTO lake.main.{table} SELECT * FROM arrow_scan(?)", consolidated)
 
     // Only commit after successful write
-    consumer.commitSync(offsetsFor(pending))
+    consumer.commit(offsetsFor(pending), asynchronous=False)
     pending.clear()
 ```
 

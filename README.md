@@ -66,7 +66,7 @@ All configuration via environment variables:
 | `DUCKLAKE_DATA_PATH` | yes | | S3 path for DuckLake data files |
 | `DUCKLAKE_METADATA_URL` | yes | | JDBC URL for DuckLake metadata (Postgres) |
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
-| `FLUSH_SIZE` | no | `100000` | Flush after this many bytes of Arrow data |
+| `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `BUFFER_MAX_BYTES` | no | `268435456` | Max Arrow bytes in queue before backpressure (256MB) |
 | `MAX_POLL_INTERVAL_MS` | no | `300000` | Kafka max.poll.interval.ms |
