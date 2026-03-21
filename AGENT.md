@@ -150,6 +150,15 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | Type promotion (int8→int16→int32→int64→float) | v1: all numbers are DOUBLE, all strings are VARCHAR, nested objects are JSON. Add promotion later if storage costs justify it. |
 | Timestamp detection heuristic | v1: store as VARCHAR. Let query engine cast. The ISO8601 regex will misfire on non-timestamp strings that happen to match the pattern. Add opt-in timestamp columns later. |
 
+## DuckDB Native Log Routing
+
+DuckDB's internal logs are routed into Python's `logging` module via the log storage callback API. Same pattern as `duckdb-jvm`'s `NativeLogRouter.kt` in `~/src/duckdb-jvm`.
+
+- Logger: `dsk2d.duckdb`
+- DuckDB levels mapped: debug/trace→DEBUG, info→INFO, warn→WARNING, error/fatal→ERROR
+- Messages prefixed with `[log_type]` (e.g. `[CATALOG]`, `[EXECUTE]`)
+- Enabled via `CALL enable_logging(storage='dsk2d')` + `SET logging_level='info'`
+
 ## Toolchain
 
 - **Flox**: System dependencies (Python 3.12+, uv)
