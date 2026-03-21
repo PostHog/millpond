@@ -101,6 +101,19 @@ class TestConvert:
         assert table is not None
         assert table.schema.field("flag").type == pa.bool_()
 
+    def test_nested_struct_with_null_inner_field(self):
+        """A struct field where the first sample has a null inner value must not
+        crash. This happens when _build_schema picks a sample like
+        {"referrer": null, "screen_width": 1920} — pa.array infers referrer as
+        null type, which then rejects string values in later records."""
+        messages = [
+            orjson.dumps({"props": {"referrer": None, "width": 1920}}),
+            orjson.dumps({"props": {"referrer": "google", "width": 1440}}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert len(table) == 2
+
     def test_large_integer_precision_preserved(self):
         """Integers > 2^53 must not lose precision via float64 cast."""
         large_id = 2**53 + 1  # 9007199254740993 — not representable in float64

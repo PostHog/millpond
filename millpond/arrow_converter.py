@@ -41,15 +41,23 @@ def _build_schema(records: list[dict]) -> pa.Schema:
     scans all records to build the complete key set and collects the first
     non-null sample for each key in a single pass.
     """
-    # Single pass: collect all keys (ordered) and first non-null sample per key
+    # Single pass: collect all keys (ordered) and first non-null sample per key.
+    # For nested types (dicts), prefer a sample with no null inner values to
+    # avoid inferring 'null' type for struct fields.
     first_non_null: dict[str, object] = {}
     all_keys: dict[str, None] = {}  # ordered set via dict
     for record in records:
         for k, v in record.items():
             if k not in all_keys:
                 all_keys[k] = None
-            if k not in first_non_null and v is not None:
-                first_non_null[k] = v
+            if v is not None:
+                existing = first_non_null.get(k)
+                if existing is None:
+                    first_non_null[k] = v
+                elif isinstance(v, dict) and isinstance(existing, dict) and None in existing.values():
+                    # Replace a dict sample that has null inner values
+                    if None not in v.values():
+                        first_non_null[k] = v
 
     fields = []
     for key in all_keys:
