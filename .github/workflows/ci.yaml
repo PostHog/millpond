@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: astral-sh/setup-uv@v6
+
+    - name: Format check
+      run: uv run ruff format --check dsk2d/
+
+    - name: Lint
+      run: uv run ruff check dsk2d/
+
+    - name: Unit tests
+      run: uv run pytest -m "not integration"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build Docker image
+      run: docker build -t dsk2d .

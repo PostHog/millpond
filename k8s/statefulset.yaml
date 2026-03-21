@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dsk2d-events  # change per topic
+spec:
+  replicas: 8
+  serviceName: dsk2d-events
+  selector:
+    matchLabels:
+      app: dsk2d-events
+  template:
+    metadata:
+      labels:
+        app: dsk2d-events
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 120  # time to flush pending writes
+      containers:
+      - name: dsk2d
+        image: dsk2d:latest
+        ports:
+        - name: metrics
+          containerPort: 8000
+        env:
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: "broker:9094"
+        - name: KAFKA_TOPIC
+          value: "clickhouse_events_json"
+        - name: KAFKA_PARTITION_COUNT
+          value: "512"
+        - name: REPLICA_COUNT
+          value: "8"  # must match spec.replicas
+        - name: DUCKLAKE_TABLE
+          value: "events"
+        - name: DUCKLAKE_DATA_PATH
+          value: "s3://posthog-ducklake-prod-us/data"
+        - name: DUCKLAKE_METADATA_URL
+          value: "jdbc:postgresql://rds-host/ducklake"
+        - name: FLUSH_SIZE
+          value: "100000"
+        - name: FLUSH_INTERVAL_MS
+          value: "60000"
+        - name: BUFFER_MAX_BYTES
+          value: "268435456"  # 256MB
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10

@@ -1,0 +1,141 @@
+services:
+  # --- Infrastructure ---
+
+  kafka:
+    image: apache/kafka:3.9.0
+    hostname: kafka
+    volumes:
+      - ./test/kafka-server.properties:/opt/kafka/config/kraft/server.properties:ro
+    environment:
+      CLUSTER_ID: dsk2d-local-dev-cluster-001
+    command: >
+      bash -c "
+      /opt/kafka/bin/kafka-storage.sh format -t $$CLUSTER_ID -c /opt/kafka/config/kraft/server.properties --ignore-formatted &&
+      /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/kraft/server.properties
+      "
+    healthcheck:
+      test: /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9094
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  postgres:
+    image: postgres:17
+    hostname: postgres
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ducklake
+      POSTGRES_PASSWORD: ducklake
+      POSTGRES_DB: ducklake
+    healthcheck:
+      test: pg_isready -U ducklake -d ducklake
+      interval: 2s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    hostname: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: mc ready local
+      interval: 2s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/ducklake &&
+      mc anonymous set download local/ducklake
+      "
+
+  # --- Topic Setup ---
+
+  kafka-init:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9094 --create --if-not-exists --topic test-events --partitions 8 --replication-factor 1"]
+
+  # --- Producer: writes sample JSON to Kafka ---
+
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    entrypoint: python
+    command: /app/test/producer.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: test-events
+      KAFKA_PARTITION_COUNT: 8
+      RECORDS_PER_SECOND: 1000
+      TOTAL_RECORDS: 10000
+    volumes:
+      - ./test:/app/test:ro
+
+  # --- DSK2D Consumers ---
+
+  dsk2d-0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment: &dsk2d-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: test-events
+      KAFKA_PARTITION_COUNT: 8
+      REPLICA_COUNT: 2
+      POD_NAME: dsk2d-test-0
+      DUCKLAKE_TABLE: events
+      DUCKLAKE_DATA_PATH: s3://ducklake/data
+      DUCKLAKE_METADATA_URL: postgresql://ducklake:ducklake@postgres:5432/ducklake
+      DUCKLAKE_CONNECTION: ":memory:"
+      FLUSH_SIZE: 5000
+      FLUSH_INTERVAL_MS: 5000
+      BUFFER_MAX_BYTES: 67108864
+      DUCKDB_S3_ENDPOINT: minio:9000
+      DUCKDB_S3_ACCESS_KEY_ID: minioadmin
+      DUCKDB_S3_SECRET_ACCESS_KEY: minioadmin
+      DUCKDB_S3_USE_SSL: "false"
+      DUCKDB_S3_URL_STYLE: path
+
+  dsk2d-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *dsk2d-env
+      POD_NAME: dsk2d-test-1
