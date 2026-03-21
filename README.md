@@ -76,6 +76,7 @@ All configuration via environment variables:
 
 ```bash
 just build        # build Docker image
+kubectl apply -f k8s/service.yaml
 kubectl apply -f k8s/statefulset.yaml
 ```
 
@@ -85,7 +86,17 @@ Partition count is discovered at startup via `consumer.list_topics()`. Each pod 
 my_partitions = [p for p in range(partition_count) if p % replica_count == ordinal]
 ```
 
-Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
+### Updating
+
+Rolling updates are a poor fit — pods with different `REPLICA_COUNT` values cause double-assignment or gaps. Since Kafka is the durable buffer:
+
+1. **Canary**: Deploy one pod with the new version, verify metrics
+2. **Graceful shutdown**: Scale to 0 (pods flush and commit)
+3. **Full redeploy**: Update image/config, scale back up from committed offsets
+
+Downtime = drain time + startup time (~2-3 min). Kafka buffers trivially.
+
+**Never `kubectl scale` without updating `REPLICA_COUNT`.** Use Helm to manage both atomically.
 
 ## Multiple Pipelines
 

@@ -109,7 +109,6 @@ services:
     environment: &dsk2d-env
       KAFKA_BOOTSTRAP_SERVERS: kafka:9094
       KAFKA_TOPIC: test-events
-      KAFKA_PARTITION_COUNT: 8
       REPLICA_COUNT: 2
       POD_NAME: dsk2d-test-0
       DUCKLAKE_TABLE: events

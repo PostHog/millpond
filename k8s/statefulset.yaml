@@ -32,7 +32,7 @@ spec:
         - name: REPLICA_COUNT
           value: "8"  # must match spec.replicas
         - name: DUCKLAKE_CONNECTION
-          value: ":memory:"
+          value: ":memory:"  # always in-memory — DuckLake metadata lives in Postgres
         - name: DUCKLAKE_TABLE
           value: "events"
         - name: DUCKLAKE_DATA_PATH

@@ -205,7 +205,7 @@ spec:
         - name: DUCKLAKE_METADATA_URL
           value: "jdbc:postgresql://rds-host/ducklake"
         - name: FLUSH_SIZE
-          value: "100000"
+          value: "104857600"  # 100MB
         - name: FLUSH_INTERVAL_MS
           value: "60000"
         - name: BUFFER_MAX_BYTES

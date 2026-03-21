@@ -29,7 +29,7 @@ K8s StatefulSet (N replicas)
        └─ ByteBoundedQueue (capacity bounded by BUFFER_MAX_BYTES)
 ```
 
-**Note**: Python's `queue.Queue` only supports item-count capacity. `ByteBoundedQueue` is a custom ~20-line wrapper using `threading.Semaphore` (initialized to `BUFFER_MAX_BYTES`), `collections.deque`, and `threading.Lock`. Acquire `batch.nbytes` on put, release on take.
+**Note**: Python's `queue.Queue` only supports item-count capacity. `ByteBoundedQueue` is a custom ~20-line wrapper using `threading.Semaphore` (initialized to `BUFFER_MAX_BYTES`), `collections.deque`, and `threading.Lock`. Acquire `batch.nbytes` on put, release on take. Guard: if a single batch exceeds `BUFFER_MAX_BYTES`, log a warning and allow it through to avoid deadlock.
 
 - **No consumer groups.** Each pod computes its partitions from its StatefulSet ordinal and total partition count, uses `consumer.assign()`.
 - **Backpressure** is implicit: queue fills → consumer blocks → poll() stops → Kafka waits.
@@ -217,6 +217,25 @@ DuckDB's internal logs are routed into Python's `logging` module via the log sto
 - Messages prefixed with `[log_type]` (e.g. `[CATALOG]`, `[EXECUTE]`)
 - Enabled via `CALL enable_logging(storage='dsk2d')` + `SET logging_level='info'`
 
+## Deployment Strategy
+
+Rolling updates are a poor fit for static partition assignment — during the roll, pods run with different `REPLICA_COUNT` values, causing temporary double-assignment (duplicate writes) or gaps. Since Kafka is the durable buffer, a simpler strategy works:
+
+1. **Canary**: Deploy one pod with the new version. Verify it consumes and flushes correctly (check metrics, lag, error rate).
+2. **Graceful shutdown**: Scale the StatefulSet to 0. All pods flush pending writes, commit offsets, and exit. Partitions stop being consumed — Kafka holds the data.
+3. **Full redeploy**: Update the image/config, scale back up. Each pod picks up from committed offsets. Zero data loss.
+
+Downtime = time to drain + time to start new pods. With `terminationGracePeriodSeconds: 120` and typical S3 flush latency, expect ~2-3 minutes of no consumption. Kafka buffers this trivially.
+
+**Never `kubectl scale` without updating `REPLICA_COUNT`.** Use Helm to manage both atomically. If someone scales without Helm, partitions will be unevenly or doubly assigned until corrected.
+
+## HTTP Server
+
+Both Prometheus metrics (`/metrics`) and health checks (`/healthz`) run on port 8000. `prometheus_client.start_http_server()` does not support custom routes, so DSK2D uses a custom `http.server.HTTPServer` that serves both:
+
+- `GET /metrics` → Prometheus exposition format (via `prometheus_client.generate_latest()`)
+- `GET /healthz` → 200 if last poll and last flush are within thresholds, 503 otherwise
+
 ## Toolchain
 
 - **Flox**: System dependencies (Python 3.12+, uv)
@@ -229,7 +248,7 @@ DuckDB's internal logs are routed into Python's `logging` module via the log sto
 | `confluent-kafka>=2.6` | librdkafka Python wrapper |
 | `duckdb>=1.2` | DuckDB Python client |
 | `pyarrow>=18.0` | Arrow tables, zero-copy DuckDB integration |
-| `orjson>=3.10` | Fast JSON parsing (C implementation) |
+| `orjson>=3.10` | Fast JSON parsing (Rust) |
 | `prometheus-client>=0.21` | Metrics exposition |
 
 ## Project Structure
