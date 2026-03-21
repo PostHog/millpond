@@ -59,8 +59,13 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     return conn
 
 
+_tables_ensured: set[str] = set()
+
+
 def _ensure_table(conn: duckdb.DuckDBPyConnection, table_name: str, batch: pa.Table) -> None:
-    """Create the DuckLake table from Arrow schema if it doesn't exist."""
+    """Create the DuckLake table from Arrow schema if it doesn't exist. Cached after first call."""
+    if table_name in _tables_ensured:
+        return
     conn.register("_schema_batch", batch.slice(0, 0))  # empty batch, just schema
     try:
         conn.execute(
@@ -69,6 +74,7 @@ def _ensure_table(conn: duckdb.DuckDBPyConnection, table_name: str, batch: pa.Ta
         )
     finally:
         conn.unregister("_schema_batch")
+    _tables_ensured.add(table_name)
 
 
 def write(
