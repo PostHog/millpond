@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from urllib.parse import urlparse
 
 import duckdb
@@ -9,6 +10,15 @@ from millpond import schema
 from millpond.config import Config
 
 log = logging.getLogger(__name__)
+
+_SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
+
+
+def _sanitize_setting_value(val: str) -> str:
+    """Validate a DuckDB SET value to prevent SQL injection."""
+    if not _SETTING_VALUE_RE.match(val):
+        raise ValueError(f"Illegal character in DuckDB setting value: {val!r}")
+    return val
 
 
 def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
@@ -27,7 +37,7 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
         val = os.environ.get(key)
         if val is not None:
             setting = key.lower().replace("duckdb_", "")
-            conn.execute(f"SET {setting} = '{val}'")
+            conn.execute(f"SET {setting} = '{_sanitize_setting_value(val)}'")
 
     conn.execute("LOAD httpfs")
     conn.execute("LOAD ducklake")
