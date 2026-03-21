@@ -87,3 +87,29 @@ my_partitions = [p for p in range(partition_count) if p % replica_count == ordin
 ```
 
 Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
+
+## Multiple Pipelines
+
+Each topic→table mapping is a separate StatefulSet. The application doesn't change — just the env vars. Template with Helm:
+
+```yaml
+# values.yaml
+pipelines:
+  events:
+    topic: clickhouse_events_json
+    table: events
+    partitions: 512
+    replicas: 8
+  sessions:
+    topic: clickhouse_sessions_json
+    table: sessions
+    partitions: 64
+    replicas: 4
+  logs:
+    topic: app_logs
+    table: logs
+    partitions: 128
+    replicas: 8
+```
+
+One `range` over `pipelines` in the StatefulSet template produces N independent StatefulSets. Adding a pipeline is adding a block to `values.yaml` and running `helm upgrade`.
