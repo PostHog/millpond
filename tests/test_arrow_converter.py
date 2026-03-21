@@ -71,11 +71,16 @@ class TestConvert:
         table = convert([])
         assert table is None
 
-    def test_nested_objects_preserved(self):
+    def test_nested_objects_serialized_as_json(self):
         messages = [orjson.dumps({"meta": {"key": "value"}, "tags": [1, 2, 3]})]
         table = convert(messages)
         assert table is not None
         assert len(table) == 1
+        # Nested objects are serialized to JSON strings
+        assert table.schema.field("meta").type == pa.string()
+        assert table.schema.field("tags").type == pa.string()
+        assert table.column("meta").to_pylist() == ['{"key":"value"}']
+        assert table.column("tags").to_pylist() == ["[1,2,3]"]
 
     def test_null_values(self):
         messages = [orjson.dumps({"a": 1, "b": None})]
@@ -102,10 +107,7 @@ class TestConvert:
         assert table.schema.field("flag").type == pa.bool_()
 
     def test_nested_struct_with_null_inner_field(self):
-        """A struct field where the first sample has a null inner value must not
-        crash. This happens when _build_schema picks a sample like
-        {"referrer": null, "screen_width": 1920} — pa.array infers referrer as
-        null type, which then rejects string values in later records."""
+        """Nested dicts with null inner values are serialized to JSON strings."""
         messages = [
             orjson.dumps({"props": {"referrer": None, "width": 1920}}),
             orjson.dumps({"props": {"referrer": "google", "width": 1440}}),
@@ -113,6 +115,31 @@ class TestConvert:
         table = convert(messages)
         assert table is not None
         assert len(table) == 2
+        # Nested dicts become JSON strings, avoiding struct type inference issues
+        assert table.schema.field("props").type == pa.string()
+
+    def test_mixed_type_bool_and_string(self):
+        """Same field is bool in one record and string in another."""
+        messages = [
+            orjson.dumps({"flag_response": True}),
+            orjson.dumps({"flag_response": "variant-a"}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert len(table) == 2
+        assert table.schema.field("flag_response").type == pa.string()
+        assert table.column("flag_response").to_pylist() == ["True", "variant-a"]
+
+    def test_mixed_type_int_and_string(self):
+        """Same field is int in one record and string in another."""
+        messages = [
+            orjson.dumps({"employee_count": 50}),
+            orjson.dumps({"employee_count": "51-200"}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert len(table) == 2
+        assert table.schema.field("employee_count").type == pa.string()
 
     def test_large_integer_precision_preserved(self):
         """Integers > 2^53 must not lose precision via float64 cast."""
