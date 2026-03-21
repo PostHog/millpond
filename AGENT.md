@@ -8,7 +8,9 @@ Replaces: [PostHog/ducklake-kafka-connect](https://github.com/PostHog/ducklake-k
 
 ## Why Not Kafka Connect
 
-Kafka Connect owns the consumer. The connector is a plugin that implements `SinkTask.put()`. Connect calls `put()` with records; if it returns, Connect considers them handled. This creates:
+Kafka is already a queue with buffering, backpressure, and offset management built in. The entire Kafka Connect connector exists to re-implement worse versions of these things because the framework won't let you use them directly.
+
+Connect owns the consumer. The connector is a plugin that implements `SinkTask.put()`. Connect calls `put()` with records; if it returns, Connect considers them handled. This creates:
 
 - **No backpressure**: Can't say "not ready." Blocking in `put()` triggers consumer eviction + rebalance.
 - **No explicit offset control**: Connect commits after `put()` returns, not after successful write. Data loss window.
@@ -40,6 +42,14 @@ The hot path is all C/C++ (librdkafka, orjson, PyArrow, DuckDB). Python is glue 
 
 If Python ever shows up in profiles, the entire app ports to C with the same structure and similar line count — all libraries have C APIs.
 
+#### Kafka Consumer Tuning
+
+Two critical tuning knobs for confluent-kafka-python:
+
+1. **Use `consume(num_messages=N)` batch API, not `poll()`**. Amortizes the Python↔C boundary crossing cost per call. The `consume()` [docstring](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#confluent_kafka.Consumer.consume) explicitly notes it is more performant than calling `poll()` in a loop. Community benchmarks report significant throughput gains (see confluent-kafka-python issues [#291](https://github.com/confluentinc/confluent-kafka-python/issues/291), [#612](https://github.com/confluentinc/confluent-kafka-python/issues/612)).
+
+2. **Set `fetch.min.bytes` to 1MB+** (default is 1 byte). This is the single biggest throughput lever — reduces fetch request count dramatically by letting the broker accumulate data before responding. Trade latency for throughput. Pair with `fetch.max.wait.ms=500`. See [Kafka consumer config docs](https://kafka.apache.org/documentation/#consumerconfigs_fetch.min.bytes) and [Confluent throughput optimization guide](https://docs.confluent.io/cloud/current/client-apps/optimizing/throughput.html).
+
 ### Static Partition Assignment
 
 Pod ordinal from StatefulSet hostname (e.g. `dsk2d-events-3` → ordinal `3`).
@@ -48,7 +58,13 @@ Pod ordinal from StatefulSet hostname (e.g. `dsk2d-events-3` → ordinal `3`).
 my_partitions = [p for p in range(partition_count) if p % replica_count == ordinal]
 ```
 
-`REPLICA_COUNT` and `KAFKA_PARTITION_COUNT` are env vars. Scaling requires updating both the StatefulSet replicas and the env var.
+**Partition count**: discovered at startup via `consumer.list_topics(topic)`. No env var — eliminates desync risk if partitions are added server-side.
+
+**Replica count**: set via `REPLICA_COUNT` env var (matches `spec.replicas` in the StatefulSet). This is operator-controlled and can't be discovered reliably from inside the pod.
+
+Alternative considered: both as env vars (`KAFKA_PARTITION_COUNT`, `REPLICA_COUNT`). Simpler but creates a desync risk for partition count, which can change server-side without the env var being updated. Replica count doesn't have this problem — it's always set by the operator via kubectl.
+
+Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
 
 ### Cross-Thread Offset Commit
 
@@ -73,12 +89,9 @@ Writer thread uses `queue.get(timeout=remaining_time_until_flush)` to handle bot
 
 Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 
-1. Parse JSON via `orjson` (C, ~1GB/s)
-2. Infer PyArrow schema from Python types
-3. Timestamp detection: ISO8601 regex, excluding ID-like fields (`_id`, `_uuid`, `_key` suffixes)
-4. Schema merging across records with different shapes (type promotion: int→int64, int+float→float, etc.)
-5. Schema caching per topic, recomputed on new fields
-6. `pa.Table.from_pylist()` builds the columnar batch
+1. Parse JSON via `orjson` (Rust, ~1GB/s)
+2. `pa.Table.from_pylist()` builds the columnar batch — PyArrow infers the superset schema across all dicts
+3. v1 types: all numbers → DOUBLE, all strings → VARCHAR, nested objects → JSON. No timestamp detection, no type promotion (see Deferred Complexity)
 
 ### DuckLake Write
 
@@ -92,10 +105,28 @@ Zero-copy Arrow scan. Table auto-created and evolved (ADD COLUMN, ALTER COLUMN S
 
 ### Table Schema Evolution
 
-- New fields → `ALTER TABLE ADD COLUMN`
-- Numeric promotion (TINYINT→SMALLINT→INTEGER→BIGINT, FLOAT→DOUBLE) → `ALTER COLUMN SET DATA TYPE`
-- Struct/list/map → stored as JSON in DuckDB
-- `_inserted_at TIMESTAMP` added automatically, set to `NOW()` on write
+The ducklake-kafka-connect connector has two custom layers for schema evolution:
+
+1. **`ArrowSchemaMerge`** — Unifies Arrow schemas within a single batch (records in the same flush with different shapes). Field union, numeric/timestamp type promotion, recursive struct/list/map merging.
+2. **`DucklakeTableManager`** — Compares the unified Arrow schema against the DuckLake table and issues DDL (`ADD COLUMN`, `ALTER COLUMN SET DATA TYPE`). Caches known columns to avoid repeated `PRAGMA table_info` round-trips.
+
+**DuckLake handles all the DDL natively.** The extension supports `ADD COLUMN`, `DROP COLUMN`, `ALTER COLUMN SET DATA TYPE` with widening-only enforcement (TINYINT→SMALLINT→INTEGER→BIGINT, FLOAT→DOUBLE, TIMESTAMP→TIMESTAMPTZ). Invalid promotions are rejected by the extension itself.
+
+**DSK2D simplifies this.** The connector's `ArrowSchemaMerge` exists because Kafka Connect can deliver heterogeneous records in the same `put()` call. In DSK2D, `pa.Table.from_pylist()` handles intra-batch schema unification implicitly — PyArrow infers the superset schema across all dicts in the list.
+
+DSK2D schema evolution approach:
+
+1. `pa.Table.from_pylist()` infers superset schema across all records in the batch
+2. Before write, compare `table.schema` against cached DuckLake table schema
+3. New field → `ALTER TABLE ADD COLUMN IF NOT EXISTS`
+4. Wider type → `ALTER TABLE ALTER COLUMN SET DATA TYPE` (DuckLake enforces widening-only)
+5. Incompatible change → DuckLake rejects it, log + metric + skip
+6. `_inserted_at TIMESTAMP` added automatically, set to `NOW()` on write
+
+Source files for reference:
+- `DucklakeTableManager.java` — DDL detection and execution
+- `ArrowSchemaMerge.java` — intra-batch schema unification
+- DuckLake extension `ducklake_table_entry.cpp` lines 698-770 — native type promotion rules
 
 ## Metrics
 
@@ -123,8 +154,8 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 
 | Risk | Mitigation |
 |------|------------|
-| `REPLICA_COUNT` / `KAFKA_PARTITION_COUNT` env var desync causes double-writes or gaps | Query `consumer.list_topics()` at startup for partition count. Derive replica count from StatefulSet headless service DNS or K8s API. Eliminate both env vars. |
-| Concurrent DDL from multiple pods (two pods both ALTER TABLE simultaneously) | Use `ALTER TABLE ADD COLUMN IF NOT EXISTS`. For type conflicts, use Postgres advisory lock around DDL, or designate lowest-ordinal pod as schema owner. |
+| Partition count desync | Partition count discovered via `consumer.list_topics()` at startup — no env var. `REPLICA_COUNT` env var must match `spec.replicas`; desync causes uneven assignment but not data loss (some partitions double-assigned, some unassigned). |
+| Concurrent DDL from multiple pods (two pods both ALTER TABLE simultaneously) | `ADD COLUMN IF NOT EXISTS` is idempotent — multiple pods racing is harmless. `ALTER COLUMN SET DATA TYPE` widening to the same target is also idempotent. Postgres advisory locks (`pg_advisory_lock(hashtext('dsk2d-schema-' || table))`) available if contention materializes, but unlikely. Cannot designate a single schema-owner pod because schema discovery is distributed (new fields can appear in any partition). In practice, schema changes are rare — the primary use case (events) uses a stable schema that relies on maps/dictionaries for extensibility rather than adding columns. |
 | Liveness probe only checks prometheus HTTP, not app health | Add `/healthz` endpoint that checks last-poll and last-flush recency. Pod is unhealthy if either exceeds a threshold. |
 
 ### High
@@ -141,7 +172,30 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 |------|------------|
 | Poison records (malformed JSON) | `orjson.loads()` failure skips record, increments `dsk2d_errors_total{type=json}`, logs. Does not kill batch or pod. |
 | Memory limits (256MB buffer + DuckDB + PyArrow + librdkafka) | Profile under load before production. 1Gi limit is a placeholder. |
-| No DLQ | Log + metric for v1. DLQ (produce to `{topic}-dlq`) is a later addition — Kafka Connect got this for free from the framework. |
+
+### What We Lose
+
+| Feature | Impact |
+|---------|--------|
+| Consumer-level fan-out (N consumers for M partitions where N > M) | Not needed. A single Python consumer handles 500K+ msg/sec; per-partition peak is ~9.5K. Fan-out would require consumer groups, which we've eliminated. |
+| Auto-healing (consumer group reassigns partitions from failed consumers) | A failed pod's partitions stop being consumed until K8s restarts it. If a partition can't consistently be read, that's a Kafka-side problem, not a consumer architecture problem. |
+| DLQ (dead letter queue) | See below. |
+
+#### Why We Don't Implement a DLQ
+
+Kafka Connect provides DLQ [for free](https://www.confluent.io/blog/kafka-connect-deep-dive-error-handling-dead-letter-queues/), but in practice DLQs are an anti-pattern for pipelines with ordering and at-least-once guarantees.
+
+**DLQs break ordering.** Rerouting a message to a DLQ and reprocessing it later means it arrives out of order relative to newer events. For idempotent data (logs) that's tolerable. For anything with ordering semantics, [it's catastrophic](https://www.kai-waehner.de/blog/2022/05/30/error-handling-via-dead-letter-queue-in-apache-kafka/). You can't re-insert a message into its original partition order.
+
+**DLQs become silent graveyards.** They're [enabled after the first outage, then nobody monitors them](https://www.confluent.io/learn/kafka-dead-letter-queue/). The topic exists but nobody watches it grow. Without a recovery workflow, they just accumulate unresolved messages.
+
+**DLQ floods are almost always one root cause.** [Debugging 25,000 failed DLQ messages](https://skey.uk/post/kafka-dead-letter-queue-troubleshooting-guide/) typically reveals 1-2 underlying issues amplified by batch processing and retries. The DLQ is a noisy symptom log, not a resolution mechanism.
+
+**DLQs defer decisions, they don't help make them.** You still need to investigate, fix, and replay. At which point you could have just fixed the root cause and replayed from Kafka offsets directly — which is exactly what `assign()` + explicit offset commit gives you for free.
+
+Even [Confluent's own docs](https://www.confluent.io/learn/kafka-dead-letter-queue/) admit the feature is "currently limited in scope," and Confluent's Kai Waehner [explicitly calls out](https://www.kai-waehner.de/blog/2022/05/30/error-handling-via-dead-letter-queue-in-apache-kafka/) using DLQ for backpressure as an anti-pattern.
+
+**DSK2D approach:** Poison records get logged, metricked (`dsk2d_records_skipped_total`), and skipped. If the skip rate spikes, fix the root cause and replay from committed offsets.
 
 ### Deferred Complexity (not for v1)
 

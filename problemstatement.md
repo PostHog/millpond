@@ -27,6 +27,8 @@ Offset commit is explicit: only after a successful write. No data loss window.
 
 ## Why Kafka Connect can't do this
 
+Kafka is already a queue — it has buffering, backpressure, and offset management built in. Kafka Connect forces the connector to re-implement worse versions of all three because the framework won't let you use them directly.
+
 Connect owns the consumer. The connector is a plugin that implements `SinkTask`:
 
 ```java
@@ -123,7 +125,8 @@ a two-lock protocol — to do what a `LinkedBlockingQueue` does in 3 lines.
 
 ```
 consumer = new KafkaConsumer(config)
-consumer.subscribe(topics)
+partitions = computeAssignment(topic, partitionCount, replicaCount, ordinal)
+consumer.assign(partitions)  // static assignment, no consumer group
 
 while (!shutdown):
     records = consumer.poll(Duration.ofMillis(100))
@@ -162,25 +165,26 @@ while (!shutdown):
 | Offset safety | Data loss window (put → commit gap) | Commit after write |
 | Code complexity | ~1100 lines + framework | ~200 lines |
 | Deployment | Strimzi CRD, Connect worker cluster | Single K8s Deployment |
-| Scaling | tasksMax + consumer group | replicas + consumer group |
-| Rebalance handling | Connect framework (complex) | KafkaConsumer cooperative sticky (simple) |
+| Scaling | tasksMax + consumer group | replicas + static partition assignment |
+| Rebalance handling | Connect framework (complex) | None — static assignment via pod ordinal |
 | Monitoring | JMX → JMX Exporter → Prometheus | Direct Prometheus client |
 | Schema evolution | Managed in connector | Same DuckLake DDL |
 | Multi-table | topic2table.map config | One deployment per table (simple) or router |
 
 ### Scaling model
 
-Each pod runs one consumer in a consumer group. K8s scales pods, Kafka
-rebalances partitions. No Connect worker cluster, no Strimzi operator,
+Each pod runs one consumer with statically assigned partitions. K8s manages
+pod lifecycle, partition assignment is computed from pod ordinal. No consumer
+groups, no rebalances, no Connect worker cluster, no Strimzi operator,
 no KafkaConnect CRD, no connector plugins.
 
 ```yaml
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: dsk2d-events
 spec:
-  replicas: 8  # 8 consumers in the group
+  replicas: 8  # 8 pods, partitions distributed by ordinal
   template:
     spec:
       containers:
@@ -190,7 +194,9 @@ spec:
           value: "broker:9094"
         - name: KAFKA_TOPIC
           value: "clickhouse_events_json"
-        - name: DUCKLAKE_JDBC_URL
+        - name: REPLICA_COUNT
+          value: "8"
+        - name: DUCKLAKE_CONNECTION
           value: "jdbc:duckdb:"
         - name: DUCKLAKE_TABLE
           value: "events"

@@ -61,8 +61,7 @@ All configuration via environment variables:
 |----------|----------|---------|-------------|
 | `KAFKA_BOOTSTRAP_SERVERS` | yes | | Kafka broker addresses |
 | `KAFKA_TOPIC` | yes | | Topic to consume |
-| `KAFKA_PARTITION_COUNT` | yes | | Total partitions for the topic |
-| `REPLICA_COUNT` | yes | | Number of StatefulSet replicas |
+| `REPLICA_COUNT` | yes | | Number of StatefulSet replicas (must match `spec.replicas`) |
 | `DUCKLAKE_TABLE` | yes | | Target DuckLake table name |
 | `DUCKLAKE_DATA_PATH` | yes | | S3 path for DuckLake data files |
 | `DUCKLAKE_METADATA_URL` | yes | | JDBC URL for DuckLake metadata (Postgres) |
@@ -71,7 +70,7 @@ All configuration via environment variables:
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `BUFFER_MAX_BYTES` | no | `268435456` | Max Arrow bytes in queue before backpressure (256MB) |
 | `MAX_POLL_INTERVAL_MS` | no | `300000` | Kafka max.poll.interval.ms |
-| `GROUP_ID` | no | `dsk2d-{topic}-{table}` | Kafka group.id (used for offset storage only) |
+| `GROUP_ID` | no | `dsk2d-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics |
 
 ## Deployment
 
@@ -80,7 +79,7 @@ just build        # build Docker image
 kubectl apply -f k8s/statefulset.yaml
 ```
 
-Each pod computes its partition assignment from its ordinal:
+Partition count is discovered at startup via `consumer.list_topics()`. Each pod computes its partition assignment from its ordinal:
 
 ```python
 my_partitions = [p for p in range(partition_count) if p % replica_count == ordinal]
