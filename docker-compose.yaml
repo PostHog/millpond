@@ -137,3 +137,67 @@ services:
     environment:
       <<: *millpond-env
       POD_NAME: millpond-test-1
+
+  # --- Metrics & Dashboarding ---
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    configs:
+      - source: prometheus-config
+        target: /etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    configs:
+      - source: grafana-datasources
+        target: /etc/grafana/provisioning/datasources/prometheus.yml
+      - source: grafana-dashboard-provider
+        target: /etc/grafana/provisioning/dashboards/dashboards.yml
+      - source: grafana-dashboard-millpond
+        target: /var/lib/grafana/dashboards/millpond.json
+
+configs:
+  prometheus-config:
+    content: |
+      global:
+        scrape_interval: 5s
+      scrape_configs:
+        - job_name: millpond
+          static_configs:
+            - targets:
+                - millpond-0:8000
+                - millpond-1:8000
+
+  grafana-datasources:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: false
+
+  grafana-dashboard-provider:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: millpond
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards
+            foldersFromFilesStructure: false
+
+  grafana-dashboard-millpond:
+    file: ./grafana/dashboards/millpond.json

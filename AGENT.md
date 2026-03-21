@@ -17,6 +17,8 @@ Connect owns the consumer. The connector is a plugin that implements `SinkTask.p
 - **No consumer configuration**: Can't set `ConsumerRebalanceListener`, can't control poll timing, can't use `pause()`/`resume()`.
 - **Rebalance hell**: `close(revoked)` / `open(assigned)` while scheduler thread may still be flushing from old assignment.
 
+- **Metrics hell**: Connect defines and only supports its own `KafkaMetric` for individual connectors. Exposed via JMX, not Prometheus. Getting useful latency percentiles requires a JMX Exporter sidecar, custom relabeling rules, and significant mangling to produce anything actionable.
+
 The result: the connector reimplements a blocking queue with ~1100 lines of ceremony.
 
 ## Architecture

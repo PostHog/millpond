@@ -75,6 +75,14 @@ During a rebalance:
 
 This is where most of the complexity in DucklakeSinkTask lives.
 
+### Metrics are JMX, not Prometheus
+
+Connect defines and only supports its own `KafkaMetric` for individual
+connectors.
+Getting useful latency percentiles requires a JMX Exporter sidecar, custom
+relabeling rules, and significant mangling to produce anything actionable.
+A standalone app just uses `prometheus_client` directly.
+
 ## What Connect forces you to build
 
 Because Connect owns the consumer, the connector must reimplement buffering,
