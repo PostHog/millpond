@@ -154,6 +154,29 @@ Source files for reference:
 - `ArrowSchemaMerge.java` — intra-batch schema unification
 - DuckLake extension `ducklake_table_entry.cpp` lines 698-770 — native type promotion rules
 
+## Reference: PostHog Events Schema
+
+The primary use case is consuming from the `clickhouse_events_json` topic. The schema is defined by the [PostHog ingestion pipeline](https://posthog.com/docs/how-posthog-works/ingestion-pipeline) and documented in the [data model](https://posthog.com/docs/how-posthog-works/data-model).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `uuid` | String | UUIDv4/v7 event identifier |
+| `event` | String | Event name (`page_view`, `$autocapture`, custom) |
+| `properties` | String | **JSON-encoded string** — not a nested object |
+| `timestamp` | String (ISO 8601) | When the event was captured |
+| `team_id` | Int64 | PostHog project identifier |
+| `distinct_id` | String | User identifier |
+| `created_at` | String (ISO 8601) | Server receipt time |
+| `elements_chain` | String | DOM hierarchy for autocapture events |
+| `elements_hash` | String | Hash of elements chain |
+
+Key observations:
+- **`properties` is a JSON string within the JSON record**, not a nested object. From Millpond's perspective it's a VARCHAR column — no struct/map type inference needed.
+- **Top-level schema is extremely stable.** All extensibility lives inside `properties`. New top-level fields are rare, validating the "schema rarely changes" assumption.
+- **`_timestamp` and `_offset`** appear in ClickHouse's [Kafka table engine](https://posthog.com/docs/how-posthog-works/clickhouse) but are Kafka metadata not present in the message payload. Millpond adds `_inserted_at` instead.
+
+Source: [PostHog architecture](https://posthog.com/docs/how-posthog-works), [plugin-server](https://github.com/PostHog/plugin-server) (event producer).
+
 ## Metrics
 
 Prometheus via `prometheus_client`, HTTP on port 8000.
@@ -226,7 +249,7 @@ Even [Confluent's own docs](https://www.confluent.io/learn/kafka-dead-letter-que
 | Feature | Status |
 |---------|--------|
 | Type promotion (int8→int16→int32→int64→float) | v1: all numbers are DOUBLE, all strings are VARCHAR, nested objects are JSON. Add promotion later if storage costs justify it. |
-| Timestamp detection heuristic | v1: store as VARCHAR. Let query engine cast. The ISO8601 regex will misfire on non-timestamp strings that happen to match the pattern. Add opt-in timestamp columns later. |
+| Timestamp detection heuristic | v1: store as VARCHAR. Let query engine cast. The ISO8601 regex will misfire on non-timestamp strings that happen to match the pattern. Add opt-in timestamp columns later. When adding this, port the ID field heuristic from ducklake-kafka-connect's `SinkRecordToArrowConverter`: fields ending in `_uuid`, `uuid`, `_id`, `id`, `_key`, `key` must be forced to VARCHAR to prevent UUID strings like `"2024-02-28T23:59:59Z"` from being mis-inferred as timestamps. |
 
 ## DuckDB Logging
 
