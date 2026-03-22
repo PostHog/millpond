@@ -71,12 +71,74 @@ def _build_schema(records: list[dict]) -> pa.Schema:
     return pa.schema(fields)
 
 
+def _stringify_mixed_type_values(records: list[dict], schema: pa.Schema) -> list[dict]:
+    """Coerce values to strings for fields where the inferred type doesn't match all values.
+
+    JSON data from heterogeneous sources can have the same key as bool in one
+    record and string in another. Rather than crash, stringify mismatched values.
+    """
+    # Build a map of field name -> expected Python types for the inferred Arrow type
+    type_checks: dict[str, type | tuple[type, ...]] = {}
+    for field in schema:
+        if pa.types.is_boolean(field.type):
+            type_checks[field.name] = bool
+        elif pa.types.is_integer(field.type):
+            type_checks[field.name] = int
+        elif pa.types.is_floating(field.type):
+            type_checks[field.name] = (int, float)
+        elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+            type_checks[field.name] = str
+
+    # Scan for conflicts
+    conflicting_keys: set[str] = set()
+    for record in records:
+        for k, v in record.items():
+            if v is not None and k in type_checks:
+                if not isinstance(v, type_checks[k]):
+                    conflicting_keys.add(k)
+
+    if not conflicting_keys:
+        return records
+
+    log.info("Mixed types detected in fields %s, coercing to string", conflicting_keys)
+
+    # Stringify conflicting fields and patch the schema later
+    patched = []
+    for record in records:
+        new_record = dict(record)
+        for k in conflicting_keys:
+            if k in new_record and new_record[k] is not None:
+                new_record[k] = str(new_record[k])
+        patched.append(new_record)
+    return patched
+
+
+def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
+    """Serialize nested dicts and lists to JSON strings.
+
+    PyArrow's struct inference breaks on mixed types inside nested objects
+    (e.g. a field that is bool in one record and string in another within a
+    nested dict). Serializing nested objects to JSON strings avoids this
+    entirely — they become VARCHAR columns in DuckDB, queryable via JSON functions.
+    """
+    flattened = []
+    for record in records:
+        new = {}
+        for k, v in record.items():
+            if isinstance(v, (dict, list)):
+                new[k] = orjson.dumps(v).decode()
+            else:
+                new[k] = v
+        flattened.append(new)
+    return flattened
+
+
 def convert(messages: list[bytes]) -> pa.Table | None:
     """Convert raw Kafka message values to an Arrow table.
 
     Parses JSON via orjson, builds a PyArrow table using the union of all keys
-    across all records, and casts all numeric columns to DOUBLE to prevent
-    INT64/DOUBLE type wobble across batches.
+    across all records, normalizes numeric types, and handles mixed-type fields
+    by coercing to string. Nested dicts/lists are serialized to JSON strings.
 
     Returns None if no valid records were parsed.
     """
@@ -95,6 +157,8 @@ def convert(messages: list[bytes]) -> pa.Table | None:
     if not records:
         return None
 
+    records = _flatten_nested_to_json(records)
+    records = _stringify_mixed_type_values(records, _build_schema(records))
     schema = _build_schema(records)
     table = pa.Table.from_pylist(records, schema=schema)
     table = _normalize_numeric_types(table)

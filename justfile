@@ -52,6 +52,24 @@ test-integration:
 [group('test')]
 ci: fmt-check lint test
 
+# === Docker ===
+
+# Start the docker-compose dev environment (Kafka, Postgres, MinIO, producer, 2 millpond pods)
+[group('docker')]
+up:
+    docker compose build
+    docker compose up -d
+
+# Stop the docker-compose dev environment
+[group('docker')]
+down:
+    docker compose down -v
+
+# Open a DuckDB shell attached to the local DuckLake (requires `just up` first)
+[group('docker')]
+duck:
+    duckdb -init test/ducklake-init.sql
+
 # === Build ===
 
 # Build Docker image
