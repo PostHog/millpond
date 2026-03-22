@@ -6,31 +6,297 @@
   "links": [],
   "panels": [
     {
-      "title": "Records Consumed (rate/s)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "title": "Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Total Records Consumed (rate/s)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
       "targets": [
         {
-          "expr": "sum(rate(millpond_records_consumed_total[1m])) by (partition)",
-          "legendFormat": "partition {{partition}}"
+          "expr": "sum(rate(millpond_records_consumed_total[1m]))",
+          "legendFormat": "consumed/s"
         }
       ]
     },
     {
-      "title": "Records Written (rate/s)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "title": "Total Records Written (rate/s)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
       "targets": [
         {
           "expr": "sum(rate(millpond_records_written_total[1m]))",
-          "legendFormat": "written"
+          "legendFormat": "written/s"
         }
       ]
     },
     {
-      "title": "Flush Duration (p50 / p95 / p99)",
+      "title": "Flushes/s",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(millpond_batches_flushed_total[1m]))",
+          "legendFormat": "flushes/s"
+        }
+      ]
+    },
+    {
+      "title": "Pending Bytes",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 104857600 },
+              { "color": "red", "value": 536870912 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "millpond_pending_bytes",
+          "legendFormat": "pending"
+        }
+      ]
+    },
+    {
+      "title": "Total Consumer Lag",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10000 },
+              { "color": "red", "value": 100000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(kafka_consumergroup_lag)",
+          "legendFormat": "lag"
+        }
+      ]
+    },
+    {
+      "title": "Error Rate",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(millpond_errors_total[1m]))",
+          "legendFormat": "errors/s"
+        }
+      ]
+    },
+    {
+      "title": "Millpond Consumers",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Records Consumed/s by Partition",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(millpond_records_consumed_total[1m])) by (partition)",
+          "legendFormat": "p{{partition}}"
+        }
+      ]
+    },
+    {
+      "title": "Records Consumed/s by Pod",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(millpond_records_consumed_total[1m])) by (instance)",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "Records Written/s by Pod",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(millpond_records_written_total[1m])) by (instance)",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "Flush Duration p50/p95/p99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum(rate(millpond_flush_duration_seconds_bucket[5m])) by (le))",
@@ -44,17 +310,27 @@
           "expr": "histogram_quantile(0.99, sum(rate(millpond_flush_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "p99"
         }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        }
-      }
+      ]
     },
     {
-      "title": "Flush Size (bytes)",
+      "title": "Flush Size bytes p50/p95",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum(rate(millpond_flush_size_bytes_bucket[5m])) by (le))",
@@ -64,17 +340,60 @@
           "expr": "histogram_quantile(0.95, sum(rate(millpond_flush_size_bytes_bucket[5m])) by (le))",
           "legendFormat": "p95"
         }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes"
-        }
-      }
+      ]
     },
     {
-      "title": "Consumer Lag (by partition)",
+      "title": "Consumer Lag & Offsets",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Consumer Lag by Partition (kafka-exporter)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "kafka_consumergroup_lag{topic=\"test-events\"}",
+          "legendFormat": "p{{partition}}"
+        }
+      ]
+    },
+    {
+      "title": "Millpond Consumer Lag",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
       "targets": [
         {
           "expr": "millpond_consumer_lag",
@@ -83,25 +402,286 @@
       ]
     },
     {
-      "title": "Pending Bytes",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "targets": [
-        {
-          "expr": "millpond_pending_bytes",
-          "legendFormat": "pending"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes"
-        }
-      }
+      "title": "Kafka Broker",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "collapsed": false,
+      "panels": []
     },
     {
-      "title": "Errors (rate/s)",
+      "title": "Topic Offset Rate",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(kafka_topic_partition_current_offset[1m])) by (topic)",
+          "legendFormat": "{{topic}}"
+        }
+      ]
+    },
+    {
+      "title": "Messages In/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(kafka_topic_partition_current_offset[1m]))",
+          "legendFormat": "messages/s"
+        }
+      ]
+    },
+    {
+      "title": "MinIO / S3",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "S3 Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(minio_s3_requests_total[1m])) by (api)",
+          "legendFormat": "{{api}}"
+        }
+      ]
+    },
+    {
+      "title": "Bucket Size",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "minio_cluster_usage_total_bytes",
+          "legendFormat": "ducklake"
+        }
+      ]
+    },
+    {
+      "title": "Object Count",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 49 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "minio_cluster_usage_object_total",
+          "legendFormat": "objects"
+        }
+      ]
+    },
+    {
+      "title": "S3 Traffic Received",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 49 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(minio_s3_traffic_received_bytes[1m])",
+          "legendFormat": "received"
+        }
+      ]
+    },
+    {
+      "title": "Postgres (DuckLake Metadata)",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Transactions/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 58 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(pg_stat_database_xact_commit{datname=\"ducklake\"}[1m])",
+          "legendFormat": "commits/s"
+        }
+      ]
+    },
+    {
+      "title": "Active Connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 58 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "pg_stat_database_numbackends{datname=\"ducklake\"}",
+          "legendFormat": "connections"
+        }
+      ]
+    },
+    {
+      "title": "Database Size",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 58 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "pg_database_size_bytes{datname=\"ducklake\"}",
+          "legendFormat": "size"
+        }
+      ]
+    },
+    {
+      "title": "Errors & Skipped",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Errors by Type",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
       "targets": [
         {
           "expr": "sum(rate(millpond_errors_total[1m])) by (type)",
@@ -110,35 +690,28 @@
       ]
     },
     {
-      "title": "Records Skipped (rate/s)",
+      "title": "Records Skipped",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
       "targets": [
         {
           "expr": "sum(rate(millpond_records_skipped_total[1m])) by (reason)",
           "legendFormat": "{{reason}}"
-        }
-      ]
-    },
-    {
-      "title": "Batches Flushed (rate/s)",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 32 },
-      "targets": [
-        {
-          "expr": "sum(rate(millpond_batches_flushed_total[1m]))",
-          "legendFormat": "flushes/s"
-        }
-      ]
-    },
-    {
-      "title": "Flush Size (records, p50)",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 32 },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, sum(rate(millpond_flush_size_records_bucket[5m])) by (le))",
-          "legendFormat": "records"
         }
       ]
     }

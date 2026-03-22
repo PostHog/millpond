@@ -45,6 +45,7 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_PROMETHEUS_AUTH_TYPE: public
     command: server /data --console-address ":9001"
     healthcheck:
       test: mc ready local
@@ -71,7 +72,13 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-c", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9094 --create --if-not-exists --topic test-events --partitions 8 --replication-factor 1"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9094 --create --if-not-exists --topic test-events --partitions 8 --replication-factor 1 &&
+        echo "Waiting for consumer group coordinator..." &&
+        /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9094 --group millpond-test-events-events --describe 2>&1 || true
 
   # --- Producer: writes sample JSON to Kafka ---
 
@@ -129,6 +136,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    entrypoint: ["sh", "-c", "sleep 2 && millpond"]
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -139,6 +147,23 @@ services:
     environment:
       <<: *millpond-env
       POD_NAME: millpond-test-1
+
+  # --- Metrics Exporters ---
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: ["--kafka.server=kafka:9094"]
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://ducklake:ducklake@postgres:5432/ducklake?sslmode=disable"
 
   # --- Metrics & Dashboarding ---
 
@@ -177,6 +202,16 @@ configs:
             - targets:
                 - millpond-0:8000
                 - millpond-1:8000
+        - job_name: kafka
+          static_configs:
+            - targets: ["kafka-exporter:9308"]
+        - job_name: postgres
+          static_configs:
+            - targets: ["postgres-exporter:9187"]
+        - job_name: minio
+          metrics_path: /minio/v2/metrics/cluster
+          static_configs:
+            - targets: ["minio:9000"]
 
   grafana-datasources:
     content: |

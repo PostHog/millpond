@@ -70,6 +70,11 @@ down:
 duck:
     duckdb -init test/ducklake-init.sql
 
+# Open the Grafana dashboard (requires `just up` first)
+[group('docker')]
+dashboard:
+    open http://localhost:3000/d/millpond/millpond
+
 # === Build ===
 
 # Build Docker image
