@@ -78,7 +78,11 @@ services:
       - |
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9094 --create --if-not-exists --topic test-events --partitions 8 --replication-factor 1 &&
         echo "Waiting for consumer group coordinator..." &&
-        /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9094 --group millpond-test-events-events --describe 2>&1 || true
+        for i in $(seq 1 20); do
+          /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9094 --group millpond-test-events-events --describe >/dev/null 2>&1 && echo "Coordinator ready." && break
+          echo "  attempt $i/20..."
+          sleep 1
+        done
 
   # --- Producer: writes sample JSON to Kafka ---
 
@@ -136,7 +140,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    entrypoint: ["sh", "-c", "sleep 2 && millpond"]
+    entrypoint: ["sh", "-c", "sleep 2 && exec millpond"]
     depends_on:
       kafka-init:
         condition: service_completed_successfully

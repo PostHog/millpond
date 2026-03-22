@@ -158,7 +158,7 @@
       },
       "targets": [
         {
-          "expr": "sum(kafka_consumergroup_lag)",
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=~\"millpond-.*\"})",
           "legendFormat": "lag"
         }
       ]
@@ -370,7 +370,7 @@
       },
       "targets": [
         {
-          "expr": "kafka_consumergroup_lag{topic=\"test-events\"}",
+          "expr": "kafka_consumergroup_lag{topic=\"test-events\",consumergroup=~\"millpond-.*\"}",
           "legendFormat": "p{{partition}}"
         }
       ]
@@ -494,7 +494,7 @@
       ]
     },
     {
-      "title": "Bucket Size",
+      "title": "Total Storage Size",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
       "fieldConfig": {
