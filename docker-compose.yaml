@@ -103,6 +103,9 @@ services:
       KAFKA_PARTITION_COUNT: 8
       RECORDS_PER_SECOND: 1000
       TOTAL_RECORDS: -1
+    healthcheck:
+      test: ["CMD-SHELL", "true"]  # producer has no HTTP server; override Dockerfile HEALTHCHECK
+      interval: 10s
     volumes:
       - ./test:/app/test:ro
 

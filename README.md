@@ -98,6 +98,7 @@ All configuration via environment variables:
 ```bash
 just build        # build Docker image
 kubectl apply -f k8s/service.yaml
+kubectl apply -f k8s/pdb.yaml
 kubectl apply -f k8s/statefulset.yaml
 ```
 
