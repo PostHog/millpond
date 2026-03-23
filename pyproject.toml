@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "millpond"
 version = "0.1.0"
 description = "Kafka to DuckLake"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",
