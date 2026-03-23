@@ -70,7 +70,7 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     pg_connstr_sql = pg_connstr.replace("'", "''")
     conn.execute(f"""
         ATTACH 'ducklake:postgres:{pg_connstr_sql}' AS lake (
-            DATA_PATH '{cfg.ducklake_data_path}'
+            DATA_PATH '{cfg.ducklake_data_path.replace("'", "''")}'
         )
     """)
 
