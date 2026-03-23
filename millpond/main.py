@@ -45,6 +45,10 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr):
                 exc_info=True,
             )
             metrics.errors_total.labels(type="write_retry").inc()
+            # Invalidate cached schema so retry re-runs evolve() — another pod
+            # may have changed the table schema since our last attempt.
+            if schema_mgr is not None:
+                schema_mgr.invalidate()
             time.sleep(delay)
 
 

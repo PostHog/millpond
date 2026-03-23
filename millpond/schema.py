@@ -89,8 +89,9 @@ class SchemaManager:
         """Load current column names and types from DuckLake."""
         try:
             result = self._conn.execute(
-                f"SELECT column_name, data_type FROM information_schema.columns "
-                f"WHERE table_catalog = 'lake' AND table_schema = 'main' AND table_name = '{self._table_name}'"
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' AND table_schema = 'main' AND table_name = ?",
+                [self._table_name],
             ).fetchall()
             self._known_columns = {row[0]: _normalize_duckdb_type(row[1]) for row in result}
             self._initialized = True

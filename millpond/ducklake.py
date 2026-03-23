@@ -14,6 +14,18 @@ log = logging.getLogger(__name__)
 _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
 
 
+def _escape_libpq(value: str | None) -> str:
+    """Escape a value for a libpq connection string.
+
+    Wraps in single quotes and doubles any internal single quotes or backslashes.
+    See: https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
+    """
+    if value is None:
+        return "''"
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
 def _sanitize_setting_value(val: str) -> str:
     """Validate a DuckDB SET value to prevent SQL injection."""
     if not _SETTING_VALUE_RE.match(val):
@@ -50,7 +62,8 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     parsed = urlparse(cfg.ducklake_metadata_url)
     pg_connstr = (
         f"host={parsed.hostname} port={parsed.port or 5432} "
-        f"dbname={parsed.path.lstrip('/')} user={parsed.username} password={parsed.password}"
+        f"dbname={parsed.path.lstrip('/')} user={_escape_libpq(parsed.username)} "
+        f"password={_escape_libpq(parsed.password)}"
     )
     conn.execute(f"""
         ATTACH 'ducklake:postgres:{pg_connstr}' AS lake (

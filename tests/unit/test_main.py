@@ -47,6 +47,15 @@ class TestWriteWithRetry:
             calls = [c.args[0] for c in mock_time.sleep.call_args_list]
             assert calls == [1.0, 2.0]
 
+    def test_invalidates_schema_on_retry(self):
+        db = MagicMock()
+        schema_mgr = MagicMock()
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.ducklake") as mock_dl, patch("millpond.main.time"):
+            mock_dl.write.side_effect = [OSError("schema conflict"), None]
+            _write_with_retry(db, "test", table, schema_mgr)
+            schema_mgr.invalidate.assert_called_once()
+
 
 class TestFlushErrorDistinction:
     """Offset commit failures must be distinguishable from write failures in metrics and logs."""
@@ -95,6 +104,19 @@ class TestFlushErrorDistinction:
         # Should not raise — commit succeeds on second attempt
         _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
         assert kafka.commit.call_count == 2
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    @patch("millpond.main.ducklake")
+    def test_commit_retry_exponential_backoff(self, mock_dl, mock_metrics, mock_server, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
+        kafka.commit.side_effect = [KafkaException("fail"), KafkaException("fail"), None]
+
+        _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
+        delays = [c.args[0] for c in mock_time.sleep.call_args_list]
+        assert delays == [0.5, 1.0]
 
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")
