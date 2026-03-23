@@ -65,8 +65,11 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
         f"dbname={_escape_libpq(parsed.path.lstrip('/'))} user={_escape_libpq(parsed.username)} "
         f"password={_escape_libpq(parsed.password)}"
     )
+    # Double single quotes for DuckDB SQL string literal — the libpq layer
+    # inside DuckLake sees the unescaped quotes after DuckDB parses the string.
+    pg_connstr_sql = pg_connstr.replace("'", "''")
     conn.execute(f"""
-        ATTACH 'ducklake:postgres:{pg_connstr}' AS lake (
+        ATTACH 'ducklake:postgres:{pg_connstr_sql}' AS lake (
             DATA_PATH '{cfg.ducklake_data_path}'
         )
     """)
