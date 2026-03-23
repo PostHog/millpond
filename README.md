@@ -151,7 +151,6 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 
 ### Nice to have
 
-- [ ] Add librdkafka consumer metrics (confluent-kafka exposes internal stats via `statistics.interval.ms`)
 - [ ] Measure intra-batch schema variability (how often do keys differ across records in a single consume batch?)
 
 ## NOTE

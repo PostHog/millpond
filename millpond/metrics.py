@@ -60,3 +60,27 @@ last_committed_offset = Gauge(
     "Last committed offset",
     ["partition"],
 )
+
+# librdkafka internal stats (via statistics.interval.ms callback)
+rdkafka_replyq = Gauge(
+    "millpond_rdkafka_replyq",
+    "Number of ops waiting for broker response",
+)
+rdkafka_msg_cnt = Gauge(
+    "millpond_rdkafka_msg_cnt",
+    "Messages in internal producer/consumer queues",
+)
+rdkafka_msg_size = Gauge(
+    "millpond_rdkafka_msg_size",
+    "Bytes in internal producer/consumer queues",
+)
+rdkafka_broker_rtt_avg = Gauge(
+    "millpond_rdkafka_broker_rtt_avg_seconds",
+    "Broker round-trip time average",
+    ["broker"],
+)
+rdkafka_broker_rtt_p99 = Gauge(
+    "millpond_rdkafka_broker_rtt_p99_seconds",
+    "Broker round-trip time p99",
+    ["broker"],
+)

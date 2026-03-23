@@ -1,11 +1,32 @@
+import json
 import logging
 
 from confluent_kafka import Consumer, TopicPartition
 from confluent_kafka.admin import AdminClient
 
+from millpond import metrics
 from millpond.config import Config
 
 log = logging.getLogger(__name__)
+
+
+def _on_stats(stats_json: str) -> None:
+    """Parse librdkafka stats JSON and update Prometheus gauges."""
+    try:
+        stats = json.loads(stats_json)
+    except (json.JSONDecodeError, TypeError):
+        return
+
+    metrics.rdkafka_replyq.set(stats.get("replyq", 0))
+    metrics.rdkafka_msg_cnt.set(stats.get("msg_cnt", 0))
+    metrics.rdkafka_msg_size.set(stats.get("msg_size", 0))
+
+    for broker_info in stats.get("brokers", {}).values():
+        name = broker_info.get("name", "unknown")
+        rtt = broker_info.get("rtt", {})
+        # librdkafka reports RTT in microseconds
+        metrics.rdkafka_broker_rtt_avg.labels(broker=name).set(rtt.get("avg", 0) / 1_000_000)
+        metrics.rdkafka_broker_rtt_p99.labels(broker=name).set(rtt.get("p99", 0) / 1_000_000)
 
 
 def discover_partition_count(cfg: Config) -> int:
@@ -49,6 +70,8 @@ def create(cfg: Config) -> Consumer:
             "enable.auto.offset.store": False,
             "fetch.min.bytes": cfg.fetch_min_bytes,
             "fetch.wait.max.ms": cfg.fetch_max_wait_ms,
+            "statistics.interval.ms": 5000,
+            "stats_cb": _on_stats,
         }
     )
 
