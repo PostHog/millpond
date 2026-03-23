@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
+import pytest
 from confluent_kafka import KafkaException
 
 from millpond.main import _convert_batch, _flush, _write_with_retry
@@ -31,11 +32,9 @@ class TestWriteWithRetry:
         table = pa.table({"a": [1]})
         with patch("millpond.main.ducklake") as mock_dl, patch("millpond.main.time"):
             mock_dl.write.side_effect = OSError("persistent failure")
-            try:
+            with pytest.raises(OSError):
                 _write_with_retry(db, "test", table, schema_mgr)
-                assert False, "Should have raised"
-            except OSError:
-                assert mock_dl.write.call_count == 3
+            assert mock_dl.write.call_count == 3
 
     def test_exponential_backoff(self):
         db = MagicMock()
@@ -79,11 +78,8 @@ class TestFlushErrorDistinction:
         db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
         kafka.commit.side_effect = KafkaException("broker unavailable")
 
-        try:
+        with pytest.raises(KafkaException):
             _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
-            assert False, "Should have raised"
-        except KafkaException:
-            pass
 
         assert kafka.commit.call_count == 3
         # Each failed attempt increments the offset_commit error counter
@@ -126,11 +122,8 @@ class TestFlushErrorDistinction:
         db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
         mock_dl.write.side_effect = OSError("S3 timeout")
 
-        try:
+        with pytest.raises(OSError):
             _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
-            assert False, "Should have raised"
-        except OSError:
-            pass
 
         # offset_commit error should NOT have been incremented
         commit_calls = [
