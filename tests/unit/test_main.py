@@ -61,10 +61,12 @@ class TestFlushErrorDistinction:
         schema_mgr = MagicMock()
         return db, cfg, kafka, table, offsets, schema_mgr
 
+    @patch("millpond.main.time")
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")
     @patch("millpond.main.ducklake")
-    def test_commit_failure_increments_offset_commit_error(self, mock_dl, mock_metrics, mock_server):
+    def test_commit_failure_raises_after_retries(self, mock_dl, mock_metrics, mock_server, mock_time):
+        mock_time.monotonic.return_value = 0.0
         db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
         kafka.commit.side_effect = KafkaException("broker unavailable")
 
@@ -74,8 +76,25 @@ class TestFlushErrorDistinction:
         except KafkaException:
             pass
 
-        mock_metrics.errors_total.labels.assert_called_with(type="offset_commit")
-        mock_metrics.errors_total.labels(type="offset_commit").inc.assert_called_once()
+        assert kafka.commit.call_count == 3
+        # Each failed attempt increments the offset_commit error counter
+        commit_calls = [
+            c for c in mock_metrics.errors_total.labels.call_args_list if c.kwargs.get("type") == "offset_commit"
+        ]
+        assert len(commit_calls) == 3
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    @patch("millpond.main.ducklake")
+    def test_commit_succeeds_after_retry(self, mock_dl, mock_metrics, mock_server, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
+        kafka.commit.side_effect = [KafkaException("transient"), None]
+
+        # Should not raise — commit succeeds on second attempt
+        _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
+        assert kafka.commit.call_count == 2
 
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")

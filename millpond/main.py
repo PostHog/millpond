@@ -13,6 +13,8 @@ log = logging.getLogger(__name__)
 _LAG_SAMPLE_INTERVAL_S = 60.0  # how often to query watermark offsets for lag metrics
 _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
+_COMMIT_MAX_RETRIES = 3
+_COMMIT_BASE_DELAY_S = 0.5
 
 
 def _convert_batch(values: list[bytes]) -> pa.Table | None:
@@ -57,12 +59,28 @@ def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets
         TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
         for (topic, partition), offset in offsets.items()
     ]
-    try:
-        kafka.commit(offsets=tp_offsets, asynchronous=False)
-    except Exception:
-        metrics.errors_total.labels(type="offset_commit").inc()
-        log.error("Offset commit failed after successful write — duplicates possible on restart", exc_info=True)
-        raise
+    for attempt in range(_COMMIT_MAX_RETRIES):
+        try:
+            kafka.commit(offsets=tp_offsets, asynchronous=False)
+            break
+        except Exception:
+            metrics.errors_total.labels(type="offset_commit").inc()
+            if attempt == _COMMIT_MAX_RETRIES - 1:
+                log.error(
+                    "Offset commit failed after %d attempts — duplicates possible on restart",
+                    _COMMIT_MAX_RETRIES,
+                    exc_info=True,
+                )
+                raise
+            delay = _COMMIT_BASE_DELAY_S * (2**attempt)
+            log.warning(
+                "Offset commit failed (attempt %d/%d), retrying in %.1fs",
+                attempt + 1,
+                _COMMIT_MAX_RETRIES,
+                delay,
+                exc_info=True,
+            )
+            time.sleep(delay)
 
     log.info(
         "Flush: %d records, %d bytes, %d columns, write=%.2fs, elapsed=%.1fs",

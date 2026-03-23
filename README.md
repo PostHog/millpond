@@ -118,6 +118,19 @@ Downtime = drain time + startup time (~2-3 min). Kafka buffers trivially.
 
 **Never `kubectl scale` without updating `REPLICA_COUNT`.** Use Helm to manage both atomically.
 
+## Error Handling and Retries
+
+The flush path has two failure points, each with its own retry policy:
+
+| Operation | Retries | Backoff | On exhaustion |
+|-----------|---------|---------|---------------|
+| DuckLake write | 3 | Exponential (1s, 2s, 4s) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
+| Offset commit | 3 | Exponential (0.5s, 1s, 2s) | Re-raise → pod crashes, replays from last committed offset (duplicates bounded by one flush batch) |
+
+Both use `errors_total{type="write_retry"}` and `errors_total{type="offset_commit"}` counters so transient vs persistent failures are distinguishable in dashboards.
+
+**Why crash after exhausting retries?** A persistent write failure means S3 or Postgres is down — continuing would just accumulate pending data in memory until OOM. A persistent commit failure means the Kafka coordinator is unreachable — the write already succeeded, but without committed offsets the next restart will replay the batch (at-least-once duplicates). In both cases, crashing lets K8s apply its restart backoff, and Kafka holds the data safely until the dependency recovers.
+
 ## Multiple Pipelines
 
 Each topic→table mapping is a separate StatefulSet. The application doesn't change — just the env vars. Template with Helm:
