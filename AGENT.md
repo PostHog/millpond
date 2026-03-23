@@ -330,6 +330,8 @@ millpond/
 │   ├── ducklake.py           # DuckDB/DuckLake connection, table mgmt, writes
 │   ├── metrics.py            # Prometheus metric definitions
 │   └── server.py             # HTTP server for /metrics and /healthz
+├── tools/
+│   └── sizing-calculator.html  # Interactive flush/object sizing calculator
 ├── tests/
 │   ├── unit/                 # Fast, no external deps
 │   ├── integration/          # Local DuckDB write path + schema evolution

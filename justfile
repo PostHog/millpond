@@ -85,6 +85,11 @@ dashboard:
 minio:
     open http://localhost:9001
 
+# Open the sizing calculator
+[group('docker')]
+sizing:
+    open tools/sizing-calculator.html
+
 # === Build ===
 
 # Build Docker image

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Millpond Sizing Calculator</title>
+<style>
+  :root { --bg: #1a1a2e; --card: #16213e; --accent: #0f3460; --text: #e0e0e0; --hi: #e94560; --ok: #4ecca3; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: var(--bg); color: var(--text); padding: 2rem; max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.3rem; }
+  h1 span { color: var(--hi); }
+  .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
+  .card { background: var(--card); border-radius: 8px; padding: 1.2rem; }
+  .card h2 { font-size: 0.9rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 1rem; }
+  label { display: block; font-size: 0.85rem; margin-bottom: 0.3rem; color: #aaa; }
+  input[type=number] { width: 100%; background: var(--accent); border: 1px solid #333; border-radius: 4px; padding: 0.5rem; color: var(--text); font-size: 1rem; font-family: inherit; margin-bottom: 0.8rem; }
+  input[type=number]:focus { outline: none; border-color: var(--hi); }
+  .results { background: var(--card); border-radius: 8px; padding: 1.2rem; margin-bottom: 1.5rem; }
+  .results h2 { font-size: 0.9rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 1rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th { text-align: left; padding: 0.4rem 0.6rem; color: #888; font-weight: normal; border-bottom: 1px solid #333; }
+  td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #222; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .warn { color: var(--hi); }
+  .good { color: var(--ok); }
+  .note { font-size: 0.8rem; color: #666; margin-top: 0.8rem; }
+  .rec { background: var(--accent); border-radius: 8px; padding: 1.2rem; border-left: 3px solid var(--ok); }
+  .rec h2 { font-size: 0.9rem; color: var(--ok); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+  .rec code { background: #0a0a1a; padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.85rem; }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<h1><span>Millpond</span> Sizing Calculator</h1>
+<p class="subtitle">Estimate Parquet object sizes, memory requirements, and flush behavior</p>
+
+<div class="grid">
+  <div class="card">
+    <h2>Pipeline</h2>
+    <label>Messages per second (per partition)</label>
+    <input type="number" id="msgs_per_partition" value="4000" min="1">
+    <label>Partition count</label>
+    <input type="number" id="partitions" value="512" min="1">
+    <label>Replica count</label>
+    <input type="number" id="replicas" value="8" min="1">
+    <label>Parquet bytes per row</label>
+    <input type="number" id="parquet_bpr" value="366" min="1">
+  </div>
+  <div class="card">
+    <h2>Configuration</h2>
+    <label>FLUSH_INTERVAL_MS</label>
+    <input type="number" id="flush_interval" value="60000" min="1000" step="1000">
+    <label>FLUSH_SIZE (Arrow bytes)</label>
+    <input type="number" id="flush_size" value="104857600" min="1000000">
+    <label>Arrow-to-Parquet ratio</label>
+    <input type="number" id="compression" value="2.8" min="1" step="0.1">
+    <label>Target Parquet object size (MB)</label>
+    <input type="number" id="target_mb" value="128" min="1">
+  </div>
+</div>
+
+<div class="results">
+  <h2>Flush Estimates</h2>
+  <table>
+    <thead>
+      <tr><th>Metric</th><th style="text-align:right">Value</th></tr>
+    </thead>
+    <tbody id="output"></tbody>
+  </table>
+  <p class="note" id="trigger_note"></p>
+</div>
+
+<div class="results">
+  <h2>Sensitivity — Parquet Size by Interval</h2>
+  <table>
+    <thead>
+      <tr><th>Interval</th><th style="text-align:right">Parquet/file</th><th style="text-align:right">Arrow in memory</th><th style="text-align:right">Files/day</th></tr>
+    </thead>
+    <tbody id="sensitivity"></tbody>
+  </table>
+</div>
+
+<div class="rec" id="recommendation"></div>
+
+<script>
+function fmt(bytes) {
+  if (bytes >= 1e9) return (bytes/1e9).toFixed(1) + ' GB';
+  if (bytes >= 1e6) return (bytes/1e6).toFixed(1) + ' MB';
+  if (bytes >= 1e3) return (bytes/1e3).toFixed(1) + ' KB';
+  return bytes.toFixed(0) + ' B';
+}
+
+function fmtN(n) {
+  return n.toLocaleString('en-US', {maximumFractionDigits: 0});
+}
+
+function sizeClass(bytes, target) {
+  const mb = bytes / 1e6;
+  if (mb < 1) return 'warn';
+  if (mb >= target * 0.7 && mb <= target * 1.5) return 'good';
+  return '';
+}
+
+function memClass(bytes) {
+  const mi = bytes / (1024*1024);
+  if (mi > 1024) return 'warn';
+  return '';
+}
+
+function calc() {
+  const msgsPerPart = +document.getElementById('msgs_per_partition').value;
+  const partitions = +document.getElementById('partitions').value;
+  const replicas = +document.getElementById('replicas').value;
+  const parquetBpr = +document.getElementById('parquet_bpr').value;
+  const flushInterval = +document.getElementById('flush_interval').value;
+  const flushSize = +document.getElementById('flush_size').value;
+  const ratio = +document.getElementById('compression').value;
+  const targetMb = +document.getElementById('target_mb').value;
+
+  const partsPerPod = Math.ceil(partitions / replicas);
+  const msgsPerPod = msgsPerPart * partsPerPod;
+  const totalMsgs = msgsPerPart * partitions;
+
+  const intervalS = flushInterval / 1000;
+  const arrowBpr = parquetBpr * ratio;
+
+  // Time-triggered scenario
+  const rowsPerInterval = msgsPerPod * intervalS;
+  const arrowPerInterval = rowsPerInterval * arrowBpr;
+  const parquetPerInterval = rowsPerInterval * parquetBpr;
+
+  // Size-triggered scenario
+  const timeToFillSize = flushSize / (msgsPerPod * arrowBpr);
+  const sizeTriggered = timeToFillSize < intervalS;
+
+  const actualInterval = sizeTriggered ? timeToFillSize : intervalS;
+  const actualParquet = sizeTriggered ? (flushSize / ratio) : parquetPerInterval;
+  const actualArrow = sizeTriggered ? flushSize : arrowPerInterval;
+  const actualRows = sizeTriggered ? Math.floor(flushSize / arrowBpr) : rowsPerInterval;
+
+  const filesPerPodPerDay = (86400 / actualInterval);
+  const filesPerDay = filesPerPodPerDay * replicas;
+
+  // Memory estimate: Arrow buffer + overhead (DuckDB ~30MB, librdkafka ~100MB, Python ~30MB)
+  const overhead = 160 * 1024 * 1024;
+  const memNeeded = actualArrow + overhead;
+
+  const out = document.getElementById('output');
+  const rows = [
+    ['Total throughput', fmtN(totalMsgs) + ' msg/s'],
+    ['Partitions per pod', fmtN(partsPerPod)],
+    ['Messages per pod', fmtN(msgsPerPod) + ' msg/s'],
+    ['Flush trigger', sizeTriggered ? '<span class="warn">size (' + actualInterval.toFixed(1) + 's)</span>' : 'time (' + intervalS + 's)'],
+    ['Rows per flush', fmtN(actualRows)],
+    ['Arrow per flush', '<span class="' + memClass(actualArrow) + '">' + fmt(actualArrow) + '</span>'],
+    ['Parquet per flush', '<span class="' + sizeClass(actualParquet, targetMb) + '">' + fmt(actualParquet) + '</span>'],
+    ['Est. memory per pod', '<span class="' + memClass(memNeeded) + '">' + fmt(memNeeded) + '</span>'],
+    ['Files per day (all pods)', fmtN(Math.round(filesPerDay))],
+  ];
+  out.innerHTML = rows.map(r => '<tr><td>' + r[0] + '</td><td class="num">' + r[1] + '</td></tr>').join('');
+
+  const note = document.getElementById('trigger_note');
+  note.innerHTML = sizeTriggered
+    ? 'Size trigger fires at ' + actualInterval.toFixed(1) + 's before the ' + intervalS + 's interval expires.'
+    : 'Time trigger fires at ' + intervalS + 's. FLUSH_SIZE ceiling (' + fmt(flushSize) + ' Arrow) is not reached.';
+
+  // Sensitivity table
+  const intervals = [30, 60, 90, 120, 180, 300];
+  const sens = document.getElementById('sensitivity');
+  sens.innerHTML = intervals.map(s => {
+    const ms = s * 1000;
+    const tFill = flushSize / (msgsPerPod * arrowBpr);
+    const triggered = tFill < s;
+    const effInterval = triggered ? tFill : s;
+    const pq = triggered ? (flushSize / ratio) : (msgsPerPod * s * parquetBpr);
+    const ar = triggered ? flushSize : (msgsPerPod * s * arrowBpr);
+    const fpd = Math.round((86400 / effInterval) * replicas);
+    const marker = (ms === flushInterval) ? ' *' : '';
+    return '<tr><td>' + s + 's' + marker + '</td>'
+      + '<td class="num"><span class="' + sizeClass(pq, targetMb) + '">' + fmt(pq) + '</span></td>'
+      + '<td class="num"><span class="' + memClass(ar) + '">' + fmt(ar) + '</span></td>'
+      + '<td class="num">' + fmtN(fpd) + '</td></tr>';
+  }).join('');
+
+  // Recommendation
+  const rec = document.getElementById('recommendation');
+  const targetParquet = targetMb * 1e6;
+  const idealInterval = targetParquet / (msgsPerPod * parquetBpr);
+  const idealArrow = msgsPerPod * idealInterval * arrowBpr;
+  const idealMem = idealArrow + overhead;
+  const idealMemMi = Math.ceil(idealMem / (1024*1024) / 128) * 128; // round up to 128Mi
+
+  if (idealInterval < 10) {
+    rec.innerHTML = '<h2>Recommendation</h2>'
+      + '<p>At this volume, even a 10s interval exceeds ' + targetMb + 'MB. '
+      + 'Set <code>FLUSH_INTERVAL_MS=10000</code> and let the size trigger handle it. '
+      + 'Memory limit: <code>' + idealMemMi + 'Mi</code>.</p>';
+  } else if (idealInterval > 600) {
+    rec.innerHTML = '<h2>Recommendation</h2>'
+      + '<p>Volume is too low to reach ' + targetMb + 'MB within a reasonable interval. '
+      + 'Use <code>FLUSH_INTERVAL_MS=60000</code> and run <code>ducklake_merge_adjacent_files()</code> periodically to compact.</p>';
+  } else {
+    const recIntervalMs = Math.round(idealInterval / 5) * 5 * 1000; // round to nearest 5s
+    rec.innerHTML = '<h2>Recommendation for ~' + targetMb + 'MB objects</h2>'
+      + '<p><code>FLUSH_INTERVAL_MS=' + recIntervalMs + '</code> &mdash; '
+      + 'produces ~' + fmt(targetParquet) + ' Parquet per file at mean volume. '
+      + 'Memory limit: <code>' + idealMemMi + 'Mi</code>. '
+      + 'Set <code>FLUSH_SIZE</code> to <code>' + fmtN(Math.round(idealArrow * 2)) + '</code> as a burst ceiling.</p>';
+  }
+}
+
+document.querySelectorAll('input').forEach(el => el.addEventListener('input', calc));
+calc();
+</script>
+</body>
+</html>
