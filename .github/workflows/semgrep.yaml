@@ -1,0 +1,56 @@
+name: Semgrep
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  SEMGREP_ENABLE_VERSION_CHECK: 'false'
+
+jobs:
+  semgrep-python:
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run Semgrep
+        run: |
+          semgrep \
+            --config "p/python" \
+            --config "p/owasp-top-ten" \
+            --config "p/security-audit" \
+            --config "p/trailofbits" \
+            --error \
+            --metrics=off \
+            --verbose \
+            millpond/
+
+  semgrep-general:
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run Semgrep
+        run: |
+          semgrep \
+            --config "p/owasp-top-ten" \
+            --config "p/security-audit" \
+            --config "p/trailofbits" \
+            --config "p/github-actions" \
+            --error \
+            --metrics=off \
+            --verbose \
+            --exclude ./millpond/ \
+            .
