@@ -109,6 +109,8 @@ jobs:
       with:
         context: .
         push: true
+        build-args: |
+          MILLPOND_VERSION=${{ steps.next_tag.outputs.version }}
         tags: |
           ghcr.io/posthog/millpond:${{ steps.next_tag.outputs.tag }}
           ghcr.io/posthog/millpond:latest
