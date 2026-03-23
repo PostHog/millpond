@@ -53,6 +53,13 @@ class _HealthState:
         """Backward-compatible: same as is_ready()."""
         return self.is_ready()
 
+    def status_body(self) -> str:
+        """Diagnostic string for health check responses."""
+        now = time.monotonic()
+        poll_age = f"{now - self._last_poll:.1f}s ago" if self._started else "never"
+        flush_age = f"{now - self._last_flush:.1f}s ago" if self._has_flushed else "never"
+        return f"poll={poll_age} flush={flush_age}"
+
 
 health = _HealthState()
 
@@ -68,23 +75,25 @@ def _make_handler():
                 self.end_headers()
                 self.wfile.write(payload)
             elif self.path == "/healthz":
+                body = health.status_body()
                 if health.is_alive():
                     self.send_response(200)
                     self.end_headers()
-                    self.wfile.write(b"ok\n")
+                    self.wfile.write(f"ok {body}\n".encode())
                 else:
                     self.send_response(503)
                     self.end_headers()
-                    self.wfile.write(b"unhealthy\n")
+                    self.wfile.write(f"unhealthy {body}\n".encode())
             elif self.path == "/readyz":
+                body = health.status_body()
                 if health.is_ready():
                     self.send_response(200)
                     self.end_headers()
-                    self.wfile.write(b"ok\n")
+                    self.wfile.write(f"ok {body}\n".encode())
                 else:
                     self.send_response(503)
                     self.end_headers()
-                    self.wfile.write(b"not ready\n")
+                    self.wfile.write(f"not ready {body}\n".encode())
             else:
                 self.send_response(404)
                 self.end_headers()

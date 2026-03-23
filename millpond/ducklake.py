@@ -75,6 +75,7 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     return conn
 
 
+# Assumes single connection for pod lifetime. Must be cleared if connection is ever recycled.
 _tables_ensured: set[str] = set()
 
 
