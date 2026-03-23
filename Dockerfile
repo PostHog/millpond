@@ -17,13 +17,14 @@ COPY --from=builder /app/millpond /app/millpond
 
 ENV PATH="/app/.venv/bin:$PATH"
 
+RUN useradd --create-home --shell /bin/false millpond
+USER millpond
+
 # Pre-install DuckDB extensions at build time to avoid runtime network dependency.
+# Must run as millpond user so extensions land in ~/.duckdb/extensions/ (not /root/).
 # httpfs must be installed before ducklake — there's a race condition with S3 access
 # if ducklake loads first and tries to use httpfs before it's available.
 RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres')"
-
-RUN useradd --create-home --shell /bin/false millpond
-USER millpond
 
 # Health check for non-K8s environments (K8s uses liveness/readiness probes in statefulset.yaml)
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
