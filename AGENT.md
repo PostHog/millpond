@@ -310,7 +310,8 @@ millpond/
 ├── docker-compose.yaml       # Full dev stack (Kafka, Postgres, MinIO, Grafana)
 ├── k8s/
 │   ├── statefulset.yaml
-│   └── service.yaml          # Headless service for StatefulSet
+│   ├── service.yaml          # Headless service for StatefulSet
+│   └── pdb.yaml              # PodDisruptionBudget
 ├── millpond/
 │   ├── __init__.py
 │   ├── main.py               # Entry point, main loop, signal handling

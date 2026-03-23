@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: millpond-events  # change per topic
+spec:
+  # Allow at most one pod unavailable at a time during voluntary disruptions
+  # (node drain, cluster upgrade). Kafka buffers during downtime.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: millpond-events
