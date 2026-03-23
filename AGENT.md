@@ -275,6 +275,17 @@ Unlike the JVM client (which supports custom log storage callbacks — see `duck
 
 For now, DuckDB logging is left at defaults. If needed, enable with `CALL enable_logging(storage='stdout')` and DuckDB will write to stderr in CSV format alongside Python's structured logs.
 
+## Releases
+
+Every merge to `main` triggers `.github/workflows/release.yaml`:
+
+1. Auto-bumps patch version from latest git tag (`v0.0.1` → `v0.0.2`)
+2. Builds a source tarball (`millpond-v0.0.X.tar.gz`) containing `pyproject.toml`, `uv.lock`, and all source — attached to the GitHub release
+3. Builds and pushes Docker image to `ghcr.io/posthog/millpond:<tag>` and `:latest`
+4. Creates GitHub release with auto-generated changelog
+
+The tarball is the primary artifact for external Docker builds (e.g. `posthog-cloud-infra`). It includes the lockfile so `uv sync --frozen` produces reproducible installs with pinned binary wheels. Do not distribute standalone wheels — they lack the lockfile and resolve unpinned deps from PyPI.
+
 ## Deployment Strategy
 
 Rolling updates are a poor fit for static partition assignment — during the roll, pods run with different `REPLICA_COUNT` values, causing temporary double-assignment (duplicate writes) or gaps. Since Kafka is the durable buffer, a simpler strategy works:
@@ -316,6 +327,9 @@ millpond/
 ├── pyproject.toml            # Dependencies and metadata (uv source of truth)
 ├── uv.lock                   # Resolved dependency lock (committed)
 ├── .flox/                    # Flox environment
+├── .github/workflows/
+│   ├── ci.yaml               # Format, lint, unit tests on PR/push
+│   └── release.yaml          # Auto-version, tarball, Docker image, GitHub release
 ├── Dockerfile
 ├── docker-compose.yaml       # Full dev stack (Kafka, Postgres, MinIO, Grafana)
 ├── k8s/

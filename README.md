@@ -94,10 +94,18 @@ All configuration via environment variables:
 | `STATS_INTERVAL_MS` | no | `5000` | librdkafka internal stats emission interval (0 to disable) |
 | `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
 
+## Releases
+
+Every merge to `main` automatically:
+1. Bumps the patch version (`v0.0.1` → `v0.0.2`)
+2. Builds and pushes a Docker image to `ghcr.io/posthog/millpond:<tag>`
+3. Creates a GitHub release with changelog
+
+Images: `ghcr.io/posthog/millpond:v0.0.X` or `ghcr.io/posthog/millpond:latest`
+
 ## Deployment
 
 ```bash
-just build        # build Docker image
 kubectl apply -f k8s/service.yaml
 kubectl apply -f k8s/pdb.yaml
 kubectl apply -f k8s/statefulset.yaml
