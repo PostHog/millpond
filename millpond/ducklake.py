@@ -92,6 +92,6 @@ def write(
         schema_mgr.evolve(batch.schema)
     conn.register("_arrow_batch", batch)
     try:
-        conn.execute(f"INSERT INTO lake.main.{table_name} SELECT *, NOW() AS _inserted_at FROM _arrow_batch")
+        conn.execute(f"INSERT INTO lake.main.{table_name} BY NAME (SELECT *, NOW() AS _inserted_at FROM _arrow_batch)")
     finally:
         conn.unregister("_arrow_batch")

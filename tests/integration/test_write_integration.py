@@ -81,9 +81,9 @@ class TestSchemaEvolution:
         schema_mgr = SchemaManager(conn, "events")
         write(conn, "events", batch1, schema_mgr)
 
-        # Second batch introduces a new column — verify DDL happens
+        # Second write introduces a new column — full write, not just evolve
         batch2 = pa.table({"event": ["view"], "source": ["web"]})
-        schema_mgr.evolve(batch2.schema)
+        write(conn, "events", batch2, schema_mgr)
 
         cols = conn.execute(
             "SELECT column_name FROM information_schema.columns "
@@ -91,6 +91,10 @@ class TestSchemaEvolution:
         ).fetchall()
         col_names = {row[0] for row in cols}
         assert "source" in col_names
+
+        # Verify data landed correctly
+        rows = conn.execute("SELECT event, source FROM lake.main.events ORDER BY event").fetchall()
+        assert rows == [("click", None), ("view", "web")]
 
     def test_widen_integer_to_bigint(self, conn):
         # Create table with INTEGER column
@@ -125,9 +129,9 @@ class TestSchemaEvolution:
         schema_mgr = SchemaManager(conn, "events")
         write(conn, "events", batch1, schema_mgr)
 
-        # Verify evolve adds multiple columns in one call
+        # Full write with multiple new columns
         batch2 = pa.table({"a": [2], "b": ["x"], "c": [3.0]})
-        schema_mgr.evolve(batch2.schema)
+        write(conn, "events", batch2, schema_mgr)
 
         cols = conn.execute(
             "SELECT column_name FROM information_schema.columns "
@@ -135,6 +139,10 @@ class TestSchemaEvolution:
         ).fetchall()
         col_names = {row[0] for row in cols}
         assert {"a", "b", "c", "_inserted_at"} <= col_names
+
+        # Verify data integrity
+        rows = conn.execute("SELECT a, b, c FROM lake.main.events ORDER BY a").fetchall()
+        assert rows == [(1, None, None), (2, "x", 3.0)]
 
     def test_schema_cached_across_writes(self, conn):
         batch = pa.table({"event": ["click"]})
