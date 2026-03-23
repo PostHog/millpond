@@ -300,10 +300,11 @@ Downtime = time to drain + time to start new pods. With `terminationGracePeriodS
 
 ## HTTP Server
 
-Both Prometheus metrics (`/metrics`) and health checks (`/healthz`) run on port 8000. `prometheus_client.start_http_server()` does not support custom routes, so Millpond uses a custom `http.server.HTTPServer` that serves both:
+Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTPServer` (`prometheus_client.start_http_server()` doesn't support custom routes):
 
 - `GET /metrics` → Prometheus exposition format (via `prometheus_client.generate_latest()`)
-- `GET /healthz` → 200 if last poll and last flush are within thresholds, 503 otherwise
+- `GET /healthz` → liveness: 200 if started and last poll within `max_poll_age_s` (300s), 503 otherwise
+- `GET /readyz` → readiness: 200 if alive and last flush within `max_flush_age_s` (600s), 503 otherwise. Idle topics (no flush yet) pass readiness.
 
 ## Toolchain
 
