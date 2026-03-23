@@ -65,19 +65,22 @@ def create(cfg: Config) -> Consumer:
 
     log.info("Assigned partitions: %s", my_partitions)
 
-    consumer = Consumer(
-        {
-            "bootstrap.servers": cfg.bootstrap_servers,
-            "group.id": cfg.group_id,
-            "auto.offset.reset": "earliest",
-            "enable.auto.commit": False,
-            "enable.auto.offset.store": False,
-            "fetch.min.bytes": cfg.fetch_min_bytes,
-            "fetch.wait.max.ms": cfg.fetch_max_wait_ms,
-            "statistics.interval.ms": cfg.stats_interval_ms,
-            "stats_cb": _on_stats,
-        }
-    )
+    consumer_config = {
+        "bootstrap.servers": cfg.bootstrap_servers,
+        "group.id": cfg.group_id,
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": False,
+        "enable.auto.offset.store": False,
+        "fetch.min.bytes": cfg.fetch_min_bytes,
+        "fetch.wait.max.ms": cfg.fetch_max_wait_ms,
+        "statistics.interval.ms": cfg.stats_interval_ms,
+        "stats_cb": _on_stats,
+    }
+    # Merge KAFKA_CONSUMER_* overrides (e.g. security.protocol, sasl.mechanism)
+    for key, val in cfg.kafka_config_overrides:
+        consumer_config[key] = val
+
+    consumer = Consumer(consumer_config)
 
     consumer.assign([TopicPartition(cfg.topic, p) for p in my_partitions])
     return consumer

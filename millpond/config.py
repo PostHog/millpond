@@ -41,6 +41,9 @@ class Config:
     consume_batch_size: int
     stats_interval_ms: int
 
+    # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
+    kafka_config_overrides: tuple[tuple[str, str], ...]
+
     @property
     def flush_interval_s(self) -> float:
         return self.flush_interval_ms / 1000.0
@@ -84,6 +87,15 @@ def load() -> Config:
             f"DUCKLAKE_PARTITION_BY {partition_by!r} contains unsafe characters (must match [a-zA-Z0-9_(),\\s]+)"
         )
 
+    # Collect KAFKA_CONSUMER_* env vars as librdkafka config overrides.
+    # e.g. KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL -> security.protocol=SASL_SSL
+    _KAFKA_CONSUMER_PREFIX = "KAFKA_CONSUMER_"
+    kafka_overrides = tuple(
+        (k[len(_KAFKA_CONSUMER_PREFIX):].lower().replace("_", "."), v)
+        for k, v in os.environ.items()
+        if k.startswith(_KAFKA_CONSUMER_PREFIX)
+    )
+
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
         topic=topic,
@@ -101,6 +113,7 @@ def load() -> Config:
         fetch_max_wait_ms=int(os.environ.get("FETCH_MAX_WAIT_MS", "500")),
         consume_batch_size=int(os.environ.get("CONSUME_BATCH_SIZE", "1000")),
         stats_interval_ms=int(os.environ.get("STATS_INTERVAL_MS", "5000")),
+        kafka_config_overrides=kafka_overrides,
     )
 
     log.info(
