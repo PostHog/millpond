@@ -126,6 +126,10 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     environment: &millpond-env
       KAFKA_BOOTSTRAP_SERVERS: kafka:9094
       KAFKA_TOPIC: test-events
@@ -158,6 +162,10 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     environment:
       <<: *millpond-env
       POD_NAME: millpond-test-1
