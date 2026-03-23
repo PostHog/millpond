@@ -149,11 +149,7 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 ### Pre-production
 - [ ] Use `INSERT INTO ... BY NAME` in `ducklake.write()` for column-order safety
 
-### Nice to have
-
-- [ ] Measure intra-batch schema variability (how often do keys differ across records in a single consume batch?)
-
-## NOTE
+## Note
 This project should absolutely be called TableFowl, but that would be an [SEO](https://www.confluent.io/product/tableflow/) and linguistic palaver.
 
 ---

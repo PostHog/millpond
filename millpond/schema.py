@@ -130,6 +130,7 @@ class SchemaManager:
                         f'ADD COLUMN IF NOT EXISTS "{field.name}" {duckdb_type}'
                     )
                     self._known_columns[field.name] = duckdb_type
+                    metrics.schema_columns_added_total.inc()
                 except duckdb.Error as e:
                     log.warning("Failed to add column %s: %s", field.name, e)
                     metrics.errors_total.labels(type="schema").inc()
@@ -149,6 +150,7 @@ class SchemaManager:
                         f'ALTER COLUMN "{field.name}" SET DATA TYPE {duckdb_type}'
                     )
                     self._known_columns[field.name] = duckdb_type
+                    metrics.schema_columns_widened_total.inc()
                 except duckdb.Error as e:
                     # DuckLake rejects invalid promotions — log and continue
                     log.warning(

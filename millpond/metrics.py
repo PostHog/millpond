@@ -62,6 +62,17 @@ last_committed_offset = Gauge(
 )
 
 # librdkafka internal stats (via statistics.interval.ms callback)
+# Schema evolution
+schema_columns_added_total = Counter(
+    "millpond_schema_columns_added_total",
+    "Columns added via schema evolution",
+)
+schema_columns_widened_total = Counter(
+    "millpond_schema_columns_widened_total",
+    "Columns widened via schema evolution",
+)
+
+# librdkafka internal stats (via statistics.interval.ms callback)
 rdkafka_replyq = Gauge(
     "millpond_rdkafka_replyq",
     "Number of ops waiting for broker response",

@@ -195,6 +195,8 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | `millpond_pending_bytes` | Gauge | Current pending Arrow bytes awaiting flush |
 | `millpond_consumer_lag` | Gauge | Highwater - committed (by partition) |
 | `millpond_last_committed_offset` | Gauge | Last committed offset (by partition) |
+| `millpond_schema_columns_added_total` | Counter | Columns added via schema evolution |
+| `millpond_schema_columns_widened_total` | Counter | Columns widened via schema evolution |
 | `millpond_rdkafka_replyq` | Gauge | Ops waiting for broker response (librdkafka) |
 | `millpond_rdkafka_msg_cnt` | Gauge | Messages in internal librdkafka queues |
 | `millpond_rdkafka_msg_size` | Gauge | Bytes in internal librdkafka queues |

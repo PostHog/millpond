@@ -5,6 +5,8 @@ ducklake.write() and schema.SchemaManager code paths without requiring
 Postgres or S3.
 """
 
+from unittest.mock import patch
+
 import duckdb
 import pyarrow as pa
 import pytest
@@ -153,3 +155,36 @@ class TestSchemaEvolution:
         # Next evolve should reload
         schema_mgr.evolve(batch.schema)
         assert schema_mgr._initialized
+
+    @patch("millpond.schema.metrics")
+    def test_column_added_increments_counter(self, mock_metrics, conn):
+        batch1 = pa.table({"event": ["click"]})
+        schema_mgr = SchemaManager(conn, "events")
+        write(conn, "events", batch1, schema_mgr)
+
+        batch2 = pa.table({"event": ["view"], "source": ["web"]})
+        schema_mgr.evolve(batch2.schema)
+
+        mock_metrics.schema_columns_added_total.inc.assert_called_once()
+
+    @patch("millpond.schema.metrics")
+    def test_type_widened_increments_counter(self, mock_metrics, conn):
+        conn.execute("CREATE TABLE lake.main.events (x INTEGER)")
+        schema_mgr = SchemaManager(conn, "events")
+
+        batch = pa.table({"x": pa.array([1], type=pa.int64())})
+        schema_mgr.evolve(batch.schema)
+
+        mock_metrics.schema_columns_widened_total.inc.assert_called_once()
+
+    @patch("millpond.schema.metrics")
+    def test_no_change_no_counter(self, mock_metrics, conn):
+        batch = pa.table({"event": ["click"]})
+        schema_mgr = SchemaManager(conn, "events")
+        write(conn, "events", batch, schema_mgr)
+
+        # Same schema again — no evolution needed
+        schema_mgr.evolve(batch.schema)
+
+        mock_metrics.schema_columns_added_total.inc.assert_not_called()
+        mock_metrics.schema_columns_widened_total.inc.assert_not_called()
