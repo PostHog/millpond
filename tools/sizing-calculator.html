@@ -161,9 +161,9 @@ function calc() {
   const sizeTriggered = timeToFillSize < intervalS;
 
   const actualInterval = sizeTriggered ? timeToFillSize : intervalS;
-  const actualParquet = sizeTriggered ? (flushSize / ratio) : parquetPerInterval;
-  const actualArrow = sizeTriggered ? flushSize : arrowPerInterval;
   const actualRows = sizeTriggered ? Math.floor(flushSize / arrowBpr) : rowsPerInterval;
+  const actualArrow = actualRows * arrowBpr;
+  const actualParquet = actualRows * parquetBpr;
 
   const filesPerPodPerDay = (86400 / actualInterval);
   const filesPerDay = filesPerPodPerDay * replicas;
