@@ -158,8 +158,11 @@ def convert(messages: list[bytes]) -> pa.Table | None:
         return None
 
     records = _flatten_nested_to_json(records)
-    records = _stringify_mixed_type_values(records, _build_schema(records))
     schema = _build_schema(records)
-    table = pa.Table.from_pylist(records, schema=schema)
+    patched = _stringify_mixed_type_values(records, schema)
+    if patched is not records:
+        # Mixed types were found and coerced — re-infer schema with string types
+        schema = _build_schema(patched)
+    table = pa.Table.from_pylist(patched, schema=schema)
     table = _normalize_numeric_types(table)
     return table
