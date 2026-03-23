@@ -117,6 +117,7 @@ def _ensure_table(
         _validate_partition_expr(partition_by)
         conn.execute(f"ALTER TABLE lake.main.{table_name} SET PARTITIONED BY ({partition_by})")
         log.info("Table %s partitioned by: %s", table_name, partition_by)
+    # Cache AFTER both CREATE and ALTER succeed — if either fails, retry on next write.
     _tables_ensured.add(table_name)
 
 
