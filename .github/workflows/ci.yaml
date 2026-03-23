@@ -44,4 +44,4 @@ jobs:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Build Docker image
-      run: docker build --build-arg MILLPOND_VERSION=0.0.0-ci -t millpond .
+      run: docker build --build-arg MILLPOND_VERSION=0.0.0.dev0 -t millpond .
