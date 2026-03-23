@@ -125,6 +125,9 @@ def main():
     metrics.init(f"{cfg.topic}-{cfg.ducklake_table}")
     http = server.start()
 
+    # No connection recovery logic — if DuckLake/Postgres fails, the pod crashes
+    # and K8s restarts it. Reconnection adds complexity for no benefit when the
+    # restart path already handles offset replay correctly.
     db = ducklake.connect(cfg)
     schema_mgr = schema.SchemaManager(db, cfg.ducklake_table)
     kafka = consumer.create(cfg)
