@@ -300,15 +300,21 @@ millpond/
 ├── uv.lock                   # Resolved dependency lock (committed)
 ├── .flox/                    # Flox environment
 ├── Dockerfile
+├── docker-compose.yaml       # Full dev stack (Kafka, Postgres, MinIO, Grafana)
 ├── k8s/
 │   ├── statefulset.yaml
 │   └── service.yaml          # Headless service for StatefulSet
-└── millpond/
-    ├── __init__.py
-    ├── main.py              # Entry point, main loop, signal handling
-    ├── config.py             # Env var → dataclass
-    ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + DOUBLE cast)
-    ├── ducklake.py           # DuckDB/DuckLake connection, table mgmt, writes
-    ├── metrics.py            # Prometheus metric definitions
-    └── server.py             # HTTP server for /metrics and /healthz
+├── millpond/
+│   ├── __init__.py
+│   ├── main.py               # Entry point, main loop, signal handling
+│   ├── config.py             # Env var → dataclass
+│   ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + DOUBLE cast)
+│   ├── ducklake.py           # DuckDB/DuckLake connection, table mgmt, writes
+│   ├── metrics.py            # Prometheus metric definitions
+│   └── server.py             # HTTP server for /metrics and /healthz
+├── tests/
+│   ├── unit/                 # Fast, no external deps
+│   ├── integration/          # Local DuckDB write path + schema evolution
+│   └── e2e/                  # Full docker-compose stack via testcontainers
+└── test/                     # Dev fixtures (producer.py, ducklake-init.sql)
 ```

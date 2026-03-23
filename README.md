@@ -63,10 +63,12 @@ just run
 ## Development
 
 ```bash
-just fmt          # format code
-just lint         # lint code
-just test         # run unit tests
-just ci           # format check + lint + test
+just fmt               # format code
+just lint              # lint code
+just test              # run unit tests
+just test-integration  # run integration tests (local DuckDB)
+just test-e2e          # run E2E tests (docker-compose, builds stack automatically)
+just ci                # format check + lint + unit tests
 ```
 
 ## Configuration
@@ -146,9 +148,9 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 
 ### Pre-production
 - [ ] Use `INSERT INTO ... BY NAME` in `ducklake.write()` for column-order safety
-- [ ] E2E test via docker-compose with assertions
 
 ### Nice to have
+
 - [ ] Add librdkafka consumer metrics (confluent-kafka exposes internal stats via `statistics.interval.ms`)
 - [ ] Measure intra-batch schema variability (how often do keys differ across records in a single consume batch?)
 

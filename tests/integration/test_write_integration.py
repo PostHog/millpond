@@ -9,7 +9,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-from millpond.ducklake import _ensure_table, _tables_ensured, write
+from millpond.ducklake import _tables_ensured, write
 from millpond.schema import SchemaManager
 
 
