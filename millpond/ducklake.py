@@ -17,7 +17,7 @@ _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
 def _escape_libpq(value: str | None) -> str:
     """Escape a value for a libpq connection string.
 
-    Wraps in single quotes and doubles any internal single quotes or backslashes.
+    Wraps in single quotes and backslash-escapes internal single quotes and backslashes.
     See: https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
     """
     if value is None:
