@@ -118,10 +118,11 @@ class TestFlushErrorDistinction:
         delays = [c.args[0] for c in mock_time.sleep.call_args_list]
         assert delays == [0.5, 1.0]
 
+    @patch("millpond.main.time")
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")
     @patch("millpond.main.ducklake")
-    def test_write_failure_does_not_increment_offset_commit_error(self, mock_dl, mock_metrics, mock_server):
+    def test_write_failure_does_not_increment_offset_commit_error(self, mock_dl, mock_metrics, mock_server, mock_time):
         db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
         mock_dl.write.side_effect = OSError("S3 timeout")
 
