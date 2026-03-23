@@ -34,6 +34,7 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr):
             ducklake.write(db, table_name, consolidated, schema_mgr)
             return
         except Exception:
+            metrics.errors_total.labels(type="write_retry").inc()
             if attempt == _WRITE_MAX_RETRIES - 1:
                 raise
             delay = _WRITE_BASE_DELAY_S * (2**attempt)
@@ -44,7 +45,6 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr):
                 delay,
                 exc_info=True,
             )
-            metrics.errors_total.labels(type="write_retry").inc()
             # Invalidate cached schema so retry re-runs evolve() — another pod
             # may have changed the table schema since our last attempt.
             if schema_mgr is not None:
