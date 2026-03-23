@@ -5,7 +5,7 @@ ducklake.write() and schema.SchemaManager code paths without requiring
 Postgres or S3.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import duckdb
 import pyarrow as pa
@@ -196,3 +196,52 @@ class TestSchemaEvolution:
 
         mock_metrics.schema_columns_added_total.inc.assert_not_called()
         mock_metrics.schema_columns_widened_total.inc.assert_not_called()
+
+    @patch("millpond.schema.metrics")
+    def test_incompatible_type_change_increments_error(self, mock_metrics, conn):
+        """Incompatible type change should be rejected, logged, and metricked.
+
+        DuckLake enforces widening-only for ALTER COLUMN SET DATA TYPE, but
+        plain DuckDB allows nearly anything. We simulate DuckLake's rejection
+        by wrapping the connection to raise on ALTER COLUMN.
+        """
+        conn.execute("CREATE TABLE lake.main.events (x BIGINT)")
+        schema_mgr = SchemaManager(conn, "events")
+        schema_mgr._load_table_schema()
+
+        # Wrap the connection to reject ALTER COLUMN (simulating DuckLake)
+        real_conn = schema_mgr._conn
+        mock_conn = MagicMock(wraps=real_conn)
+        mock_conn.execute = MagicMock(
+            side_effect=lambda sql, *a, **kw: (
+                (_ for _ in ()).throw(duckdb.Error("Cannot narrow BIGINT to INTEGER"))
+                if "ALTER COLUMN" in sql
+                else real_conn.execute(sql, *a, **kw)
+            )
+        )
+        schema_mgr._conn = mock_conn
+
+        # Arrow batch with narrower type
+        batch = pa.table({"x": pa.array([1], type=pa.int32())})
+        schema_mgr.evolve(batch.schema)
+
+        # Should have incremented the schema error counter
+        mock_metrics.errors_total.labels.assert_called_with(type="schema")
+        mock_metrics.errors_total.labels(type="schema").inc.assert_called_once()
+        # Column type should remain BIGINT
+        assert schema_mgr._known_columns["x"] == "BIGINT"
+
+    @patch("millpond.schema.metrics")
+    def test_unsafe_field_name_skipped(self, mock_metrics, conn):
+        """Fields with unsafe names (SQL injection risk) should be skipped."""
+        batch1 = pa.table({"event": ["click"]})
+        schema_mgr = SchemaManager(conn, "events")
+        write(conn, "events", batch1, schema_mgr)
+
+        # Simulate a batch with an unsafe field name
+        unsafe_schema = pa.schema([pa.field("event", pa.string()), pa.field("x; DROP TABLE", pa.string())])
+        schema_mgr.evolve(unsafe_schema)
+
+        mock_metrics.records_skipped_total.labels.assert_called_with(reason="unsafe_field_name")
+        # The unsafe column should not have been added
+        assert "x; DROP TABLE" not in schema_mgr._known_columns
