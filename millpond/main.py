@@ -122,6 +122,7 @@ def main():
     log.info("millpond starting")
 
     cfg = config.load()
+    metrics.init(f"{cfg.topic}-{cfg.ducklake_table}")
     http = server.start()
 
     db = ducklake.connect(cfg)
