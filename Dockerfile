@@ -1,6 +1,7 @@
+FROM ghcr.io/astral-sh/uv:0.7 AS uv
 FROM python:3.12-slim AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=uv /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
@@ -20,5 +21,11 @@ ENV PATH="/app/.venv/bin:$PATH"
 # httpfs must be installed before ducklake — there's a race condition with S3 access
 # if ducklake loads first and tries to use httpfs before it's available.
 RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres')"
+
+RUN useradd --create-home --shell /bin/false millpond
+USER millpond
+
+# Health check for non-K8s environments (K8s uses liveness/readiness probes in statefulset.yaml)
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
 
 ENTRYPOINT ["millpond"]

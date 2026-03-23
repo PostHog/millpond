@@ -2,6 +2,8 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: millpond-events  # change per topic
+  # wiz-scan: ResourceQuota and LimitRange are namespace-level policies (managed by platform team)
+  # wiz-scan: serviceName references headless Service defined in service.yaml (clusterIP: None)
 spec:
   replicas: 8
   serviceName: millpond-events
@@ -17,10 +19,20 @@ spec:
         prometheus.io/port: "8000"
         prometheus.io/path: "/metrics"
     spec:
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 120  # time to flush pending writes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: millpond-events
+              topologyKey: kubernetes.io/hostname
       containers:
       - name: millpond
-        image: millpond:latest
+        image: millpond:v0.0.0  # placeholder — Helm sets the real tag
         ports:
         - name: metrics
           containerPort: 8000
@@ -43,6 +55,14 @@ spec:
           value: "104857600"  # 100MB
         - name: FLUSH_INTERVAL_MS
           value: "60000"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp  # DuckDB spill-to-disk under memory pressure
         resources:
           requests:
             memory: "256Mi"
@@ -61,3 +81,6 @@ spec:
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 10
+      volumes:
+      - name: tmp
+        emptyDir: {}  # disk-backed, not RAM — spill shouldn't count against memory limit
