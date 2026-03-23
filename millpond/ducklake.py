@@ -91,6 +91,11 @@ def _validate_partition_expr(expr: str) -> str:
 _tables_ensured: set[str] = set()
 
 
+def reset_table_cache() -> None:
+    """Clear the table creation cache. Call when the DuckDB connection is recycled."""
+    _tables_ensured.clear()
+
+
 def _ensure_table(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
