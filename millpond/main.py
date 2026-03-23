@@ -52,7 +52,7 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=Non
             time.sleep(delay)
 
 
-def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr):
+def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr, trigger="time"):
     """Write to DuckLake, commit offsets, update metrics."""
     t0 = time.monotonic()
     _write_with_retry(db, cfg.ducklake_table, consolidated, schema_mgr, cfg.partition_by)
@@ -99,7 +99,7 @@ def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets
     metrics.flush_size_bytes.observe(pending_bytes)
     metrics.flush_size_records.observe(pending_records)
     metrics.records_written_total.inc(pending_records)
-    metrics.batches_flushed_total.inc()
+    metrics.batches_flushed_total.labels(trigger=trigger).inc()
     server.health.record_flush()
 
     # Always update committed offset metrics (cheap, local)
@@ -189,11 +189,14 @@ def main():
 
             # Check flush triggers
             elapsed = time.monotonic() - last_flush
-            should_flush = pending_records > 0 and (pending_bytes >= cfg.flush_size or elapsed >= cfg.flush_interval_s)
+            size_triggered = pending_bytes >= cfg.flush_size
+            time_triggered = elapsed >= cfg.flush_interval_s
+            should_flush = pending_records > 0 and (size_triggered or time_triggered)
 
             if should_flush:
+                trigger = "size" if size_triggered else "time"
                 consolidated = pa.concat_tables(pending, promote_options="default")
-                _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
+                _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr, trigger)
 
                 # Sample lag metrics periodically, not on every flush
                 now = time.monotonic()

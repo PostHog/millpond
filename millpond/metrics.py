@@ -27,7 +27,7 @@ _records_written_total = Counter(
 _batches_flushed_total = Counter(
     "millpond_batches_flushed_total",
     "Flush cycles completed",
-    ["pipeline"],
+    ["pipeline", "trigger"],
 )
 _records_skipped_total = Counter(
     "millpond_records_skipped_total",
@@ -153,6 +153,7 @@ def init(pipeline: str):
 
     # Metrics with additional labels — wrap so .labels() auto-injects pipeline
     records_consumed_total = _AutoPipelineLabels(_records_consumed_total, pipeline)
+    batches_flushed_total = _AutoPipelineLabels(_batches_flushed_total, pipeline)
     records_skipped_total = _AutoPipelineLabels(_records_skipped_total, pipeline)
     errors_total = _AutoPipelineLabels(_errors_total, pipeline)
     consumer_lag = _AutoPipelineLabels(_consumer_lag, pipeline)
@@ -162,7 +163,6 @@ def init(pipeline: str):
 
     # Metrics with no other labels — pre-label to get direct .inc()/.set()/.observe()
     records_written_total = _records_written_total.labels(pipeline=pipeline)
-    batches_flushed_total = _batches_flushed_total.labels(pipeline=pipeline)
     flush_duration_seconds = _flush_duration_seconds.labels(pipeline=pipeline)
     arrow_conversion_seconds = _arrow_conversion_seconds.labels(pipeline=pipeline)
     flush_size_bytes = _flush_size_bytes.labels(pipeline=pipeline)

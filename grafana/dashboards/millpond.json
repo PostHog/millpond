@@ -110,7 +110,7 @@
       ]
     },
     {
-      "title": "Flushes/s",
+      "title": "Flushes/s by Trigger",
       "type": "stat",
       "gridPos": {
         "h": 4,
@@ -145,8 +145,8 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(millpond_batches_flushed_total[1m]))",
-          "legendFormat": "flushes/s"
+          "expr": "sum(rate(millpond_batches_flushed_total[1m])) by (trigger)",
+          "legendFormat": "{{trigger}}"
         }
       ]
     },
