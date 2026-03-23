@@ -1,6 +1,6 @@
 import pytest
 
-from millpond.ducklake import _sanitize_setting_value
+from millpond.ducklake import _escape_libpq, _sanitize_setting_value
 
 
 class TestSanitizeSettingValue:
@@ -33,3 +33,20 @@ class TestSanitizeSettingValue:
     def test_empty_rejected(self):
         with pytest.raises(ValueError, match="Illegal character"):
             _sanitize_setting_value("")
+
+
+class TestEscapeLibpq:
+    def test_plain_value(self):
+        assert _escape_libpq("ducklake") == "'ducklake'"
+
+    def test_single_quote(self):
+        assert _escape_libpq("pass'word") == "'pass\\'word'"
+
+    def test_backslash(self):
+        assert _escape_libpq("pass\\word") == "'pass\\\\word'"
+
+    def test_both(self):
+        assert _escape_libpq("it's\\complex") == "'it\\'s\\\\complex'"
+
+    def test_none(self):
+        assert _escape_libpq(None) == "''"

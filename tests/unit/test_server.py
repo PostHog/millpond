@@ -77,3 +77,27 @@ class TestHealthBackcompat:
         h = _HealthState()
         h.mark_started()
         assert h.is_healthy() == h.is_ready()
+
+
+class TestStatusBody:
+    def test_before_start(self):
+        h = _HealthState()
+        body = h.status_body()
+        assert "poll=never" in body
+        assert "flush=never" in body
+
+    def test_after_start(self):
+        h = _HealthState()
+        h.mark_started()
+        body = h.status_body()
+        assert "poll=" in body
+        assert "s ago" in body
+        assert "flush=never" in body
+
+    def test_after_flush(self):
+        h = _HealthState()
+        h.mark_started()
+        h.record_flush()
+        body = h.status_body()
+        assert "flush=" in body
+        assert "flush=never" not in body

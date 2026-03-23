@@ -30,6 +30,10 @@ flush_duration_seconds = Histogram(
     "millpond_flush_duration_seconds",
     "Time per DuckLake write",
 )
+arrow_conversion_seconds = Histogram(
+    "millpond_arrow_conversion_seconds",
+    "Time to convert JSON to Arrow table",
+)
 flush_size_bytes = Histogram(
     "millpond_flush_size_bytes",
     "Arrow bytes per flush",
@@ -55,4 +59,39 @@ last_committed_offset = Gauge(
     "millpond_last_committed_offset",
     "Last committed offset",
     ["partition"],
+)
+
+# librdkafka internal stats (via statistics.interval.ms callback)
+# Schema evolution
+schema_columns_added_total = Counter(
+    "millpond_schema_columns_added_total",
+    "Columns added via schema evolution",
+)
+schema_columns_widened_total = Counter(
+    "millpond_schema_columns_widened_total",
+    "Columns widened via schema evolution",
+)
+
+# librdkafka internal stats (via statistics.interval.ms callback)
+rdkafka_replyq = Gauge(
+    "millpond_rdkafka_replyq",
+    "Number of ops waiting for broker response",
+)
+rdkafka_msg_cnt = Gauge(
+    "millpond_rdkafka_msg_cnt",
+    "Messages in internal producer/consumer queues",
+)
+rdkafka_msg_size = Gauge(
+    "millpond_rdkafka_msg_size",
+    "Bytes in internal producer/consumer queues",
+)
+rdkafka_broker_rtt_avg = Gauge(
+    "millpond_rdkafka_broker_rtt_avg_seconds",
+    "Broker round-trip time average",
+    ["broker"],
+)
+rdkafka_broker_rtt_p99 = Gauge(
+    "millpond_rdkafka_broker_rtt_p99_seconds",
+    "Broker round-trip time p99",
+    ["broker"],
 )

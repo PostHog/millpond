@@ -22,6 +22,7 @@ millpond = "millpond.main:main"
 dev = [
     "pytest>=8.0",
     "ruff>=0.8",
+    "testcontainers>=4.14.2",
 ]
 
 [tool.ruff]
@@ -34,4 +35,5 @@ select = ["E", "F", "I", "UP"]
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "e2e: marks tests as E2E tests requiring docker-compose stack",
 ]

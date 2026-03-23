@@ -63,10 +63,12 @@ just run
 ## Development
 
 ```bash
-just fmt          # format code
-just lint         # lint code
-just test         # run unit tests
-just ci           # format check + lint + test
+just fmt               # format code
+just lint              # lint code
+just test              # run unit tests
+just test-integration  # run integration tests (local DuckDB)
+just test-e2e          # run E2E tests (docker-compose, builds stack automatically)
+just ci                # format check + lint + unit tests
 ```
 
 ## Configuration
@@ -80,11 +82,15 @@ All configuration via environment variables:
 | `REPLICA_COUNT` | yes | | Number of StatefulSet replicas (must match `spec.replicas`) |
 | `DUCKLAKE_TABLE` | yes | | Target DuckLake table name |
 | `DUCKLAKE_DATA_PATH` | yes | | S3 path for DuckLake data files |
-| `DUCKLAKE_METADATA_URL` | yes | | JDBC URL for DuckLake metadata (Postgres) |
+| `DUCKLAKE_METADATA_URL` | yes | | Postgres URL for DuckLake metadata (`postgresql://user:pass@host:5432/db`) |
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `GROUP_ID` | no | `millpond-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
+| `CONSUME_BATCH_SIZE` | no | `1000` | Max messages per `consume()` call — amortizes Python↔C boundary cost |
+| `FETCH_MIN_BYTES` | no | `1048576` | Broker accumulates at least this many bytes before responding (1MB) |
+| `FETCH_MAX_WAIT_MS` | no | `500` | Max broker wait when `fetch.min.bytes` not yet satisfied |
+| `STATS_INTERVAL_MS` | no | `5000` | librdkafka internal stats emission interval (0 to disable) |
 | `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
 
 ## Deployment
@@ -113,6 +119,19 @@ Downtime = drain time + startup time (~2-3 min). Kafka buffers trivially.
 
 **Never `kubectl scale` without updating `REPLICA_COUNT`.** Use Helm to manage both atomically.
 
+## Error Handling and Retries
+
+The flush path has two failure points, each with its own retry policy:
+
+| Operation | Attempts | Backoff between failures | On exhaustion |
+|-----------|----------|--------------------------|---------------|
+| DuckLake write | 3 | 1s, 2s (last attempt raises immediately) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
+| Offset commit | 3 | 0.5s, 1s (last attempt raises immediately) | Re-raise → pod crashes, replays from last committed offset (duplicates bounded by one flush batch) |
+
+Both use `errors_total{type="write_retry"}` and `errors_total{type="offset_commit"}` counters so transient vs persistent failures are distinguishable in dashboards.
+
+**Why crash after exhausting retries?** A persistent write failure means S3 or Postgres is down — continuing would just accumulate pending data in memory until OOM. A persistent commit failure means the Kafka coordinator is unreachable — the write already succeeded, but without committed offsets the next restart will replay the batch (at-least-once duplicates). In both cases, crashing lets K8s apply its restart backoff, and Kafka holds the data safely until the dependency recovers.
+
 ## Multiple Pipelines
 
 Each topic→table mapping is a separate StatefulSet. The application doesn't change — just the env vars. Template with Helm:
@@ -139,27 +158,7 @@ pipelines:
 
 One `range` over `pipelines` in the StatefulSet template produces N independent StatefulSets. Adding a pipeline is adding a block to `values.yaml` and running `helm upgrade`.
 
-## TODO
-
-### Pre-production
-- [ ] Retry with backoff on DuckLake write failure (transient S3/Postgres errors currently kill the pod)
-- [ ] Move `get_watermark_offsets` to periodic/sampled — currently 1 sync RPC per partition per flush
-- [ ] Distinguish offset commit failure from write failure in logs/metrics
-- [ ] Normalize schema evolution type comparison (DuckDB may return different type names than our mapping)
-- [ ] Add e2e latency metric (Kafka message timestamp → DuckLake write)
-- [ ] Add Arrow conversion time metric
-- [ ] Document `CONSUME_BATCH_SIZE`, `FETCH_MIN_BYTES`, `FETCH_MAX_WAIT_MS` in config table
-- [ ] Optimize `_build_schema` type inference loop (currently O(keys × records))
-- [ ] Integration tests for write path and schema evolution
-- [ ] E2E test via docker-compose with assertions
-
-### Nice to have
-- [ ] Add Kafka broker metrics to Prometheus/Grafana (JMX Exporter sidecar on Kafka)
-- [ ] Add Postgres metrics to Prometheus/Grafana (postgres_exporter for DuckLake metadata DB)
-- [ ] Add librdkafka consumer metrics (confluent-kafka exposes internal stats via `statistics.interval.ms`)
-- [ ] Measure intra-batch schema variability (how often do keys differ across records in a single consume batch?)
-
-## NOTE
+## Note
 This project should absolutely be called TableFowl, but that would be an [SEO](https://www.confluent.io/product/tableflow/) and linguistic palaver.
 
 ---

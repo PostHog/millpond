@@ -89,8 +89,9 @@ class SchemaManager:
         """Load current column names and types from DuckLake."""
         try:
             result = self._conn.execute(
-                f"SELECT column_name, data_type FROM information_schema.columns "
-                f"WHERE table_catalog = 'lake' AND table_schema = 'main' AND table_name = '{self._table_name}'"
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' AND table_schema = 'main' AND table_name = ?",
+                [self._table_name],
             ).fetchall()
             self._known_columns = {row[0]: _normalize_duckdb_type(row[1]) for row in result}
             self._initialized = True
@@ -130,6 +131,7 @@ class SchemaManager:
                         f'ADD COLUMN IF NOT EXISTS "{field.name}" {duckdb_type}'
                     )
                     self._known_columns[field.name] = duckdb_type
+                    metrics.schema_columns_added_total.inc()
                 except duckdb.Error as e:
                     log.warning("Failed to add column %s: %s", field.name, e)
                     metrics.errors_total.labels(type="schema").inc()
@@ -149,6 +151,7 @@ class SchemaManager:
                         f'ALTER COLUMN "{field.name}" SET DATA TYPE {duckdb_type}'
                     )
                     self._known_columns[field.name] = duckdb_type
+                    metrics.schema_columns_widened_total.inc()
                 except duckdb.Error as e:
                     # DuckLake rejects invalid promotions — log and continue
                     log.warning(

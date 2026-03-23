@@ -54,6 +54,9 @@ class TestLoad:
         assert cfg.flush_size == 104857600
         assert cfg.flush_interval_ms == 60000
         assert cfg.fetch_min_bytes == 1048576
+        assert cfg.fetch_max_wait_ms == 500
+        assert cfg.consume_batch_size == 1000
+        assert cfg.stats_interval_ms == 5000
 
     def test_ordinal_exceeds_replica_count(self, monkeypatch):
         monkeypatch.setenv("POD_NAME", "millpond-events-5")

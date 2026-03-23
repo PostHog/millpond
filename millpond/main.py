@@ -13,6 +13,18 @@ log = logging.getLogger(__name__)
 _LAG_SAMPLE_INTERVAL_S = 60.0  # how often to query watermark offsets for lag metrics
 _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
+_COMMIT_MAX_RETRIES = 3
+_COMMIT_BASE_DELAY_S = 0.5
+
+
+def _convert_batch(values: list[bytes]) -> pa.Table | None:
+    """Convert raw message values to Arrow, timing the conversion."""
+    t0 = time.monotonic()
+    table = arrow_converter.convert(values)
+    if table is not None:
+        duration = time.monotonic() - t0
+        metrics.arrow_conversion_seconds.observe(duration)
+    return table
 
 
 def _write_with_retry(db, table_name, consolidated, schema_mgr):
@@ -22,6 +34,7 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr):
             ducklake.write(db, table_name, consolidated, schema_mgr)
             return
         except Exception:
+            metrics.errors_total.labels(type="write_retry").inc()
             if attempt == _WRITE_MAX_RETRIES - 1:
                 raise
             delay = _WRITE_BASE_DELAY_S * (2**attempt)
@@ -32,7 +45,10 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr):
                 delay,
                 exc_info=True,
             )
-            metrics.errors_total.labels(type="write_retry").inc()
+            # Invalidate cached schema so retry re-runs evolve() — another pod
+            # may have changed the table schema since our last attempt.
+            if schema_mgr is not None:
+                schema_mgr.invalidate()
             time.sleep(delay)
 
 
@@ -47,7 +63,28 @@ def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets
         TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
         for (topic, partition), offset in offsets.items()
     ]
-    kafka.commit(offsets=tp_offsets, asynchronous=False)
+    for attempt in range(_COMMIT_MAX_RETRIES):
+        try:
+            kafka.commit(offsets=tp_offsets, asynchronous=False)
+            break
+        except Exception:
+            metrics.errors_total.labels(type="offset_commit").inc()
+            if attempt == _COMMIT_MAX_RETRIES - 1:
+                log.error(
+                    "Offset commit failed after %d attempts — duplicates possible on restart",
+                    _COMMIT_MAX_RETRIES,
+                    exc_info=True,
+                )
+                raise
+            delay = _COMMIT_BASE_DELAY_S * (2**attempt)
+            log.warning(
+                "Offset commit failed (attempt %d/%d), retrying in %.1fs",
+                attempt + 1,
+                _COMMIT_MAX_RETRIES,
+                delay,
+                exc_info=True,
+            )
+            time.sleep(delay)
 
     log.info(
         "Flush: %d records, %d bytes, %d columns, write=%.2fs, elapsed=%.1fs",
@@ -133,7 +170,7 @@ def main():
 
                 if values:
                     skipped = 0
-                    table = arrow_converter.convert(values)
+                    table = _convert_batch(values)
                     if table is not None:
                         skipped = len(values) - len(table)
                         pending.append(table)

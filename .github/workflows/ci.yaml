@@ -21,7 +21,7 @@ jobs:
       run: uv run ruff check millpond/
 
     - name: Unit tests
-      run: uv run pytest -m "not integration"
+      run: uv run pytest -m "not integration and not e2e"
 
   build:
     runs-on: ubuntu-latest

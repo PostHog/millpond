@@ -188,12 +188,20 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | `millpond_batches_flushed_total` | Counter | Flush cycles completed |
 | `millpond_records_skipped_total` | Counter | Records skipped (by reason: json_parse, schema) |
 | `millpond_errors_total` | Counter | Errors by type (kafka/duckdb/arrow/json) |
+| `millpond_arrow_conversion_seconds` | Histogram | Time to convert JSON to Arrow table |
 | `millpond_flush_duration_seconds` | Histogram | Time per DuckLake write |
 | `millpond_flush_size_bytes` | Histogram | Arrow bytes per flush |
 | `millpond_flush_size_records` | Histogram | Records per flush |
 | `millpond_pending_bytes` | Gauge | Current pending Arrow bytes awaiting flush |
 | `millpond_consumer_lag` | Gauge | Highwater - committed (by partition) |
 | `millpond_last_committed_offset` | Gauge | Last committed offset (by partition) |
+| `millpond_schema_columns_added_total` | Counter | Columns added via schema evolution |
+| `millpond_schema_columns_widened_total` | Counter | Columns widened via schema evolution |
+| `millpond_rdkafka_replyq` | Gauge | Ops waiting for broker response (librdkafka) |
+| `millpond_rdkafka_msg_cnt` | Gauge | Messages in internal librdkafka queues |
+| `millpond_rdkafka_msg_size` | Gauge | Bytes in internal librdkafka queues |
+| `millpond_rdkafka_broker_rtt_avg_seconds` | Gauge | Broker round-trip time average (by broker) |
+| `millpond_rdkafka_broker_rtt_p99_seconds` | Gauge | Broker round-trip time p99 (by broker) |
 
 ## Known Risks and Mitigations (Architect Review)
 
@@ -299,15 +307,21 @@ millpond/
 ├── uv.lock                   # Resolved dependency lock (committed)
 ├── .flox/                    # Flox environment
 ├── Dockerfile
+├── docker-compose.yaml       # Full dev stack (Kafka, Postgres, MinIO, Grafana)
 ├── k8s/
 │   ├── statefulset.yaml
 │   └── service.yaml          # Headless service for StatefulSet
-└── millpond/
-    ├── __init__.py
-    ├── main.py              # Entry point, main loop, signal handling
-    ├── config.py             # Env var → dataclass
-    ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + DOUBLE cast)
-    ├── ducklake.py           # DuckDB/DuckLake connection, table mgmt, writes
-    ├── metrics.py            # Prometheus metric definitions
-    └── server.py             # HTTP server for /metrics and /healthz
+├── millpond/
+│   ├── __init__.py
+│   ├── main.py               # Entry point, main loop, signal handling
+│   ├── config.py             # Env var → dataclass
+│   ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + DOUBLE cast)
+│   ├── ducklake.py           # DuckDB/DuckLake connection, table mgmt, writes
+│   ├── metrics.py            # Prometheus metric definitions
+│   └── server.py             # HTTP server for /metrics and /healthz
+├── tests/
+│   ├── unit/                 # Fast, no external deps
+│   ├── integration/          # Local DuckDB write path + schema evolution
+│   └── e2e/                  # Full docker-compose stack via testcontainers
+└── test/                     # Dev fixtures (producer.py, ducklake-init.sql)
 ```
