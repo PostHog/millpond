@@ -90,6 +90,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        MILLPOND_VERSION: "0.0.0-dev"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -115,6 +117,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        MILLPOND_VERSION: "0.0.0-dev"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -144,6 +148,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        MILLPOND_VERSION: "0.0.0-dev"
     entrypoint: ["sh", "-c", "sleep 2 && exec millpond"]
     depends_on:
       kafka-init:
