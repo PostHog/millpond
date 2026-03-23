@@ -123,10 +123,10 @@ Downtime = drain time + startup time (~2-3 min). Kafka buffers trivially.
 
 The flush path has two failure points, each with its own retry policy:
 
-| Operation | Retries | Backoff | On exhaustion |
-|-----------|---------|---------|---------------|
-| DuckLake write | 3 | Exponential (1s, 2s, 4s) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
-| Offset commit | 3 | Exponential (0.5s, 1s, 2s) | Re-raise → pod crashes, replays from last committed offset (duplicates bounded by one flush batch) |
+| Operation | Attempts | Backoff between failures | On exhaustion |
+|-----------|----------|--------------------------|---------------|
+| DuckLake write | 3 | 1s, 2s (last attempt raises immediately) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
+| Offset commit | 3 | 0.5s, 1s (last attempt raises immediately) | Re-raise → pod crashes, replays from last committed offset (duplicates bounded by one flush batch) |
 
 Both use `errors_total{type="write_retry"}` and `errors_total{type="offset_commit"}` counters so transient vs persistent failures are distinguishable in dashboards.
 
