@@ -85,6 +85,9 @@ All configuration via environment variables:
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `GROUP_ID` | no | `millpond-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
+| `CONSUME_BATCH_SIZE` | no | `1000` | Max messages per `consume()` call — amortizes Python↔C boundary cost |
+| `FETCH_MIN_BYTES` | no | `1048576` | Broker accumulates at least this many bytes before responding (1MB) |
+| `FETCH_MAX_WAIT_MS` | no | `500` | Max broker wait when `fetch.min.bytes` not yet satisfied |
 | `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
 
 ## Deployment
@@ -142,7 +145,6 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 ## TODO
 
 ### Pre-production
-- [ ] Document `CONSUME_BATCH_SIZE`, `FETCH_MIN_BYTES`, `FETCH_MAX_WAIT_MS` in config table
 - [ ] Integration tests for write path and schema evolution
 - [ ] E2E test via docker-compose with assertions
 
