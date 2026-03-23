@@ -91,7 +91,7 @@ def load() -> Config:
     # e.g. KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL -> security.protocol=SASL_SSL
     _KAFKA_CONSUMER_PREFIX = "KAFKA_CONSUMER_"
     kafka_overrides = tuple(
-        (k[len(_KAFKA_CONSUMER_PREFIX):].lower().replace("_", "."), v)
+        (k[len(_KAFKA_CONSUMER_PREFIX) :].lower().replace("_", "."), v)
         for k, v in os.environ.items()
         if k.startswith(_KAFKA_CONSUMER_PREFIX)
     )
