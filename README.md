@@ -129,7 +129,7 @@ Set `DUCKLAKE_PARTITION_BY` to enable Hive-style partitioning on S3. Files are w
 DUCKLAKE_PARTITION_BY="year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)"
 ```
 
-Partition on `_inserted_at` (always a real TIMESTAMP), not source `timestamp` fields (typically VARCHAR).
+Partition on `_inserted_at` (always a real TIMESTAMP), not source `timestamp` fields (typically VARCHAR). Applied via `ALTER TABLE SET PARTITIONED BY` on first write — idempotent, safe for multiple pods and restarts. If added to an existing unpartitioned table, new files get HSP layout while old files remain flat; DuckLake queries both transparently via metadata.
 
 ## Error Handling and Retries
 
