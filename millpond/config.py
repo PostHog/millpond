@@ -79,8 +79,7 @@ def load() -> Config:
     partition_by = os.environ.get("DUCKLAKE_PARTITION_BY", "").strip() or None
     if partition_by and not _SAFE_PARTITION_EXPR.match(partition_by):
         raise RuntimeError(
-            f"DUCKLAKE_PARTITION_BY {partition_by!r} contains unsafe characters "
-            "(must match [a-zA-Z0-9_(),\\s]+)"
+            f"DUCKLAKE_PARTITION_BY {partition_by!r} contains unsafe characters (must match [a-zA-Z0-9_(),\\s]+)"
         )
 
     cfg = Config(
