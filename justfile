@@ -41,17 +41,17 @@ lint-fix:
 # Run unit tests
 [group('test')]
 test:
-    uv run pytest tests/unit
+    uv run python -m pytest tests/unit
 
 # Run integration tests
 [group('test')]
 test-integration:
-    uv run pytest tests/integration
+    uv run python -m pytest tests/integration
 
 # Run E2E test (brings up docker-compose stack automatically)
 [group('test')]
 test-e2e:
-    uv run pytest tests/e2e -v -s
+    uv run python -m pytest tests/e2e -v -s
 
 # Full CI check
 [group('test')]

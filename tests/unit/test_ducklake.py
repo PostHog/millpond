@@ -1,6 +1,6 @@
 import pytest
 
-from millpond.ducklake import _escape_libpq, _sanitize_setting_value, _validate_partition_expr
+from millpond.ducklake import _escape_libpq, _sanitize_setting_value, _tables_ensured, _validate_partition_expr, reset_table_cache
 
 
 class TestSanitizeSettingValue:
@@ -76,3 +76,11 @@ class TestEscapeLibpq:
 
     def test_none(self):
         assert _escape_libpq(None) == "''"
+
+
+class TestResetTableCache:
+    def test_reset_clears_ensured_tables(self):
+        _tables_ensured.add("test_table")
+        assert "test_table" in _tables_ensured
+        reset_table_cache()
+        assert len(_tables_ensured) == 0

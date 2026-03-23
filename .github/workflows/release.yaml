@@ -65,7 +65,9 @@ jobs:
         NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
         NEXT_VERSION: ${{ steps.next_tag.outputs.version }}
       run: |
-        # Write version file so tarball consumers don't need .git history
+        # Write version file for reference — tarball consumers use
+        # SETUPTOOLS_SCM_PRETEND_VERSION at install time, which generates the
+        # full hatch-vcs _version.py with __version_tuple__ etc.
         echo "__version__ = \"${NEXT_VERSION}\"" > millpond/_version.py
         # git archive doesn't include untracked files, so use tar directly
         tar czf "millpond-${NEXT_TAG}.tar.gz" \

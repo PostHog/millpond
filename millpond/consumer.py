@@ -11,7 +11,11 @@ log = logging.getLogger(__name__)
 
 
 def _on_stats(stats_json: str) -> None:
-    """Parse librdkafka stats JSON and update Prometheus gauges."""
+    """Parse librdkafka stats JSON and update Prometheus gauges.
+
+    Called on the librdkafka background thread, not the main thread.
+    prometheus_client Gauge.set() is thread-safe (atomic double write).
+    """
     try:
         stats = orjson.loads(stats_json)
     except (orjson.JSONDecodeError, TypeError):
@@ -65,19 +69,23 @@ def create(cfg: Config) -> Consumer:
 
     log.info("Assigned partitions: %s", my_partitions)
 
-    consumer = Consumer(
-        {
-            "bootstrap.servers": cfg.bootstrap_servers,
-            "group.id": cfg.group_id,
-            "auto.offset.reset": "earliest",
-            "enable.auto.commit": False,
-            "enable.auto.offset.store": False,
-            "fetch.min.bytes": cfg.fetch_min_bytes,
-            "fetch.wait.max.ms": cfg.fetch_max_wait_ms,
-            "statistics.interval.ms": cfg.stats_interval_ms,
-            "stats_cb": _on_stats,
-        }
-    )
+    consumer_config = {
+        "bootstrap.servers": cfg.bootstrap_servers,
+        "group.id": cfg.group_id,
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": False,
+        "enable.auto.offset.store": False,
+        "fetch.min.bytes": cfg.fetch_min_bytes,
+        "fetch.wait.max.ms": cfg.fetch_max_wait_ms,
+        "max.poll.interval.ms": 600000,  # 10 min — accommodates long S3 flushes
+        "statistics.interval.ms": cfg.stats_interval_ms,
+        "stats_cb": _on_stats,
+    }
+    # Merge KAFKA_CONSUMER_* overrides (e.g. security.protocol, sasl.mechanism)
+    for key, val in cfg.kafka_config_overrides:
+        consumer_config[key] = val
+
+    consumer = Consumer(consumer_config)
 
     consumer.assign([TopicPartition(cfg.topic, p) for p in my_partitions])
     return consumer

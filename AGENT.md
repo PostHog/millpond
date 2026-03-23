@@ -84,6 +84,8 @@ Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
 
 **`group.id`**: defaults to `millpond-{topic}-{table}`. Used only for offset storage in `__consumer_offsets` (no consumer group semantics). Changing `group.id` loses all committed offsets and triggers a full replay from `earliest`.
 
+**Monitoring caveat**: because we use `assign()` instead of `subscribe()`, standard consumer group monitoring tools (`kafka-consumer-groups.sh`, Burrow, etc.) show empty output or stale data. Use Millpond's own `millpond_consumer_lag` metric for lag monitoring, and `millpond_last_committed_offset` for offset tracking.
+
 ### Flush Triggers
 
 Both time-based and size-based:
@@ -98,9 +100,9 @@ Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 
 1. Parse JSON via `orjson` (Rust, ~1GB/s)
 2. `pa.Table.from_pylist()` builds the columnar batch — PyArrow infers the superset schema across all dicts
-3. v1 types: all numbers → DOUBLE, all strings → VARCHAR, nested objects → JSON. No timestamp detection, no type promotion (see Deferred Complexity)
+3. v1 types: integers → INT64, floats → FLOAT64, all strings → VARCHAR, nested objects → JSON. No timestamp detection (see Deferred Complexity)
 
-**Important**: `orjson` parses JSON integers as Python `int`, so `pa.Table.from_pylist()` infers INT64 for integer-only columns. A column that's INT64 in batch N and DOUBLE in batch N+1 (because one value was `1.5`) causes type wobble. v1 must cast all numeric columns to DOUBLE after `from_pylist()` to avoid this.
+**Important**: `orjson` parses JSON integers as Python `int`, so `pa.Table.from_pylist()` infers INT64 for integer-only columns. A column that's INT64 in batch N and FLOAT64 in batch N+1 (because one value was `1.5`) causes type wobble. `_normalize_numeric_types()` casts all integers to INT64 and all floats to FLOAT64 after `from_pylist()` to prevent this.
 
 **Caveat**: `pa.Table.from_pylist()` infers the schema from the first record's keys only. `arrow_converter.py` works around this by pre-scanning all records to build the full key union and passing an explicit schema to `from_pylist()`. The pre-scan is effectively free (pointer iteration over dict keys).
 
@@ -266,7 +268,7 @@ Even [Confluent's own docs](https://www.confluent.io/learn/kafka-dead-letter-que
 
 | Feature | Status |
 |---------|--------|
-| Type promotion (int8→int16→int32→int64→float) | v1: all numbers are DOUBLE, all strings are VARCHAR, nested objects are JSON. Add promotion later if storage costs justify it. |
+| Type promotion (int8→int16→int32→int64→float) | v1: integers normalized to INT64, floats to FLOAT64, all strings VARCHAR, nested objects JSON. Add finer promotion later if storage costs justify it. |
 | Timestamp detection heuristic | v1: store as VARCHAR. Let query engine cast. The ISO8601 regex will misfire on non-timestamp strings that happen to match the pattern. Add opt-in timestamp columns later. When adding this, port the ID field heuristic from ducklake-kafka-connect's `SinkRecordToArrowConverter`: fields ending in `_uuid`, `uuid`, `_id`, `id`, `_key`, `key` must be forced to VARCHAR to prevent UUID strings like `"2024-02-28T23:59:59Z"` from being mis-inferred as timestamps. |
 
 ## DuckDB Logging
@@ -300,10 +302,11 @@ Downtime = time to drain + time to start new pods. With `terminationGracePeriodS
 
 ## HTTP Server
 
-Both Prometheus metrics (`/metrics`) and health checks (`/healthz`) run on port 8000. `prometheus_client.start_http_server()` does not support custom routes, so Millpond uses a custom `http.server.HTTPServer` that serves both:
+Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTPServer` (`prometheus_client.start_http_server()` doesn't support custom routes):
 
 - `GET /metrics` → Prometheus exposition format (via `prometheus_client.generate_latest()`)
-- `GET /healthz` → 200 if last poll and last flush are within thresholds, 503 otherwise
+- `GET /healthz` → liveness: 200 if started and last poll within `max_poll_age_s` (300s), 503 otherwise
+- `GET /readyz` → readiness: 200 if alive and last flush within `max_flush_age_s` (600s), 503 otherwise. Idle topics (no flush yet) pass readiness.
 
 ## Toolchain
 
@@ -340,7 +343,7 @@ millpond/
 │   ├── __init__.py
 │   ├── main.py               # Entry point, main loop, signal handling
 │   ├── config.py             # Env var → dataclass
-│   ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + DOUBLE cast)
+│   ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + numeric normalization)
 │   ├── ducklake.py           # DuckDB/DuckLake connection, table mgmt, writes
 │   ├── metrics.py            # Prometheus metric definitions
 │   └── server.py             # HTTP server for /metrics and /healthz
