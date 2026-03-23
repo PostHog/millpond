@@ -142,20 +142,14 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 ## TODO
 
 ### Pre-production
-- [ ] Retry with backoff on DuckLake write failure (transient S3/Postgres errors currently kill the pod)
-- [ ] Move `get_watermark_offsets` to periodic/sampled — currently 1 sync RPC per partition per flush
 - [ ] Distinguish offset commit failure from write failure in logs/metrics
-- [ ] Normalize schema evolution type comparison (DuckDB may return different type names than our mapping)
 - [ ] Add e2e latency metric (Kafka message timestamp → DuckLake write)
 - [ ] Add Arrow conversion time metric
 - [ ] Document `CONSUME_BATCH_SIZE`, `FETCH_MIN_BYTES`, `FETCH_MAX_WAIT_MS` in config table
-- [ ] Optimize `_build_schema` type inference loop (currently O(keys × records))
 - [ ] Integration tests for write path and schema evolution
 - [ ] E2E test via docker-compose with assertions
 
 ### Nice to have
-- [ ] Add Kafka broker metrics to Prometheus/Grafana (JMX Exporter sidecar on Kafka)
-- [ ] Add Postgres metrics to Prometheus/Grafana (postgres_exporter for DuckLake metadata DB)
 - [ ] Add librdkafka consumer metrics (confluent-kafka exposes internal stats via `statistics.interval.ms`)
 - [ ] Measure intra-batch schema variability (how often do keys differ across records in a single consume batch?)
 

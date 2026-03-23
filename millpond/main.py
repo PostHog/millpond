@@ -47,7 +47,12 @@ def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets
         TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
         for (topic, partition), offset in offsets.items()
     ]
-    kafka.commit(offsets=tp_offsets, asynchronous=False)
+    try:
+        kafka.commit(offsets=tp_offsets, asynchronous=False)
+    except Exception:
+        metrics.errors_total.labels(type="offset_commit").inc()
+        log.error("Offset commit failed after successful write — duplicates possible on restart", exc_info=True)
+        raise
 
     log.info(
         "Flush: %d records, %d bytes, %d columns, write=%.2fs, elapsed=%.1fs",
