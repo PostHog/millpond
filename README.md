@@ -82,7 +82,7 @@ All configuration via environment variables:
 | `REPLICA_COUNT` | yes | | Number of StatefulSet replicas (must match `spec.replicas`) |
 | `DUCKLAKE_TABLE` | yes | | Target DuckLake table name |
 | `DUCKLAKE_DATA_PATH` | yes | | S3 path for DuckLake data files |
-| `DUCKLAKE_METADATA_URL` | yes | | JDBC URL for DuckLake metadata (Postgres) |
+| `DUCKLAKE_METADATA_URL` | yes | | Postgres URL for DuckLake metadata (`postgresql://user:pass@host:5432/db`) |
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
