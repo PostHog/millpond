@@ -73,6 +73,7 @@ def create(cfg: Config) -> Consumer:
         "enable.auto.offset.store": False,
         "fetch.min.bytes": cfg.fetch_min_bytes,
         "fetch.wait.max.ms": cfg.fetch_max_wait_ms,
+        "max.poll.interval.ms": 600000,  # 10 min — accommodates long S3 flushes
         "statistics.interval.ms": cfg.stats_interval_ms,
         "stats_cb": _on_stats,
     }
