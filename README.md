@@ -145,7 +145,7 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 ## TODO
 
 ### Pre-production
-- [ ] Integration tests for write path and schema evolution
+- [ ] Use `INSERT INTO ... BY NAME` in `ducklake.write()` for column-order safety
 - [ ] E2E test via docker-compose with assertions
 
 ### Nice to have
