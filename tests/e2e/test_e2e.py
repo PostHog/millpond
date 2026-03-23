@@ -21,7 +21,7 @@ COMPOSE_DIR = str(Path(__file__).resolve().parents[2])
 @pytest.fixture(scope="module")
 def compose():
     """Bring up the full stack, yield, then tear down."""
-    with DockerCompose(COMPOSE_DIR, build=True) as c:
+    with DockerCompose(COMPOSE_DIR, compose_file_name="docker-compose.yaml", build=True) as c:
         c.wait_for("http://localhost:9000/minio/health/live")
         yield c
 
