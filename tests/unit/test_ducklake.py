@@ -1,6 +1,6 @@
 import pytest
 
-from millpond.ducklake import _escape_libpq, _sanitize_setting_value
+from millpond.ducklake import _escape_libpq, _sanitize_setting_value, _validate_partition_expr
 
 
 class TestSanitizeSettingValue:
@@ -33,6 +33,32 @@ class TestSanitizeSettingValue:
     def test_empty_rejected(self):
         with pytest.raises(ValueError, match="Illegal character"):
             _sanitize_setting_value("")
+
+
+class TestValidatePartitionExpr:
+    def test_simple_column(self):
+        assert _validate_partition_expr("region") == "region"
+
+    def test_temporal_functions(self):
+        assert _validate_partition_expr("year(ts),month(ts),day(ts),hour(ts)") == "year(ts),month(ts),day(ts),hour(ts)"
+
+    def test_mixed(self):
+        assert _validate_partition_expr("team_id,year(timestamp)") == "team_id,year(timestamp)"
+
+    def test_spaces_around_commas(self):
+        assert _validate_partition_expr("year(ts), month(ts)") == "year(ts), month(ts)"
+
+    def test_sql_injection_rejected(self):
+        with pytest.raises(ValueError, match="unsafe"):
+            _validate_partition_expr("year(ts); DROP TABLE x")
+
+    def test_comment_injection_rejected(self):
+        with pytest.raises(ValueError, match="unsafe"):
+            _validate_partition_expr("year(ts) -- comment")
+
+    def test_quoted_string_rejected(self):
+        with pytest.raises(ValueError, match="unsafe"):
+            _validate_partition_expr("'malicious'")
 
 
 class TestEscapeLibpq:

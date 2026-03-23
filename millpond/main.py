@@ -27,11 +27,11 @@ def _convert_batch(values: list[bytes]) -> pa.Table | None:
     return table
 
 
-def _write_with_retry(db, table_name, consolidated, schema_mgr):
+def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=None):
     """Write to DuckLake with exponential backoff on transient failures."""
     for attempt in range(_WRITE_MAX_RETRIES):
         try:
-            ducklake.write(db, table_name, consolidated, schema_mgr)
+            ducklake.write(db, table_name, consolidated, schema_mgr, partition_by)
             return
         except Exception:
             metrics.errors_total.labels(type="write_retry").inc()
@@ -55,7 +55,7 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr):
 def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr):
     """Write to DuckLake, commit offsets, update metrics."""
     t0 = time.monotonic()
-    _write_with_retry(db, cfg.ducklake_table, consolidated, schema_mgr)
+    _write_with_retry(db, cfg.ducklake_table, consolidated, schema_mgr, cfg.partition_by)
     write_duration = time.monotonic() - t0
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded
@@ -122,6 +122,7 @@ def main():
     log.info("millpond starting")
 
     cfg = config.load()
+    metrics.init(f"{cfg.topic}-{cfg.ducklake_table}")
     http = server.start()
 
     db = ducklake.connect(cfg)

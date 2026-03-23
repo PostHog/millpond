@@ -4,10 +4,12 @@ FROM python:3.12-slim AS builder
 COPY --from=uv /uv /usr/local/bin/uv
 
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock LICENSE ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY millpond/ millpond/
+ARG MILLPOND_VERSION=0.0.0.dev0
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=$MILLPOND_VERSION
 RUN uv sync --frozen --no-dev
 
 FROM python:3.12-slim

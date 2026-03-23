@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.egg-info/
+millpond/_version.py
 dist/
 .ruff_cache/
 .pytest_cache/

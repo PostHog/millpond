@@ -84,6 +84,7 @@ All configuration via environment variables:
 | `DUCKLAKE_DATA_PATH` | yes | | S3 path for DuckLake data files |
 | `DUCKLAKE_METADATA_URL` | yes | | Postgres URL for DuckLake metadata (`postgresql://user:pass@host:5432/db`) |
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
+| `DUCKLAKE_PARTITION_BY` | no | | Hive-style partition expression (e.g. `year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)`). Applied via `ALTER TABLE SET PARTITIONED BY` on first write. |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `GROUP_ID` | no | `millpond-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
@@ -93,10 +94,18 @@ All configuration via environment variables:
 | `STATS_INTERVAL_MS` | no | `5000` | librdkafka internal stats emission interval (0 to disable) |
 | `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
 
+## Releases
+
+Every merge to `main` automatically:
+1. Bumps the patch version (`v0.0.1` → `v0.0.2`)
+2. Builds and pushes a Docker image to `ghcr.io/posthog/millpond:<tag>`
+3. Creates a GitHub release with changelog
+
+Images: `ghcr.io/posthog/millpond:v0.0.X` or `ghcr.io/posthog/millpond:latest`
+
 ## Deployment
 
 ```bash
-just build        # build Docker image
 kubectl apply -f k8s/service.yaml
 kubectl apply -f k8s/pdb.yaml
 kubectl apply -f k8s/statefulset.yaml
@@ -119,6 +128,59 @@ Rolling updates are a poor fit — pods with different `REPLICA_COUNT` values ca
 Downtime = drain time + startup time (~2-3 min). Kafka buffers trivially.
 
 **Never `kubectl scale` without updating `REPLICA_COUNT`.** Use Helm to manage both atomically.
+
+## Partitioning
+
+Set `DUCKLAKE_PARTITION_BY` to enable Hive-style partitioning on S3. Files are written into `key=value/` directories (e.g. `year=2026/month=3/day=23/hour=21/*.parquet`), enabling S3 prefix filtering, bulk lifecycle rules, and partition discovery by external tools.
+
+```bash
+DUCKLAKE_PARTITION_BY="year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)"
+```
+
+Partition on `_inserted_at` (always a real TIMESTAMP), not source `timestamp` fields (typically VARCHAR). Applied via `ALTER TABLE SET PARTITIONED BY` on first write — idempotent, safe for multiple pods and restarts. If added to an existing unpartitioned table, new files get HSP layout while old files remain flat; DuckLake queries both transparently via metadata.
+
+## Object Sizing
+
+S3 throughput scales with object size — small objects (<1MB) waste per-request overhead, while larger objects (128MB+) maximize GET/PUT throughput. Millpond flushes are triggered by whichever comes first: `FLUSH_SIZE` (Arrow bytes in memory) or `FLUSH_INTERVAL_MS` (wall clock). The resulting Parquet file is typically **3-4x smaller** than the Arrow representation due to columnar encoding and compression.
+
+At steady state with moderate volume, most flushes are **time-triggered** — the interval expires before the size ceiling is hit. Object size is therefore driven by: `(msgs/s per pod) × (bytes/msg as Parquet) × (flush interval)`.
+
+### Sizing by volume
+
+Assuming ~366 bytes/row in Parquet (7-column event schema), 512 partitions, 8 replicas (64 partitions/pod):
+
+| Per-partition msg/s | Total msg/s | Per-pod msg/s | Parquet/file @60s | Parquet/file @90s | Memory/pod @90s |
+|---|---|---|---|---|---|
+| 500 | 256K | 32K | ~11MB | ~17MB | 512Mi |
+| 1K | 512K | 64K | ~23MB | ~34MB | 512Mi |
+| 2K | 1M | 128K | ~45MB | ~68MB | 512Mi |
+| 4K | 2M | 256K | ~90MB | ~135MB | 640Mi |
+| 9.5K (peak) | 4.9M | 608K | ~213MB | ~320MB | 1Gi |
+
+### Recommended settings for ~128MB target objects
+
+For a pipeline averaging 4K msg/s per partition with 512 partitions and 8 replicas:
+
+```yaml
+FLUSH_SIZE: "1073741824"       # 1GB Arrow ceiling (safety valve for burst/catchup)
+FLUSH_INTERVAL_MS: "90000"     # 90s — produces ~135MB Parquet at mean volume
+```
+
+Memory limit: 640Mi (90s × 256K msg/s × ~1KB Arrow/msg ≈ ~230MB Arrow + DuckDB + librdkafka overhead).
+
+At peak (9.5K/partition), the size trigger fires at ~35s producing ~320MB objects — acceptable, and the pod stays within 1Gi.
+
+### When to add a merge job
+
+If your volume is low enough that time-triggered flushes produce <10MB objects, consider running `ducklake_merge_adjacent_files()` periodically to compact small files:
+
+```sql
+CALL ducklake_merge_adjacent_files('lake', 'events');
+```
+
+This is an out-of-band maintenance operation, not part of the hot path.
+
+See the [sizing calculator](https://posthog.github.io/millpond/sizing-calculator.html) for interactive estimates.
 
 ## Error Handling and Retries
 

@@ -80,6 +80,16 @@ duck:
 dashboard:
     open http://localhost:3000/d/millpond/millpond
 
+# Open the MinIO console (requires `just up` first, login: minioadmin/minioadmin)
+[group('docker')]
+minio:
+    open http://localhost:9001
+
+# Open the sizing calculator
+[group('docker')]
+sizing:
+    open tools/sizing-calculator.html
+
 # === Build ===
 
 # Build Docker image

@@ -83,3 +83,34 @@ class TestLoad:
             monkeypatch.setenv("DUCKLAKE_TABLE", name)
             cfg = load()
             assert cfg.ducklake_table == name
+
+    def test_partition_by_default_none(self):
+        cfg = load()
+        assert cfg.partition_by is None
+
+    def test_partition_by_set(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_PARTITION_BY", "year(timestamp),month(timestamp)")
+        cfg = load()
+        assert cfg.partition_by == "year(timestamp),month(timestamp)"
+
+    def test_partition_by_valid_expressions(self, monkeypatch):
+        for expr in [
+            "region",
+            "year(ts)",
+            "year(ts),month(ts),day(ts),hour(ts)",
+            "year(created_at), month(created_at)",
+            "team_id,year(timestamp)",
+        ]:
+            monkeypatch.setenv("DUCKLAKE_PARTITION_BY", expr)
+            cfg = load()
+            assert cfg.partition_by == expr
+
+    def test_partition_by_sql_injection_rejected(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_PARTITION_BY", "year(ts); DROP TABLE x")
+        with pytest.raises(RuntimeError, match="unsafe"):
+            load()
+
+    def test_partition_by_empty_string_treated_as_none(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_PARTITION_BY", "")
+        cfg = load()
+        assert cfg.partition_by is None

@@ -32,7 +32,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: millpond
-        image: millpond:v0.0.0  # placeholder — Helm sets the real tag
+        image: ghcr.io/posthog/millpond:v0.0.0  # Helm sets the real tag
         ports:
         - name: metrics
           containerPort: 8000

@@ -78,11 +78,25 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     return conn
 
 
+def _validate_partition_expr(expr: str) -> str:
+    """Validate a partition expression to prevent SQL injection."""
+    from millpond.config import SAFE_PARTITION_EXPR
+
+    if not SAFE_PARTITION_EXPR.match(expr):
+        raise ValueError(f"Partition expression contains unsafe characters: {expr!r}")
+    return expr
+
+
 # Assumes single connection for pod lifetime. Must be cleared if connection is ever recycled.
 _tables_ensured: set[str] = set()
 
 
-def _ensure_table(conn: duckdb.DuckDBPyConnection, table_name: str, batch: pa.Table) -> None:
+def _ensure_table(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    batch: pa.Table,
+    partition_by: str | None = None,
+) -> None:
     """Create the DuckLake table from Arrow schema if it doesn't exist. Cached after first call."""
     if table_name in _tables_ensured:
         return
@@ -94,6 +108,10 @@ def _ensure_table(conn: duckdb.DuckDBPyConnection, table_name: str, batch: pa.Ta
         )
     finally:
         conn.unregister("_schema_batch")
+    if partition_by is not None:
+        _validate_partition_expr(partition_by)
+        conn.execute(f"ALTER TABLE lake.main.{table_name} SET PARTITIONED BY ({partition_by})")
+        log.info("Table %s partitioned by: %s", table_name, partition_by)
     _tables_ensured.add(table_name)
 
 
@@ -102,9 +120,10 @@ def write(
     table_name: str,
     batch: pa.Table,
     schema_mgr: "schema.SchemaManager | None" = None,
+    partition_by: str | None = None,
 ) -> None:
     """Write an Arrow table to DuckLake with _inserted_at timestamp."""
-    _ensure_table(conn, table_name, batch)
+    _ensure_table(conn, table_name, batch, partition_by)
     if schema_mgr is not None:
         schema_mgr.evolve(batch.schema)
     conn.register("_arrow_batch", batch)

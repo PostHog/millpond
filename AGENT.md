@@ -127,6 +127,16 @@ conn.unregister('arrow_batch')
 
 Zero-copy Arrow scan. Table auto-created and evolved (ADD COLUMN, ALTER COLUMN SET DATA TYPE) to match Arrow schema.
 
+### Hive-Style Partitioning
+
+If `DUCKLAKE_PARTITION_BY` is set, `_ensure_table()` runs `ALTER TABLE SET PARTITIONED BY (...)` after table creation. DuckLake writes files into Hive-style directories (`year=2026/month=3/day=23/hour=21/*.parquet`).
+
+- Partitioning is applied on first write per pod lifetime (idempotent — `SET PARTITIONED BY` with the same expression is a no-op, safe for multiple pods and restarts)
+- Typical expression: `year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)`
+- `_inserted_at` is always a TIMESTAMP (set at write time via `NOW()`), so temporal functions work reliably
+- Source `timestamp` fields are VARCHAR (not TIMESTAMP), so partition on `_inserted_at` not `timestamp`
+- DuckLake handles partition routing automatically on INSERT — no changes to write path
+
 ### Table Schema Evolution
 
 The ducklake-kafka-connect connector has two custom layers for schema evolution:
@@ -265,6 +275,17 @@ Unlike the JVM client (which supports custom log storage callbacks — see `duck
 
 For now, DuckDB logging is left at defaults. If needed, enable with `CALL enable_logging(storage='stdout')` and DuckDB will write to stderr in CSV format alongside Python's structured logs.
 
+## Releases
+
+Every merge to `main` triggers `.github/workflows/release.yaml`:
+
+1. Auto-bumps patch version from latest git tag (`v0.0.1` → `v0.0.2`)
+2. Builds a source tarball (`millpond-v0.0.X.tar.gz`) containing `pyproject.toml`, `uv.lock`, and all source — attached to the GitHub release
+3. Builds and pushes Docker image to `ghcr.io/posthog/millpond:<tag>` and `:latest`
+4. Creates GitHub release with auto-generated changelog
+
+The tarball is the primary artifact for external Docker builds (e.g. `posthog-cloud-infra`). It includes the lockfile so `uv sync --frozen` produces reproducible installs with pinned binary wheels. Do not distribute standalone wheels — they lack the lockfile and resolve unpinned deps from PyPI.
+
 ## Deployment Strategy
 
 Rolling updates are a poor fit for static partition assignment — during the roll, pods run with different `REPLICA_COUNT` values, causing temporary double-assignment (duplicate writes) or gaps. Since Kafka is the durable buffer, a simpler strategy works:
@@ -306,6 +327,9 @@ millpond/
 ├── pyproject.toml            # Dependencies and metadata (uv source of truth)
 ├── uv.lock                   # Resolved dependency lock (committed)
 ├── .flox/                    # Flox environment
+├── .github/workflows/
+│   ├── ci.yaml               # Format, lint, unit tests on PR/push
+│   └── release.yaml          # Auto-version, tarball, Docker image, GitHub release
 ├── Dockerfile
 ├── docker-compose.yaml       # Full dev stack (Kafka, Postgres, MinIO, Grafana)
 ├── k8s/
@@ -320,6 +344,8 @@ millpond/
 │   ├── ducklake.py           # DuckDB/DuckLake connection, table mgmt, writes
 │   ├── metrics.py            # Prometheus metric definitions
 │   └── server.py             # HTTP server for /metrics and /healthz
+├── tools/
+│   └── sizing-calculator.html  # Interactive flush/object sizing calculator
 ├── tests/
 │   ├── unit/                 # Fast, no external deps
 │   ├── integration/          # Local DuckDB write path + schema evolution
