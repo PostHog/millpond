@@ -180,7 +180,7 @@ CALL ducklake_merge_adjacent_files('lake', 'events');
 
 This is an out-of-band maintenance operation, not part of the hot path.
 
-See the [sizing calculator](tools/sizing-calculator.html) for interactive estimates.
+See the [sizing calculator](https://posthog.github.io/millpond/sizing-calculator.html) for interactive estimates.
 
 ## Error Handling and Retries
 
