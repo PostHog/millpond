@@ -23,7 +23,7 @@ services:
     image: postgres:17
     hostname: postgres
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_USER: ducklake
       POSTGRES_PASSWORD: ducklake
@@ -40,8 +40,8 @@ services:
     image: minio/minio:latest
     hostname: minio
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -171,14 +171,15 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATA_SOURCE_NAME: "postgresql://ducklake:ducklake@postgres:5432/ducklake?sslmode=disable"
+      # nosemgrep: trailofbits.generic.postgres-insecure-sslmode.postgres-insecure-sslmode
+      DATA_SOURCE_NAME: "postgresql://ducklake:ducklake@postgres:5432/ducklake?sslmode=disable"  # local dev — no TLS available
 
   # --- Metrics & Dashboarding ---
 
   prometheus:
     image: prom/prometheus:latest
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
     configs:
       - source: prometheus-config
         target: /etc/prometheus/prometheus.yml
@@ -186,7 +187,7 @@ services:
   grafana:
     image: grafana/grafana-oss:latest
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin

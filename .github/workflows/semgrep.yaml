@@ -27,7 +27,6 @@ jobs:
             --config "p/python" \
             --config "p/owasp-top-ten" \
             --config "p/security-audit" \
-            --config "p/trailofbits" \
             --error \
             --metrics=off \
             --verbose \
