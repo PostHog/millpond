@@ -74,7 +74,7 @@ def create(cfg: Config) -> Consumer:
             "enable.auto.offset.store": False,
             "fetch.min.bytes": cfg.fetch_min_bytes,
             "fetch.wait.max.ms": cfg.fetch_max_wait_ms,
-            "statistics.interval.ms": 5000,
+            "statistics.interval.ms": cfg.stats_interval_ms,
             "stats_cb": _on_stats,
         }
     )

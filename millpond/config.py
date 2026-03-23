@@ -33,6 +33,7 @@ class Config:
     fetch_min_bytes: int
     fetch_max_wait_ms: int
     consume_batch_size: int
+    stats_interval_ms: int
 
     @property
     def flush_interval_s(self) -> float:
@@ -86,6 +87,7 @@ def load() -> Config:
         fetch_min_bytes=int(os.environ.get("FETCH_MIN_BYTES", "1048576")),
         fetch_max_wait_ms=int(os.environ.get("FETCH_MAX_WAIT_MS", "500")),
         consume_batch_size=int(os.environ.get("CONSUME_BATCH_SIZE", "1000")),
+        stats_interval_ms=int(os.environ.get("STATS_INTERVAL_MS", "5000")),
     )
 
     log.info(
