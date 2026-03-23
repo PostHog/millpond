@@ -142,9 +142,6 @@ One `range` over `pipelines` in the StatefulSet template produces N independent 
 ## TODO
 
 ### Pre-production
-- [ ] Distinguish offset commit failure from write failure in logs/metrics
-- [ ] Add e2e latency metric (Kafka message timestamp → DuckLake write)
-- [ ] Add Arrow conversion time metric
 - [ ] Document `CONSUME_BATCH_SIZE`, `FETCH_MIN_BYTES`, `FETCH_MAX_WAIT_MS` in config table
 - [ ] Integration tests for write path and schema evolution
 - [ ] E2E test via docker-compose with assertions

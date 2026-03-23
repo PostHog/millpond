@@ -106,3 +106,39 @@ class TestFlushErrorDistinction:
 
         mock_metrics.records_written_total.inc.assert_called_once_with(2)
         mock_metrics.batches_flushed_total.inc.assert_called_once()
+
+
+class TestArrowConversionTiming:
+    """Arrow conversion time should be tracked via a histogram metric."""
+
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    @patch("millpond.main.arrow_converter")
+    def test_conversion_time_observed(self, mock_converter, mock_metrics, mock_server):
+        """convert() duration should be observed on the histogram."""
+        mock_converter.convert.return_value = pa.table({"a": [1]})
+
+        # Import main loop internals — we'll call the conversion section directly
+        # by running a single iteration. Easier to test via _convert_batch helper.
+        from millpond.main import _convert_batch
+
+        table = _convert_batch([b'{"a": 1}'], mock_metrics)
+        assert table is not None
+        mock_metrics.arrow_conversion_seconds.observe.assert_called_once()
+        # The observed value should be a non-negative float
+        observed = mock_metrics.arrow_conversion_seconds.observe.call_args[0][0]
+        assert isinstance(observed, float)
+        assert observed >= 0
+
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    @patch("millpond.main.arrow_converter")
+    def test_conversion_time_not_observed_when_none(self, mock_converter, mock_metrics, mock_server):
+        """If convert() returns None, no timing should be observed."""
+        mock_converter.convert.return_value = None
+
+        from millpond.main import _convert_batch
+
+        table = _convert_batch([b'garbage'], mock_metrics)
+        assert table is None
+        mock_metrics.arrow_conversion_seconds.observe.assert_not_called()

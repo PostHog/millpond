@@ -15,6 +15,16 @@ _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
 
 
+def _convert_batch(values: list[bytes], mets=None) -> pa.Table | None:
+    """Convert raw message values to Arrow, timing the conversion."""
+    t0 = time.monotonic()
+    table = arrow_converter.convert(values)
+    if table is not None:
+        duration = time.monotonic() - t0
+        (mets or metrics).arrow_conversion_seconds.observe(duration)
+    return table
+
+
 def _write_with_retry(db, table_name, consolidated, schema_mgr):
     """Write to DuckLake with exponential backoff on transient failures."""
     for attempt in range(_WRITE_MAX_RETRIES):
@@ -138,7 +148,7 @@ def main():
 
                 if values:
                     skipped = 0
-                    table = arrow_converter.convert(values)
+                    table = _convert_batch(values)
                     if table is not None:
                         skipped = len(values) - len(table)
                         pending.append(table)

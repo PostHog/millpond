@@ -30,6 +30,10 @@ flush_duration_seconds = Histogram(
     "millpond_flush_duration_seconds",
     "Time per DuckLake write",
 )
+arrow_conversion_seconds = Histogram(
+    "millpond_arrow_conversion_seconds",
+    "Time to convert JSON to Arrow table",
+)
 flush_size_bytes = Histogram(
     "millpond_flush_size_bytes",
     "Arrow bytes per flush",
