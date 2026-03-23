@@ -133,6 +133,7 @@ services:
       DUCKLAKE_CONNECTION: ":memory:"
       FLUSH_SIZE: 5000
       FLUSH_INTERVAL_MS: 5000
+      DUCKLAKE_PARTITION_BY: "year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)"
       DUCKDB_S3_ENDPOINT: minio:9000
       DUCKDB_S3_ACCESS_KEY_ID: minioadmin
       DUCKDB_S3_SECRET_ACCESS_KEY: minioadmin

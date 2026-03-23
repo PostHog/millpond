@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_SAFE_PARTITION_EXPR = re.compile(r"^[a-zA-Z0-9_(),\s]+$")
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,9 @@ class Config:
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
     flush_interval_ms: int  # ms since last flush
+
+    # Partitioning
+    partition_by: str | None  # e.g. "year(timestamp),month(timestamp),day(timestamp),hour(timestamp)"
 
     # Consumer tuning
     fetch_min_bytes: int
@@ -72,6 +76,13 @@ def load() -> Config:
 
     group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{ducklake_table}")
 
+    partition_by = os.environ.get("DUCKLAKE_PARTITION_BY", "").strip() or None
+    if partition_by and not _SAFE_PARTITION_EXPR.match(partition_by):
+        raise RuntimeError(
+            f"DUCKLAKE_PARTITION_BY {partition_by!r} contains unsafe characters "
+            "(must match [a-zA-Z0-9_(),\\s]+)"
+        )
+
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
         topic=topic,
@@ -82,6 +93,7 @@ def load() -> Config:
         ducklake_data_path=_require("DUCKLAKE_DATA_PATH"),
         ducklake_metadata_url=_require("DUCKLAKE_METADATA_URL"),
         ducklake_connection=_require("DUCKLAKE_CONNECTION"),
+        partition_by=partition_by,
         flush_size=int(os.environ.get("FLUSH_SIZE", "104857600")),
         flush_interval_ms=int(os.environ.get("FLUSH_INTERVAL_MS", "60000")),
         fetch_min_bytes=int(os.environ.get("FETCH_MIN_BYTES", "1048576")),

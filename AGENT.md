@@ -127,6 +127,16 @@ conn.unregister('arrow_batch')
 
 Zero-copy Arrow scan. Table auto-created and evolved (ADD COLUMN, ALTER COLUMN SET DATA TYPE) to match Arrow schema.
 
+### Hive-Style Partitioning
+
+If `DUCKLAKE_PARTITION_BY` is set, `_ensure_table()` runs `ALTER TABLE SET PARTITIONED BY (...)` after table creation. DuckLake writes files into Hive-style directories (`year=2026/month=3/day=23/hour=21/*.parquet`).
+
+- Partitioning is applied once on first write (idempotent — DuckLake ignores if already partitioned)
+- Typical expression: `year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)`
+- `_inserted_at` is always a TIMESTAMP (set at write time via `NOW()`), so temporal functions work reliably
+- Source `timestamp` fields are VARCHAR (not TIMESTAMP), so partition on `_inserted_at` not `timestamp`
+- DuckLake handles partition routing automatically on INSERT — no changes to write path
+
 ### Table Schema Evolution
 
 The ducklake-kafka-connect connector has two custom layers for schema evolution:

@@ -84,6 +84,7 @@ All configuration via environment variables:
 | `DUCKLAKE_DATA_PATH` | yes | | S3 path for DuckLake data files |
 | `DUCKLAKE_METADATA_URL` | yes | | Postgres URL for DuckLake metadata (`postgresql://user:pass@host:5432/db`) |
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
+| `DUCKLAKE_PARTITION_BY` | no | | Hive-style partition expression (e.g. `year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)`). Applied via `ALTER TABLE SET PARTITIONED BY` on first write. |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `GROUP_ID` | no | `millpond-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
@@ -119,6 +120,16 @@ Rolling updates are a poor fit — pods with different `REPLICA_COUNT` values ca
 Downtime = drain time + startup time (~2-3 min). Kafka buffers trivially.
 
 **Never `kubectl scale` without updating `REPLICA_COUNT`.** Use Helm to manage both atomically.
+
+## Partitioning
+
+Set `DUCKLAKE_PARTITION_BY` to enable Hive-style partitioning on S3. Files are written into `key=value/` directories (e.g. `year=2026/month=3/day=23/hour=21/*.parquet`), enabling S3 prefix filtering, bulk lifecycle rules, and partition discovery by external tools.
+
+```bash
+DUCKLAKE_PARTITION_BY="year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)"
+```
+
+Partition on `_inserted_at` (always a real TIMESTAMP), not source `timestamp` fields (typically VARCHAR).
 
 ## Error Handling and Retries
 

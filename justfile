@@ -80,6 +80,11 @@ duck:
 dashboard:
     open http://localhost:3000/d/millpond/millpond
 
+# Open the MinIO console (requires `just up` first, login: minioadmin/minioadmin)
+[group('docker')]
+minio:
+    open http://localhost:9001
+
 # === Build ===
 
 # Build Docker image
