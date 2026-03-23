@@ -24,10 +24,10 @@ jobs:
 
     - name: Bump patch version
       id: next_tag
+      env:
+        CURRENT_TAG: ${{ steps.latest_tag.outputs.tag }}
       run: |
-        current="${{ steps.latest_tag.outputs.tag }}"
-        # Strip v prefix, split, bump patch
-        version="${current#v}"
+        version="${CURRENT_TAG#v}"
         IFS='.' read -r major minor patch <<< "$version"
         next="v${major}.${minor}.$((patch + 1))"
         echo "tag=$next" >> "$GITHUB_OUTPUT"
@@ -35,49 +35,52 @@ jobs:
 
     - name: Generate changelog
       id: changelog
+      env:
+        PREV_TAG: ${{ steps.latest_tag.outputs.tag }}
+        COMMIT_SHA: ${{ github.sha }}
       run: |
-        prev="${{ steps.latest_tag.outputs.tag }}"
-        next="${{ steps.next_tag.outputs.tag }}"
-        sha="${{ github.sha }}"
-        short_sha="${sha:0:7}"
-
         {
           echo "body<<CHANGELOG_EOF"
           echo "## Changes"
           echo ""
-          if [ "$prev" = "v0.0.0" ]; then
+          if [ "$PREV_TAG" = "v0.0.0" ]; then
             git log --pretty=format:"- %s (%h)" HEAD
           else
-            git log --pretty=format:"- %s (%h)" "${prev}..HEAD"
+            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..HEAD"
           fi
           echo ""
           echo ""
           echo "---"
-          echo "**Commit:** ${sha}"
+          echo "**Commit:** ${COMMIT_SHA}"
           echo "**Author:** $(git log -1 --pretty=format:'%an')"
           echo "CHANGELOG_EOF"
         } >> "$GITHUB_OUTPUT"
 
     - name: Build release tarball
+      env:
+        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
       run: |
-        tag="${{ steps.next_tag.outputs.tag }}"
-        # Archive source + lockfile (everything needed for a locked install)
-        git archive --format=tar.gz --prefix="millpond-${tag}/" HEAD \
-          -o "millpond-${tag}.tar.gz"
+        git archive --format=tar.gz --prefix="millpond-${NEXT_TAG}/" HEAD \
+          -o "millpond-${NEXT_TAG}.tar.gz"
 
     - name: Create git tag
+      env:
+        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
       run: |
-        git tag "${{ steps.next_tag.outputs.tag }}"
-        git push origin "${{ steps.next_tag.outputs.tag }}"
+        git tag "$NEXT_TAG"
+        git push origin "$NEXT_TAG"
 
     - name: Create GitHub release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
+        COMMIT_SHA: ${{ github.sha }}
+        CHANGELOG_BODY: ${{ steps.changelog.outputs.body }}
       run: |
-        gh release create "${{ steps.next_tag.outputs.tag }}" \
-          --title "${{ steps.next_tag.outputs.tag }} (${{ github.sha }})" \
-          --notes "${{ steps.changelog.outputs.body }}" \
-          "millpond-${{ steps.next_tag.outputs.tag }}.tar.gz"
+        gh release create "$NEXT_TAG" \
+          --title "${NEXT_TAG} (${COMMIT_SHA})" \
+          --notes "$CHANGELOG_BODY" \
+          "millpond-${NEXT_TAG}.tar.gz"
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3
