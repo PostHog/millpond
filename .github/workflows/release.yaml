@@ -75,25 +75,8 @@ jobs:
           pyproject.toml uv.lock LICENSE README.md Dockerfile \
           millpond/ tests/ test/
 
-    - name: Create git tag
-      env:
-        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
-      run: |
-        git tag "$NEXT_TAG"
-        git push origin "$NEXT_TAG"
-
-    - name: Create GitHub release
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
-        COMMIT_SHA: ${{ github.sha }}
-        CHANGELOG_BODY: ${{ steps.changelog.outputs.body }}
-      run: |
-        gh release create "$NEXT_TAG" \
-          --title "${NEXT_TAG} (${COMMIT_SHA})" \
-          --notes "$CHANGELOG_BODY" \
-          "millpond-${NEXT_TAG}.tar.gz"
-
+    # Build and push Docker image before creating the release —
+    # if the image fails, we don't end up with an orphaned release/tag.
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3
 
@@ -116,3 +99,22 @@ jobs:
           ghcr.io/posthog/millpond:latest
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    - name: Create git tag
+      env:
+        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
+      run: |
+        git tag "$NEXT_TAG"
+        git push origin "$NEXT_TAG"
+
+    - name: Create GitHub release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
+        COMMIT_SHA: ${{ github.sha }}
+        CHANGELOG_BODY: ${{ steps.changelog.outputs.body }}
+      run: |
+        gh release create "$NEXT_TAG" \
+          --title "${NEXT_TAG} (${COMMIT_SHA})" \
+          --notes "$CHANGELOG_BODY" \
+          "millpond-${NEXT_TAG}.tar.gz"

@@ -12,7 +12,7 @@ version-file = "millpond/_version.py"
 name = "millpond"
 dynamic = ["version"]
 description = "Kafka to DuckLake"
-license = "MIT"
+license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",

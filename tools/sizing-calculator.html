@@ -40,24 +40,24 @@
 <div class="grid">
   <div class="card">
     <h2>Pipeline</h2>
-    <label>Messages per second (per partition)</label>
+    <label for="msgs_per_partition">Messages per second (per partition)</label>
     <input type="number" id="msgs_per_partition" value="4000" min="1">
-    <label>Partition count</label>
+    <label for="partitions">Partition count</label>
     <input type="number" id="partitions" value="512" min="1">
-    <label>Replica count</label>
+    <label for="replicas">Replica count</label>
     <input type="number" id="replicas" value="8" min="1">
-    <label>Parquet bytes per row</label>
+    <label for="parquet_bpr">Parquet bytes per row</label>
     <input type="number" id="parquet_bpr" value="366" min="1">
   </div>
   <div class="card">
     <h2>Configuration</h2>
-    <label>FLUSH_INTERVAL_MS</label>
+    <label for="flush_interval">FLUSH_INTERVAL_MS</label>
     <input type="number" id="flush_interval" value="60000" min="1000" step="1000">
-    <label>FLUSH_SIZE (Arrow bytes)</label>
+    <label for="flush_size">FLUSH_SIZE (Arrow bytes)</label>
     <input type="number" id="flush_size" value="104857600" min="1000000">
-    <label>Arrow-to-Parquet ratio</label>
+    <label for="compression">Arrow-to-Parquet ratio</label>
     <input type="number" id="compression" value="2.8" min="1" step="0.1">
-    <label>Target Parquet object size (MB)</label>
+    <label for="target_mb">Target Parquet object size (MB)</label>
     <input type="number" id="target_mb" value="128" min="1">
   </div>
 </div>
@@ -110,6 +110,30 @@ function memClass(bytes) {
   return '';
 }
 
+function makeCell(text, cls, extra) {
+  const td = document.createElement('td');
+  if (extra) td.className = extra;
+  if (cls) {
+    const span = document.createElement('span');
+    span.className = cls;
+    span.textContent = text;
+    td.appendChild(span);
+  } else {
+    td.textContent = text;
+  }
+  return td;
+}
+
+function makeRow(cells) {
+  const tr = document.createElement('tr');
+  cells.forEach(c => tr.appendChild(c));
+  return tr;
+}
+
+function clearAndAppend(parent, children) {
+  parent.replaceChildren(...children);
+}
+
 function calc() {
   const msgsPerPart = +document.getElementById('msgs_per_partition').value;
   const partitions = +document.getElementById('partitions').value;
@@ -148,68 +172,79 @@ function calc() {
   const overhead = 160 * 1024 * 1024;
   const memNeeded = actualArrow + overhead;
 
+  // --- Output table ---
   const out = document.getElementById('output');
-  const rows = [
-    ['Total throughput', fmtN(totalMsgs) + ' msg/s'],
-    ['Partitions per pod', fmtN(partsPerPod)],
-    ['Messages per pod', fmtN(msgsPerPod) + ' msg/s'],
-    ['Flush trigger', sizeTriggered ? '<span class="warn">size (' + actualInterval.toFixed(1) + 's)</span>' : 'time (' + intervalS + 's)'],
-    ['Rows per flush', fmtN(actualRows)],
-    ['Arrow per flush', '<span class="' + memClass(actualArrow) + '">' + fmt(actualArrow) + '</span>'],
-    ['Parquet per flush', '<span class="' + sizeClass(actualParquet, targetMb) + '">' + fmt(actualParquet) + '</span>'],
-    ['Est. memory per pod', '<span class="' + memClass(memNeeded) + '">' + fmt(memNeeded) + '</span>'],
-    ['Files per day (all pods)', fmtN(Math.round(filesPerDay))],
+  const triggerText = sizeTriggered
+    ? 'size (' + actualInterval.toFixed(1) + 's)'
+    : 'time (' + intervalS + 's)';
+  const outputRows = [
+    ['Total throughput', fmtN(totalMsgs) + ' msg/s', ''],
+    ['Partitions per pod', fmtN(partsPerPod), ''],
+    ['Messages per pod', fmtN(msgsPerPod) + ' msg/s', ''],
+    ['Flush trigger', triggerText, sizeTriggered ? 'warn' : ''],
+    ['Rows per flush', fmtN(actualRows), ''],
+    ['Arrow per flush', fmt(actualArrow), memClass(actualArrow)],
+    ['Parquet per flush', fmt(actualParquet), sizeClass(actualParquet, targetMb)],
+    ['Est. memory per pod', fmt(memNeeded), memClass(memNeeded)],
+    ['Files per day (all pods)', fmtN(Math.round(filesPerDay)), ''],
   ];
-  out.innerHTML = rows.map(r => '<tr><td>' + r[0] + '</td><td class="num">' + r[1] + '</td></tr>').join('');
+  clearAndAppend(out, outputRows.map(r =>
+    makeRow([makeCell(r[0], '', ''), makeCell(r[1], r[2], 'num')])
+  ));
 
   const note = document.getElementById('trigger_note');
-  note.innerHTML = sizeTriggered
+  note.textContent = sizeTriggered
     ? 'Size trigger fires at ' + actualInterval.toFixed(1) + 's before the ' + intervalS + 's interval expires.'
     : 'Time trigger fires at ' + intervalS + 's. FLUSH_SIZE ceiling (' + fmt(flushSize) + ' Arrow) is not reached.';
 
-  // Sensitivity table
+  // --- Sensitivity table ---
   const intervals = [30, 60, 90, 120, 180, 300];
   const sens = document.getElementById('sensitivity');
-  sens.innerHTML = intervals.map(s => {
-    const ms = s * 1000;
+  clearAndAppend(sens, intervals.map(s => {
     const tFill = flushSize / (msgsPerPod * arrowBpr);
     const triggered = tFill < s;
     const effInterval = triggered ? tFill : s;
     const pq = triggered ? (flushSize / ratio) : (msgsPerPod * s * parquetBpr);
     const ar = triggered ? flushSize : (msgsPerPod * s * arrowBpr);
     const fpd = Math.round((86400 / effInterval) * replicas);
-    const marker = (ms === flushInterval) ? ' *' : '';
-    return '<tr><td>' + s + 's' + marker + '</td>'
-      + '<td class="num"><span class="' + sizeClass(pq, targetMb) + '">' + fmt(pq) + '</span></td>'
-      + '<td class="num"><span class="' + memClass(ar) + '">' + fmt(ar) + '</span></td>'
-      + '<td class="num">' + fmtN(fpd) + '</td></tr>';
-  }).join('');
+    const marker = (s * 1000 === flushInterval) ? ' *' : '';
+    return makeRow([
+      makeCell(s + 's' + marker, '', ''),
+      makeCell(fmt(pq), sizeClass(pq, targetMb), 'num'),
+      makeCell(fmt(ar), memClass(ar), 'num'),
+      makeCell(fmtN(fpd), '', 'num'),
+    ]);
+  }));
 
-  // Recommendation
+  // --- Recommendation ---
   const rec = document.getElementById('recommendation');
   const targetParquet = targetMb * 1e6;
   const idealInterval = targetParquet / (msgsPerPod * parquetBpr);
   const idealArrow = msgsPerPod * idealInterval * arrowBpr;
   const idealMem = idealArrow + overhead;
-  const idealMemMi = Math.ceil(idealMem / (1024*1024) / 128) * 128; // round up to 128Mi
+  const idealMemMi = Math.ceil(idealMem / (1024*1024) / 128) * 128;
+
+  const h2 = document.createElement('h2');
+  const p = document.createElement('p');
 
   if (idealInterval < 10) {
-    rec.innerHTML = '<h2>Recommendation</h2>'
-      + '<p>At this volume, even a 10s interval exceeds ' + targetMb + 'MB. '
-      + 'Set <code>FLUSH_INTERVAL_MS=10000</code> and let the size trigger handle it. '
-      + 'Memory limit: <code>' + idealMemMi + 'Mi</code>.</p>';
+    h2.textContent = 'Recommendation';
+    p.textContent = 'At this volume, even a 10s interval exceeds ' + targetMb + 'MB. '
+      + 'Set FLUSH_INTERVAL_MS=10000 and let the size trigger handle it. '
+      + 'Memory limit: ' + idealMemMi + 'Mi.';
   } else if (idealInterval > 600) {
-    rec.innerHTML = '<h2>Recommendation</h2>'
-      + '<p>Volume is too low to reach ' + targetMb + 'MB within a reasonable interval. '
-      + 'Use <code>FLUSH_INTERVAL_MS=60000</code> and run <code>ducklake_merge_adjacent_files()</code> periodically to compact.</p>';
+    h2.textContent = 'Recommendation';
+    p.textContent = 'Volume is too low to reach ' + targetMb + 'MB within a reasonable interval. '
+      + 'Use FLUSH_INTERVAL_MS=60000 and run ducklake_merge_adjacent_files() periodically to compact.';
   } else {
-    const recIntervalMs = Math.round(idealInterval / 5) * 5 * 1000; // round to nearest 5s
-    rec.innerHTML = '<h2>Recommendation for ~' + targetMb + 'MB objects</h2>'
-      + '<p><code>FLUSH_INTERVAL_MS=' + recIntervalMs + '</code> &mdash; '
+    const recIntervalMs = Math.round(idealInterval / 5) * 5 * 1000;
+    h2.textContent = 'Recommendation for ~' + targetMb + 'MB objects';
+    p.textContent = 'FLUSH_INTERVAL_MS=' + recIntervalMs + ' \u2014 '
       + 'produces ~' + fmt(targetParquet) + ' Parquet per file at mean volume. '
-      + 'Memory limit: <code>' + idealMemMi + 'Mi</code>. '
-      + 'Set <code>FLUSH_SIZE</code> to <code>' + fmtN(Math.round(idealArrow * 2)) + '</code> as a burst ceiling.</p>';
+      + 'Memory limit: ' + idealMemMi + 'Mi. '
+      + 'Set FLUSH_SIZE to ' + fmtN(Math.round(idealArrow * 2)) + ' as a burst ceiling.';
   }
+  rec.replaceChildren(h2, p);
 }
 
 document.querySelectorAll('input').forEach(el => el.addEventListener('input', calc));
