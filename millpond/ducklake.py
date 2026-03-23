@@ -62,7 +62,7 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     parsed = urlparse(cfg.ducklake_metadata_url)
     pg_connstr = (
         f"host={parsed.hostname} port={parsed.port or 5432} "
-        f"dbname={parsed.path.lstrip('/')} user={_escape_libpq(parsed.username)} "
+        f"dbname={_escape_libpq(parsed.path.lstrip('/'))} user={_escape_libpq(parsed.username)} "
         f"password={_escape_libpq(parsed.password)}"
     )
     conn.execute(f"""
