@@ -11,7 +11,11 @@ log = logging.getLogger(__name__)
 
 
 def _on_stats(stats_json: str) -> None:
-    """Parse librdkafka stats JSON and update Prometheus gauges."""
+    """Parse librdkafka stats JSON and update Prometheus gauges.
+
+    Called on the librdkafka background thread, not the main thread.
+    prometheus_client Gauge.set() is thread-safe (atomic double write).
+    """
     try:
         stats = orjson.loads(stats_json)
     except (orjson.JSONDecodeError, TypeError):
