@@ -1,6 +1,6 @@
-import json
 import logging
 
+import orjson
 from confluent_kafka import Consumer, TopicPartition
 from confluent_kafka.admin import AdminClient
 
@@ -13,8 +13,8 @@ log = logging.getLogger(__name__)
 def _on_stats(stats_json: str) -> None:
     """Parse librdkafka stats JSON and update Prometheus gauges."""
     try:
-        stats = json.loads(stats_json)
-    except (json.JSONDecodeError, TypeError):
+        stats = orjson.loads(stats_json)
+    except (orjson.JSONDecodeError, TypeError):
         return
 
     metrics.rdkafka_replyq.set(stats.get("replyq", 0))
@@ -24,9 +24,13 @@ def _on_stats(stats_json: str) -> None:
     for broker_info in stats.get("brokers", {}).values():
         name = broker_info.get("name", "unknown")
         rtt = broker_info.get("rtt", {})
-        # librdkafka reports RTT in microseconds
-        metrics.rdkafka_broker_rtt_avg.labels(broker=name).set(rtt.get("avg", 0) / 1_000_000)
-        metrics.rdkafka_broker_rtt_p99.labels(broker=name).set(rtt.get("p99", 0) / 1_000_000)
+        # librdkafka reports RTT in microseconds; -1 means no samples
+        avg = rtt.get("avg", -1)
+        p99 = rtt.get("p99", -1)
+        if avg >= 0:
+            metrics.rdkafka_broker_rtt_avg.labels(broker=name).set(avg / 1_000_000)
+        if p99 >= 0:
+            metrics.rdkafka_broker_rtt_p99.labels(broker=name).set(p99 / 1_000_000)
 
 
 def discover_partition_count(cfg: Config) -> int:

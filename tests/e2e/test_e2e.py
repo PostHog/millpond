@@ -9,12 +9,13 @@ Usage:
 """
 
 import time
+from pathlib import Path
 
 import duckdb
 import pytest
 from testcontainers.compose import DockerCompose
 
-COMPOSE_DIR = "."
+COMPOSE_DIR = str(Path(__file__).resolve().parents[2])
 
 
 @pytest.fixture(scope="module")

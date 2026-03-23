@@ -15,13 +15,13 @@ _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
 
 
-def _convert_batch(values: list[bytes], mets=None) -> pa.Table | None:
+def _convert_batch(values: list[bytes]) -> pa.Table | None:
     """Convert raw message values to Arrow, timing the conversion."""
     t0 = time.monotonic()
     table = arrow_converter.convert(values)
     if table is not None:
         duration = time.monotonic() - t0
-        (mets or metrics).arrow_conversion_seconds.observe(duration)
+        metrics.arrow_conversion_seconds.observe(duration)
     return table
 
 

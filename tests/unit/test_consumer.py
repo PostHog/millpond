@@ -1,5 +1,5 @@
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from millpond.consumer import _on_stats, compute_assignment
 
@@ -66,13 +66,49 @@ class TestOnStats:
 
     @patch("millpond.consumer.metrics")
     def test_rtt_converted_to_seconds(self, mock_metrics):
+        # Use distinct mocks per broker so we can verify per-broker values
+        broker_avg_mocks = {}
+        broker_p99_mocks = {}
+
+        def avg_labels(broker):
+            if broker not in broker_avg_mocks:
+                broker_avg_mocks[broker] = MagicMock()
+            return broker_avg_mocks[broker]
+
+        def p99_labels(broker):
+            if broker not in broker_p99_mocks:
+                broker_p99_mocks[broker] = MagicMock()
+            return broker_p99_mocks[broker]
+
+        mock_metrics.rdkafka_broker_rtt_avg.labels = avg_labels
+        mock_metrics.rdkafka_broker_rtt_p99.labels = p99_labels
+
         _on_stats(self.STATS_BLOB)
-        # Collect all set() calls via the shared mock — labels() returns the same
-        # mock regardless of args, so we check the values passed to set() directly.
-        avg_values = [c.args[0] for c in mock_metrics.rdkafka_broker_rtt_avg.labels().set.call_args_list]
-        p99_values = [c.args[0] for c in mock_metrics.rdkafka_broker_rtt_p99.labels().set.call_args_list]
-        assert sorted(avg_values) == [0.003, 0.005]
-        assert sorted(p99_values) == [0.008, 0.012]
+
+        broker_avg_mocks["broker1:9092/1"].set.assert_called_once_with(0.005)
+        broker_avg_mocks["broker2:9092/2"].set.assert_called_once_with(0.003)
+        broker_p99_mocks["broker1:9092/1"].set.assert_called_once_with(0.012)
+        broker_p99_mocks["broker2:9092/2"].set.assert_called_once_with(0.008)
+
+    @patch("millpond.consumer.metrics")
+    def test_negative_rtt_skipped(self, mock_metrics):
+        """librdkafka reports rtt=-1 when no samples exist; should not set gauge."""
+        blob = json.dumps(
+            {
+                "replyq": 0,
+                "msg_cnt": 0,
+                "msg_size": 0,
+                "brokers": {
+                    "bootstrap:9092/bootstrap": {
+                        "name": "bootstrap:9092/bootstrap",
+                        "rtt": {"avg": -1, "p99": -1},
+                    }
+                },
+            }
+        )
+        _on_stats(blob)
+        mock_metrics.rdkafka_broker_rtt_avg.labels.assert_not_called()
+        mock_metrics.rdkafka_broker_rtt_p99.labels.assert_not_called()
 
     @patch("millpond.consumer.metrics")
     def test_malformed_json_ignored(self, mock_metrics):
