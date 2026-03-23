@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
   contents: write
   packages: write
@@ -59,9 +63,17 @@ jobs:
     - name: Build release tarball
       env:
         NEXT_TAG: ${{ steps.next_tag.outputs.tag }}
+        NEXT_VERSION: ${{ steps.next_tag.outputs.version }}
       run: |
-        git archive --format=tar.gz --prefix="millpond-${NEXT_TAG}/" HEAD \
-          -o "millpond-${NEXT_TAG}.tar.gz"
+        # Write version file so tarball consumers don't need .git history
+        echo "__version__ = \"${NEXT_VERSION}\"" > millpond/_version.py
+        # git archive doesn't include untracked files, so use tar directly
+        tar czf "millpond-${NEXT_TAG}.tar.gz" \
+          --transform "s,^,millpond-${NEXT_TAG}/," \
+          --exclude='.git' --exclude='*.pyc' --exclude='__pycache__' \
+          --exclude='.venv' --exclude='.flox' \
+          pyproject.toml uv.lock LICENSE README.md Dockerfile \
+          millpond/ tests/ test/
 
     - name: Create git tag
       env:

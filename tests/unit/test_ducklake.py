@@ -1,5 +1,3 @@
-from unittest.mock import MagicMock
-
 import pytest
 
 from millpond.ducklake import _escape_libpq, _sanitize_setting_value, _validate_partition_expr

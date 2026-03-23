@@ -12,7 +12,6 @@ from millpond.config import Config
 log = logging.getLogger(__name__)
 
 _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
-_SAFE_PARTITION_EXPR = re.compile(r"^[a-zA-Z0-9_(),\s]+$")
 
 
 def _escape_libpq(value: str | None) -> str:
@@ -81,7 +80,9 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
 
 def _validate_partition_expr(expr: str) -> str:
     """Validate a partition expression to prevent SQL injection."""
-    if not _SAFE_PARTITION_EXPR.match(expr):
+    from millpond.config import SAFE_PARTITION_EXPR
+
+    if not SAFE_PARTITION_EXPR.match(expr):
         raise ValueError(f"Partition expression contains unsafe characters: {expr!r}")
     return expr
 

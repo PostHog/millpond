@@ -4,7 +4,9 @@ import re
 from dataclasses import dataclass
 
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-_SAFE_PARTITION_EXPR = re.compile(r"^[a-zA-Z0-9_(),\s]+$")
+
+# Shared with ducklake._validate_partition_expr — keep in sync or import from here.
+SAFE_PARTITION_EXPR = re.compile(r"^[a-zA-Z0-9_(),\s]+$")
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +79,7 @@ def load() -> Config:
     group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{ducklake_table}")
 
     partition_by = os.environ.get("DUCKLAKE_PARTITION_BY", "").strip() or None
-    if partition_by and not _SAFE_PARTITION_EXPR.match(partition_by):
+    if partition_by and not SAFE_PARTITION_EXPR.match(partition_by):
         raise RuntimeError(
             f"DUCKLAKE_PARTITION_BY {partition_by!r} contains unsafe characters (must match [a-zA-Z0-9_(),\\s]+)"
         )
