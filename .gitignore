@@ -7,3 +7,4 @@ dist/
 .ruff_cache/
 .pytest_cache/
 .claude/settings.local.json
+session-*.md
