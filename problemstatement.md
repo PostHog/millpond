@@ -198,7 +198,7 @@ spec:
         - name: DUCKLAKE_TABLE
           value: "events"
         - name: DUCKLAKE_DATA_PATH
-          value: "s3://posthog-ducklake-prod-us/data"
+          value: "s3://your-bucket/data"
         - name: DUCKLAKE_METADATA_URL
           value: "jdbc:postgresql://rds-host/ducklake"
         - name: FLUSH_SIZE
