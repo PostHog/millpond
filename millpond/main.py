@@ -196,7 +196,18 @@ def main():
             if should_flush:
                 trigger = "size" if size_triggered else "time"
                 consolidated = pa.concat_tables(pending, promote_options="default")
-                _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr, trigger)
+                _flush(
+                    db,
+                    cfg,
+                    kafka,
+                    consolidated,
+                    pending_bytes,
+                    pending_records,
+                    offsets,
+                    elapsed,
+                    schema_mgr,
+                    trigger,
+                )
 
                 # Sample lag metrics periodically, not on every flush
                 now = time.monotonic()
