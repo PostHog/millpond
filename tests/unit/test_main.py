@@ -137,10 +137,11 @@ class TestFlushErrorDistinction:
     def test_successful_flush_records_write_metrics(self, mock_dl, mock_metrics, mock_server):
         db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
 
-        _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
+        _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr, trigger="size")
 
         mock_metrics.records_written_total.inc.assert_called_once_with(2)
-        mock_metrics.batches_flushed_total.inc.assert_called_once()
+        mock_metrics.batches_flushed_total.labels.assert_called_once_with(trigger="size")
+        mock_metrics.batches_flushed_total.labels.return_value.inc.assert_called_once()
 
 
 class TestArrowConversionTiming:

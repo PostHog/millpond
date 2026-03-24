@@ -197,7 +197,7 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 |--------|------|-------------|
 | `millpond_records_consumed_total` | Counter | Records polled (by partition) |
 | `millpond_records_written_total` | Counter | Records written to DuckLake |
-| `millpond_batches_flushed_total` | Counter | Flush cycles completed |
+| `millpond_batches_flushed_total` | Counter | Flush cycles completed (by trigger: `size` or `time`) |
 | `millpond_records_skipped_total` | Counter | Records skipped (by reason: json_parse, schema) |
 | `millpond_errors_total` | Counter | Errors by type (kafka/duckdb/arrow/json) |
 | `millpond_arrow_conversion_seconds` | Histogram | Time to convert JSON to Arrow table |
