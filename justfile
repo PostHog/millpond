@@ -59,16 +59,32 @@ ci: fmt-check lint test
 
 # === Docker ===
 
+# Generate SSL certs for local Kafka (one-time setup)
+[group('docker')]
+ssl-certs:
+    ./test/generate-ssl-certs.sh
+
 # Start the docker-compose dev environment (Kafka, Postgres, MinIO, producer, 2 millpond pods)
 [group('docker')]
 up:
     docker compose build
     docker compose up -d
 
+# Start the docker-compose dev environment with SSL Kafka
+[group('docker')]
+up-ssl: ssl-certs
+    docker compose -f docker-compose.yaml -f docker-compose.ssl.yaml build
+    docker compose -f docker-compose.yaml -f docker-compose.ssl.yaml up -d
+
 # Stop the docker-compose dev environment
 [group('docker')]
 down:
     docker compose down -v
+
+# Stop the SSL docker-compose dev environment
+[group('docker')]
+down-ssl:
+    docker compose -f docker-compose.yaml -f docker-compose.ssl.yaml down -v
 
 # Open a DuckDB shell attached to the local DuckLake (requires `just up` first)
 [group('docker')]

@@ -1,7 +1,10 @@
 import json
 from unittest.mock import MagicMock, patch
 
-from millpond.consumer import _on_stats, compute_assignment
+import pytest
+
+from millpond.consumer import _base_kafka_config, _on_stats, compute_assignment, create, discover_partition_count
+from millpond.config import Config
 
 
 class TestComputeAssignment:
@@ -115,3 +118,145 @@ class TestOnStats:
         _on_stats("not json")
         # Should not raise, gauges should not be called
         mock_metrics.rdkafka_replyq.set.assert_not_called()
+
+
+def _make_cfg(**overrides) -> Config:
+    defaults = dict(
+        bootstrap_servers="localhost:9092",
+        topic="test-topic",
+        group_id="test-group",
+        replica_count=4,
+        ordinal=1,
+        ducklake_table="events",
+        ducklake_data_path="s3://bucket/data",
+        ducklake_connection=":memory:",
+        rds_host="localhost",
+        rds_port="5432",
+        rds_database="ducklake",
+        rds_username="ducklake",
+        rds_password="pass",
+        flush_size=100,
+        flush_interval_ms=1000,
+        partition_by=None,
+        fetch_min_bytes=1,
+        fetch_max_wait_ms=500,
+        consume_batch_size=1000,
+        stats_interval_ms=5000,
+        kafka_config_overrides=(("security.protocol", "SSL"),),
+    )
+    defaults.update(overrides)
+    return Config(**defaults)
+
+
+class TestBaseKafkaConfig:
+    def test_includes_bootstrap_servers(self):
+        cfg = _make_cfg()
+        base = _base_kafka_config(cfg)
+        assert base["bootstrap.servers"] == "localhost:9092"
+
+    def test_includes_client_id(self):
+        cfg = _make_cfg(ordinal=3)
+        base = _base_kafka_config(cfg)
+        assert base["client.id"] == "millpond-test-topic-events-3"
+
+    def test_includes_overrides(self):
+        cfg = _make_cfg(kafka_config_overrides=(("security.protocol", "SSL"), ("sasl.mechanism", "PLAIN")))
+        base = _base_kafka_config(cfg)
+        assert base["security.protocol"] == "SSL"
+        assert base["sasl.mechanism"] == "PLAIN"
+
+    def test_empty_overrides(self):
+        cfg = _make_cfg(kafka_config_overrides=())
+        base = _base_kafka_config(cfg)
+        assert "security.protocol" not in base
+
+
+class TestDiscoverPartitionCount:
+    @patch("millpond.consumer.AdminClient")
+    def test_returns_partition_count(self, mock_admin_cls):
+        mock_admin = MagicMock()
+        mock_admin_cls.return_value = mock_admin
+        mock_topic = MagicMock()
+        mock_topic.error = None
+        mock_topic.partitions = {0: None, 1: None, 2: None}
+        mock_admin.list_topics.return_value.topics = {"test-topic": mock_topic}
+
+        cfg = _make_cfg()
+        count = discover_partition_count(cfg)
+        assert count == 3
+
+    @patch("millpond.consumer.AdminClient")
+    def test_passes_overrides_to_admin_client(self, mock_admin_cls):
+        mock_admin = MagicMock()
+        mock_admin_cls.return_value = mock_admin
+        mock_topic = MagicMock()
+        mock_topic.error = None
+        mock_topic.partitions = {0: None}
+        mock_admin.list_topics.return_value.topics = {"test-topic": mock_topic}
+
+        cfg = _make_cfg(kafka_config_overrides=(("security.protocol", "SSL"),))
+        discover_partition_count(cfg)
+
+        admin_config = mock_admin_cls.call_args[0][0]
+        assert admin_config["security.protocol"] == "SSL"
+        assert admin_config["bootstrap.servers"] == "localhost:9092"
+
+    @patch("millpond.consumer.AdminClient")
+    def test_topic_not_found(self, mock_admin_cls):
+        mock_admin = MagicMock()
+        mock_admin_cls.return_value = mock_admin
+        mock_admin.list_topics.return_value.topics = {}
+
+        cfg = _make_cfg()
+        with pytest.raises(RuntimeError, match="not found"):
+            discover_partition_count(cfg)
+
+    @patch("millpond.consumer.AdminClient")
+    def test_topic_error(self, mock_admin_cls):
+        mock_admin = MagicMock()
+        mock_admin_cls.return_value = mock_admin
+        mock_topic = MagicMock()
+        mock_topic.error = "LEADER_NOT_AVAILABLE"
+        mock_admin.list_topics.return_value.topics = {"test-topic": mock_topic}
+
+        cfg = _make_cfg()
+        with pytest.raises(RuntimeError, match="error"):
+            discover_partition_count(cfg)
+
+
+class TestCreate:
+    @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=8)
+    def test_assigns_correct_partitions(self, mock_discover, mock_consumer_cls):
+        cfg = _make_cfg(ordinal=1, replica_count=4)
+        create(cfg)
+
+        assign_call = mock_consumer_cls.return_value.assign
+        assign_call.assert_called_once()
+        partitions = assign_call.call_args[0][0]
+        assert [tp.partition for tp in partitions] == [1, 5]
+
+    @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=8)
+    def test_passes_overrides_to_consumer(self, mock_discover, mock_consumer_cls):
+        cfg = _make_cfg(kafka_config_overrides=(("security.protocol", "SSL"),))
+        create(cfg)
+
+        consumer_config = mock_consumer_cls.call_args[0][0]
+        assert consumer_config["security.protocol"] == "SSL"
+
+    @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=8)
+    def test_sets_client_id(self, mock_discover, mock_consumer_cls):
+        cfg = _make_cfg(ordinal=2, replica_count=4)
+        create(cfg)
+
+        consumer_config = mock_consumer_cls.call_args[0][0]
+        assert consumer_config["client.id"] == "millpond-test-topic-events-2"
+
+    @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=2)
+    def test_no_partitions_raises(self, mock_discover, mock_consumer_cls):
+        cfg = _make_cfg(ordinal=3, replica_count=4)
+        with pytest.raises(RuntimeError, match="No partitions assigned"):
+            create(cfg)

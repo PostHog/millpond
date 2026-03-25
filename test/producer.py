@@ -731,13 +731,19 @@ def make_event(i: int) -> dict:
 def main():
     from confluent_kafka import Producer
 
-    producer = Producer({
+    producer_config = {
         "bootstrap.servers": BOOTSTRAP_SERVERS,
         "linger.ms": 50,
         "batch.num.messages": 10000,
         "queue.buffering.max.messages": 100000,
         "compression.type": "lz4",
-    })
+    }
+    # Merge KAFKA_PRODUCER_* env vars (e.g. KAFKA_PRODUCER_SECURITY_PROTOCOL=SSL)
+    prefix = "KAFKA_PRODUCER_"
+    for k, v in os.environ.items():
+        if k.startswith(prefix):
+            producer_config[k[len(prefix):].lower().replace("_", ".")] = v
+    producer = Producer(producer_config)
 
     infinite = TOTAL_RECORDS == -1
     if infinite:
