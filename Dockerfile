@@ -12,12 +12,16 @@ ARG MILLPOND_VERSION=0.0.0.dev0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=$MILLPOND_VERSION
 RUN uv sync --frozen --no-dev
 
+# Install DuckDB CLI (pinned to match the Python package version)
+RUN uv tool install "duckdb-cli>=1.4,<1.5"
+
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends just && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/millpond /app/millpond
+COPY --from=builder /root/.local/bin/duckdb /usr/local/bin/duckdb
 COPY tools/justfile /justfile
 
 ENV PATH="/app/.venv/bin:$PATH"
