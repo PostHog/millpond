@@ -25,8 +25,14 @@ class Config:
     # DuckLake
     ducklake_table: str
     ducklake_data_path: str
-    ducklake_metadata_url: str
     ducklake_connection: str
+
+    # RDS (DuckLake metadata store)
+    rds_host: str
+    rds_port: str
+    rds_database: str
+    rds_username: str
+    rds_password: str
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
@@ -104,8 +110,12 @@ def load() -> Config:
         ordinal=ordinal,
         ducklake_table=ducklake_table,
         ducklake_data_path=_require("DUCKLAKE_DATA_PATH"),
-        ducklake_metadata_url=_require("DUCKLAKE_METADATA_URL"),
         ducklake_connection=_require("DUCKLAKE_CONNECTION"),
+        rds_host=_require("DUCKLAKE_RDS_HOST"),
+        rds_port=os.environ.get("DUCKLAKE_RDS_PORT", "5432"),
+        rds_database=os.environ.get("DUCKLAKE_RDS_DATABASE", "ducklake"),
+        rds_username=os.environ.get("DUCKLAKE_RDS_USERNAME", "ducklake"),
+        rds_password=_require("DUCKLAKE_RDS_PASSWORD"),
         partition_by=partition_by,
         flush_size=int(os.environ.get("FLUSH_SIZE", "104857600")),
         flush_interval_ms=int(os.environ.get("FLUSH_INTERVAL_MS", "60000")),

@@ -82,8 +82,12 @@ All configuration via environment variables:
 | `REPLICA_COUNT` | yes | | Number of StatefulSet replicas (must match `spec.replicas`) |
 | `DUCKLAKE_TABLE` | yes | | Target DuckLake table name |
 | `DUCKLAKE_DATA_PATH` | yes | | S3 path for DuckLake data files |
-| `DUCKLAKE_METADATA_URL` | yes | | Postgres URL for DuckLake metadata (`postgresql://user:pass@host:5432/db`) |
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
+| `DUCKLAKE_RDS_HOST` | yes | | Postgres host for DuckLake metadata |
+| `DUCKLAKE_RDS_PORT` | no | `5432` | Postgres port |
+| `DUCKLAKE_RDS_DATABASE` | no | `ducklake` | Postgres database name |
+| `DUCKLAKE_RDS_USERNAME` | no | `ducklake` | Postgres username |
+| `DUCKLAKE_RDS_PASSWORD` | yes | | Postgres password |
 | `DUCKLAKE_PARTITION_BY` | no | | Hive-style partition expression (e.g. `year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)`). Applied via `ALTER TABLE SET PARTITIONED BY` on first write. |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |

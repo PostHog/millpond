@@ -1,5 +1,19 @@
 # Millpond — Dead Simple Kafka to DuckLake
 
+## Pre-push Checklist
+
+Always run before pushing:
+
+```bash
+just lint       # ruff check
+just fmt-check  # ruff format --check
+just test       # unit tests
+```
+
+All three must pass. Do not push with lint or test failures.
+
+Prefer fixup commits over amending and force-pushing.
+
 ## What This Is
 
 A standalone Python app that replaces Kafka Connect for writing Kafka topic data to DuckLake. Single thread, single loop, no framework.
@@ -114,7 +128,8 @@ At startup, `ducklake.py` must:
 conn = duckdb.connect(config.ducklake_connection)
 conn.execute("LOAD httpfs")       # must load before ducklake — race condition with S3 access
 conn.execute("LOAD ducklake")
-conn.execute(f"ATTACH 'ducklake:{config.ducklake_metadata_url}' AS lake (DATA_PATH '{config.ducklake_data_path}')")
+pg_connstr = f"host={config.rds_host} port={config.rds_port} dbname='{config.rds_database}' user='{config.rds_username}' password='{config.rds_password}'"
+conn.execute(f"ATTACH 'ducklake:postgres:{pg_connstr}' AS lake (DATA_PATH '{config.ducklake_data_path}')")
 ```
 
 Extensions are pre-installed in the Docker image at build time (no runtime network dependency). `httpfs` must be loaded before `ducklake` to avoid a race condition where ducklake tries to access S3 before httpfs is available.
