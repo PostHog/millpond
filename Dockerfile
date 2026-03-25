@@ -14,8 +14,11 @@ RUN uv sync --frozen --no-dev
 
 FROM python:3.12-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends just && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/millpond /app/millpond
+COPY tools/justfile /justfile
 
 ENV PATH="/app/.venv/bin:$PATH"
 

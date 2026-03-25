@@ -1,0 +1,69 @@
+# DuckLake maintenance tasks
+# Requires: DUCKLAKE_RDS_PASSWORD, DUCKDB_S3_ACCESS_KEY_ID, DUCKDB_S3_SECRET_ACCESS_KEY
+
+duckdb := env("DUCKDB", "duckdb")
+
+rds_host := env("DUCKLAKE_RDS_HOST", "")
+rds_port := env("DUCKLAKE_RDS_PORT", "5432")
+rds_db := env("DUCKLAKE_RDS_DATABASE", "ducklake")
+rds_user := env("DUCKLAKE_RDS_USERNAME", "ducklake")
+rds_password := env("DUCKLAKE_RDS_PASSWORD", "")
+s3_region := env("DUCKDB_S3_REGION", "us-east-1")
+s3_key := env("DUCKDB_S3_ACCESS_KEY_ID", "")
+s3_secret := env("DUCKDB_S3_SECRET_ACCESS_KEY", "")
+data_path := env("DUCKLAKE_DATA_PATH", "")
+
+_setup := "LOAD httpfs; LOAD ducklake; LOAD postgres; SET s3_region = '" + s3_region + "'; SET s3_endpoint = 's3." + s3_region + ".amazonaws.com'; SET s3_access_key_id = '" + s3_key + "'; SET s3_secret_access_key = '" + s3_secret + "'; SET s3_use_ssl = true; SET s3_url_style = 'vhost'; ATTACH 'postgres:host=" + rds_host + " port=" + rds_port + " dbname=" + rds_db + " user=" + rds_user + " password=" + rds_password + "' AS lake (TYPE ducklake, DATA_PATH '" + data_path + "'); USE lake;"
+
+default:
+    @just --list
+
+# Open an interactive DuckDB shell connected to the DuckLake
+shell:
+    {{ duckdb }} -cmd "{{ _setup }}"
+
+# Drop a table
+drop table:
+    {{ duckdb }} -c "{{ _setup }} DROP TABLE lake.{{ table }};"
+
+# Expire snapshots (dry run)
+expire-dry-run days="7":
+    {{ duckdb }} -c "{{ _setup }} CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL '{{ days }} days', dry_run => true);"
+
+# Expire snapshots
+expire days="7":
+    {{ duckdb }} -c "{{ _setup }} CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL '{{ days }} days');"
+
+# Preview files scheduled for deletion
+cleanup-dry-run days="1":
+    {{ duckdb }} -c "{{ _setup }} CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL '{{ days }} days', dry_run => true);"
+
+# Delete files scheduled for deletion
+cleanup days="1":
+    {{ duckdb }} -c "{{ _setup }} CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL '{{ days }} days');"
+
+# Delete all files scheduled for deletion regardless of age
+cleanup-all:
+    {{ duckdb }} -c "{{ _setup }} CALL ducklake_cleanup_old_files('lake', cleanup_all => true);"
+
+# Preview orphaned files
+orphans-dry-run:
+    {{ duckdb }} -c "{{ _setup }} CALL ducklake_delete_orphaned_files('lake', dry_run => true);"
+
+# Delete orphaned files
+orphans:
+    {{ duckdb }} -c "{{ _setup }} CALL ducklake_delete_orphaned_files('lake');"
+
+# Full maintenance: expire snapshots + cleanup files
+maintain days="7":
+    just expire {{ days }}
+    just cleanup {{ days }}
+
+# Full maintenance dry run
+maintain-dry-run days="7":
+    just expire-dry-run {{ days }}
+    just cleanup-dry-run {{ days }}
+
+# Run CHECKPOINT (integrated merge + expire + cleanup)
+checkpoint:
+    {{ duckdb }} -c "{{ _setup }} CHECKPOINT lake;"
