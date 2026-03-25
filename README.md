@@ -69,7 +69,32 @@ just test              # run unit tests
 just test-integration  # run integration tests (local DuckDB)
 just test-e2e          # run E2E tests (docker-compose, builds stack automatically)
 just ci                # format check + lint + unit tests
+just up                # start docker-compose stack (plaintext Kafka)
+just up-ssl            # start docker-compose stack with SSL Kafka (closer to prod)
+just down              # stop docker-compose stack
+just down-ssl          # stop SSL docker-compose stack
 ```
+
+### SSL Kafka Testing
+
+The `just up-ssl` recipe generates self-signed certs and runs Kafka with SSL listeners, matching the production MSK configuration. This exercises the `KAFKA_CONSUMER_*` env var override path that isn't tested with plaintext Kafka.
+
+Requires Docker (uses `keytool` from the Kafka container image for cert generation).
+
+### DuckLake Maintenance
+
+`tools/justfile` contains DuckLake maintenance recipes and is baked into the Docker image at `/justfile`. From inside a running pod:
+
+```bash
+just --list              # see available recipes
+just maintain-dry-run 3  # preview: expire >3 day snapshots + cleanup
+just maintain 3          # execute it
+just shell               # interactive DuckDB shell connected to DuckLake
+just drop events         # drop a table (data files remain until cleanup)
+just orphans-dry-run     # preview orphaned S3 files
+```
+
+All recipes use the pod's existing env vars (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`).
 
 ## Configuration
 
