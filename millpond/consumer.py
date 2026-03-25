@@ -10,6 +10,17 @@ from millpond.config import Config
 log = logging.getLogger(__name__)
 
 
+def _base_kafka_config(cfg: Config) -> dict:
+    """Base config shared by all Kafka clients (AdminClient, Consumer)."""
+    base = {
+        "bootstrap.servers": cfg.bootstrap_servers,
+        "client.id": f"millpond-{cfg.topic}-{cfg.ducklake_table}-{cfg.ordinal}",
+    }
+    for key, val in cfg.kafka_config_overrides:
+        base[key] = val
+    return base
+
+
 def _on_stats(stats_json: str) -> None:
     """Parse librdkafka stats JSON and update Prometheus gauges.
 
@@ -39,7 +50,7 @@ def _on_stats(stats_json: str) -> None:
 
 def discover_partition_count(cfg: Config) -> int:
     """Discover partition count for the topic via broker metadata."""
-    admin = AdminClient({"bootstrap.servers": cfg.bootstrap_servers})
+    admin = AdminClient(_base_kafka_config(cfg))
     metadata = admin.list_topics(topic=cfg.topic, timeout=30)
     topic_meta = metadata.topics.get(cfg.topic)
     if topic_meta is None:
@@ -70,7 +81,7 @@ def create(cfg: Config) -> Consumer:
     log.info("Assigned partitions: %s", my_partitions)
 
     consumer_config = {
-        "bootstrap.servers": cfg.bootstrap_servers,
+        **_base_kafka_config(cfg),
         "group.id": cfg.group_id,
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
@@ -81,9 +92,6 @@ def create(cfg: Config) -> Consumer:
         "statistics.interval.ms": cfg.stats_interval_ms,
         "stats_cb": _on_stats,
     }
-    # Merge KAFKA_CONSUMER_* overrides (e.g. security.protocol, sasl.mechanism)
-    for key, val in cfg.kafka_config_overrides:
-        consumer_config[key] = val
 
     consumer = Consumer(consumer_config)
 
