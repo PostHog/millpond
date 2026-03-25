@@ -137,7 +137,11 @@ services:
       POD_NAME: millpond-test-0
       DUCKLAKE_TABLE: events
       DUCKLAKE_DATA_PATH: s3://ducklake/data
-      DUCKLAKE_METADATA_URL: postgresql://ducklake:ducklake@postgres:5432/ducklake
+      DUCKLAKE_RDS_HOST: postgres
+      DUCKLAKE_RDS_PORT: "5432"
+      DUCKLAKE_RDS_DATABASE: ducklake
+      DUCKLAKE_RDS_USERNAME: ducklake
+      DUCKLAKE_RDS_PASSWORD: ducklake
       DUCKLAKE_CONNECTION: ":memory:"
       FLUSH_SIZE: 5000
       FLUSH_INTERVAL_MS: 5000

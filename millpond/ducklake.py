@@ -1,7 +1,6 @@
 import logging
 import os
 import re
-from urllib.parse import urlparse
 
 import duckdb
 import pyarrow as pa
@@ -55,15 +54,14 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     conn.execute("LOAD ducklake")
     conn.execute("LOAD postgres")
 
-    # Parse the PG URL into a libpq connection string for DuckLake.
+    # Build a libpq connection string for DuckLake.
     # The 'postgres:' prefix tells DuckLake to use the Postgres extension
     # for metadata storage rather than a local DuckDB file.
     # See: https://ducklake.select/docs/stable/duckdb/usage/connecting
-    parsed = urlparse(cfg.ducklake_metadata_url)
     pg_connstr = (
-        f"host={parsed.hostname} port={parsed.port or 5432} "
-        f"dbname={_escape_libpq(parsed.path.lstrip('/'))} user={_escape_libpq(parsed.username)} "
-        f"password={_escape_libpq(parsed.password)}"
+        f"host={cfg.rds_host} port={cfg.rds_port} "
+        f"dbname={_escape_libpq(cfg.rds_database)} user={_escape_libpq(cfg.rds_username)} "
+        f"password={_escape_libpq(cfg.rds_password)}"
     )
     # Double single quotes for DuckDB SQL string literal — the libpq layer
     # inside DuckLake sees the unescaped quotes after DuckDB parses the string.
@@ -74,7 +72,13 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
         )
     """)
 
-    log.info("DuckLake connected: metadata=%s data=%s", cfg.ducklake_metadata_url, cfg.ducklake_data_path)
+    log.info(
+        "DuckLake connected: metadata=%s:%s/%s data=%s",
+        cfg.rds_host,
+        cfg.rds_port,
+        cfg.rds_database,
+        cfg.ducklake_data_path,
+    )
     return conn
 
 

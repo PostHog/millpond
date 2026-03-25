@@ -34,7 +34,8 @@ class TestLoad:
         monkeypatch.setenv("POD_NAME", "millpond-events-2")
         monkeypatch.setenv("DUCKLAKE_TABLE", "events")
         monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
-        monkeypatch.setenv("DUCKLAKE_METADATA_URL", "postgresql://user:pass@host:5432/db")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
         monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
 
     def test_loads(self):
