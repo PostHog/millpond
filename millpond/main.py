@@ -45,8 +45,9 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=Non
                 delay,
                 exc_info=True,
             )
-            # Invalidate cached schema so retry re-runs evolve() — another pod
-            # may have changed the table schema since our last attempt.
+            # Invalidate caches so retry re-checks table existence and schema —
+            # another pod may have created the table or changed columns.
+            ducklake.reset_table_cache()
             if schema_mgr is not None:
                 schema_mgr.invalidate()
             time.sleep(delay)

@@ -12,7 +12,19 @@ just test       # unit tests
 
 All three must pass. Do not push with lint or test failures.
 
+For changes to Kafka client code or config handling, also verify with SSL Kafka:
+
+```bash
+just up-ssl     # start docker-compose with SSL Kafka
+# verify pods connect and flush
+just down-ssl
+```
+
 Prefer fixup commits over amending and force-pushing.
+
+## Maintenance Tooling
+
+`tools/justfile` contains DuckLake maintenance recipes (expire snapshots, cleanup files, delete orphans, compaction). It is copied to `/justfile` in the Docker image and uses the pod's existing env vars. The `DUCKDB` env var can override the duckdb binary path.
 
 ## What This Is
 

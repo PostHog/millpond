@@ -100,28 +100,63 @@ def reset_table_cache() -> None:
     _tables_ensured.clear()
 
 
+def _table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    """Check if a table exists in the DuckLake catalog."""
+    result = conn.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_catalog = 'lake' AND table_schema = 'main' AND table_name = ?",
+        [table_name],
+    ).fetchone()
+    return result is not None
+
+
 def _ensure_table(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
     batch: pa.Table,
     partition_by: str | None = None,
 ) -> None:
-    """Create the DuckLake table from Arrow schema if it doesn't exist. Cached after first call."""
+    """Create the DuckLake table if it doesn't exist. Cached after first call.
+
+    Handles concurrent creation by multiple pods: if CREATE or ALTER fails
+    with a serialization/catalog error, we check if the table now exists
+    and treat that as success.
+    """
     if table_name in _tables_ensured:
         return
+
+    if _table_exists(conn, table_name):
+        log.info("Table %s already exists", table_name)
+        _tables_ensured.add(table_name)
+        return
+
     conn.register("_schema_batch", batch.slice(0, 0))  # empty batch, just schema
     try:
         conn.execute(
             f"CREATE TABLE IF NOT EXISTS lake.main.{table_name} AS "
             "SELECT *, NOW() AS _inserted_at FROM _schema_batch WHERE false"
         )
+    except duckdb.Error as e:
+        # Another pod may have created the table concurrently
+        if _table_exists(conn, table_name):
+            log.info("Table %s created by another pod, continuing", table_name)
+        else:
+            raise RuntimeError(f"Failed to create table {table_name}: {e}") from e
     finally:
         conn.unregister("_schema_batch")
+
     if partition_by is not None:
         _validate_partition_expr(partition_by)
-        conn.execute(f"ALTER TABLE lake.main.{table_name} SET PARTITIONED BY ({partition_by})")
-        log.info("Table %s partitioned by: %s", table_name, partition_by)
-    # Cache AFTER both CREATE and ALTER succeed — if either fails, retry on next write.
+        try:
+            conn.execute(f"ALTER TABLE lake.main.{table_name} SET PARTITIONED BY ({partition_by})")
+            log.info("Table %s partitioned by: %s", table_name, partition_by)
+        except duckdb.Error as e:
+            # Another pod may have already set partitioning — verify table exists and continue
+            if _table_exists(conn, table_name):
+                log.info("Table %s partition may have been set by another pod, continuing: %s", table_name, e)
+            else:
+                raise RuntimeError(f"Failed to partition table {table_name}: {e}") from e
+
     _tables_ensured.add(table_name)
 
 
