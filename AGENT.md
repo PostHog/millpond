@@ -12,6 +12,8 @@ just test       # unit tests
 
 All three must pass. Do not push with lint or test failures.
 
+Prefer fixup commits over amending and force-pushing.
+
 ## What This Is
 
 A standalone Python app that replaces Kafka Connect for writing Kafka topic data to DuckLake. Single thread, single loop, no framework.
