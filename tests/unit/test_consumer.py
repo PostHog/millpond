@@ -138,6 +138,8 @@ def _make_cfg(**overrides) -> Config:
         flush_size=100,
         flush_interval_ms=1000,
         partition_by=None,
+        filter_field=None,
+        filter_value=None,
         fetch_min_bytes=1,
         fetch_max_wait_ms=500,
         consume_batch_size=1000,

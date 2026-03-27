@@ -129,3 +129,25 @@ class TestLoad:
     def test_kafka_consumer_overrides_default_empty(self):
         cfg = load()
         assert cfg.kafka_config_overrides == ()
+
+    def test_filter_default_none(self):
+        cfg = load()
+        assert cfg.filter_field is None
+        assert cfg.filter_value is None
+
+    def test_filter_both_set(self, monkeypatch):
+        monkeypatch.setenv("FILTER_FIELD", "team_id")
+        monkeypatch.setenv("FILTER_VALUE", "42")
+        cfg = load()
+        assert cfg.filter_field == "team_id"
+        assert cfg.filter_value == "42"
+
+    def test_filter_field_without_value_rejected(self, monkeypatch):
+        monkeypatch.setenv("FILTER_FIELD", "team_id")
+        with pytest.raises(RuntimeError, match="FILTER_FIELD and FILTER_VALUE must both be set"):
+            load()
+
+    def test_filter_value_without_field_rejected(self, monkeypatch):
+        monkeypatch.setenv("FILTER_VALUE", "42")
+        with pytest.raises(RuntimeError, match="FILTER_FIELD and FILTER_VALUE must both be set"):
+            load()

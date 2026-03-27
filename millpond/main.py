@@ -4,6 +4,7 @@ import sys
 import time
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from confluent_kafka import TopicPartition
 
 from millpond import arrow_converter, config, consumer, ducklake, logging_config, metrics, schema, server
@@ -25,6 +26,17 @@ def _convert_batch(values: list[bytes]) -> pa.Table | None:
         duration = time.monotonic() - t0
         metrics.arrow_conversion_seconds.observe(duration)
     return table
+
+
+def _apply_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
+    """Filter table by field/value if configured. Returns the (possibly smaller) table."""
+    if cfg.filter_field is None:
+        return table
+    filtered = table.filter(pc.equal(table[cfg.filter_field], cfg.filter_value))
+    filtered_out = len(table) - len(filtered)
+    if filtered_out > 0:
+        metrics.records_skipped_total.labels(reason="filter").inc(filtered_out)
+    return filtered
 
 
 def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=None):
@@ -178,9 +190,11 @@ def main():
                     table = _convert_batch(values)
                     if table is not None:
                         skipped = len(values) - len(table)
-                        pending.append(table)
-                        pending_bytes += table.nbytes
-                        pending_records += len(table)
+                        table = _apply_filter(table, cfg)
+                        if len(table) > 0:
+                            pending.append(table)
+                            pending_bytes += table.nbytes
+                            pending_records += len(table)
                         metrics.pending_bytes.set(pending_bytes)
                     else:
                         skipped = len(values)

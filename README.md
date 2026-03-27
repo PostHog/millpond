@@ -36,6 +36,12 @@ K8s StatefulSet (N replicas)
 - Static partition assignment via pod ordinal — no consumer groups
 - If a pod dies, its partitions stop being consumed until K8s restarts it
 
+## Record Filtering
+
+Millpond can optionally filter records by a field value, keeping only records where a specified column matches a given string. Set `FILTER_FIELD` and `FILTER_VALUE` (both required together).
+
+Filtered records are tracked via the `millpond_records_skipped_total{reason="filter"}` metric.
+
 ## Performance
 
 The hot path is all C/C++: librdkafka → orjson → PyArrow → DuckDB (zero-copy Arrow scan). Python is glue.
@@ -135,6 +141,8 @@ All configuration via environment variables:
 | `FETCH_MAX_WAIT_MS` | no | `500` | Max broker wait when `fetch.min.bytes` not yet satisfied |
 | `STATS_INTERVAL_MS` | no | `5000` | librdkafka internal stats emission interval (0 to disable) |
 | `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
+| `FILTER_FIELD` | no | | Column name to filter on. Must be set with `FILTER_VALUE`. |
+| `FILTER_VALUE` | no | | Value to match in `FILTER_FIELD`. Only records where `FILTER_FIELD == FILTER_VALUE` (string comparison) are written. All others are discarded after parsing. |
 
 ## Releases
 

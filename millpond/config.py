@@ -47,6 +47,10 @@ class Config:
     consume_batch_size: int
     stats_interval_ms: int
 
+    # Record filter (optional) — only keep records where filter_field == filter_value
+    filter_field: str | None
+    filter_value: str | None
+
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
@@ -123,15 +127,21 @@ def load() -> Config:
         fetch_max_wait_ms=int(os.environ.get("FETCH_MAX_WAIT_MS", "500")),
         consume_batch_size=int(os.environ.get("CONSUME_BATCH_SIZE", "1000")),
         stats_interval_ms=int(os.environ.get("STATS_INTERVAL_MS", "5000")),
+        filter_field=os.environ.get("FILTER_FIELD"),
+        filter_value=os.environ.get("FILTER_VALUE"),
         kafka_config_overrides=kafka_overrides,
     )
 
+    if bool(cfg.filter_field) != bool(cfg.filter_value):
+        raise RuntimeError("FILTER_FIELD and FILTER_VALUE must both be set or both be unset")
+
     log.info(
-        "Config: topic=%s table=%s ordinal=%d/%d group_id=%s",
+        "Config: topic=%s table=%s ordinal=%d/%d group_id=%s filter=%s",
         topic,
         ducklake_table,
         ordinal,
         replica_count,
         cfg.group_id,
+        f"{cfg.filter_field}={cfg.filter_value}" if cfg.filter_field else "none",
     )
     return cfg

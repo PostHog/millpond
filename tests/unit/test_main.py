@@ -4,7 +4,8 @@ import pyarrow as pa
 import pytest
 from confluent_kafka import KafkaException
 
-from millpond.main import _convert_batch, _flush, _write_with_retry
+from millpond.main import _apply_filter, _convert_batch, _flush, _write_with_retry
+from millpond.config import Config
 
 
 class TestWriteWithRetry:
@@ -142,6 +143,52 @@ class TestFlushErrorDistinction:
         mock_metrics.records_written_total.inc.assert_called_once_with(2)
         mock_metrics.batches_flushed_total.labels.assert_called_once_with(trigger="size")
         mock_metrics.batches_flushed_total.labels.return_value.inc.assert_called_once()
+
+
+def _make_filter_cfg(filter_field=None, filter_value=None):
+    return MagicMock(spec=Config, filter_field=filter_field, filter_value=filter_value)
+
+
+class TestApplyFilter:
+    def test_no_filter_returns_table_unchanged(self):
+        table = pa.table({"team_id": ["42", "99"], "event": ["click", "view"]})
+        cfg = _make_filter_cfg()
+        result = _apply_filter(table, cfg)
+        assert len(result) == 2
+
+    def test_filters_by_field_value(self):
+        table = pa.table({"team_id": ["42", "99", "42"], "event": ["a", "b", "c"]})
+        cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
+        result = _apply_filter(table, cfg)
+        assert len(result) == 2
+        assert result.column("event").to_pylist() == ["a", "c"]
+
+    def test_filter_removes_all(self):
+        table = pa.table({"team_id": ["99", "100"], "event": ["a", "b"]})
+        cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
+        result = _apply_filter(table, cfg)
+        assert len(result) == 0
+
+    def test_filter_keeps_all(self):
+        table = pa.table({"team_id": ["42", "42"], "event": ["a", "b"]})
+        cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
+        result = _apply_filter(table, cfg)
+        assert len(result) == 2
+
+    @patch("millpond.main.metrics")
+    def test_filter_increments_skip_metric(self, mock_metrics):
+        table = pa.table({"team_id": ["42", "99", "100"], "event": ["a", "b", "c"]})
+        cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
+        _apply_filter(table, cfg)
+        mock_metrics.records_skipped_total.labels.assert_called_with(reason="filter")
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(2)
+
+    @patch("millpond.main.metrics")
+    def test_no_metric_when_nothing_filtered(self, mock_metrics):
+        table = pa.table({"team_id": ["42"], "event": ["a"]})
+        cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
+        _apply_filter(table, cfg)
+        mock_metrics.records_skipped_total.labels.assert_not_called()
 
 
 class TestArrowConversionTiming:
