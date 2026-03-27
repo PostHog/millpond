@@ -24,7 +24,11 @@ Prefer fixup commits over amending and force-pushing.
 
 ## Maintenance Tooling
 
-`tools/justfile` contains DuckLake maintenance recipes (expire snapshots, cleanup files, delete orphans, compaction). It is copied to `/justfile` in the Docker image and uses the pod's existing env vars. The `DUCKDB` env var can override the duckdb binary path.
+`tools/maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint). It connects to DuckLake using the same env vars as the main app (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`) but does not import from the `millpond` package. Designed to run as a K8s CronJob reusing the same Docker image.
+
+If `PUSHGATEWAY_URL` is set, the script pushes two metrics: `maintenance_start_time{operation}` (pushed immediately on start) and `maintenance_duration_seconds{operation, status}` (pushed on completion). This enables Grafana annotation queries for maintenance windows.
+
+`tools/justfile` wraps the script for interactive use and is copied to `/justfile` in the Docker image. The `shell` and `drop` recipes still use the DuckDB CLI directly. The `DUCKDB` env var can override the duckdb binary path.
 
 ## What This Is
 
@@ -375,7 +379,9 @@ millpond/
 │   ├── metrics.py            # Prometheus metric definitions
 │   └── server.py             # HTTP server for /metrics and /healthz
 ├── tools/
-│   └── sizing-calculator.html  # Interactive flush/object sizing calculator
+│   ├── maintenance.py           # Self-contained DuckLake maintenance script (K8s CronJob)
+│   ├── justfile                 # Interactive wrapper for maintenance.py + DuckDB CLI shell
+│   └── sizing-calculator.html   # Interactive flush/object sizing calculator
 ├── tests/
 │   ├── unit/                 # Fast, no external deps
 │   ├── integration/          # Local DuckDB write path + schema evolution

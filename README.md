@@ -83,7 +83,20 @@ Requires Docker (uses `keytool` from the Kafka container image for cert generati
 
 ### DuckLake Maintenance
 
-`tools/justfile` contains DuckLake maintenance recipes and is baked into the Docker image at `/justfile`. From inside a running pod:
+`tools/maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint). It is baked into the Docker image at `/app/tools/maintenance.py` and designed to run as a K8s CronJob reusing the same image and credentials as the main application.
+
+```bash
+python /app/tools/maintenance.py maintain --days 7          # expire snapshots + cleanup files
+python /app/tools/maintenance.py maintain --days 7 --dry-run # preview only
+python /app/tools/maintenance.py expire --days 3            # expire snapshots only
+python /app/tools/maintenance.py cleanup --days 1           # cleanup scheduled files only
+python /app/tools/maintenance.py checkpoint                 # integrated merge + expire + cleanup
+python /app/tools/maintenance.py orphans                    # delete orphaned S3 files
+```
+
+If `PUSHGATEWAY_URL` is set, the script pushes `maintenance_start_time` (on start) and `maintenance_duration_seconds` (on completion) to a Prometheus Pushgateway, enabling Grafana annotation queries for maintenance windows.
+
+`tools/justfile` wraps the script and is also baked into the image at `/justfile` for interactive use:
 
 ```bash
 just --list              # see available recipes
@@ -94,7 +107,7 @@ just drop events         # drop a table (data files remain until cleanup)
 just orphans-dry-run     # preview orphaned S3 files
 ```
 
-All recipes use the pod's existing env vars (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`).
+All commands use the pod's existing env vars (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`).
 
 ## Configuration
 

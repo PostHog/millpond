@@ -9,6 +9,10 @@ Requires the same env vars as the tools/justfile:
   DUCKLAKE_RDS_USERNAME, DUCKLAKE_RDS_PASSWORD, DUCKLAKE_DATA_PATH,
   DUCKDB_S3_REGION, DUCKDB_S3_ACCESS_KEY_ID, DUCKDB_S3_SECRET_ACCESS_KEY
   (plus optional DUCKDB_S3_ENDPOINT, DUCKDB_S3_USE_SSL, DUCKDB_S3_URL_STYLE)
+
+Optional:
+  PUSHGATEWAY_URL — Prometheus Pushgateway address (e.g. http://pushgateway:9091).
+                     If unset, metrics are not pushed and the script runs without instrumentation.
 """
 
 from __future__ import annotations
@@ -18,8 +22,10 @@ import logging
 import os
 import re
 import sys
+import time
 
 import duckdb
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
 log = logging.getLogger("maintenance")
 
@@ -61,6 +67,13 @@ def connect() -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect()
 
     # S3 config from env vars
+    s3_region = os.environ.get("DUCKDB_S3_REGION", "us-east-1")
+    s3_defaults = {
+        "s3_region": s3_region,
+        "s3_endpoint": f"s3.{s3_region}.amazonaws.com",
+        "s3_use_ssl": "true",
+        "s3_url_style": "vhost",
+    }
     for key in (
         "DUCKDB_S3_ENDPOINT",
         "DUCKDB_S3_ACCESS_KEY_ID",
@@ -70,9 +83,11 @@ def connect() -> duckdb.DuckDBPyConnection:
         "DUCKDB_S3_REGION",
     ):
         val = os.environ.get(key)
+        setting = key.lower().replace("duckdb_", "")
         if val is not None:
-            setting = key.lower().replace("duckdb_", "")
             conn.execute(f"SET {setting} = '{_sanitize_setting_value(val)}'")
+        elif setting in s3_defaults:
+            conn.execute(f"SET {setting} = '{_sanitize_setting_value(s3_defaults[setting])}'")
 
     conn.execute("LOAD httpfs")
     conn.execute("LOAD ducklake")
@@ -206,11 +221,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _push(registry: CollectorRegistry, pushgateway: str) -> None:
+    """Push metrics to the pushgateway, logging but not raising on failure."""
+    try:
+        push_to_gateway(pushgateway, job="ducklake-maintenance", registry=registry)
+    except Exception:
+        log.exception("Failed to push metrics to %s", pushgateway)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
 
+    pushgateway = os.environ.get("PUSHGATEWAY_URL")
+    registry = CollectorRegistry()
+    start_time = Gauge(
+        "maintenance_start_time",
+        "Unix timestamp when the maintenance operation started",
+        ["operation"],
+        registry=registry,
+    )
+    duration = Gauge(
+        "maintenance_duration_seconds",
+        "Duration of the maintenance operation",
+        ["operation", "status"],
+        registry=registry,
+    )
+    operation = args.command
+    if hasattr(args, "days") and args.days < 1:
+        parser.error("--days must be >= 1")
+
+    start_time.labels(operation=operation).set(time.time())
+    if pushgateway:
+        _push(registry, pushgateway)
+
+    t0 = time.monotonic()
+    status = "success"
+    conn = None
     conn = connect()
     try:
         match args.command:
@@ -226,8 +274,18 @@ def main(argv: list[str] | None = None) -> None:
                 maintain(conn, args.days, args.dry_run)
             case "checkpoint":
                 checkpoint(conn)
+    except Exception:
+        status = "error"
+        log.exception("Maintenance operation %s failed", operation)
+        raise
     finally:
-        conn.close()
+        elapsed = time.monotonic() - t0
+        duration.labels(operation=operation, status=status).set(elapsed)
+        if conn is not None:
+            conn.close()
+        if pushgateway:
+            _push(registry, pushgateway)
+        log.info("Operation %s finished: status=%s duration=%.1fs", operation, status, elapsed)
 
 
 if __name__ == "__main__":
