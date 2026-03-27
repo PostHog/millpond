@@ -23,6 +23,7 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/millpond /app/millpond
 COPY --from=builder /root/.local/bin/duckdb /usr/local/bin/duckdb
 COPY tools/justfile /justfile
+COPY tools/maintenance.py /app/tools/maintenance.py
 
 ENV PATH="/app/.venv/bin:$PATH"
 
