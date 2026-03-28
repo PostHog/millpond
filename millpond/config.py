@@ -127,8 +127,8 @@ def load() -> Config:
         fetch_max_wait_ms=int(os.environ.get("FETCH_MAX_WAIT_MS", "500")),
         consume_batch_size=int(os.environ.get("CONSUME_BATCH_SIZE", "1000")),
         stats_interval_ms=int(os.environ.get("STATS_INTERVAL_MS", "5000")),
-        filter_field=os.environ.get("FILTER_FIELD"),
-        filter_value=os.environ.get("FILTER_VALUE"),
+        filter_field=os.environ.get("FILTER_FIELD", "").strip() or None,
+        filter_value=os.environ.get("FILTER_VALUE", "").strip() or None,
         kafka_config_overrides=kafka_overrides,
     )
 
