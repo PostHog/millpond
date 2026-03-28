@@ -32,7 +32,11 @@ def _apply_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
     """Filter table by field/value if configured. Returns the (possibly smaller) table."""
     if cfg.filter_field is None:
         return table
-    filtered = table.filter(pc.equal(table[cfg.filter_field], cfg.filter_value))
+    if cfg.filter_field not in table.column_names:
+        log.warning("Filter field %r not in table schema, keeping all records", cfg.filter_field)
+        return table
+    column = pc.cast(table[cfg.filter_field], pa.string())
+    filtered = table.filter(pc.equal(column, cfg.filter_value))
     filtered_out = len(table) - len(filtered)
     if filtered_out > 0:
         metrics.records_skipped_total.labels(reason="filter").inc(filtered_out)
@@ -65,13 +69,8 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=Non
             time.sleep(delay)
 
 
-def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr, trigger="time"):
-    """Write to DuckLake, commit offsets, update metrics."""
-    t0 = time.monotonic()
-    _write_with_retry(db, cfg.ducklake_table, consolidated, schema_mgr, cfg.partition_by)
-    write_duration = time.monotonic() - t0
-
-    # Commit offsets synchronously — at-least-once requires knowing commit succeeded
+def _commit_offsets(kafka, offsets):
+    """Commit Kafka offsets with retries. Returns the TopicPartition list committed."""
     tp_offsets = [
         TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
         for (topic, partition), offset in offsets.items()
@@ -79,7 +78,7 @@ def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets
     for attempt in range(_COMMIT_MAX_RETRIES):
         try:
             kafka.commit(offsets=tp_offsets, asynchronous=False)
-            break
+            return tp_offsets
         except Exception:
             metrics.errors_total.labels(type="offset_commit").inc()
             if attempt == _COMMIT_MAX_RETRIES - 1:
@@ -98,6 +97,15 @@ def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets
                 exc_info=True,
             )
             time.sleep(delay)
+
+
+def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr, trigger="time"):
+    """Write to DuckLake, commit offsets, update metrics."""
+    t0 = time.monotonic()
+    _write_with_retry(db, cfg.ducklake_table, consolidated, schema_mgr, cfg.partition_by)
+    write_duration = time.monotonic() - t0
+
+    tp_offsets = _commit_offsets(kafka, offsets)
 
     log.info(
         "Flush: %d records, %d bytes, %d columns, write=%.2fs, elapsed=%.1fs",
@@ -238,6 +246,13 @@ def main():
                 pending_records = 0
                 offsets.clear()
                 metrics.pending_bytes.set(0)
+                last_flush = time.monotonic()
+
+            elif time_triggered and offsets:
+                # No pending records but offsets advanced (e.g. all records filtered out).
+                # Commit offsets so restarts don't replay already-processed data.
+                _commit_offsets(kafka, offsets)
+                offsets.clear()
                 last_flush = time.monotonic()
 
     except Exception:

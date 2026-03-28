@@ -136,12 +136,13 @@ def load() -> Config:
         raise RuntimeError("FILTER_FIELD and FILTER_VALUE must both be set or both be unset")
 
     log.info(
-        "Config: topic=%s table=%s ordinal=%d/%d group_id=%s filter=%s",
+        "Config: topic=%s table=%s ordinal=%d/%d group_id=%s",
         topic,
         ducklake_table,
         ordinal,
         replica_count,
         cfg.group_id,
-        f"{cfg.filter_field}={cfg.filter_value}" if cfg.filter_field else "none",
     )
+    if cfg.filter_field:
+        log.info("Filter: %s=%s", cfg.filter_field, cfg.filter_value)
     return cfg

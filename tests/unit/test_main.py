@@ -151,33 +151,46 @@ def _make_filter_cfg(filter_field=None, filter_value=None):
 
 class TestApplyFilter:
     def test_no_filter_returns_table_unchanged(self):
-        table = pa.table({"team_id": ["42", "99"], "event": ["click", "view"]})
+        table = pa.table({"team_id": [42, 99], "event": ["click", "view"]})
         cfg = _make_filter_cfg()
         result = _apply_filter(table, cfg)
         assert len(result) == 2
 
-    def test_filters_by_field_value(self):
-        table = pa.table({"team_id": ["42", "99", "42"], "event": ["a", "b", "c"]})
+    def test_filters_by_string_field(self):
+        table = pa.table({"region": ["us", "eu", "us"], "event": ["a", "b", "c"]})
+        cfg = _make_filter_cfg(filter_field="region", filter_value="us")
+        result = _apply_filter(table, cfg)
+        assert len(result) == 2
+        assert result.column("event").to_pylist() == ["a", "c"]
+
+    def test_filters_by_numeric_field(self):
+        table = pa.table({"team_id": [42, 99, 42], "event": ["a", "b", "c"]})
         cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
         result = _apply_filter(table, cfg)
         assert len(result) == 2
         assert result.column("event").to_pylist() == ["a", "c"]
 
     def test_filter_removes_all(self):
-        table = pa.table({"team_id": ["99", "100"], "event": ["a", "b"]})
+        table = pa.table({"team_id": [99, 100], "event": ["a", "b"]})
         cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
         result = _apply_filter(table, cfg)
         assert len(result) == 0
 
     def test_filter_keeps_all(self):
-        table = pa.table({"team_id": ["42", "42"], "event": ["a", "b"]})
+        table = pa.table({"team_id": [42, 42], "event": ["a", "b"]})
+        cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
+        result = _apply_filter(table, cfg)
+        assert len(result) == 2
+
+    def test_missing_field_keeps_all(self):
+        table = pa.table({"event": ["a", "b"]})
         cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
         result = _apply_filter(table, cfg)
         assert len(result) == 2
 
     @patch("millpond.main.metrics")
     def test_filter_increments_skip_metric(self, mock_metrics):
-        table = pa.table({"team_id": ["42", "99", "100"], "event": ["a", "b", "c"]})
+        table = pa.table({"team_id": [42, 99, 100], "event": ["a", "b", "c"]})
         cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
         _apply_filter(table, cfg)
         mock_metrics.records_skipped_total.labels.assert_called_with(reason="filter")
@@ -185,7 +198,7 @@ class TestApplyFilter:
 
     @patch("millpond.main.metrics")
     def test_no_metric_when_nothing_filtered(self, mock_metrics):
-        table = pa.table({"team_id": ["42"], "event": ["a"]})
+        table = pa.table({"team_id": [42], "event": ["a"]})
         cfg = _make_filter_cfg(filter_field="team_id", filter_value="42")
         _apply_filter(table, cfg)
         mock_metrics.records_skipped_total.labels.assert_not_called()
