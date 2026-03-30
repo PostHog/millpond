@@ -3,7 +3,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from millpond.consumer import _base_kafka_config, _on_stats, compute_assignment, create, discover_partition_count
+from millpond.consumer import (
+    _base_kafka_config,
+    _maybe_attach_oauth_cb,
+    _on_stats,
+    compute_assignment,
+    create,
+    discover_partition_count,
+)
 from millpond.config import Config
 
 
@@ -160,15 +167,68 @@ class TestBaseKafkaConfig:
         assert base["client.id"] == "millpond-test-topic-events-3"
 
     def test_includes_overrides(self):
-        cfg = _make_cfg(kafka_config_overrides=(("security.protocol", "SSL"), ("sasl.mechanism", "PLAIN")))
+        cfg = _make_cfg(kafka_config_overrides=(("security.protocol", "SSL"), ("sasl.mechanisms", "PLAIN")))
         base = _base_kafka_config(cfg)
         assert base["security.protocol"] == "SSL"
-        assert base["sasl.mechanism"] == "PLAIN"
+        assert base["sasl.mechanisms"] == "PLAIN"
 
     def test_empty_overrides(self):
         cfg = _make_cfg(kafka_config_overrides=())
         base = _base_kafka_config(cfg)
         assert "security.protocol" not in base
+
+
+class TestMaybeAttachOauthCb:
+    def test_noop_for_ssl_config(self):
+        config = {"bootstrap.servers": "localhost:9092", "security.protocol": "SSL"}
+        result = _maybe_attach_oauth_cb(config)
+        assert "oauth_cb" not in result
+
+    def test_noop_when_no_sasl(self):
+        config = {"bootstrap.servers": "localhost:9092"}
+        result = _maybe_attach_oauth_cb(config)
+        assert "oauth_cb" not in result
+
+    @patch.dict("os.environ", {"AWS_REGION": "us-east-1"})
+    def test_attaches_callback_for_oauthbearer(self):
+        mock_provider = MagicMock()
+        mock_provider.generate_auth_token.return_value = ("fake-token", 1700000000000)
+        with patch.dict("sys.modules", {"aws_msk_iam_auth": MagicMock(MSKAuthTokenProvider=mock_provider)}):
+            config = {"bootstrap.servers": "localhost:9092", "sasl.mechanisms": "OAUTHBEARER"}
+            result = _maybe_attach_oauth_cb(config)
+            assert "oauth_cb" in result
+            token, expiry = result["oauth_cb"]("")
+            assert token == "fake-token"
+            assert expiry == 1700000000.0
+
+    def test_singular_mechanism_ignored_with_warning(self, caplog):
+        config = {"bootstrap.servers": "localhost:9092", "sasl.mechanism": "OAUTHBEARER"}
+        result = _maybe_attach_oauth_cb(config)
+        assert "oauth_cb" not in result
+        assert "sasl.mechanisms (plural)" in caplog.text
+
+    def test_raises_when_signer_not_installed(self):
+        with patch.dict("sys.modules", {"aws_msk_iam_auth": None}):
+            config = {"bootstrap.servers": "localhost:9092", "sasl.mechanisms": "OAUTHBEARER"}
+            with pytest.raises(RuntimeError, match="aws-msk-iam-sasl-signer-python is required"):
+                _maybe_attach_oauth_cb(config)
+
+    @patch.dict("os.environ", {"AWS_REGION": "eu-central-1"})
+    def test_uses_aws_region_env(self):
+        mock_provider = MagicMock()
+        mock_provider.generate_auth_token.return_value = ("token", 1000)
+        with patch.dict("sys.modules", {"aws_msk_iam_auth": MagicMock(MSKAuthTokenProvider=mock_provider)}):
+            config = {"sasl.mechanisms": "OAUTHBEARER"}
+            result = _maybe_attach_oauth_cb(config)
+            result["oauth_cb"]("")
+            mock_provider.generate_auth_token.assert_called_with("eu-central-1")
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_raises_when_region_not_set(self):
+        with patch.dict("sys.modules", {"aws_msk_iam_auth": MagicMock()}):
+            config = {"sasl.mechanisms": "OAUTHBEARER"}
+            with pytest.raises(RuntimeError, match="AWS_REGION or AWS_DEFAULT_REGION must be set"):
+                _maybe_attach_oauth_cb(config)
 
 
 class TestDiscoverPartitionCount:

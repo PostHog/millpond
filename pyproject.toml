@@ -22,6 +22,9 @@ dependencies = [
     "prometheus-client>=0.21",
 ]
 
+[project.optional-dependencies]
+msk-iam = ["aws-msk-iam-sasl-signer-python>=1.0.0"]
+
 [project.scripts]
 millpond = "millpond.main:main"
 

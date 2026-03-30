@@ -263,6 +263,19 @@ pipelines:
 
 One `range` over `pipelines` in the StatefulSet template produces N independent StatefulSets. Adding a pipeline is adding a block to `values.yaml` and running `helm upgrade`.
 
+## AWS Credential Isolation
+
+Millpond uses two separate AWS credential paths that must not interfere with each other:
+
+| Component | Auth | Credential source |
+|---|---|---|
+| Kafka (MSK) | SASL/OAUTHBEARER | IRSA (standard AWS credential chain) |
+| S3 (DuckLake data files) | Static IAM keys | `DUCKDB_S3_ACCESS_KEY_ID` / `DUCKDB_S3_SECRET_ACCESS_KEY` |
+
+DuckDB's [aws extension does not support IRSA](https://github.com/duckdb/duckdb-aws/issues/31) — it cannot perform the `AssumeRoleWithWebIdentity` token exchange that IRSA requires. Until that is resolved, S3 access requires static credentials.
+
+These static credentials are passed via DuckDB-specific env var names, not the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. This is deliberate: standard AWS env vars take precedence in the credential chain and would shadow the IRSA role used for Kafka authentication.
+
 ## Note
 This project should absolutely be called TableFowl, but that would be an [SEO](https://www.confluent.io/product/tableflow/) and linguistic palaver.
 

@@ -1,4 +1,5 @@
 import logging
+import os
 
 import orjson
 from confluent_kafka import Consumer, TopicPartition
@@ -10,6 +11,41 @@ from millpond.config import Config
 log = logging.getLogger(__name__)
 
 
+def _maybe_attach_oauth_cb(config: dict) -> dict:
+    """If SASL OAUTHBEARER is configured, attach the MSK IAM token callback."""
+    if "sasl.mechanism" in config and "sasl.mechanisms" not in config:
+        log.warning(
+            "sasl.mechanism (singular) is set but librdkafka uses sasl.mechanisms (plural). "
+            "Use KAFKA_CONSUMER_SASL_MECHANISMS instead of KAFKA_CONSUMER_SASL_MECHANISM."
+        )
+    sasl_mechanism = config.get("sasl.mechanisms")
+    if sasl_mechanism != "OAUTHBEARER":
+        return config
+    try:
+        from aws_msk_iam_auth import MSKAuthTokenProvider
+    except ImportError:
+        raise RuntimeError(
+            "aws-msk-iam-sasl-signer-python is required for OAUTHBEARER auth. "
+            "Install with: pip install millpond[msk-iam]"
+        ) from None
+
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if not region:
+        raise RuntimeError("AWS_REGION or AWS_DEFAULT_REGION must be set when using OAUTHBEARER auth")
+    log.info("MSK IAM auth enabled (region=%s)", region)
+
+    def oauth_cb(config_str):
+        try:
+            token, expiry_ms = MSKAuthTokenProvider.generate_auth_token(region)
+            return token, expiry_ms / 1000
+        except Exception:
+            log.exception("MSK IAM token generation failed")
+            raise
+
+    config["oauth_cb"] = oauth_cb
+    return config
+
+
 def _base_kafka_config(cfg: Config) -> dict:
     """Base config shared by all Kafka clients (AdminClient, Consumer)."""
     base = {
@@ -18,7 +54,7 @@ def _base_kafka_config(cfg: Config) -> dict:
     }
     for key, val in cfg.kafka_config_overrides:
         base[key] = val
-    return base
+    return _maybe_attach_oauth_cb(base)
 
 
 def _on_stats(stats_json: str) -> None:
