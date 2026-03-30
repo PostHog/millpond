@@ -11,6 +11,11 @@ default:
 sync:
     uv sync
 
+# Install git hooks
+[group('dev')]
+install-hooks:
+    git config core.hooksPath .githooks
+
 # Run the application
 [group('dev')]
 run:

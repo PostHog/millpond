@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running ruff check..."
+uv run ruff check millpond/
+
+echo "Running ruff format check..."
+uv run ruff format --check millpond/
+
+echo "Pre-commit checks passed."
