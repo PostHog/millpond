@@ -31,9 +31,7 @@ def _maybe_attach_oauth_cb(config: dict) -> dict:
 
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     if not region:
-        raise RuntimeError(
-            "AWS_REGION or AWS_DEFAULT_REGION must be set when using OAUTHBEARER auth"
-        )
+        raise RuntimeError("AWS_REGION or AWS_DEFAULT_REGION must be set when using OAUTHBEARER auth")
     log.info("MSK IAM auth enabled (region=%s)", region)
 
     def oauth_cb(config_str):
