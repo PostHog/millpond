@@ -5,12 +5,12 @@ COPY --from=uv /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock LICENSE ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project --extra msk-iam
 
 COPY millpond/ millpond/
 ARG MILLPOND_VERSION=0.0.0.dev0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=$MILLPOND_VERSION
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra msk-iam
 
 # Install DuckDB CLI (pinned to match the Python package version)
 RUN uv tool install "duckdb-cli>=1.4,<1.5"

@@ -118,12 +118,12 @@ class TestLoad:
 
     def test_kafka_consumer_overrides(self, monkeypatch):
         monkeypatch.setenv("KAFKA_CONSUMER_SECURITY_PROTOCOL", "SASL_SSL")
-        monkeypatch.setenv("KAFKA_CONSUMER_SASL_MECHANISM", "PLAIN")
+        monkeypatch.setenv("KAFKA_CONSUMER_SASL_MECHANISMS", "PLAIN")
         monkeypatch.setenv("KAFKA_CONSUMER_SASL_USERNAME", "user1")
         cfg = load()
         overrides = dict(cfg.kafka_config_overrides)
         assert overrides["security.protocol"] == "SASL_SSL"
-        assert overrides["sasl.mechanism"] == "PLAIN"
+        assert overrides["sasl.mechanisms"] == "PLAIN"
         assert overrides["sasl.username"] == "user1"
 
     def test_kafka_consumer_overrides_default_empty(self):

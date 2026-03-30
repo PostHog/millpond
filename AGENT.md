@@ -80,6 +80,17 @@ while not shutdown:
 
 ## Key Design Decisions
 
+### Credential Isolation
+
+Millpond has two independent credential paths that must not interfere:
+
+- **Kafka (MSK)**: SASL/OAUTHBEARER via IRSA. The `aws-msk-iam-sasl-signer-python` library uses the standard AWS credential chain (IRSA projected token → STS → temporary creds).
+- **S3 (DuckLake data)**: Static IAM credentials via `DUCKDB_S3_ACCESS_KEY_ID` / `DUCKDB_S3_SECRET_ACCESS_KEY`. DuckDB's aws extension does not support IRSA ([duckdb/duckdb-aws#31](https://github.com/duckdb/duckdb-aws/issues/31)).
+
+The S3 credentials use DuckDB-specific env var names, **not** the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. This is intentional — standard AWS env vars would shadow IRSA in the credential chain and break MSK IAM auth. Do not change the S3 credential env var names to standard AWS names.
+
+`aws-msk-iam-sasl-signer-python` is an optional dependency (`pip install millpond[msk-iam]`) but the Dockerfile always installs it (`--extra msk-iam`). All production deployments use IAM auth. The optional dep is for local dev where boto3/botocore (~15MB) may not be wanted.
+
 ### Language: Python
 
 The hot path is all C/C++ (librdkafka, orjson, PyArrow, DuckDB). Python is glue — it touches each record once to pass a parsed dict into a list. Performance bottleneck is S3 write latency, not Python.
