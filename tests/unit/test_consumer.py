@@ -223,6 +223,13 @@ class TestMaybeAttachOauthCb:
             result["oauth_cb"]("")
             mock_provider.generate_auth_token.assert_called_with("eu-central-1")
 
+    @patch.dict("os.environ", {}, clear=True)
+    def test_raises_when_region_not_set(self):
+        with patch.dict("sys.modules", {"aws_msk_iam_auth": MagicMock()}):
+            config = {"sasl.mechanisms": "OAUTHBEARER"}
+            with pytest.raises(RuntimeError, match="AWS_REGION or AWS_DEFAULT_REGION must be set"):
+                _maybe_attach_oauth_cb(config)
+
 
 class TestDiscoverPartitionCount:
     @patch("millpond.consumer.AdminClient")
