@@ -23,7 +23,8 @@ jobs:
     - name: Get latest tag
       id: latest_tag
       run: |
-        tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        tag=$(git tag --sort=-v:refname | head -1 || echo "v0.0.0")
+        [ -z "$tag" ] && tag="v0.0.0"
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
     - name: Bump patch version
