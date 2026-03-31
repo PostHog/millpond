@@ -193,7 +193,7 @@ class TestMaybeAttachOauthCb:
     def test_attaches_callback_for_oauthbearer(self):
         mock_provider = MagicMock()
         mock_provider.generate_auth_token.return_value = ("fake-token", 1700000000000)
-        with patch.dict("sys.modules", {"aws_msk_iam_auth": MagicMock(MSKAuthTokenProvider=mock_provider)}):
+        with patch.dict("sys.modules", {"aws_msk_iam_sasl_signer": MagicMock(MSKAuthTokenProvider=mock_provider)}):
             config = {"bootstrap.servers": "localhost:9092", "sasl.mechanisms": "OAUTHBEARER"}
             result = _maybe_attach_oauth_cb(config)
             assert "oauth_cb" in result
@@ -208,7 +208,7 @@ class TestMaybeAttachOauthCb:
         assert "sasl.mechanisms (plural)" in caplog.text
 
     def test_raises_when_signer_not_installed(self):
-        with patch.dict("sys.modules", {"aws_msk_iam_auth": None}):
+        with patch.dict("sys.modules", {"aws_msk_iam_sasl_signer": None}):
             config = {"bootstrap.servers": "localhost:9092", "sasl.mechanisms": "OAUTHBEARER"}
             with pytest.raises(RuntimeError, match="aws-msk-iam-sasl-signer-python is required"):
                 _maybe_attach_oauth_cb(config)
@@ -217,7 +217,7 @@ class TestMaybeAttachOauthCb:
     def test_uses_aws_region_env(self):
         mock_provider = MagicMock()
         mock_provider.generate_auth_token.return_value = ("token", 1000)
-        with patch.dict("sys.modules", {"aws_msk_iam_auth": MagicMock(MSKAuthTokenProvider=mock_provider)}):
+        with patch.dict("sys.modules", {"aws_msk_iam_sasl_signer": MagicMock(MSKAuthTokenProvider=mock_provider)}):
             config = {"sasl.mechanisms": "OAUTHBEARER"}
             result = _maybe_attach_oauth_cb(config)
             result["oauth_cb"]("")
@@ -225,7 +225,7 @@ class TestMaybeAttachOauthCb:
 
     @patch.dict("os.environ", {}, clear=True)
     def test_raises_when_region_not_set(self):
-        with patch.dict("sys.modules", {"aws_msk_iam_auth": MagicMock()}):
+        with patch.dict("sys.modules", {"aws_msk_iam_sasl_signer": MagicMock()}):
             config = {"sasl.mechanisms": "OAUTHBEARER"}
             with pytest.raises(RuntimeError, match="AWS_REGION or AWS_DEFAULT_REGION must be set"):
                 _maybe_attach_oauth_cb(config)
