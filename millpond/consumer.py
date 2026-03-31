@@ -32,6 +32,11 @@ def _maybe_attach_oauth_cb(config: dict) -> dict:
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     if not region:
         raise RuntimeError("AWS_REGION or AWS_DEFAULT_REGION must be set when using OAUTHBEARER auth")
+
+    # MSK rejects token refreshes if the session name changes between re-authentications.
+    # Each call to generate_auth_token() creates a new botocore session with a random name.
+    # Pin it so the principal stays stable across refreshes on the same connection.
+    os.environ.setdefault("AWS_ROLE_SESSION_NAME", "millpond")
     log.info("MSK IAM auth enabled (region=%s)", region)
 
     def oauth_cb(config_str):
