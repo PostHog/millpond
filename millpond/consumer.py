@@ -22,7 +22,7 @@ def _maybe_attach_oauth_cb(config: dict) -> dict:
     if sasl_mechanism != "OAUTHBEARER":
         return config
     try:
-        from aws_msk_iam_auth import MSKAuthTokenProvider
+        from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
     except ImportError:
         raise RuntimeError(
             "aws-msk-iam-sasl-signer-python is required for OAUTHBEARER auth. "
