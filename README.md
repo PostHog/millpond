@@ -276,6 +276,21 @@ DuckDB's [aws extension does not support IRSA](https://github.com/duckdb/duckdb-
 
 These static credentials are passed via DuckDB-specific env var names, not the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. This is deliberate: standard AWS env vars take precedence in the credential chain and would shadow the IRSA role used for Kafka authentication.
 
+## Operational Notes
+
+### Periodic MSK IAM auth errors
+
+When using MSK IAM authentication (SASL/OAUTHBEARER), you will see periodic bursts of `connection reset by peer` and `SASL OAUTHBEARER mechanism handshake failed` errors in the logs every ~48 minutes. These are **expected and harmless**.
+
+librdkafka does not re-authenticate on existing connections when the OAUTHBEARER token refreshes ([KIP-255](https://cwiki.apache.org/confluence/display/KAFKA/KIP-255%3A+OAuth+Authentication+via+SASL%2FOAUTHBEARER)). Instead, the MSK broker closes the connection when the old token expires (~15 min lifetime), and librdkafka reconnects with the refreshed token. The ~48 minute interval corresponds to the IRSA projected token refresh (80% of the default 1-hour TTL).
+
+The errors come from librdkafka's internal logger (the `%3|...|FAIL|` lines) and bypass Python's log formatting. They auto-resolve within seconds with no data loss.
+
+Related issues:
+- [confluent-kafka-python #1485](https://github.com/confluentinc/confluent-kafka-python/issues/1485) — oauth token not refreshing on existing connections
+- [aws-msk-iam-auth #143](https://github.com/aws/aws-msk-iam-auth/issues/143) — re-authentication fails with OAUTHBEARER
+- [aws-msk-iam-auth #176](https://github.com/aws/aws-msk-iam-auth/issues/176) — second re-authentication fails with default credentials
+
 ## Note
 This project should absolutely be called TableFowl, but that would be an [SEO](https://www.confluent.io/product/tableflow/) and linguistic palaver.
 
