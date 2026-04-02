@@ -2,7 +2,7 @@ import logging
 import os
 
 import orjson
-from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka import OFFSET_STORED, Consumer, TopicPartition
 from confluent_kafka.admin import AdminClient
 
 from millpond import metrics
@@ -136,5 +136,9 @@ def create(cfg: Config) -> Consumer:
 
     consumer = Consumer(consumer_config)
 
-    consumer.assign([TopicPartition(cfg.topic, p) for p in my_partitions])
+    # OFFSET_STORED: resume from committed offset in __consumer_offsets.
+    # Falls back to auto.offset.reset (earliest) if no offset committed.
+    # Critical for replica count changes — new pods must resume from offsets
+    # committed by whichever pod previously owned each partition.
+    consumer.assign([TopicPartition(cfg.topic, p, OFFSET_STORED) for p in my_partitions])
     return consumer
