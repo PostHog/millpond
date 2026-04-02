@@ -100,9 +100,9 @@ fullness = pending_bytes / flush_size
 batch_size = max(10, int(max_batch * (1.0 - fullness)))
 ```
 
-This prevents OOM during catchup without manual tuning. During catchup, the buffer fills quickly, batch size drops, flushes happen frequently with small batches. At steady state, the buffer is mostly empty and batch size stays at max.
+This smooths throughput during catchup without manual tuning. During catchup, the buffer fills quickly, batch size drops, flushes happen frequently with small batches. At steady state, the buffer is mostly empty and batch size stays at max. OOM prevention comes from `queued.max.messages.kbytes` (set in consumer.py), which bounds librdkafka's internal fetch buffer per partition.
 
-Metrics: `millpond_buffer_fullness` (0.0-1.0) and `millpond_consume_batch_size_current` for monitoring.
+Metrics: `millpond_buffer_fullness` (0.0 = empty, can exceed 1.0 if buffer overshoots flush threshold) and `millpond_consume_batch_size_current` for monitoring.
 
 ### Language: Python
 

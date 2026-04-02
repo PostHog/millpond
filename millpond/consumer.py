@@ -2,7 +2,7 @@ import logging
 import os
 
 import orjson
-from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka import OFFSET_STORED, Consumer, TopicPartition
 from confluent_kafka.admin import AdminClient
 
 from millpond import metrics
@@ -130,12 +130,18 @@ def create(cfg: Config) -> Consumer:
         "fetch.min.bytes": cfg.fetch_min_bytes,
         "fetch.wait.max.ms": cfg.fetch_max_wait_ms,
         "max.poll.interval.ms": 600000,  # 10 min — accommodates long S3 flushes
-        "queued.max.messages.kbytes": 16384,  # 16MB per partition — bounds librdkafka internal memory
         "statistics.interval.ms": cfg.stats_interval_ms,
         "stats_cb": _on_stats,
     }
+    # Default to 16MB per partition to bound librdkafka internal memory.
+    # Allow override via KAFKA_CONSUMER_QUEUED_MAX_MESSAGES_KBYTES.
+    consumer_config.setdefault("queued.max.messages.kbytes", 16384)
 
     consumer = Consumer(consumer_config)
 
-    consumer.assign([TopicPartition(cfg.topic, p) for p in my_partitions])
+    # OFFSET_STORED: resume from committed offset in __consumer_offsets.
+    # Falls back to auto.offset.reset (earliest) if no offset committed.
+    # Critical for replica count changes — new pods must resume from offsets
+    # committed by whichever pod previously owned each partition.
+    consumer.assign([TopicPartition(cfg.topic, p, OFFSET_STORED) for p in my_partitions])
     return consumer

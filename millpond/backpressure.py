@@ -17,11 +17,7 @@ Without that, librdkafka pre-fetches up to 64MB per partition regardless
 of how slowly we dequeue.
 """
 
-import logging
-
 from millpond import metrics
-
-log = logging.getLogger(__name__)
 
 # Minimum batch size — never go below this to avoid per-call overhead domination
 MIN_BATCH_SIZE = 10
@@ -34,7 +30,7 @@ _max_batch_size: int = 1000
 def init(max_batch_size: int) -> None:
     """Set the max batch size from config. Called once at startup."""
     global _max_batch_size
-    _max_batch_size = max_batch_size
+    _max_batch_size = max(max_batch_size, MIN_BATCH_SIZE)
 
 
 def compute_batch_size(pending_bytes: int, flush_size: int) -> int:

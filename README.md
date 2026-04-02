@@ -38,11 +38,11 @@ K8s StatefulSet (N replicas)
 
 ## Adaptive Backpressure
 
-The consume batch size automatically scales based on how full the pending buffer is relative to the flush threshold. When the buffer is empty, millpond consumes at full speed. As the buffer approaches the flush size, the batch size drops proportionally, reducing memory growth and preventing OOM during catchup.
+The consume batch size automatically scales based on how full the pending buffer is relative to the flush threshold. When the buffer is empty, millpond consumes at full speed. As the buffer approaches the flush size, the batch size drops proportionally, smoothing throughput during catchup and traffic spikes. OOM prevention comes from bounding librdkafka's internal fetch buffer via `queued.max.messages.kbytes` (16MB per partition).
 
 ```
 fullness = pending_bytes / flush_size
-batch_size = max(10, CONSUME_BATCH_SIZE * (1.0 - fullness))
+batch_size = max(10, int(CONSUME_BATCH_SIZE * (1.0 - fullness)))
 ```
 
 Metrics: `millpond_buffer_fullness` and `millpond_consume_batch_size_current`.

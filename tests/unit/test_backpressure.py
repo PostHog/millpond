@@ -55,6 +55,11 @@ class TestComputeBatchSize:
         assert compute_batch_size(50_000_000, 100_000_000) == 250
 
     @patch("millpond.backpressure.metrics")
+    def test_max_below_min_clamped(self, mock_metrics):
+        init(5)
+        assert compute_batch_size(0, 100_000_000) == MIN_BATCH_SIZE
+
+    @patch("millpond.backpressure.metrics")
     def test_sets_fullness_metric(self, mock_metrics):
         compute_batch_size(25_000_000, 100_000_000)
         mock_metrics.buffer_fullness.set.assert_called_with(0.25)
