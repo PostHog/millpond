@@ -315,6 +315,15 @@ class TestCreate:
         assert consumer_config["client.id"] == "millpond-test-topic-events-2"
 
     @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=8)
+    def test_sets_queued_max_messages_kbytes(self, mock_discover, mock_consumer_cls):
+        cfg = _make_cfg()
+        create(cfg)
+
+        consumer_config = mock_consumer_cls.call_args[0][0]
+        assert consumer_config["queued.max.messages.kbytes"] == 16384
+
+    @patch("millpond.consumer.Consumer")
     @patch("millpond.consumer.discover_partition_count", return_value=2)
     def test_no_partitions_raises(self, mock_discover, mock_consumer_cls):
         cfg = _make_cfg(ordinal=3, replica_count=4)

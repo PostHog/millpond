@@ -6,7 +6,7 @@ import time
 import pyarrow as pa
 from confluent_kafka import TopicPartition
 
-from millpond import arrow_converter, config, consumer, ducklake, logging_config, metrics, schema, server
+from millpond import arrow_converter, backpressure, config, consumer, ducklake, logging_config, metrics, schema, server
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +132,7 @@ def main():
     db = ducklake.connect(cfg)
     schema_mgr = schema.SchemaManager(db, cfg.ducklake_table)
     kafka = consumer.create(cfg)
+    backpressure.init(cfg.consume_batch_size)
     server.health.mark_started()
 
     shutdown = False
@@ -158,7 +159,8 @@ def main():
             remaining = cfg.flush_interval_s - (time.monotonic() - last_flush)
             timeout = max(remaining, 0.1)
 
-            msgs = kafka.consume(num_messages=cfg.consume_batch_size, timeout=timeout)
+            batch_size = backpressure.compute_batch_size(pending_bytes, cfg.flush_size)
+            msgs = kafka.consume(num_messages=batch_size, timeout=timeout)
             if msgs:
                 server.health.record_poll()
                 values = []

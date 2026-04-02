@@ -36,6 +36,17 @@ K8s StatefulSet (N replicas)
 - Static partition assignment via pod ordinal — no consumer groups
 - If a pod dies, its partitions stop being consumed until K8s restarts it
 
+## Adaptive Backpressure
+
+The consume batch size automatically scales based on how full the pending buffer is relative to the flush threshold. When the buffer is empty, millpond consumes at full speed. As the buffer approaches the flush size, the batch size drops proportionally, reducing memory growth and preventing OOM during catchup.
+
+```
+fullness = pending_bytes / flush_size
+batch_size = max(10, CONSUME_BATCH_SIZE * (1.0 - fullness))
+```
+
+Metrics: `millpond_buffer_fullness` and `millpond_consume_batch_size_current`.
+
 ## Performance
 
 The hot path is all C/C++: librdkafka → orjson → PyArrow → DuckDB (zero-copy Arrow scan). Python is glue.

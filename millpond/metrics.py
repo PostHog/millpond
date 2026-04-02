@@ -68,6 +68,16 @@ _pending_bytes = Gauge(
     "Current pending Arrow bytes awaiting flush",
     ["pipeline"],
 )
+_buffer_fullness = Gauge(
+    "millpond_buffer_fullness",
+    "Ratio of pending bytes to flush size (0.0 = empty, 1.0 = flush threshold)",
+    ["pipeline"],
+)
+_consume_batch_size_current = Gauge(
+    "millpond_consume_batch_size_current",
+    "Current adaptive consume batch size",
+    ["pipeline"],
+)
 _consumer_lag = Gauge(
     "millpond_consumer_lag",
     "Highwater mark minus committed offset",
@@ -129,6 +139,8 @@ arrow_conversion_seconds = _arrow_conversion_seconds
 flush_size_bytes = _flush_size_bytes
 flush_size_records = _flush_size_records
 pending_bytes = _pending_bytes
+buffer_fullness = _buffer_fullness
+consume_batch_size_current = _consume_batch_size_current
 consumer_lag = _consumer_lag
 last_committed_offset = _last_committed_offset
 schema_columns_added_total = _schema_columns_added_total
@@ -146,7 +158,7 @@ def init(pipeline: str):
     global records_skipped_total, errors_total
     global flush_duration_seconds, arrow_conversion_seconds
     global flush_size_bytes, flush_size_records
-    global pending_bytes, consumer_lag, last_committed_offset
+    global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total
     global rdkafka_replyq, rdkafka_msg_cnt, rdkafka_msg_size
     global rdkafka_broker_rtt_avg, rdkafka_broker_rtt_p99
@@ -168,6 +180,8 @@ def init(pipeline: str):
     flush_size_bytes = _flush_size_bytes.labels(pipeline=pipeline)
     flush_size_records = _flush_size_records.labels(pipeline=pipeline)
     pending_bytes = _pending_bytes.labels(pipeline=pipeline)
+    buffer_fullness = _buffer_fullness.labels(pipeline=pipeline)
+    consume_batch_size_current = _consume_batch_size_current.labels(pipeline=pipeline)
     schema_columns_added_total = _schema_columns_added_total.labels(pipeline=pipeline)
     schema_columns_widened_total = _schema_columns_widened_total.labels(pipeline=pipeline)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline)
