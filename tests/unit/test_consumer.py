@@ -319,12 +319,12 @@ class TestCreate:
     @patch("millpond.consumer.Consumer")
     @patch("millpond.consumer.discover_partition_count", return_value=8)
     def test_assign_uses_stored_offsets(self, mock_discover, mock_consumer_cls):
-        """Verify assign() does not set explicit offsets — librdkafka defaults to STORED.
+        """Verify assign() explicitly uses OFFSET_STORED for all partitions.
 
-        STORED means: use committed offset from __consumer_offsets if available,
-        otherwise fall back to auto.offset.reset (earliest). This is critical for
-        replica count changes — a new pod must resume from the offset committed
-        by whichever pod previously owned that partition.
+        STORED means: resume from the committed offset in __consumer_offsets,
+        falling back to auto.offset.reset (earliest) if none exists. This is
+        critical for replica count changes — a new pod must resume from the
+        offset committed by whichever pod previously owned that partition.
         """
         cfg = _make_cfg(ordinal=0, replica_count=2)
         create(cfg)
