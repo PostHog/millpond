@@ -3,6 +3,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from confluent_kafka import OFFSET_STORED
+
 from millpond.consumer import (
     _base_kafka_config,
     _maybe_attach_oauth_cb,
@@ -313,6 +315,37 @@ class TestCreate:
 
         consumer_config = mock_consumer_cls.call_args[0][0]
         assert consumer_config["client.id"] == "millpond-test-topic-events-2"
+
+    @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=8)
+    def test_assign_uses_stored_offsets(self, mock_discover, mock_consumer_cls):
+        """Verify assign() explicitly uses OFFSET_STORED for all partitions.
+
+        STORED means: resume from the committed offset in __consumer_offsets,
+        falling back to auto.offset.reset (earliest) if none exists. This is
+        critical for replica count changes — a new pod must resume from the
+        offset committed by whichever pod previously owned that partition.
+        """
+        cfg = _make_cfg(ordinal=0, replica_count=2)
+        create(cfg)
+
+        assign_call = mock_consumer_cls.return_value.assign
+        partitions = assign_call.call_args[0][0]
+        for tp in partitions:
+            assert tp.offset == OFFSET_STORED, (
+                f"Partition {tp.partition} has offset {tp.offset}, expected OFFSET_STORED ({OFFSET_STORED}). "
+                "assign() must use OFFSET_STORED to resume from committed offsets."
+            )
+
+    @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=8)
+    def test_auto_offset_reset_is_earliest(self, mock_discover, mock_consumer_cls):
+        """Verify auto.offset.reset=earliest for partitions with no committed offset."""
+        cfg = _make_cfg()
+        create(cfg)
+
+        consumer_config = mock_consumer_cls.call_args[0][0]
+        assert consumer_config["auto.offset.reset"] == "earliest"
 
     @patch("millpond.consumer.Consumer")
     @patch("millpond.consumer.discover_partition_count", return_value=2)
