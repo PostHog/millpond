@@ -133,6 +133,9 @@ def create(cfg: Config) -> Consumer:
         "statistics.interval.ms": cfg.stats_interval_ms,
         "stats_cb": _on_stats,
     }
+    # Default to 16MB per partition to bound librdkafka internal memory.
+    # Allow override via KAFKA_CONSUMER_QUEUED_MAX_MESSAGES_KBYTES.
+    consumer_config.setdefault("queued.max.messages.kbytes", 16384)
 
     consumer = Consumer(consumer_config)
 

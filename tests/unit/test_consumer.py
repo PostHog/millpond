@@ -2,6 +2,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from confluent_kafka import OFFSET_STORED
 
 from confluent_kafka import OFFSET_STORED
 
@@ -315,6 +316,15 @@ class TestCreate:
 
         consumer_config = mock_consumer_cls.call_args[0][0]
         assert consumer_config["client.id"] == "millpond-test-topic-events-2"
+
+    @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=8)
+    def test_sets_queued_max_messages_kbytes(self, mock_discover, mock_consumer_cls):
+        cfg = _make_cfg()
+        create(cfg)
+
+        consumer_config = mock_consumer_cls.call_args[0][0]
+        assert consumer_config["queued.max.messages.kbytes"] == 16384
 
     @patch("millpond.consumer.Consumer")
     @patch("millpond.consumer.discover_partition_count", return_value=8)

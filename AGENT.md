@@ -91,6 +91,19 @@ The S3 credentials use DuckDB-specific env var names, **not** the standard `AWS_
 
 `aws-msk-iam-sasl-signer-python` is an optional dependency (`pip install millpond[msk-iam]`) but the Dockerfile always installs it (`--extra msk-iam`). All production deployments use IAM auth. The optional dep is for local dev where boto3/botocore (~15MB) may not be wanted.
 
+### Adaptive Backpressure
+
+`backpressure.py` implements proportional batch sizing based on buffer fullness. The consume batch size scales linearly from `CONSUME_BATCH_SIZE` (max, when buffer is empty) down to 10 (min, when buffer is at flush threshold). No state machine, no mode switching — one formula:
+
+```
+fullness = pending_bytes / flush_size
+batch_size = max(10, int(max_batch * (1.0 - fullness)))
+```
+
+This smooths throughput during catchup without manual tuning. During catchup, the buffer fills quickly, batch size drops, flushes happen frequently with small batches. At steady state, the buffer is mostly empty and batch size stays at max. OOM prevention comes from `queued.max.messages.kbytes` (set in consumer.py), which bounds librdkafka's internal fetch buffer per partition.
+
+Metrics: `millpond_buffer_fullness` (0.0 = empty, can exceed 1.0 if buffer overshoots flush threshold) and `millpond_consume_batch_size_current` for monitoring.
+
 ### Language: Python
 
 The hot path is all C/C++ (librdkafka, orjson, PyArrow, DuckDB). Python is glue — it touches each record once to pass a parsed dict into a list. Performance bottleneck is S3 write latency, not Python.
