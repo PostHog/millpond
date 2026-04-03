@@ -1,0 +1,46 @@
+name: Promote to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to promote (e.g. v0.0.23)'
+        required: true
+        type: string
+
+concurrency:
+  group: promote-to-prod
+  cancel-in-progress: false
+
+permissions:
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Log in to GHCR
+      uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Validate version
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        if ! echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::Invalid version format: '$VERSION'. Expected: v0.0.0"
+          exit 1
+        fi
+
+    - name: Retag as prod
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        echo "Promoting ghcr.io/posthog/millpond:${VERSION} → prod"
+        docker buildx imagetools create \
+          --tag "ghcr.io/posthog/millpond:prod" \
+          "ghcr.io/posthog/millpond:${VERSION}"
+        echo "Done. ghcr.io/posthog/millpond:prod now points to ${VERSION}"
