@@ -22,12 +22,21 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
+    - name: Validate version
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        if ! echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::Invalid version format: '$VERSION'. Expected: v0.0.0"
+          exit 1
+        fi
+
     - name: Retag as prod
       env:
         VERSION: ${{ inputs.version }}
       run: |
         echo "Promoting ghcr.io/posthog/millpond:${VERSION} → prod"
         docker buildx imagetools create \
-          --tag ghcr.io/posthog/millpond:prod \
-          ghcr.io/posthog/millpond:${VERSION}
+          --tag "ghcr.io/posthog/millpond:prod" \
+          "ghcr.io/posthog/millpond:${VERSION}"
         echo "Done. ghcr.io/posthog/millpond:prod now points to ${VERSION}"
