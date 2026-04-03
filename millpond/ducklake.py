@@ -54,6 +54,11 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     conn.execute("LOAD ducklake")
     conn.execute("LOAD postgres")
 
+    # Partitioned INSERTs hold concurrent write buffers per partition value.
+    # With high-cardinality partition keys this can exhaust memory.
+    # Disabling insertion order allows DuckDB to process partitions sequentially.
+    conn.execute("SET preserve_insertion_order = false")
+
     # Build a libpq connection string for DuckLake.
     # The 'postgres:' prefix tells DuckLake to use the Postgres extension
     # for metadata storage rather than a local DuckDB file.
