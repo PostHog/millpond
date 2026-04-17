@@ -14,6 +14,8 @@ This exists in Rust but not as a Python-callable library. [pysimdjson](https://p
 
 ### Long-term: Arrow IPC on the wire
 
+> **PoC validated** — see branch [`experiment/arrow-message-payload`](https://github.com/PostHog/millpond/tree/experiment/arrow-message-payload) and [`experiments/arrow-payload/FINDINGS.md`](https://github.com/PostHog/millpond/blob/experiment/arrow-message-payload/experiments/arrow-payload/FINDINGS.md) for full results.
+
 If the producer writes Arrow IPC format directly to Kafka, the consumer becomes:
 
 ```python
@@ -35,7 +37,36 @@ Estimated improvement:
 
 Fewer pods → fewer DuckLake metadata transactions → less Postgres catalog contention. Everything gets better. Requires producer-side changes (PostHog ingestion pipeline).
 
-### Endgame: Arrow IPC + C
+### Endgame: Arrow IPC + C++ (validated)
+
+The PoC on the experiment branch proves this works end-to-end. The C++ consumer (~250 LOC) achieves true zero-copy from librdkafka's receive buffer through to DuckDB's `arrow_scan`:
+
+```
+librdkafka recv buffer ──(zero-copy wrap)──> Arrow IPC reader ──(Arrow C Data Interface)──> DuckDB arrow_scan ──> INSERT into DuckLake
+```
+
+Key correction from the original text below: there is no `memcpy` between librdkafka and DuckDB. The librdkafka buffer **is** the Arrow buffer — wrapped in place via `arrow::Buffer(ptr, len)`. The only copy is DuckDB materializing into its own column store during `INSERT`, which is unavoidable regardless of source format.
+
+#### PoC smoke-test results (2026-04-12, Apple Silicon)
+
+| Metric | Value |
+|---|---|
+| Producer rate (rate-limited) | 10 batches/sec × 1000 records = 10K rec/sec |
+| Per-batch Arrow IPC wire size | ~1.10–1.14 MB uncompressed |
+| Consumer behavior | Kept up trivially, 0 lag across 8 partitions |
+| Records ingested (~30s run) | 660,000 |
+| Arrow IPC → parquet compression | ~3.2× (1.12 MB → 350 KB) |
+| Consumer crashes / data loss | 0 / 0 |
+
+The consumer was never saturated — these numbers reflect producer-limited throughput, not the consumer ceiling.
+
+#### Gotchas worth knowing
+
+- **`duckdb_arrow_stream` ABI**: The typedef looks like it wants a wrapper struct. It does not — DuckDB `reinterpret_cast`s the argument directly to `ArrowArrayStream*`. Pass `reinterpret_cast<duckdb_arrow_stream>(&c_stream)`, not a wrapper. Guaranteed segfault otherwise.
+- **Buffer lifetime**: `msg->payload` is owned by librdkafka until `rd_kafka_message_destroy()`. All Arrow + DuckDB work must complete synchronously before destroy. The PoC uses a non-owning `arrow::Buffer` and calls destroy last in each loop iteration.
+- **Buffer alignment**: librdkafka does not align to Arrow's preferred 64-byte boundary. Arrow IPC tolerates this; DuckDB copies on INSERT anyway.
+
+#### Original sketch (preserved for reference)
 
 With Arrow IPC on the wire, the entire consumer reduces to three library calls in a loop:
 
