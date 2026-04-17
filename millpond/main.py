@@ -2,6 +2,7 @@ import logging
 import signal
 import sys
 import time
+from importlib.metadata import PackageNotFoundError, version
 
 import pyarrow as pa
 from confluent_kafka import TopicPartition
@@ -121,7 +122,11 @@ def _update_lag_metrics(kafka, tp_offsets):
 
 def main():
     logging_config.setup()
-    log.info("millpond starting")
+    try:
+        __version__ = version("millpond")
+    except PackageNotFoundError:
+        __version__ = "0.0.0+unknown"
+    log.info("millpond %s starting", __version__)
 
     cfg = config.load()
     metrics.init(f"{cfg.topic}-{cfg.ducklake_table}")
