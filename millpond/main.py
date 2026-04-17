@@ -11,6 +11,7 @@ from millpond import arrow_converter, backpressure, config, consumer, ducklake, 
 log = logging.getLogger(__name__)
 
 _LAG_SAMPLE_INTERVAL_S = 60.0  # how often to query watermark offsets for lag metrics
+_HEARTBEAT_INTERVAL_S = 60.0  # periodic log when idle (well under 300s liveness timeout)
 _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
 _COMMIT_MAX_RETRIES = 3
@@ -156,6 +157,7 @@ def main():
     offsets: dict[tuple[str, int], int] = {}  # (topic, partition) -> max offset
     last_flush = time.monotonic()
     last_lag_sample = 0.0  # force immediate first sample
+    last_heartbeat = time.monotonic()
 
     try:
         while not shutdown:
@@ -164,8 +166,19 @@ def main():
 
             batch_size = backpressure.compute_batch_size(pending_bytes, cfg.flush_size)
             msgs = kafka.consume(num_messages=batch_size, timeout=timeout)
+            server.health.record_poll()
+
+            now = time.monotonic()
+            if now - last_heartbeat >= _HEARTBEAT_INTERVAL_S:
+                log.info(
+                    "Heartbeat: pending=%d records (%d bytes), partitions=%d",
+                    pending_records,
+                    pending_bytes,
+                    len(offsets),
+                )
+                last_heartbeat = now
+
             if msgs:
-                server.health.record_poll()
                 values = []
                 for msg in msgs:
                     if msg.error():
