@@ -152,6 +152,7 @@ def _make_cfg(**overrides) -> Config:
         fetch_max_wait_ms=500,
         consume_batch_size=1000,
         stats_interval_ms=5000,
+        broker_source="",
         kafka_config_overrides=(("security.protocol", "SSL"),),
     )
     defaults.update(overrides)

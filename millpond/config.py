@@ -47,6 +47,9 @@ class Config:
     consume_batch_size: int
     stats_interval_ms: int
 
+    # Broker source label for metrics (e.g. "msk", "warpstream")
+    broker_source: str
+
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
@@ -123,6 +126,7 @@ def load() -> Config:
         fetch_max_wait_ms=int(os.environ.get("FETCH_MAX_WAIT_MS", "500")),
         consume_batch_size=int(os.environ.get("CONSUME_BATCH_SIZE", "1000")),
         stats_interval_ms=int(os.environ.get("STATS_INTERVAL_MS", "5000")),
+        broker_source=os.environ.get("BROKER_SOURCE", "").strip().lower(),
         kafka_config_overrides=kafka_overrides,
     )
 
