@@ -124,7 +124,7 @@ def main():
     log.info("millpond starting")
 
     cfg = config.load()
-    metrics.init(f"{cfg.topic}-{cfg.ducklake_table}")
+    metrics.init(f"{cfg.topic}-{cfg.ducklake_table}", broker_source=cfg.broker_source)
     http = server.start()
     server.health.mark_started()
     log.info("Health server started, probes passing")
