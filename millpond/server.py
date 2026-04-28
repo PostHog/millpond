@@ -41,7 +41,7 @@ class _HealthState:
         """Readiness: is the process started and actively polling?
 
         A consumer with no incoming data is still ready — it's sitting in its
-        consume-write loop waiting for messages.  Flush recency is not checked
+        consume-write loop waiting for messages. Flush recency is not checked
         because topics can legitimately receive no data for extended periods
         (e.g. during ingestion cutover).
         """
