@@ -361,7 +361,7 @@ Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTP
 
 - `GET /metrics` → Prometheus exposition format (via `prometheus_client.generate_latest()`)
 - `GET /healthz` → liveness: 200 if started and last poll within `max_poll_age_s` (300s), 503 otherwise
-- `GET /readyz` → readiness: 200 if alive and last flush within `max_flush_age_s` (600s), 503 otherwise. Idle topics (no flush yet) pass readiness.
+- `GET /readyz` → readiness: 200 if started and last poll within `max_poll_age_s` (300s), 503 otherwise. A consumer with no incoming data is still ready — it's sitting in its consume-write loop.
 
 ## Toolchain
 

@@ -11,9 +11,8 @@ log = logging.getLogger(__name__)
 class _HealthState:
     """Tracks recency of poll and flush for health checks."""
 
-    def __init__(self, max_poll_age_s: float = 300, max_flush_age_s: float = 600):
+    def __init__(self, max_poll_age_s: float = 300):
         self.max_poll_age_s = max_poll_age_s
-        self.max_flush_age_s = max_flush_age_s
         self._last_poll: float = 0
         self._last_flush: float = 0
         self._started: bool = False
@@ -39,15 +38,14 @@ class _HealthState:
         return (now - self._last_poll) < self.max_poll_age_s
 
     def is_ready(self) -> bool:
-        """Readiness: is the process healthy and keeping up?"""
-        if not self.is_alive():
-            return False
-        # Only check flush recency if at least one flush has occurred.
-        # Idle topics with no messages should not fail readiness for not flushing.
-        if self._has_flushed:
-            now = time.monotonic()
-            return (now - self._last_flush) < self.max_flush_age_s
-        return True
+        """Readiness: is the process started and actively polling?
+
+        A consumer with no incoming data is still ready — it's sitting in its
+        consume-write loop waiting for messages. Flush recency is not checked
+        because topics can legitimately receive no data for extended periods
+        (e.g. during ingestion cutover).
+        """
+        return self.is_alive()
 
     def is_healthy(self) -> bool:
         """Backward-compatible: same as is_ready()."""
