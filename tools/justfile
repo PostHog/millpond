@@ -96,7 +96,7 @@ checkpoint:
 # Probe: merge up to a few adjacent files in one table (no target_file_size change)
 [group('compaction')]
 compact-probe table="events" max_compacted_files="2":
-    {{ duckdb }} -c "{{ _setup }} CALL ducklake_merge_adjacent_files('lake', '{{ table }}', max_compacted_files => {{ max_compacted_files }});"
+    python {{ maintenance }} compact-probe --table "{{ table }}" --max-compacted-files {{ max_compacted_files }}
 
 # Tier 0 -> Tier 1: merge files < 1 MiB into ~5 MiB files
 [group('compaction')]

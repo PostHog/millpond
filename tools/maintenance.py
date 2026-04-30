@@ -24,11 +24,25 @@ import os
 import re
 import sys
 import time
+from importlib.metadata import PackageNotFoundError, version
 
 import duckdb
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
 log = logging.getLogger("maintenance")
+
+
+def _log_version() -> None:
+    try:
+        v = version("millpond")
+    except PackageNotFoundError:
+        v = "0.0.0+unknown"
+    parts = [f"millpond {v} (maintenance)"]
+    image = os.environ.get("MILLPOND_IMAGE")
+    if image:
+        parts.append(f"image={image}")
+    log.info(" ".join(parts))
+
 
 _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
 
@@ -78,6 +92,13 @@ def _sanitize_setting_value(val: str) -> str:
     if not _SETTING_VALUE_RE.match(val):
         raise ValueError(f"Illegal character in DuckDB setting value: {val!r}")
     return val
+
+
+def _positive_int(s: str) -> int:
+    n = int(s)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
 
 
 def connect() -> duckdb.DuckDBPyConnection:
@@ -272,6 +293,18 @@ def compact(
         log.info("compact tier-%d: %s", tier, row)
 
 
+def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_files: int) -> None:
+    """Merge up to N adjacent files in one table without changing target_file_size."""
+    if not _SETTING_VALUE_RE.match(table):
+        raise ValueError(f"Illegal character in table name: {table!r}")
+    log.info("compact-probe: table=%s max_compacted_files=%d", table, max_compacted_files)
+    result = conn.execute(
+        f"CALL ducklake_merge_adjacent_files('lake', '{table}', max_compacted_files => {max_compacted_files})"
+    ).fetchall()
+    for row in result:
+        log.info("compact-probe: %s", row)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="DuckLake maintenance operations",
@@ -313,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--table", default="", help="Limit to one table; empty = catalog-wide")
     p.add_argument("--dry-run", action="store_true")
 
+    # compact-probe
+    p = sub.add_parser("compact-probe", help="Probe: merge a few adjacent files in one table")
+    p.add_argument("--table", required=True)
+    p.add_argument("--max-compacted-files", type=_positive_int, default=2)
+
     return parser
 
 
@@ -328,6 +366,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
+    _log_version()
 
     pushgateway = os.environ.get("PUSHGATEWAY_URL")
     registry = CollectorRegistry()
@@ -371,6 +410,8 @@ def main(argv: list[str] | None = None) -> None:
                 checkpoint(conn)
             case "compact":
                 compact(conn, args.tier, args.table or None, args.dry_run)
+            case "compact-probe":
+                compact_probe(conn, args.table, args.max_compacted_files)
     except Exception:
         status = "error"
         log.exception("Maintenance operation %s failed", operation)
