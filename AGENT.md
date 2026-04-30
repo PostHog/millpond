@@ -24,7 +24,9 @@ Prefer fixup commits over amending and force-pushing.
 
 ## Maintenance Tooling
 
-`tools/maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint). It connects to DuckLake using the same env vars as the main app (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`) but does not import from the `millpond` package. Designed to run as a K8s CronJob reusing the same Docker image.
+`tools/maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint, tiered compaction). It connects to DuckLake using the same env vars as the main app (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`) but does not import from the `millpond` package. Designed to run as a K8s CronJob reusing the same Docker image.
+
+The `compact` subcommand implements tiered compaction: each tier wraps `ducklake_merge_adjacent_files()` with a save/restore of the catalog's `target_file_size` option (which `ducklake_set_option` writes durably and cannot be unset). Tier specs and the steady-state default live in `TIERS` and `DEFAULT_TARGET_FILE_SIZE` at the top of the file. Bin semantics on DuckLake 1.4.x are `min_file_size` inclusive, `max_file_size` exclusive — so the tier ranges `[0, 1 MiB)`, `[1 MiB, 10 MiB)`, `[10 MiB, 64 MiB)` partition the file-size space without overlap.
 
 If `PUSHGATEWAY_URL` is set, the script pushes two metrics: `maintenance_start_time{operation}` (pushed immediately on start) and `maintenance_duration_seconds{operation, status}` (pushed on completion). This enables Grafana annotation queries for maintenance windows.
 

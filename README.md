@@ -225,11 +225,22 @@ At peak (9.5K/partition), the size trigger fires at ~35s producing ~320MB object
 
 ### When to add a merge job
 
-If your volume is low enough that time-triggered flushes produce <10MB objects, consider running `ducklake_merge_adjacent_files()` periodically to compact small files:
+If your volume is low enough that time-triggered flushes produce <10MB objects, run periodic compaction. The `compact` subcommand implements a tiered strategy: small files merge frequently into medium files, medium files merge less often into large files. Each tier saves and restores the catalog's `target_file_size` so running one tier doesn't permanently change file sizing for inserts or other compactions.
 
-```sql
-CALL ducklake_merge_adjacent_files('lake', 'events');
+```bash
+just compact-to-tier-1-dry-run        # preview: files <1 MiB → ~5 MiB
+just compact-to-tier-1                # execute (catalog-wide)
+just compact-to-tier-2 events         # tier 1->2, scoped to one table
+just compact-probe events 4           # diagnostic: merge up to 4 adjacent files in 'events'
 ```
+
+Tier ranges (verified semantics: `min_file_size` inclusive, `max_file_size` exclusive):
+
+| Recipe | Input range | Target |
+|---|---|---|
+| `compact-to-tier-1` | `[0, 1 MiB)` | ~5 MiB |
+| `compact-to-tier-2` | `[1 MiB, 10 MiB)` | ~32 MiB |
+| `compact-to-tier-3` | `[10 MiB, 64 MiB)` | ~128 MiB |
 
 This is an out-of-band maintenance operation, not part of the hot path.
 

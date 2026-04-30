@@ -18,6 +18,7 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import re
@@ -30,6 +31,23 @@ from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 log = logging.getLogger("maintenance")
 
 _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
+
+# Tiered compaction spec.
+# Bin semantics on DuckLake 1.4.x: min_file_size is inclusive, max_file_size is
+# exclusive — verified empirically. Files at exactly the boundary fall into the
+# higher tier. Targets are MiB (binary) so they line up with the byte literals.
+_MIB = 1024 * 1024
+TIERS = {
+    1: {"min": None, "max": 1 * _MIB, "target": "5MiB"},  # < 1 MiB    -> ~5 MiB
+    2: {"min": 1 * _MIB, "max": 10 * _MIB, "target": "32MiB"},  # [1, 10) MiB -> ~32 MiB
+    3: {"min": 10 * _MIB, "max": 64 * _MIB, "target": "128MiB"},  # [10, 64) MiB -> ~128 MiB
+}
+
+# DuckLake's `ducklake_set_option('target_file_size', ...)` persists in the
+# catalog across sessions and cannot be unset (NULL is rejected). When the
+# option was unset before we touched it, restore to this documented default
+# rather than leaving the catalog at whatever the last tier set.
+DEFAULT_TARGET_FILE_SIZE = "128MiB"
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -92,6 +110,7 @@ def connect() -> duckdb.DuckDBPyConnection:
     conn.execute("LOAD httpfs")
     conn.execute("LOAD ducklake")
     conn.execute("LOAD postgres")
+    conn.execute("SET pg_debug_show_queries = true")
 
     rds_host = _require("DUCKLAKE_RDS_HOST")
     rds_port = os.environ.get("DUCKLAKE_RDS_PORT", "5432")
@@ -152,9 +171,7 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         log.info("cleanup-all has no dry-run mode; skipping")
         return
     log.info("Cleaning up all files scheduled for deletion")
-    result = conn.execute(
-        "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"
-    ).fetchall()
+    result = conn.execute("CALL ducklake_cleanup_old_files('lake', cleanup_all => true)").fetchall()
     for row in result:
         log.info("cleanup-all: %s", row)
 
@@ -162,10 +179,7 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
 def orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     """Find and delete orphaned S3 files."""
     log.info("Deleting orphaned files (dry_run=%s)", dry_run)
-    result = conn.execute(
-        f"CALL ducklake_delete_orphaned_files('lake', "
-        f"dry_run => {str(dry_run).lower()})"
-    ).fetchall()
+    result = conn.execute(f"CALL ducklake_delete_orphaned_files('lake', dry_run => {str(dry_run).lower()})").fetchall()
     for row in result:
         log.info("orphans: %s", row)
 
@@ -181,6 +195,81 @@ def maintain(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
     """Full maintenance: expire snapshots then cleanup files."""
     expire(conn, days, dry_run)
     cleanup(conn, days, dry_run)
+
+
+@contextlib.contextmanager
+def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
+    """Set target_file_size for the body, restore prior value (or default) on exit."""
+    _sanitize_setting_value(value)
+    prior = conn.execute("SELECT value FROM ducklake_options('lake') WHERE option_name = 'target_file_size'").fetchone()
+    conn.execute(f"CALL ducklake_set_option('lake', 'target_file_size', '{value}')")
+    try:
+        yield
+    finally:
+        restore = prior[0] if prior else DEFAULT_TARGET_FILE_SIZE
+        _sanitize_setting_value(restore)
+        conn.execute(f"CALL ducklake_set_option('lake', 'target_file_size', '{restore}')")
+        log.info("target_file_size restored to %s", restore)
+
+
+def compact(
+    conn: duckdb.DuckDBPyConnection,
+    tier: int,
+    table: str | None,
+    dry_run: bool,
+) -> None:
+    """Compact files in tier N (1, 2, or 3) for the catalog or one table."""
+    spec = TIERS[tier]
+    min_b, max_b, target = spec["min"], spec["max"], spec["target"]
+    scope = f"table '{table}'" if table else "catalog-wide"
+    range_str = f"[{min_b or 0}, {max_b}) bytes"
+    log.info(
+        "Compact tier %d (%s): merge files %s into ~%s targets (dry_run=%s)",
+        tier,
+        scope,
+        range_str,
+        target,
+        dry_run,
+    )
+
+    where = ["end_snapshot IS NULL", f"file_size_bytes < {max_b}"]
+    if min_b is not None:
+        where.append(f"file_size_bytes >= {min_b}")
+    if table:
+        if not _SETTING_VALUE_RE.match(table):
+            raise ValueError(f"Illegal character in table name: {table!r}")
+        where.append(
+            f"table_id IN (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = '{table}')"
+        )
+    candidate_count, candidate_bytes = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(file_size_bytes), 0) "
+        f"FROM __ducklake_metadata_lake.ducklake_data_file WHERE {' AND '.join(where)}"
+    ).fetchone()
+    log.info(
+        "compact tier-%d candidates: %d files, %d bytes total",
+        tier,
+        candidate_count,
+        candidate_bytes,
+    )
+
+    if dry_run:
+        return
+    if candidate_count == 0:
+        log.info("compact tier-%d: nothing to do, skipping merge", tier)
+        return
+
+    args = [f"max_file_size => {max_b}"]
+    if min_b is not None:
+        args.append(f"min_file_size => {min_b}")
+    if table:
+        sql = f"CALL ducklake_merge_adjacent_files('lake', '{table}', {', '.join(args)})"
+    else:
+        sql = f"CALL ducklake_merge_adjacent_files('lake', {', '.join(args)})"
+
+    with _scoped_target_file_size(conn, target):
+        result = conn.execute(sql).fetchall()
+    for row in result:
+        log.info("compact tier-%d: %s", tier, row)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,6 +306,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # checkpoint
     sub.add_parser("checkpoint", help="CHECKPOINT (merge + expire + cleanup)")
+
+    # compact
+    p = sub.add_parser("compact", help="Tiered compaction (merge small files into larger ones)")
+    p.add_argument("--tier", type=int, choices=[1, 2, 3], required=True)
+    p.add_argument("--table", default="", help="Limit to one table; empty = catalog-wide")
+    p.add_argument("--dry-run", action="store_true")
 
     return parser
 
@@ -274,6 +369,8 @@ def main(argv: list[str] | None = None) -> None:
                 maintain(conn, args.days, args.dry_run)
             case "checkpoint":
                 checkpoint(conn)
+            case "compact":
+                compact(conn, args.tier, args.table or None, args.dry_run)
     except Exception:
         status = "error"
         log.exception("Maintenance operation %s failed", operation)
