@@ -561,26 +561,73 @@ def maintain(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
     cleanup(conn, days, dry_run)
 
 
+def _bytes_to_human(stored_value: str) -> str | None:
+    """Convert a DuckLake-stored byte-count string back to a units-suffixed form.
+
+    DuckLake persists ``target_file_size`` as raw bytes (e.g. ``'67108864'``)
+    but ``ducklake_set_option`` rejects that form on input — it needs a
+    KiB/MiB/GiB suffix. Pick the largest 1024^i unit that divides the value
+    cleanly. Returns None when the input is not a clean integer or has no
+    clean power-of-1024 representation; the caller should fall back to a
+    safe default in that case.
+    """
+    try:
+        n = int(stored_value)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    for unit, scale in (("TiB", 2**40), ("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10)):
+        if n >= scale and n % scale == 0:
+            return f"{n // scale}{unit}"
+    return None
+
+
 @contextlib.contextmanager
 def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
-    """Set target_file_size for the body, restore to DEFAULT_TARGET_FILE_SIZE on exit.
+    """Set target_file_size for the body, restore the prior catalog value on exit.
 
-    We don't try to read-and-restore the prior value: ``ducklake_options`` can
-    return multiple rows (GLOBAL/SCHEMA/TABLE scopes) and the byte-count
-    string DuckLake stores ('134217728') round-trips as an empty value here,
-    causing the restore SET to ParserException. Always restoring to the
-    documented steady-state default is robust and keeps the catalog at a known
-    value regardless of starting state.
+    Reads the prior GLOBAL value before the body runs and restores it in the
+    finally block. Operators who have intentionally configured a non-default
+    global target_file_size keep it; this command's tier-specific override
+    only applies during the wrapped body.
+
+    Three subtleties from DuckLake 1.4 internals:
+
+    * ``ducklake_options`` returns one row per GLOBAL/SCHEMA/TABLE scope, so
+      filter to ``scope = 'GLOBAL'`` — the unfiltered fetchone in the
+      original implementation could return ``('',)`` from a TABLE-scope row.
+    * DuckLake persists the value as a raw byte count (e.g. ``'67108864'``),
+      but ``ducklake_set_option`` rejects that form on input — it needs a
+      KiB/MiB/GiB suffix. Convert via ``_bytes_to_human`` before restoring.
+    * If the prior value isn't a clean power of 1024, we can't represent it
+      with a units suffix; log a warning and fall back to
+      ``DEFAULT_TARGET_FILE_SIZE`` rather than leaving the catalog at the
+      tier-specific value we set during the body.
     """
     _sanitize_setting_value(value)
+    prior_row = conn.execute(
+        f"SELECT value FROM ducklake_options('{ATTACH_NAME}') "
+        f"WHERE option_name = 'target_file_size' AND scope = 'GLOBAL'"
+    ).fetchone()
+    if prior_row and prior_row[0]:
+        restore = _bytes_to_human(prior_row[0]) or DEFAULT_TARGET_FILE_SIZE
+        if restore == DEFAULT_TARGET_FILE_SIZE:
+            log.warning(
+                "target_file_size GLOBAL value %r could not be converted to a "
+                "units-suffixed form; falling back to %s on restore",
+                prior_row[0],
+                DEFAULT_TARGET_FILE_SIZE,
+            )
+    else:
+        restore = DEFAULT_TARGET_FILE_SIZE
+    _sanitize_setting_value(restore)
     conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{value}')")
     try:
         yield
     finally:
-        conn.execute(
-            f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{DEFAULT_TARGET_FILE_SIZE}')"
-        )
-        log.info("target_file_size restored to %s", DEFAULT_TARGET_FILE_SIZE)
+        conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{restore}')")
+        log.info("target_file_size restored to %s", restore)
 
 
 def _set_compaction_tuning(conn: duckdb.DuckDBPyConnection, threads: int, memory_limit: str) -> None:

@@ -36,6 +36,39 @@ class TestSqlStringLiteral:
         assert maintenance._sql_string_literal("") == "''"
 
 
+class TestBytesToHuman:
+    """Round-trip DuckLake's stored byte-count format back to a units-suffixed form."""
+
+    def test_clean_mib(self):
+        assert maintenance._bytes_to_human("67108864") == "64MiB"
+        assert maintenance._bytes_to_human("134217728") == "128MiB"
+        assert maintenance._bytes_to_human("5242880") == "5MiB"
+
+    def test_clean_gib(self):
+        assert maintenance._bytes_to_human("1073741824") == "1GiB"
+        assert maintenance._bytes_to_human("2147483648") == "2GiB"
+
+    def test_clean_kib(self):
+        assert maintenance._bytes_to_human("1024") == "1KiB"
+        assert maintenance._bytes_to_human("4096") == "4KiB"
+
+    def test_picks_largest_clean_unit(self):
+        # 64 MiB = 65536 KiB; the converter picks MiB, not KiB.
+        assert maintenance._bytes_to_human("67108864") == "64MiB"
+
+    def test_non_power_of_1024_returns_none(self):
+        assert maintenance._bytes_to_human("12345678") is None
+
+    def test_zero_or_negative_returns_none(self):
+        assert maintenance._bytes_to_human("0") is None
+        assert maintenance._bytes_to_human("-1024") is None
+
+    def test_non_integer_returns_none(self):
+        assert maintenance._bytes_to_human("128MiB") is None
+        assert maintenance._bytes_to_human("") is None
+        assert maintenance._bytes_to_human(None) is None
+
+
 class TestLogCleanupThroughput:
     def test_typical(self, caplog):
         with caplog.at_level(logging.INFO, logger="maintenance"):
