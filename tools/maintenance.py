@@ -219,17 +219,22 @@ def maintain(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
 
 @contextlib.contextmanager
 def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
-    """Set target_file_size for the body, restore prior value (or default) on exit."""
+    """Set target_file_size for the body, restore to DEFAULT_TARGET_FILE_SIZE on exit.
+
+    We don't try to read-and-restore the prior value: ``ducklake_options('lake')``
+    can return multiple rows (GLOBAL/SCHEMA/TABLE scopes) and the byte-count
+    string DuckLake stores ('134217728') round-trips as an empty value here,
+    causing the restore SET to ParserException. Always restoring to the
+    documented steady-state default is robust and keeps the catalog at a known
+    value regardless of starting state.
+    """
     _sanitize_setting_value(value)
-    prior = conn.execute("SELECT value FROM ducklake_options('lake') WHERE option_name = 'target_file_size'").fetchone()
     conn.execute(f"CALL ducklake_set_option('lake', 'target_file_size', '{value}')")
     try:
         yield
     finally:
-        restore = prior[0] if prior else DEFAULT_TARGET_FILE_SIZE
-        _sanitize_setting_value(restore)
-        conn.execute(f"CALL ducklake_set_option('lake', 'target_file_size', '{restore}')")
-        log.info("target_file_size restored to %s", restore)
+        conn.execute(f"CALL ducklake_set_option('lake', 'target_file_size', '{DEFAULT_TARGET_FILE_SIZE}')")
+        log.info("target_file_size restored to %s", DEFAULT_TARGET_FILE_SIZE)
 
 
 def compact(
