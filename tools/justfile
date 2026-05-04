@@ -92,6 +92,11 @@ heal-orphans-dry-run:
 heal-orphans:
     python {{ maintenance }} heal-orphans
 
+# Loop dedup + heal-orphans + cleanup-all until cleanup-all exits clean
+[group('lifecycle')]
+cleanup-all-safe max_iterations="10":
+    python {{ maintenance }} cleanup-all-safe --max-iterations {{ max_iterations }}
+
 # Preview orphaned files
 [group('lifecycle')]
 orphans-dry-run:

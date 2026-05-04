@@ -421,6 +421,38 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         log.info("heal-orphans: %d orphan rows removed from the queue", n_orphans)
 
 
+def cleanup_all_safe(conn: duckdb.DuckDBPyConnection, max_iterations: int) -> None:
+    """Loop dedup + heal-orphans + cleanup-all until cleanup-all exits clean.
+
+    Each crashed `ducklake_cleanup_old_files` (DuckLake bug c1: a NoSuchKey
+    on S3 DELETE rolls back the txn but the S3 deletes already-committed are
+    permanent) creates fresh catalog-side orphans. The orchestrator heals
+    those between attempts so the next cleanup-all sees a clean queue.
+
+    The advisory lock is acquired once for the whole orchestration so all
+    three steps share mutual exclusion.
+    """
+    _acquire_advisory_lock(conn)
+    for attempt in range(1, max_iterations + 1):
+        log.info("cleanup-all-safe: attempt %d / %d", attempt, max_iterations)
+        dedup_deletions(conn, dry_run=False)
+        heal_orphans(conn, dry_run=False)
+        try:
+            cleanup_all(conn, dry_run=False)
+            log.info("cleanup-all-safe: cleanup-all succeeded on attempt %d", attempt)
+            return
+        except duckdb.IOException as e:
+            log.warning(
+                "cleanup-all-safe: cleanup-all crashed on attempt %d (%s); "
+                "looping to heal fresh orphans",
+                attempt,
+                e,
+            )
+    raise RuntimeError(
+        f"cleanup-all-safe exhausted {max_iterations} iterations without a clean cleanup-all run"
+    )
+
+
 def find_orphans(conn: duckdb.DuckDBPyConnection) -> None:
     """List catalog rows whose S3 key no longer exists.
 
@@ -632,6 +664,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dry-run", action="store_true")
 
+    # cleanup-all-safe
+    p = sub.add_parser(
+        "cleanup-all-safe",
+        help="Orchestrator: dedup + heal-orphans + cleanup-all in a loop until cleanup-all exits clean",
+    )
+    p.add_argument(
+        "--max-iterations",
+        type=_positive_int,
+        default=10,
+        help="Maximum dedup/heal/cleanup-all iterations before giving up (default 10)",
+    )
+
     # orphans
     p = sub.add_parser("orphans", help="Delete orphaned S3 files")
     p.add_argument("--dry-run", action="store_true")
@@ -723,6 +767,8 @@ def main(argv: list[str] | None = None) -> None:
                 find_orphans(conn)
             case "heal-orphans":
                 heal_orphans(conn, args.dry_run)
+            case "cleanup-all-safe":
+                cleanup_all_safe(conn, args.max_iterations)
             case "orphans":
                 orphans(conn, args.dry_run)
             case "maintain":
