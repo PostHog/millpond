@@ -165,6 +165,26 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     conn.execute(f"SET enable_http_logging = {str(debug).lower()}")
     conn.execute(f"SET pg_debug_show_queries = {str(debug).lower()}")
 
+    # The legacy SET s3_* settings above are honored by the ducklake catalog
+    # driver but not by ad-hoc httpfs ops (`glob('s3://...')`,
+    # `read_parquet('s3://...')`) in DuckDB 1.4 — those go through the SECRET
+    # manager. Mirror the same credentials into a SECRET so every recipe in
+    # this script (and any operator-typed glob) authenticates correctly.
+    s3_endpoint_val = os.environ.get("DUCKDB_S3_ENDPOINT", s3_defaults["s3_endpoint"])
+    s3_use_ssl_val = os.environ.get("DUCKDB_S3_USE_SSL", s3_defaults["s3_use_ssl"])
+    s3_url_style_val = os.environ.get("DUCKDB_S3_URL_STYLE", s3_defaults["s3_url_style"])
+    s3_key = os.environ.get("DUCKDB_S3_ACCESS_KEY_ID", "")
+    s3_secret = os.environ.get("DUCKDB_S3_SECRET_ACCESS_KEY", "")
+    for v in (s3_endpoint_val, s3_use_ssl_val, s3_url_style_val, s3_key, s3_secret, s3_region):
+        _sanitize_setting_value(v) if v else None
+    conn.execute(
+        f"CREATE OR REPLACE SECRET s3 ("
+        f"TYPE s3, PROVIDER config, "
+        f"KEY_ID '{s3_key}', SECRET '{s3_secret}', "
+        f"REGION '{s3_region}', ENDPOINT '{s3_endpoint_val}', "
+        f"URL_STYLE '{s3_url_style_val}', USE_SSL {s3_use_ssl_val})"
+    )
+
     rds_host = _require("DUCKLAKE_RDS_HOST")
     rds_port = os.environ.get("DUCKLAKE_RDS_PORT", "5432")
     rds_database = os.environ.get("DUCKLAKE_RDS_DATABASE", "ducklake")
@@ -290,7 +310,7 @@ def _acquire_advisory_lock(conn: duckdb.DuckDBPyConnection) -> None:
     """
     inner_sql = f"SELECT pg_try_advisory_lock({ADVISORY_LOCK_KEY_SQL}) AS acquired"
     held = conn.execute(
-        f"SELECT acquired FROM postgres_query('{PG_ATTACH_NAME}', '{inner_sql}')"
+        f"SELECT acquired FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(inner_sql)})"
     ).fetchone()[0]
     if not held:
         raise RuntimeError(
