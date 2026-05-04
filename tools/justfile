@@ -77,6 +77,11 @@ dedup-deletions-dry-run:
 dedup-deletions:
     python {{ maintenance }} dedup-deletions
 
+# List catalog rows whose S3 key no longer exists (catalog-side orphans)
+[group('lifecycle')]
+find-orphans:
+    python {{ maintenance }} find-orphans
+
 # Preview orphaned files
 [group('lifecycle')]
 orphans-dry-run:

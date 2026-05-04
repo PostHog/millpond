@@ -182,7 +182,8 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     conn.execute(f"ATTACH '{pg_connstr_sql}' AS {PG_ATTACH_NAME} (TYPE postgres)")
 
     if MAINTENANCE_SQL_PATH.exists():
-        conn.execute(MAINTENANCE_SQL_PATH.read_text())
+        rendered = MAINTENANCE_SQL_PATH.read_text().format(schema=METADATA_SCHEMA)
+        conn.execute(rendered)
         log.debug("Loaded SQL macros from %s", MAINTENANCE_SQL_PATH)
     else:
         log.warning("maintenance.sql not found at %s; macros unavailable", MAINTENANCE_SQL_PATH)
@@ -291,6 +292,23 @@ def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', '{delete_sql}')")
     after = conn.execute("SELECT count_pending_dups()").fetchone()[0]
     log.info("dedup-deletions: queue now has %d duplicate rows", after)
+
+
+def find_orphans(conn: duckdb.DuckDBPyConnection) -> None:
+    """List catalog rows whose S3 key no longer exists.
+
+    Pure SELECT via the `find_catalog_orphans(data_path)` macro. Logs the
+    summary on stderr and prints `data_file_id<TAB>path` rows on stdout,
+    so the output is grep / wc / xargs-friendly.
+    """
+    data_path = _require("DUCKLAKE_DATA_PATH")
+    rows = conn.execute(
+        "SELECT data_file_id, path FROM find_catalog_orphans(?)",
+        [data_path],
+    ).fetchall()
+    log.info("find-orphans: %d catalog rows reference S3 paths that no longer exist", len(rows))
+    for data_file_id, path in rows:
+        print(f"{data_file_id}\t{path}")
 
 
 def orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
@@ -474,6 +492,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dry-run", action="store_true")
 
+    # find-orphans
+    sub.add_parser(
+        "find-orphans",
+        help="List ducklake_files_scheduled_for_deletion rows whose S3 key no longer exists",
+    )
+
     # orphans
     p = sub.add_parser("orphans", help="Delete orphaned S3 files")
     p.add_argument("--dry-run", action="store_true")
@@ -561,6 +585,8 @@ def main(argv: list[str] | None = None) -> None:
                 cleanup_all(conn, args.dry_run)
             case "dedup-deletions":
                 dedup_deletions(conn, args.dry_run)
+            case "find-orphans":
+                find_orphans(conn)
             case "orphans":
                 orphans(conn, args.dry_run)
             case "maintain":
