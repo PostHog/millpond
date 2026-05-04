@@ -63,6 +63,13 @@ TIERS = {
 # rather than leaving the catalog at whatever the last tier set.
 DEFAULT_TARGET_FILE_SIZE = "128MiB"
 
+# Single source of truth for the DuckLake ATTACH name. DuckLake creates a
+# Postgres metadata schema named ``__ducklake_metadata_<attach_name>``, so the
+# attach name and the schema name must always be derived from the same value
+# or queries silently target the wrong schema.
+ATTACH_NAME = "lake"
+METADATA_SCHEMA = f"__ducklake_metadata_{ATTACH_NAME}"
+
 
 def _setup_logging(verbose: bool = False) -> None:
     level = "DEBUG" if verbose else os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -157,7 +164,7 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     )
     pg_connstr_sql = pg_connstr.replace("'", "''")
     conn.execute(f"""
-        ATTACH 'ducklake:postgres:{pg_connstr_sql}' AS lake (
+        ATTACH 'ducklake:postgres:{pg_connstr_sql}' AS {ATTACH_NAME} (
             DATA_PATH '{data_path.replace("'", "''")}'
         )
     """)
@@ -176,7 +183,7 @@ def expire(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
     """Expire snapshots older than N days."""
     log.info("Expiring snapshots older than %d days (dry_run=%s)", days, dry_run)
     result = conn.execute(
-        f"CALL ducklake_expire_snapshots('lake', "
+        f"CALL ducklake_expire_snapshots('{ATTACH_NAME}', "
         f"older_than => now() - INTERVAL '{days} days', "
         f"dry_run => {str(dry_run).lower()})"
     ).fetchall()
@@ -188,7 +195,7 @@ def cleanup(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
     """Delete files scheduled for deletion older than N days."""
     log.info("Cleaning up files older than %d days (dry_run=%s)", days, dry_run)
     result = conn.execute(
-        f"CALL ducklake_cleanup_old_files('lake', "
+        f"CALL ducklake_cleanup_old_files('{ATTACH_NAME}', "
         f"older_than => now() - INTERVAL '{days} days', "
         f"dry_run => {str(dry_run).lower()})"
     ).fetchall()
@@ -202,7 +209,7 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         log.info("cleanup-all has no dry-run mode; skipping")
         return
     log.info("Cleaning up all files scheduled for deletion")
-    result = conn.execute("CALL ducklake_cleanup_old_files('lake', cleanup_all => true)").fetchall()
+    result = conn.execute(f"CALL ducklake_cleanup_old_files('{ATTACH_NAME}', cleanup_all => true)").fetchall()
     for row in result:
         log.info("cleanup-all: %s", row)
 
@@ -210,7 +217,9 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
 def orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     """Find and delete orphaned S3 files."""
     log.info("Deleting orphaned files (dry_run=%s)", dry_run)
-    result = conn.execute(f"CALL ducklake_delete_orphaned_files('lake', dry_run => {str(dry_run).lower()})").fetchall()
+    result = conn.execute(
+        f"CALL ducklake_delete_orphaned_files('{ATTACH_NAME}', dry_run => {str(dry_run).lower()})"
+    ).fetchall()
     for row in result:
         log.info("orphans: %s", row)
 
@@ -218,7 +227,7 @@ def orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
 def checkpoint(conn: duckdb.DuckDBPyConnection) -> None:
     """Run CHECKPOINT (integrated merge + expire + cleanup)."""
     log.info("Running CHECKPOINT")
-    conn.execute("CHECKPOINT lake")
+    conn.execute(f"CHECKPOINT {ATTACH_NAME}")
     log.info("CHECKPOINT complete")
 
 
@@ -232,19 +241,21 @@ def maintain(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
 def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
     """Set target_file_size for the body, restore to DEFAULT_TARGET_FILE_SIZE on exit.
 
-    We don't try to read-and-restore the prior value: ``ducklake_options('lake')``
-    can return multiple rows (GLOBAL/SCHEMA/TABLE scopes) and the byte-count
+    We don't try to read-and-restore the prior value: ``ducklake_options`` can
+    return multiple rows (GLOBAL/SCHEMA/TABLE scopes) and the byte-count
     string DuckLake stores ('134217728') round-trips as an empty value here,
     causing the restore SET to ParserException. Always restoring to the
     documented steady-state default is robust and keeps the catalog at a known
     value regardless of starting state.
     """
     _sanitize_setting_value(value)
-    conn.execute(f"CALL ducklake_set_option('lake', 'target_file_size', '{value}')")
+    conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{value}')")
     try:
         yield
     finally:
-        conn.execute(f"CALL ducklake_set_option('lake', 'target_file_size', '{DEFAULT_TARGET_FILE_SIZE}')")
+        conn.execute(
+            f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{DEFAULT_TARGET_FILE_SIZE}')"
+        )
         log.info("target_file_size restored to %s", DEFAULT_TARGET_FILE_SIZE)
 
 
@@ -275,11 +286,11 @@ def compact(
         if not _SETTING_VALUE_RE.match(table):
             raise ValueError(f"Illegal character in table name: {table!r}")
         where.append(
-            f"table_id IN (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = '{table}')"
+            f"table_id IN (SELECT table_id FROM {METADATA_SCHEMA}.ducklake_table WHERE table_name = '{table}')"
         )
     candidate_count, candidate_bytes = conn.execute(
         f"SELECT COUNT(*), COALESCE(SUM(file_size_bytes), 0) "
-        f"FROM __ducklake_metadata_lake.ducklake_data_file WHERE {' AND '.join(where)}"
+        f"FROM {METADATA_SCHEMA}.ducklake_data_file WHERE {' AND '.join(where)}"
     ).fetchone()
     log.info(
         "compact tier-%d candidates: %d files, %d bytes total",
@@ -298,9 +309,9 @@ def compact(
     if min_b is not None:
         args.append(f"min_file_size => {min_b}")
     if table:
-        sql = f"CALL ducklake_merge_adjacent_files('lake', '{table}', {', '.join(args)})"
+        sql = f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', '{table}', {', '.join(args)})"
     else:
-        sql = f"CALL ducklake_merge_adjacent_files('lake', {', '.join(args)})"
+        sql = f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', {', '.join(args)})"
 
     with _scoped_target_file_size(conn, target):
         result = conn.execute(sql).fetchall()
@@ -314,7 +325,8 @@ def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_fil
         raise ValueError(f"Illegal character in table name: {table!r}")
     log.info("compact-probe: table=%s max_compacted_files=%d", table, max_compacted_files)
     result = conn.execute(
-        f"CALL ducklake_merge_adjacent_files('lake', '{table}', max_compacted_files => {max_compacted_files})"
+        f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', '{table}', "
+        f"max_compacted_files => {max_compacted_files})"
     ).fetchall()
     for row in result:
         log.info("compact-probe: %s", row)
