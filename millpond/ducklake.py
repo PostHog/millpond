@@ -16,13 +16,13 @@ _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
 def _escape_libpq(value: str | None) -> str:
     """Escape a value for a libpq connection string.
 
-    Wraps in single quotes and backslash-escapes internal single quotes and backslashes.
-    See: https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
+    Wraps in single quotes and SQL-style doubles internal single quotes.
+    Modern libpq with ``standard_conforming_strings=on`` (default since 9.1)
+    treats ``''`` as the embedded-quote escape; the older ``\\'`` form is rejected.
     """
     if value is None:
         return "''"
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{escaped}'"
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _sanitize_setting_value(val: str) -> str:

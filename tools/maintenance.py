@@ -84,8 +84,7 @@ def _require(name: str) -> str:
 def _escape_libpq(value: str | None) -> str:
     if value is None:
         return "''"
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{escaped}'"
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _sanitize_setting_value(val: str) -> str:

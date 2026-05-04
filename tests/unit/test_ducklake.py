@@ -78,13 +78,13 @@ class TestEscapeLibpq:
         assert _escape_libpq("ducklake") == "'ducklake'"
 
     def test_single_quote(self):
-        assert _escape_libpq("pass'word") == "'pass\\'word'"
+        assert _escape_libpq("pass'word") == "'pass''word'"
 
     def test_backslash(self):
-        assert _escape_libpq("pass\\word") == "'pass\\\\word'"
+        assert _escape_libpq("pass\\word") == "'pass\\word'"
 
     def test_both(self):
-        assert _escape_libpq("it's\\complex") == "'it\\'s\\\\complex'"
+        assert _escape_libpq("it's\\complex") == "'it''s\\complex'"
 
     def test_none(self):
         assert _escape_libpq(None) == "''"
