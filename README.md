@@ -112,7 +112,7 @@ python /app/tools/maintenance.py orphans                     # delete S3-side or
 python /app/tools/maintenance.py compact --tier 1            # tiered compaction (see "When to add a merge job")
 ```
 
-The script logs `cleanup throughput: files_processed=N queue_depth_before=A queue_depth_after=B elapsed_s=T rate_obj_s=R` after every `cleanup` / `cleanup-all`, so you can confirm steady-state throughput without enabling debug logging. Pass `--debug` to opt back into DuckDB's HTTP and Postgres-extension query logging — both are off by default because they add per-call overhead that compounds across tens of thousands of S3 deletes.
+The script logs `cleanup throughput: files_processed=N elapsed_s=T rate_obj_s=R queue_depth_after=A` after every `cleanup` / `cleanup-all` (skipped on `--dry-run`), so you can confirm steady-state throughput without enabling debug logging. `files_processed` is the actual count of files the call returned, not a queue-depth delta, so the number is accurate even when other writers enqueue deletions during the run. Pass `--debug` to opt back into DuckDB's HTTP and Postgres-extension query logging — both are off by default because they add per-call overhead that compounds across tens of thousands of S3 deletes.
 
 If `PUSHGATEWAY_URL` is set, the script pushes `maintenance_start_time` (on start) and `maintenance_duration_seconds` (on completion) to a Prometheus Pushgateway, enabling Grafana annotation queries for maintenance windows.
 
