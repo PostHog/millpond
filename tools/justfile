@@ -14,7 +14,7 @@ s3_key := env("DUCKDB_S3_ACCESS_KEY_ID", "")
 s3_secret := env("DUCKDB_S3_SECRET_ACCESS_KEY", "")
 data_path := env("DUCKLAKE_DATA_PATH", "")
 
-_setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD ducklake; LOAD postgres; SET pg_debug_show_queries = true; SET s3_region = '" + s3_region + "'; SET s3_endpoint = 's3." + s3_region + ".amazonaws.com'; SET s3_access_key_id = '" + s3_key + "'; SET s3_secret_access_key = '" + s3_secret + "'; SET s3_use_ssl = true; SET s3_url_style = 'vhost'; ATTACH 'postgres:host=" + rds_host + " port=" + rds_port + " dbname=" + rds_db + " user=" + rds_user + " password=" + rds_password + "' AS lake (TYPE ducklake, DATA_PATH '" + data_path + "'); USE lake;"
+_setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD ducklake; LOAD postgres; SET pg_debug_show_queries = true; CREATE OR REPLACE SECRET s3 (TYPE s3, PROVIDER config, KEY_ID '" + s3_key + "', SECRET '" + s3_secret + "', REGION '" + s3_region + "', ENDPOINT 's3." + s3_region + ".amazonaws.com', URL_STYLE 'vhost', USE_SSL true); ATTACH 'postgres:host=" + rds_host + " port=" + rds_port + " dbname=" + rds_db + " user=" + rds_user + " password=" + rds_password + "' AS lake (TYPE ducklake, DATA_PATH '" + data_path + "'); USE lake;"
 
 maintenance := env("MAINTENANCE_SCRIPT", "/app/tools/maintenance.py")
 
