@@ -19,6 +19,7 @@ pg_connstr := "host=" + rds_host + " port=" + rds_port + " dbname=" + rds_db + "
 _setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD ducklake; LOAD postgres; SET pg_debug_show_queries = true; CREATE OR REPLACE SECRET s3 (TYPE s3, PROVIDER config, KEY_ID '" + s3_key + "', SECRET '" + s3_secret + "', REGION '" + s3_region + "', ENDPOINT 's3." + s3_region + ".amazonaws.com', URL_STYLE 'vhost', USE_SSL true); ATTACH 'postgres:" + pg_connstr + "' AS lake (TYPE ducklake, DATA_PATH '" + data_path + "'); ATTACH '" + pg_connstr + "' AS pg (TYPE postgres); USE lake;"
 
 maintenance := env("MAINTENANCE_SCRIPT", "/app/tools/maintenance.py")
+maintenance_sql := env("MAINTENANCE_SQL", "/app/tools/maintenance.sql")
 
 default:
     @just --list
@@ -30,7 +31,7 @@ default:
 # Open an interactive DuckDB shell connected to the DuckLake
 [group('interactive')]
 shell:
-    {{ duckdb }} -cmd "{{ _setup }}"
+    {{ duckdb }} -cmd "{{ _setup }}" -cmd ".read {{ maintenance_sql }}"
 
 # Drop a table
 [group('interactive')]
@@ -65,6 +66,16 @@ cleanup days="1":
 [group('lifecycle')]
 cleanup-all:
     python {{ maintenance }} cleanup-all
+
+# Preview duplicate rows in the pending-deletion queue (workaround for DuckLake bug c5)
+[group('lifecycle')]
+dedup-deletions-dry-run:
+    python {{ maintenance }} dedup-deletions --dry-run
+
+# Drop duplicate rows from the pending-deletion queue (workaround for DuckLake bug c5)
+[group('lifecycle')]
+dedup-deletions:
+    python {{ maintenance }} dedup-deletions
 
 # Preview orphaned files
 [group('lifecycle')]

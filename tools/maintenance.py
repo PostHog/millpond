@@ -25,6 +25,7 @@ import re
 import sys
 import time
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 import duckdb
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
@@ -69,6 +70,13 @@ DEFAULT_TARGET_FILE_SIZE = "128MiB"
 # or queries silently target the wrong schema.
 ATTACH_NAME = "lake"
 METADATA_SCHEMA = f"__ducklake_metadata_{ATTACH_NAME}"
+
+# Direct Postgres ATTACH name used for `postgres_execute` / `postgres_query`
+# calls; distinct from the DuckLake-catalog ATTACH (ATTACH_NAME).
+PG_ATTACH_NAME = "pg"
+
+# Companion SQL file: header conventions plus runtime-loadable macros.
+MAINTENANCE_SQL_PATH = Path(__file__).resolve().parent / "maintenance.sql"
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -168,6 +176,16 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
             DATA_PATH '{data_path.replace("'", "''")}'
         )
     """)
+    # Direct Postgres ATTACH for postgres_execute / postgres_query; needed by
+    # the catalog-maintenance recipes that touch ctid or run DML the duckdb
+    # postgres extension doesn't expose duckdb-side.
+    conn.execute(f"ATTACH '{pg_connstr_sql}' AS {PG_ATTACH_NAME} (TYPE postgres)")
+
+    if MAINTENANCE_SQL_PATH.exists():
+        conn.execute(MAINTENANCE_SQL_PATH.read_text())
+        log.debug("Loaded SQL macros from %s", MAINTENANCE_SQL_PATH)
+    else:
+        log.warning("maintenance.sql not found at %s; macros unavailable", MAINTENANCE_SQL_PATH)
 
     log.info(
         "Connected: metadata=%s:%s/%s data=%s",
@@ -247,6 +265,32 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         log.info("cleanup-all: %s", row)
     after = _scheduled_for_deletion_count(conn)
     _log_cleanup_throughput("cleanup-all", before, after, elapsed)
+
+
+def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
+    """Drop duplicate rows from ducklake_files_scheduled_for_deletion.
+
+    The same path can land in the queue across multiple snapshots (DuckLake
+    bug c5); combined with c1, the second visit poisons cleanup-all because
+    the S3 DELETE returns NoSuchKey and rolls back the whole transaction.
+    Keep one row per distinct path (the lowest ctid) and drop the rest.
+
+    The DELETE is ctid-based and runs through the duckdb postgres extension
+    (`postgres_execute`); duckdb-side DML can't see Postgres system columns.
+    """
+    dups = conn.execute("SELECT count_pending_dups()").fetchone()[0]
+    log.info("dedup-deletions: %d duplicate rows in queue (dry_run=%s)", dups, dry_run)
+    if dry_run or dups == 0:
+        return
+    delete_sql = (
+        f"DELETE FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion "
+        f"WHERE ctid NOT IN ("
+        f"SELECT MIN(ctid) FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion GROUP BY path"
+        f")"
+    )
+    conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', '{delete_sql}')")
+    after = conn.execute("SELECT count_pending_dups()").fetchone()[0]
+    log.info("dedup-deletions: queue now has %d duplicate rows", after)
 
 
 def orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
@@ -423,6 +467,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cleanup-all", help="Delete all scheduled files")
     p.add_argument("--dry-run", action="store_true")
 
+    # dedup-deletions
+    p = sub.add_parser(
+        "dedup-deletions",
+        help="Drop duplicate rows from ducklake_files_scheduled_for_deletion (workaround for DuckLake bug c5)",
+    )
+    p.add_argument("--dry-run", action="store_true")
+
     # orphans
     p = sub.add_parser("orphans", help="Delete orphaned S3 files")
     p.add_argument("--dry-run", action="store_true")
@@ -508,6 +559,8 @@ def main(argv: list[str] | None = None) -> None:
                 cleanup(conn, args.days, args.dry_run)
             case "cleanup-all":
                 cleanup_all(conn, args.dry_run)
+            case "dedup-deletions":
+                dedup_deletions(conn, args.dry_run)
             case "orphans":
                 orphans(conn, args.dry_run)
             case "maintain":
