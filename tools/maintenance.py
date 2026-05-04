@@ -191,16 +191,46 @@ def expire(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
         log.info("expire: %s", row)
 
 
+def _scheduled_for_deletion_count(conn: duckdb.DuckDBPyConnection) -> int:
+    """Queue depth of ducklake_files_scheduled_for_deletion."""
+    return conn.execute(f"SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion").fetchone()[0]
+
+
+def _log_cleanup_throughput(operation: str, before: int, after: int, elapsed_s: float) -> None:
+    """Emit one structured line with cleanup throughput stats.
+
+    Single line, key=value pairs, grep-friendly. The before/after queue depths
+    let an operator distinguish "cleanup processed N files" from "cleanup
+    drained the whole queue" without re-running the count query manually.
+    """
+    processed = before - after
+    rate = processed / elapsed_s if elapsed_s > 0 else 0.0
+    log.info(
+        "%s throughput: files_processed=%d queue_depth_before=%d queue_depth_after=%d elapsed_s=%.1f rate_obj_s=%.1f",
+        operation,
+        processed,
+        before,
+        after,
+        elapsed_s,
+        rate,
+    )
+
+
 def cleanup(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
     """Delete files scheduled for deletion older than N days."""
     log.info("Cleaning up files older than %d days (dry_run=%s)", days, dry_run)
+    before = _scheduled_for_deletion_count(conn)
+    t0 = time.monotonic()
     result = conn.execute(
         f"CALL ducklake_cleanup_old_files('{ATTACH_NAME}', "
         f"older_than => now() - INTERVAL '{days} days', "
         f"dry_run => {str(dry_run).lower()})"
     ).fetchall()
+    elapsed = time.monotonic() - t0
     for row in result:
         log.info("cleanup: %s", row)
+    after = _scheduled_for_deletion_count(conn)
+    _log_cleanup_throughput("cleanup", before, after, elapsed)
 
 
 def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
@@ -209,9 +239,14 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         log.info("cleanup-all has no dry-run mode; skipping")
         return
     log.info("Cleaning up all files scheduled for deletion")
+    before = _scheduled_for_deletion_count(conn)
+    t0 = time.monotonic()
     result = conn.execute(f"CALL ducklake_cleanup_old_files('{ATTACH_NAME}', cleanup_all => true)").fetchall()
+    elapsed = time.monotonic() - t0
     for row in result:
         log.info("cleanup-all: %s", row)
+    after = _scheduled_for_deletion_count(conn)
+    _log_cleanup_throughput("cleanup-all", before, after, elapsed)
 
 
 def orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
