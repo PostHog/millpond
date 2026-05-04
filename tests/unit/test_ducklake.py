@@ -74,6 +74,8 @@ class TestValidatePartitionExpr:
 
 
 class TestEscapeLibpq:
+    """libpq connstring grammar: backslash escapes, NOT SQL-style doubled quotes."""
+
     def test_plain_value(self):
         assert _escape_libpq("ducklake") == "'ducklake'"
 

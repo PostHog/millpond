@@ -94,28 +94,60 @@ Requires Docker (uses `keytool` from the Kafka container image for cert generati
 
 ### DuckLake Maintenance
 
-`tools/maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint). It is baked into the Docker image at `/app/tools/maintenance.py` and designed to run as a K8s CronJob reusing the same image and credentials as the main application.
+`tools/maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint, tiered compaction, deletion-queue dedup, catalog-side orphan recovery). It is baked into the Docker image at `/app/tools/maintenance.py` and designed to run as a K8s CronJob reusing the same image and credentials as the main application.
 
 ```bash
-python /app/tools/maintenance.py maintain --days 7          # expire snapshots + cleanup files
+python /app/tools/maintenance.py maintain --days 7           # expire snapshots + cleanup files
 python /app/tools/maintenance.py maintain --days 7 --dry-run # preview only
-python /app/tools/maintenance.py expire --days 3            # expire snapshots only
-python /app/tools/maintenance.py cleanup --days 1           # cleanup scheduled files only
-python /app/tools/maintenance.py checkpoint                 # integrated merge + expire + cleanup
-python /app/tools/maintenance.py orphans                    # delete orphaned S3 files
+python /app/tools/maintenance.py expire --days 3             # expire snapshots only
+python /app/tools/maintenance.py cleanup --days 1            # cleanup scheduled files only
+python /app/tools/maintenance.py cleanup-all                 # cleanup all scheduled files regardless of age
+python /app/tools/maintenance.py dedup-deletions             # drop duplicate rows in the pending-deletion queue
+python /app/tools/maintenance.py find-orphans                # list catalog rows whose S3 key no longer exists
+python /app/tools/maintenance.py heal-orphans                # delete those catalog rows (gated B1/B3 safety checks)
+python /app/tools/maintenance.py cleanup-all-safe            # dedup + heal-orphans + cleanup-all in a loop until clean
+python /app/tools/maintenance.py fsck                        # cleanup-all-safe + ducklake_delete_orphaned_files
+python /app/tools/maintenance.py checkpoint                  # integrated merge + expire + cleanup
+python /app/tools/maintenance.py orphans                     # delete S3-side orphaned files (catalog has no row)
+python /app/tools/maintenance.py compact --tier 1            # tiered compaction (see "When to add a merge job")
 ```
 
+The script logs `cleanup throughput: files_processed=N elapsed_s=T rate_obj_s=R queue_depth_after=A` after every `cleanup` / `cleanup-all` (skipped on `--dry-run`), so you can confirm steady-state throughput without enabling debug logging. `files_processed` is the actual count of files the call returned, not a queue-depth delta, so the number is accurate even when other writers enqueue deletions during the run. Pass `--debug` to opt back into DuckDB's HTTP and Postgres-extension query logging — both are off by default because they add per-call overhead that compounds across tens of thousands of S3 deletes.
+
 If `PUSHGATEWAY_URL` is set, the script pushes `maintenance_start_time` (on start) and `maintenance_duration_seconds` (on completion) to a Prometheus Pushgateway, enabling Grafana annotation queries for maintenance windows.
+
+#### Catalog-side orphan recovery
+
+If a `cleanup-all` run is interrupted (DuckLake bug: an S3 NoSuchKey on DELETE rolls back the whole transaction, but the S3 deletes already-completed are permanent), the catalog ends up with rows in `ducklake_files_scheduled_for_deletion` that point at S3 keys that no longer exist. Every subsequent `cleanup-all` will crash on those orphans until they're cleaned up. The catalog-recovery subcommands handle this without manual SQL surgery:
+
+| Subcommand | Action |
+|---|---|
+| `find-orphans` | List orphan rows on stdout (read-only). |
+| `heal-orphans` | Delete the orphan rows. Two safety gates: B1 proves `ducklake_data_file` is non-empty AND no orphan path is still live; B3 aborts if any positional-delete vector references an orphan id. `--dry-run` runs the gates but skips the DELETE. |
+| `cleanup-all-safe` | Loop dedup-deletions + heal-orphans + cleanup-all under one advisory lock until cleanup-all exits clean. Caps at `--max-iterations` (default 10). |
+| `fsck` | `cleanup-all-safe` followed by `ducklake_delete_orphaned_files` (S3-side orphan sweep). The end-to-end "lake catalog is healthy" recipe. |
+
+Mutual exclusion comes from `pg_try_advisory_lock(hashtext('millpond-ducklake-maintenance')::bigint)` taken on the `pg` ATTACH; concurrent maintenance invocations bail with a clear error rather than racing each other's DELETEs.
+
+`tools/maintenance.sql` is loaded at every session start (both by `maintenance.py` and by the `just shell` recipe) and defines small DuckDB macros for ad-hoc inspection — `SELECT count_pending_dups()` for queue dup count, `SELECT * FROM find_catalog_orphans('s3://bucket/lake/data')` for the orphan list. The header documents the conventions (no `LEFT ANTI JOIN`, no duckdb-side `ctid`, advisory-lock key) that any new recipe must follow.
 
 `tools/justfile` wraps the script and is also baked into the image at `/justfile` for interactive use:
 
 ```bash
-just --list              # see available recipes
-just maintain-dry-run 3  # preview: expire >3 day snapshots + cleanup
-just maintain 3          # execute it
-just shell               # interactive DuckDB shell connected to DuckLake
-just drop events         # drop a table (data files remain until cleanup)
-just orphans-dry-run     # preview orphaned S3 files
+just --list                  # see available recipes
+just maintain-dry-run 3      # preview: expire >3 day snapshots + cleanup
+just maintain 3              # execute it
+just dedup-deletions-dry-run # preview duplicate rows in the pending-deletion queue
+just dedup-deletions         # drop them
+just find-orphans            # list catalog-side orphan rows
+just heal-orphans-dry-run    # preview heal-orphans (gates only, no DELETE)
+just heal-orphans            # delete catalog-side orphan rows
+just cleanup-all-safe        # dedup + heal + cleanup-all in a loop
+just fsck-dry-run            # preview fsck end-to-end
+just fsck                    # bring catalog to known-good state
+just shell                   # interactive DuckDB shell with lake + pg ATTACHed and macros loaded
+just drop events             # drop a table (data files remain until cleanup)
+just orphans-dry-run         # preview S3-side orphaned files
 ```
 
 All commands use the pod's existing env vars (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`).
@@ -241,6 +273,8 @@ Tier ranges (verified semantics: `min_file_size` inclusive, `max_file_size` excl
 | `compact-to-tier-1` | `[0, 1 MiB)` | ~5 MiB |
 | `compact-to-tier-2` | `[1 MiB, 10 MiB)` | ~32 MiB |
 | `compact-to-tier-3` | `[10 MiB, 64 MiB)` | ~128 MiB |
+
+The `compact` subcommand bounds DuckDB resource use during the merge — `--threads` (default 2) and `--memory-limit` (default 4GB) — because `ducklake_merge_adjacent_files` isn't fully streaming today and over-uses memory relative to input size. The defaults are conservative; raise them on lakes that fit comfortably in pod memory.
 
 This is an out-of-band maintenance operation, not part of the hot path.
 
