@@ -398,46 +398,62 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     if n_orphans == 0:
         return
 
-    # B1: positive-proof gate. Both clauses must hold. Per quirk r1, `path`
-    # can be stored as an absolute s3:// URI OR a bucket-relative key in
-    # either ducklake_files_scheduled_for_deletion (which feeds _orphans) and
-    # in ducklake_data_file. A naive `df.path IN (...)` match misses the live
-    # row whenever the two tables use opposite forms for the same file, so
-    # normalize both sides to absolute form before comparing.
-    total_data_files, would_be_live = conn.execute(
+    # B1: positive-proof gate. Both clauses must hold.
+    #
+    # Live filter: `end_snapshot IS NULL` is DuckLake's marker for current
+    # rows in ducklake_data_file (the same filter the compact subcommand
+    # uses to find compaction candidates). Historical rows whose
+    # end_snapshot is set are no longer live; an "orphan" path appearing
+    # only in historical rows must NOT count as would_be_live, otherwise
+    # heal-orphans aborts on perfectly valid queue entries that are only
+    # referenced by old snapshots.
+    #
+    # Dual-form path matching: per quirk r1, `path` can be stored as an
+    # absolute s3:// URI OR a bucket-relative key in either
+    # ducklake_files_scheduled_for_deletion (which feeds _orphans) or
+    # ducklake_data_file. Normalize both sides to absolute form before
+    # comparing so a same-file mismatch in storage form doesn't slip past.
+    total_live_data_files, would_be_live = conn.execute(
         f"""
         WITH orphan_abs AS (
             SELECT CASE WHEN path LIKE 's3://%' THEN path ELSE ? || '/' || path END AS abs_path
             FROM _orphans
         ),
-        data_abs AS (
+        live_data_abs AS (
             SELECT CASE WHEN path LIKE 's3://%' THEN path ELSE ? || '/' || path END AS abs_path
             FROM {METADATA_SCHEMA}.ducklake_data_file
+            WHERE end_snapshot IS NULL
         )
         SELECT
-            (SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_data_file) AS total,
-            (SELECT COUNT(*) FROM data_abs WHERE abs_path IN (SELECT abs_path FROM orphan_abs)) AS would_be_live
+            (SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_data_file
+             WHERE end_snapshot IS NULL) AS total_live,
+            (SELECT COUNT(*) FROM live_data_abs
+             WHERE abs_path IN (SELECT abs_path FROM orphan_abs)) AS would_be_live
         """,
         [data_path, data_path],
     ).fetchone()
-    if total_data_files == 0:
+    if total_live_data_files == 0:
         raise RuntimeError(
-            "heal-orphans safety gate B1 failed: ducklake_data_file is empty. "
-            "Refusing to operate on a vacuous catalog."
+            "heal-orphans safety gate B1 failed: ducklake_data_file has zero "
+            "live rows (end_snapshot IS NULL). Refusing to operate on a "
+            "vacuous catalog."
         )
     if would_be_live > 0:
         raise RuntimeError(
             f"heal-orphans safety gate B1 failed: {would_be_live} of the "
-            f"{n_orphans} 'orphan' paths still appear in ducklake_data_file. "
-            "Aborting — these are not orphans."
+            f"{n_orphans} 'orphan' paths still appear as live rows in "
+            "ducklake_data_file. Aborting — these are not orphans."
         )
 
-    # B3: any positional-delete vector pointing at an orphan id is a hard abort.
-    # The delete-vector table references the data file by data_file_id, so a
-    # match here means the file is still live for vector lookups.
+    # B3: any LIVE positional-delete vector pointing at an orphan id is a hard
+    # abort. The delete-vector table references the data file by
+    # data_file_id, so a match here means the file is still live for vector
+    # lookups. Historical (end_snapshot IS NOT NULL) delete vectors are no
+    # longer live and must not block heal-orphans, mirroring the B1 gate.
     delete_vector_refs = conn.execute(
         f"SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_delete_file "
-        f"WHERE data_file_id IN (SELECT data_file_id FROM _orphans)"
+        f"WHERE end_snapshot IS NULL "
+        f"  AND data_file_id IN (SELECT data_file_id FROM _orphans)"
     ).fetchone()[0]
     if delete_vector_refs > 0:
         raise RuntimeError(
