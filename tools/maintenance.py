@@ -100,8 +100,13 @@ def _positive_int(s: str) -> int:
     return n
 
 
-def connect() -> duckdb.DuckDBPyConnection:
-    """Connect to DuckLake using environment variables."""
+def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
+    """Connect to DuckLake using environment variables.
+
+    debug=True re-enables DuckDB's HTTP logging and the postgres extension's
+    query debug output. Both are off by default because they add per-call
+    overhead that compounds across 30k+ S3 deletes and many catalog reads.
+    """
     conn = duckdb.connect()
 
     # DuckDB defaults to spilling under '.tmp' relative to CWD; in the millpond
@@ -135,7 +140,8 @@ def connect() -> duckdb.DuckDBPyConnection:
     conn.execute("LOAD httpfs")
     conn.execute("LOAD ducklake")
     conn.execute("LOAD postgres")
-    conn.execute("SET pg_debug_show_queries = true")
+    conn.execute(f"SET enable_http_logging = {str(debug).lower()}")
+    conn.execute(f"SET pg_debug_show_queries = {str(debug).lower()}")
 
     rds_host = _require("DUCKLAKE_RDS_HOST")
     rds_port = os.environ.get("DUCKLAKE_RDS_PORT", "5432")
@@ -320,6 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--verbose", action="store_true", help="Debug logging")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable DuckDB HTTP + postgres query debug logging (high overhead; off by default)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -402,7 +413,7 @@ def main(argv: list[str] | None = None) -> None:
     t0 = time.monotonic()
     status = "success"
     conn = None
-    conn = connect()
+    conn = connect(debug=args.debug)
     try:
         match args.command:
             case "expire":
