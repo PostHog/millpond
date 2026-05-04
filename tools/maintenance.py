@@ -413,14 +413,19 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     # ducklake_files_scheduled_for_deletion (which feeds _orphans) or
     # ducklake_data_file. Normalize both sides to absolute form before
     # comparing so a same-file mismatch in storage form doesn't slip past.
+    # Use rtrim(?, '/') so an operator-configured trailing-slash data_path
+    # (e.g. 's3://bucket/lake/data/') doesn't produce '.../data//key.parquet'
+    # that fails to match the absolute form '.../data/key.parquet'.
     total_live_data_files, would_be_live = conn.execute(
         f"""
         WITH orphan_abs AS (
-            SELECT CASE WHEN path LIKE 's3://%' THEN path ELSE ? || '/' || path END AS abs_path
+            SELECT CASE WHEN path LIKE 's3://%' OR path LIKE '/%' THEN path
+                        ELSE rtrim(?, '/') || '/' || path END AS abs_path
             FROM _orphans
         ),
         live_data_abs AS (
-            SELECT CASE WHEN path LIKE 's3://%' THEN path ELSE ? || '/' || path END AS abs_path
+            SELECT CASE WHEN path LIKE 's3://%' OR path LIKE '/%' THEN path
+                        ELSE rtrim(?, '/') || '/' || path END AS abs_path
             FROM {METADATA_SCHEMA}.ducklake_data_file
             WHERE end_snapshot IS NULL
         )

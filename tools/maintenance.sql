@@ -50,20 +50,25 @@ CREATE OR REPLACE TEMP MACRO count_pending_dups() AS (
 -- it more than once in the same session.
 --
 -- Pass the lake's bucket-relative root as `data_path` (e.g.
--- `'s3://bucket/lake/data'`); maintenance.py's `find-orphans` subcommand
--- supplies it from `DUCKLAKE_DATA_PATH` for you.
+-- `'s3://bucket/lake/data'` or `'s3://bucket/lake/data/'`);
+-- maintenance.py's `find-orphans` subcommand supplies it from
+-- `DUCKLAKE_DATA_PATH` for you. We `rtrim(data_path, '/')` everywhere it
+-- appears so an operator-configured trailing slash doesn't produce
+-- `.../data//file.parquet` from the relative-form join (which would
+-- never match an absolute live row and would misclassify a still-live
+-- file as an orphan).
 --
 -- Path-matching tolerates both storage forms (per quirk r1):
 --   * absolute s3:// URI: matches `s.path = l.file` directly
---   * bucket-relative key: matches `l.file = data_path || '/' || s.path`
+--   * bucket-relative key: matches `l.file = rtrim(data_path,'/')||'/'||s.path`
 CREATE OR REPLACE TEMP MACRO find_catalog_orphans(data_path) AS TABLE (
   WITH live AS (
-    SELECT file FROM glob(data_path || '/**/*.parquet')
+    SELECT file FROM glob(rtrim(data_path, '/') || '/**/*.parquet')
   )
   SELECT s.data_file_id, s.path
   FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion s
   LEFT JOIN live l
     ON  s.path = l.file
-     OR l.file = data_path || '/' || s.path
+     OR l.file = rtrim(data_path, '/') || '/' || s.path
   WHERE l.file IS NULL
 );

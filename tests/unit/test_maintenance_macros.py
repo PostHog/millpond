@@ -15,9 +15,8 @@ historical entries.
 import re
 
 import duckdb
-import pytest
-
 import maintenance
+import pytest
 
 
 def _make_stub_lake(con):
@@ -192,6 +191,35 @@ class TestFindCatalogOrphans:
         ).fetchall()
         assert rows == [(1, "a.parquet"), (2, "b.parquet")]
 
+    def test_trailing_slash_in_data_path_no_false_orphan(self, lake_con, data_dir):
+        # `s3://bucket/lake/data/` is a common form. Without rtrim normalization
+        # the relative-form join produces `.../data//live.parquet` and the live
+        # row stored as `.../data/live.parquet` is mis-flagged as an orphan.
+        _touch(data_dir, ["live.parquet"])
+        _seed_queue(lake_con, [(1, str(data_dir / "live.parquet"))])
+        _load_macros(lake_con)
+        # Pass data_dir with a trailing slash.
+        rows = lake_con.execute("SELECT * FROM find_catalog_orphans(?)", [str(data_dir) + "/"]).fetchall()
+        assert rows == [], "trailing-slash data_path must not flag live absolute-form file as orphan"
+
+    def test_trailing_slash_in_data_path_with_relative_form_also_clean(self, lake_con, data_dir):
+        # Same case but the queue stores the relative form. Without rtrim the
+        # join would produce `.../data//live.parquet` which never matches the
+        # glob output `.../data/live.parquet`, again flagging a live file.
+        _touch(data_dir, ["live.parquet"])
+        _seed_queue(lake_con, [(1, "live.parquet")])
+        _load_macros(lake_con)
+        rows = lake_con.execute("SELECT * FROM find_catalog_orphans(?)", [str(data_dir) + "/"]).fetchall()
+        assert rows == [], "trailing-slash data_path must not flag live relative-form file as orphan"
+
+    def test_trailing_slash_still_detects_real_orphan(self, lake_con, data_dir):
+        # Sanity: rtrim normalization must not break orphan detection itself.
+        _touch(data_dir, ["live.parquet"])
+        _seed_queue(lake_con, [(1, "missing.parquet")])
+        _load_macros(lake_con)
+        rows = lake_con.execute("SELECT * FROM find_catalog_orphans(?)", [str(data_dir) + "/"]).fetchall()
+        assert rows == [(1, "missing.parquet")]
+
 
 def _seed_data_files(con, rows):
     """rows: iterable of (data_file_id, path, end_snapshot_or_None)."""
@@ -279,6 +307,26 @@ class TestHealOrphansGates:
         _seed_delete_files(lake_con, [(42, None)])  # live vector
         with pytest.raises(RuntimeError, match="safety gate B3 failed"):
             self._run(lake_con, data_dir, monkeypatch)
+
+    def test_b1_aborts_with_trailing_slash_data_path_when_path_is_live(self, lake_con, data_dir, monkeypatch):
+        # Regression: with DUCKLAKE_DATA_PATH ending in '/', the B1 gate must
+        # still match a relative-form queue path against an absolute-form live
+        # data_file row. Without rtrim normalization, the queue row would
+        # normalize to `.../data//a.parquet` (double slash) and never match
+        # the live absolute path `.../data/a.parquet` — so would_be_live
+        # would stay 0 and heal-orphans would delete a queue entry for a
+        # still-live file.
+        #
+        # Setup: data_dir is empty so find_catalog_orphans (correctly) flags
+        # the relative queue entry as an orphan. data_file has the absolute
+        # form as a live row. The B1 gate must catch the cross-form match.
+        live_abs = str(data_dir / "a.parquet")
+        _seed_queue(lake_con, [(1, "a.parquet")])  # relative
+        _seed_data_files(lake_con, [(1, live_abs, None)])  # live, absolute
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", str(data_dir) + "/")
+        _load_macros(lake_con)
+        with pytest.raises(RuntimeError, match="safety gate B1 failed.*still appear as live"):
+            maintenance.heal_orphans(lake_con, dry_run=True)
 
 
 class TestSchemaConsistency:
