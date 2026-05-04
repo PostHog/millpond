@@ -453,6 +453,34 @@ def cleanup_all_safe(conn: duckdb.DuckDBPyConnection, max_iterations: int) -> No
     )
 
 
+def fsck(conn: duckdb.DuckDBPyConnection, dry_run: bool, max_iterations: int) -> None:
+    """End-to-end "lake catalog is healthy" recipe.
+
+    Runs `cleanup-all-safe` (dedup + heal-orphans + cleanup-all in a loop)
+    followed by `ducklake_delete_orphaned_files` to mop up S3-side orphans
+    from any prior interrupted writes. Tiered compaction is intentionally
+    out of scope for this recipe; run `compact-to-tier-N` separately.
+
+    Dry-run reports the work each step would do without mutating anything.
+    """
+    if dry_run:
+        log.info("fsck dry-run: starting")
+        dups = conn.execute("SELECT count_pending_dups()").fetchone()[0]
+        log.info("fsck dry-run: %d duplicate rows in pending-deletion queue", dups)
+        data_path = _require("DUCKLAKE_DATA_PATH")
+        n_orphans = conn.execute(
+            "SELECT COUNT(*) FROM find_catalog_orphans(?)",
+            [data_path],
+        ).fetchone()[0]
+        log.info("fsck dry-run: %d catalog-side orphan rows", n_orphans)
+        orphans(conn, dry_run=True)
+        log.info("fsck dry-run: done")
+        return
+
+    cleanup_all_safe(conn, max_iterations)
+    orphans(conn, dry_run=False)
+
+
 def find_orphans(conn: duckdb.DuckDBPyConnection) -> None:
     """List catalog rows whose S3 key no longer exists.
 
@@ -676,6 +704,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum dedup/heal/cleanup-all iterations before giving up (default 10)",
     )
 
+    # fsck
+    p = sub.add_parser(
+        "fsck",
+        help="cleanup-all-safe + ducklake_delete_orphaned_files (catalog-healthy end-to-end recipe)",
+    )
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--max-iterations",
+        type=_positive_int,
+        default=10,
+        help="Maximum cleanup-all-safe iterations before giving up (default 10)",
+    )
+
     # orphans
     p = sub.add_parser("orphans", help="Delete orphaned S3 files")
     p.add_argument("--dry-run", action="store_true")
@@ -769,6 +810,8 @@ def main(argv: list[str] | None = None) -> None:
                 heal_orphans(conn, args.dry_run)
             case "cleanup-all-safe":
                 cleanup_all_safe(conn, args.max_iterations)
+            case "fsck":
+                fsck(conn, args.dry_run, args.max_iterations)
             case "orphans":
                 orphans(conn, args.dry_run)
             case "maintain":

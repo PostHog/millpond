@@ -97,6 +97,16 @@ heal-orphans:
 cleanup-all-safe max_iterations="10":
     python {{ maintenance }} cleanup-all-safe --max-iterations {{ max_iterations }}
 
+# Preview fsck (cleanup-all-safe + S3-orphan sweep, dry-run)
+[group('lifecycle')]
+fsck-dry-run:
+    python {{ maintenance }} fsck --dry-run
+
+# Bring the lake catalog to a known-good state end-to-end
+[group('lifecycle')]
+fsck max_iterations="10":
+    python {{ maintenance }} fsck --max-iterations {{ max_iterations }}
+
 # Preview orphaned files
 [group('lifecycle')]
 orphans-dry-run:
