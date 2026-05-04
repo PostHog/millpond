@@ -17,9 +17,39 @@ s3_url_style := env("DUCKDB_S3_URL_STYLE", "vhost")
 s3_use_ssl := env("DUCKDB_S3_USE_SSL", "true")
 data_path := env("DUCKLAKE_DATA_PATH", "")
 
-pg_connstr := "host=" + rds_host + " port=" + rds_port + " dbname=" + rds_db + " user=" + rds_user + " password=" + rds_password
+# Escaping convention for interpolating user-supplied env values into _setup:
+#   * libpq connstring values (dbname/user/password) need libpq-style quoting
+#     when they contain spaces or quotes — wrap in single quotes and double
+#     internal quotes. The whole connstring then gets SQL-escaped because it
+#     is also embedded as a SQL string literal in the ATTACH statement.
+#   * SQL string literals (DATA_PATH, CREATE SECRET fields, SET '...' values)
+#     just need internal single quotes doubled.
+# Without this, a password containing a single quote produces an invalid
+# connection string and a quoted bucket name produces invalid SQL.
 
-_setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD ducklake; LOAD postgres; SET pg_debug_show_queries = true; CREATE OR REPLACE SECRET s3 (TYPE s3, PROVIDER config, KEY_ID '" + s3_key + "', SECRET '" + s3_secret + "', REGION '" + s3_region + "', ENDPOINT '" + s3_endpoint + "', URL_STYLE '" + s3_url_style + "', USE_SSL " + s3_use_ssl + "); ATTACH 'postgres:" + pg_connstr + "' AS lake (TYPE ducklake, DATA_PATH '" + data_path + "'); ATTACH '" + pg_connstr + "' AS pg (TYPE postgres); USE lake;"
+_rds_db_pq := "'" + replace(rds_db, "'", "''") + "'"
+_rds_user_pq := "'" + replace(rds_user, "'", "''") + "'"
+_rds_password_pq := "'" + replace(rds_password, "'", "''") + "'"
+_pg_connstr := "host=" + rds_host + " port=" + rds_port + " dbname=" + _rds_db_pq + " user=" + _rds_user_pq + " password=" + _rds_password_pq
+_pg_connstr_sql := replace(_pg_connstr, "'", "''")
+
+_data_path_sql := replace(data_path, "'", "''")
+_s3_key_sql := replace(s3_key, "'", "''")
+_s3_secret_sql := replace(s3_secret, "'", "''")
+_s3_region_sql := replace(s3_region, "'", "''")
+_s3_endpoint_sql := replace(s3_endpoint, "'", "''")
+_s3_url_style_sql := replace(s3_url_style, "'", "''")
+
+# _setup mirrors what maintenance.py's connect() does so `just shell` ends up
+# with the same wired-up session as a maintenance subcommand:
+#   * temp_directory points at the writable emptyDir in the cron pod (the
+#     image rootfs is read-only, so the duckdb default `.tmp` would crash on
+#     any spill).
+#   * Both the legacy SET s3_* settings (honored by the ducklake catalog
+#     driver in 1.4) and the modern CREATE SECRET (required by ad-hoc httpfs
+#     ops like glob() and read_parquet()) are configured.
+
+_setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD ducklake; LOAD postgres; SET temp_directory = '/tmp/duckdb_spill'; SET pg_debug_show_queries = true; SET s3_region = '" + _s3_region_sql + "'; SET s3_endpoint = '" + _s3_endpoint_sql + "'; SET s3_access_key_id = '" + _s3_key_sql + "'; SET s3_secret_access_key = '" + _s3_secret_sql + "'; SET s3_use_ssl = '" + s3_use_ssl + "'; SET s3_url_style = '" + _s3_url_style_sql + "'; CREATE OR REPLACE SECRET s3 (TYPE s3, PROVIDER config, KEY_ID '" + _s3_key_sql + "', SECRET '" + _s3_secret_sql + "', REGION '" + _s3_region_sql + "', ENDPOINT '" + _s3_endpoint_sql + "', URL_STYLE '" + _s3_url_style_sql + "', USE_SSL " + s3_use_ssl + "); ATTACH 'postgres:" + _pg_connstr_sql + "' AS lake (TYPE ducklake, DATA_PATH '" + _data_path_sql + "'); ATTACH '" + _pg_connstr_sql + "' AS pg (TYPE postgres); USE lake;"
 
 maintenance := env("MAINTENANCE_SCRIPT", "/app/tools/maintenance.py")
 maintenance_sql := env("MAINTENANCE_SQL", "/app/tools/maintenance.sql")
