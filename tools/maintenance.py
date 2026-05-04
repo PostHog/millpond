@@ -104,9 +104,16 @@ def _require(name: str) -> str:
 
 
 def _escape_libpq(value: str | None) -> str:
+    """Escape a value for a libpq connection string.
+
+    Wraps in single quotes and backslash-escapes internal single quotes and
+    backslashes, per the libpq connstring grammar (NOT the Postgres SQL
+    parser's grammar — they're different parsers with different rules).
+    """
     if value is None:
         return "''"
-    return "'" + value.replace("'", "''") + "'"
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
 
 
 def _sanitize_setting_value(val: str) -> str:

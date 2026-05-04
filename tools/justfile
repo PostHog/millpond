@@ -17,19 +17,26 @@ s3_url_style := env("DUCKDB_S3_URL_STYLE", "vhost")
 s3_use_ssl := env("DUCKDB_S3_USE_SSL", "true")
 data_path := env("DUCKLAKE_DATA_PATH", "")
 
-# Escaping convention for interpolating user-supplied env values into _setup:
-#   * libpq connstring values (dbname/user/password) need libpq-style quoting
-#     when they contain spaces or quotes — wrap in single quotes and double
-#     internal quotes. The whole connstring then gets SQL-escaped because it
-#     is also embedded as a SQL string literal in the ATTACH statement.
-#   * SQL string literals (DATA_PATH, CREATE SECRET fields, SET '...' values)
-#     just need internal single quotes doubled.
-# Without this, a password containing a single quote produces an invalid
-# connection string and a quoted bucket name produces invalid SQL.
+# Two-layer escaping for the connstring that lands inside an ATTACH SQL literal:
+#
+#   1. libpq connstring grammar (the inner layer the duckdb postgres extension
+#      passes to libpq) — wrap value in single quotes, backslash-escape
+#      embedded `\` and `'`. NOT SQL-style `''` doubling — libpq's connstring
+#      parser is a different grammar from the Postgres SQL parser and only
+#      understands backslash escapes.
+#      https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
+#
+#   2. Postgres SQL string-literal grammar (the outer layer applied because
+#      the whole connstring is wrapped in `ATTACH '...'`) — replace every `'`
+#      with `''`. Backslashes pass through unchanged.
+#
+# Without layer 1, a password containing a single quote produces an invalid
+# libpq connstring (closes the value early). Without layer 2, the same value
+# breaks out of the wrapping ATTACH literal. Apply them in order.
 
-_rds_db_pq := "'" + replace(rds_db, "'", "''") + "'"
-_rds_user_pq := "'" + replace(rds_user, "'", "''") + "'"
-_rds_password_pq := "'" + replace(rds_password, "'", "''") + "'"
+_rds_db_pq := "'" + replace(replace(rds_db, "\\", "\\\\"), "'", "\\'") + "'"
+_rds_user_pq := "'" + replace(replace(rds_user, "\\", "\\\\"), "'", "\\'") + "'"
+_rds_password_pq := "'" + replace(replace(rds_password, "\\", "\\\\"), "'", "\\'") + "'"
 _pg_connstr := "host=" + rds_host + " port=" + rds_port + " dbname=" + _rds_db_pq + " user=" + _rds_user_pq + " password=" + _rds_password_pq
 _pg_connstr_sql := replace(_pg_connstr, "'", "''")
 
