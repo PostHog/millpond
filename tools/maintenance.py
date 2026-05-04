@@ -259,11 +259,38 @@ def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
         log.info("target_file_size restored to %s", DEFAULT_TARGET_FILE_SIZE)
 
 
+def _set_compaction_tuning(conn: duckdb.DuckDBPyConnection, threads: int, memory_limit: str) -> None:
+    """Bound DuckDB resource use for compaction.
+
+    Defaults are conservative to keep ducklake_merge_adjacent_files within a
+    cron pod's memory limit: empirically the merge plan still over-uses memory
+    relative to a pure streaming op (see DuckLake bug c8), so 2 threads / 4 GB
+    is the safe floor that succeeded where 12 threads / 20 GB OOMKilled.
+    Operators can raise via --threads / --memory-limit when the lake fits.
+    """
+    _sanitize_setting_value(memory_limit)
+    conn.execute(f"SET threads = {threads}")
+    conn.execute(f"SET memory_limit = '{memory_limit}'")
+    # Skip the implicit sort to preserve insert order; not needed for a merge
+    # that already orders by (begin_snapshot, row_id_start, data_file_id).
+    conn.execute("SET preserve_insertion_order = false")
+    # Default 30s is too tight for the multi-MB GETs/PUTs that compaction
+    # drives; 10 min covers the worst-case S3 hiccup without livelocking.
+    conn.execute("SET http_timeout = 600000")
+    log.info(
+        "compaction tuning: threads=%d memory_limit=%s preserve_insertion_order=false http_timeout=600000ms",
+        threads,
+        memory_limit,
+    )
+
+
 def compact(
     conn: duckdb.DuckDBPyConnection,
     tier: int,
     table: str | None,
     dry_run: bool,
+    threads: int,
+    memory_limit: str,
 ) -> None:
     """Compact files in tier N (1, 2, or 3) for the catalog or one table."""
     spec = TIERS[tier]
@@ -313,6 +340,7 @@ def compact(
     else:
         sql = f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', {', '.join(args)})"
 
+    _set_compaction_tuning(conn, threads, memory_limit)
     with _scoped_target_file_size(conn, target):
         result = conn.execute(sql).fetchall()
     for row in result:
@@ -377,6 +405,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tier", type=int, choices=[1, 2, 3], required=True)
     p.add_argument("--table", default="", help="Limit to one table; empty = catalog-wide")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--threads",
+        type=_positive_int,
+        default=2,
+        help="DuckDB threads during the merge (default 2; raise cautiously, see DuckLake bug c8)",
+    )
+    p.add_argument(
+        "--memory-limit",
+        default="4GB",
+        help="DuckDB memory_limit during the merge (default 4GB)",
+    )
 
     # compact-probe
     p = sub.add_parser("compact-probe", help="Probe: merge a few adjacent files in one table")
@@ -441,7 +480,7 @@ def main(argv: list[str] | None = None) -> None:
             case "checkpoint":
                 checkpoint(conn)
             case "compact":
-                compact(conn, args.tier, args.table or None, args.dry_run)
+                compact(conn, args.tier, args.table or None, args.dry_run, args.threads, args.memory_limit)
             case "compact-probe":
                 compact_probe(conn, args.table, args.max_compacted_files)
     except Exception:
