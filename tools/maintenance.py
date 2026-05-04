@@ -356,9 +356,14 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
 
     Five-step gated procedure (addresses lead-QE punch list B1/B2/B3/H1/H4):
 
-      1. Take the advisory lock.
+      1. Take the advisory lock (skipped on --dry-run since nothing
+         mutates and the dry-run output is informational only).
       2. Materialize the orphan set into a TEMP TABLE so subsequent
          safety gates and the final DELETE all see the same snapshot.
+         Done under the lock so the snapshot is stable for the whole
+         procedure — without this ordering another maintenance
+         invocation could change ducklake_files_scheduled_for_deletion
+         between scan and DELETE, invalidating the gates.
       3. Safety gate B1: prove `ducklake_data_file` is non-empty AND that
          none of the orphan paths are referenced as live data files. A
          vacuous pass (gate succeeds because the lake is empty) is not
@@ -371,6 +376,9 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     """
     data_path = _require("DUCKLAKE_DATA_PATH")
     log.info("heal-orphans: scanning for catalog-side orphans (dry_run=%s)", dry_run)
+
+    if not dry_run:
+        _acquire_advisory_lock(conn)
 
     conn.execute(
         "CREATE OR REPLACE TEMP TABLE _orphans AS "
@@ -421,11 +429,10 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     if dry_run:
         return
 
-    _acquire_advisory_lock(conn)
-    # Materialize the path list out of the temp table and ship it as a single
-    # DELETE through postgres_execute. The duckdb postgres extension
-    # autocommits per statement, so this one DELETE is atomic at the upstream
-    # Postgres layer (per quirk r4).
+    # Lock already held from step 1; materialize the path list out of the temp
+    # table and ship it as a single DELETE through postgres_execute. The duckdb
+    # postgres extension autocommits per statement, so this one DELETE is
+    # atomic at the upstream Postgres layer (per quirk r4).
     paths = [row[0] for row in conn.execute("SELECT path FROM _orphans").fetchall()]
     path_list = ", ".join(_sql_string_literal(p) for p in paths)
     delete_sql = (
