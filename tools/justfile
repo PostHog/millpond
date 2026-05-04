@@ -17,6 +17,15 @@ s3_url_style := env("DUCKDB_S3_URL_STYLE", "vhost")
 s3_use_ssl := env("DUCKDB_S3_USE_SSL", "true")
 data_path := env("DUCKLAKE_DATA_PATH", "")
 
+# DUCKDB_S3_USE_SSL must be a literal SQL boolean — it's interpolated into
+# both `SET s3_use_ssl = '<value>'` (a SQL string literal) and into
+# `CREATE OR REPLACE SECRET ... USE_SSL <value>` (an UNQUOTED bool, where
+# even a single quote in the env value would be raw SQL injection). Strict
+# whitelist beats per-context escaping here. maintenance.py applies an
+# equivalent check via `_sanitize_setting_value`; this is the just-side
+# equivalent.
+_s3_use_ssl_validated := if s3_use_ssl == "true" { "true" } else if s3_use_ssl == "false" { "false" } else { error("DUCKDB_S3_USE_SSL must be 'true' or 'false', got: " + s3_use_ssl) }
+
 # Two-layer escaping for the connstring that lands inside an ATTACH SQL literal:
 #
 #   1. libpq connstring grammar (the inner layer the duckdb postgres extension
@@ -56,7 +65,7 @@ _s3_url_style_sql := replace(s3_url_style, "'", "''")
 #     driver in 1.4) and the modern CREATE SECRET (required by ad-hoc httpfs
 #     ops like glob() and read_parquet()) are configured.
 
-_setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD ducklake; LOAD postgres; SET temp_directory = '/tmp/duckdb_spill'; SET enable_http_logging = false; SET pg_debug_show_queries = false; SET s3_region = '" + _s3_region_sql + "'; SET s3_endpoint = '" + _s3_endpoint_sql + "'; SET s3_access_key_id = '" + _s3_key_sql + "'; SET s3_secret_access_key = '" + _s3_secret_sql + "'; SET s3_use_ssl = '" + s3_use_ssl + "'; SET s3_url_style = '" + _s3_url_style_sql + "'; CREATE OR REPLACE SECRET s3 (TYPE s3, PROVIDER config, KEY_ID '" + _s3_key_sql + "', SECRET '" + _s3_secret_sql + "', REGION '" + _s3_region_sql + "', ENDPOINT '" + _s3_endpoint_sql + "', URL_STYLE '" + _s3_url_style_sql + "', USE_SSL " + s3_use_ssl + "); ATTACH 'postgres:" + _pg_connstr_sql + "' AS lake (TYPE ducklake, DATA_PATH '" + _data_path_sql + "'); ATTACH '" + _pg_connstr_sql + "' AS pg (TYPE postgres); USE lake;"
+_setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD ducklake; LOAD postgres; SET temp_directory = '/tmp/duckdb_spill'; SET enable_http_logging = false; SET pg_debug_show_queries = false; SET s3_region = '" + _s3_region_sql + "'; SET s3_endpoint = '" + _s3_endpoint_sql + "'; SET s3_access_key_id = '" + _s3_key_sql + "'; SET s3_secret_access_key = '" + _s3_secret_sql + "'; SET s3_use_ssl = " + _s3_use_ssl_validated + "; SET s3_url_style = '" + _s3_url_style_sql + "'; CREATE OR REPLACE SECRET s3 (TYPE s3, PROVIDER config, KEY_ID '" + _s3_key_sql + "', SECRET '" + _s3_secret_sql + "', REGION '" + _s3_region_sql + "', ENDPOINT '" + _s3_endpoint_sql + "', URL_STYLE '" + _s3_url_style_sql + "', USE_SSL " + _s3_use_ssl_validated + "); ATTACH 'postgres:" + _pg_connstr_sql + "' AS lake (TYPE ducklake, DATA_PATH '" + _data_path_sql + "'); ATTACH '" + _pg_connstr_sql + "' AS pg (TYPE postgres); USE lake;"
 
 maintenance := env("MAINTENANCE_SCRIPT", "/app/tools/maintenance.py")
 maintenance_sql := env("MAINTENANCE_SQL", "/app/tools/maintenance.sql")

@@ -253,30 +253,36 @@ def _scheduled_for_deletion_count(conn: duckdb.DuckDBPyConnection) -> int:
     return conn.execute(f"SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion").fetchone()[0]
 
 
-def _log_cleanup_throughput(operation: str, before: int, after: int, elapsed_s: float) -> None:
+def _log_cleanup_throughput(
+    operation: str,
+    files_processed: int,
+    elapsed_s: float,
+    queue_depth_after: int,
+) -> None:
     """Emit one structured line with cleanup throughput stats.
 
-    Single line, key=value pairs, grep-friendly. The before/after queue depths
-    let an operator distinguish "cleanup processed N files" from "cleanup
-    drained the whole queue" without re-running the count query manually.
+    Single line, key=value pairs, grep-friendly. ``files_processed`` is taken
+    directly from the count of rows ``ducklake_cleanup_old_files`` returned
+    rather than from a queue-depth delta — the delta is wrong if any other
+    writer enqueues deletions during the call (and the maintenance advisory
+    lock by design only mutexes maintenance invocations, not arbitrary
+    writers). ``queue_depth_after`` gives a "how much remains" signal but
+    isn't used in the rate.
     """
-    processed = before - after
-    rate = processed / elapsed_s if elapsed_s > 0 else 0.0
+    rate = files_processed / elapsed_s if elapsed_s > 0 else 0.0
     log.info(
-        "%s throughput: files_processed=%d queue_depth_before=%d queue_depth_after=%d elapsed_s=%.1f rate_obj_s=%.1f",
+        "%s throughput: files_processed=%d elapsed_s=%.1f rate_obj_s=%.1f queue_depth_after=%d",
         operation,
-        processed,
-        before,
-        after,
+        files_processed,
         elapsed_s,
         rate,
+        queue_depth_after,
     )
 
 
 def cleanup(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
     """Delete files scheduled for deletion older than N days."""
     log.info("Cleaning up files older than %d days (dry_run=%s)", days, dry_run)
-    before = _scheduled_for_deletion_count(conn)
     t0 = time.monotonic()
     result = conn.execute(
         f"CALL ducklake_cleanup_old_files('{ATTACH_NAME}', "
@@ -286,8 +292,12 @@ def cleanup(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
     elapsed = time.monotonic() - t0
     for row in result:
         log.info("cleanup: %s", row)
-    after = _scheduled_for_deletion_count(conn)
-    _log_cleanup_throughput("cleanup", before, after, elapsed)
+    if not dry_run:
+        # Skip throughput log on dry_run: ducklake_cleanup_old_files returns the
+        # would-be-deleted rows in dry-run mode, so len(result) is the preview
+        # count, not actually-processed work — claiming a rate from that would
+        # be misleading.
+        _log_cleanup_throughput("cleanup", len(result), elapsed, _scheduled_for_deletion_count(conn))
 
 
 def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
@@ -296,14 +306,12 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         log.info("cleanup-all has no dry-run mode; skipping")
         return
     log.info("Cleaning up all files scheduled for deletion")
-    before = _scheduled_for_deletion_count(conn)
     t0 = time.monotonic()
     result = conn.execute(f"CALL ducklake_cleanup_old_files('{ATTACH_NAME}', cleanup_all => true)").fetchall()
     elapsed = time.monotonic() - t0
     for row in result:
         log.info("cleanup-all: %s", row)
-    after = _scheduled_for_deletion_count(conn)
-    _log_cleanup_throughput("cleanup-all", before, after, elapsed)
+    _log_cleanup_throughput("cleanup-all", len(result), elapsed, _scheduled_for_deletion_count(conn))
 
 
 def _sql_string_literal(s: str) -> str:
@@ -359,6 +367,40 @@ def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     log.info("dedup-deletions: queue now has %d duplicate rows", after)
 
 
+def _heal_orphans_b1_counts(conn: duckdb.DuckDBPyConnection, data_path: str) -> tuple[int, int]:
+    """Run heal-orphans's B1 gate counts against an already-populated _orphans.
+
+    Returns ``(total_live_data_files, would_be_live)``. Filters
+    ducklake_data_file to live rows (``end_snapshot IS NULL``) and normalizes
+    both sides to absolute form so cross-table mismatches in storage form
+    don't slip past the gate. Extracted from heal_orphans so production and
+    tests share the same query — without this, regressions to the
+    ``LIKE 's3://%' OR LIKE '/%'`` branch silently slip past test fixtures
+    that only use one or the other.
+    """
+    return conn.execute(
+        f"""
+        WITH orphan_abs AS (
+            SELECT CASE WHEN path LIKE 's3://%' OR path LIKE '/%' THEN path
+                        ELSE rtrim(?, '/') || '/' || path END AS abs_path
+            FROM _orphans
+        ),
+        live_data_abs AS (
+            SELECT CASE WHEN path LIKE 's3://%' OR path LIKE '/%' THEN path
+                        ELSE rtrim(?, '/') || '/' || path END AS abs_path
+            FROM {METADATA_SCHEMA}.ducklake_data_file
+            WHERE end_snapshot IS NULL
+        )
+        SELECT
+            (SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_data_file
+             WHERE end_snapshot IS NULL) AS total_live,
+            (SELECT COUNT(*) FROM live_data_abs
+             WHERE abs_path IN (SELECT abs_path FROM orphan_abs)) AS would_be_live
+        """,
+        [data_path, data_path],
+    ).fetchone()
+
+
 def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     """Delete catalog rows whose S3 key no longer exists.
 
@@ -398,45 +440,9 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     if n_orphans == 0:
         return
 
-    # B1: positive-proof gate. Both clauses must hold.
-    #
-    # Live filter: `end_snapshot IS NULL` is DuckLake's marker for current
-    # rows in ducklake_data_file (the same filter the compact subcommand
-    # uses to find compaction candidates). Historical rows whose
-    # end_snapshot is set are no longer live; an "orphan" path appearing
-    # only in historical rows must NOT count as would_be_live, otherwise
-    # heal-orphans aborts on perfectly valid queue entries that are only
-    # referenced by old snapshots.
-    #
-    # Dual-form path matching: per quirk r1, `path` can be stored as an
-    # absolute s3:// URI OR a bucket-relative key in either
-    # ducklake_files_scheduled_for_deletion (which feeds _orphans) or
-    # ducklake_data_file. Normalize both sides to absolute form before
-    # comparing so a same-file mismatch in storage form doesn't slip past.
-    # Use rtrim(?, '/') so an operator-configured trailing-slash data_path
-    # (e.g. 's3://bucket/lake/data/') doesn't produce '.../data//key.parquet'
-    # that fails to match the absolute form '.../data/key.parquet'.
-    total_live_data_files, would_be_live = conn.execute(
-        f"""
-        WITH orphan_abs AS (
-            SELECT CASE WHEN path LIKE 's3://%' OR path LIKE '/%' THEN path
-                        ELSE rtrim(?, '/') || '/' || path END AS abs_path
-            FROM _orphans
-        ),
-        live_data_abs AS (
-            SELECT CASE WHEN path LIKE 's3://%' OR path LIKE '/%' THEN path
-                        ELSE rtrim(?, '/') || '/' || path END AS abs_path
-            FROM {METADATA_SCHEMA}.ducklake_data_file
-            WHERE end_snapshot IS NULL
-        )
-        SELECT
-            (SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_data_file
-             WHERE end_snapshot IS NULL) AS total_live,
-            (SELECT COUNT(*) FROM live_data_abs
-             WHERE abs_path IN (SELECT abs_path FROM orphan_abs)) AS would_be_live
-        """,
-        [data_path, data_path],
-    ).fetchone()
+    # B1: positive-proof gate. Both clauses must hold. The query lives in
+    # _heal_orphans_b1_counts so production and tests share one source.
+    total_live_data_files, would_be_live = _heal_orphans_b1_counts(conn, data_path)
     if total_live_data_files == 0:
         raise RuntimeError(
             "heal-orphans safety gate B1 failed: ducklake_data_file has zero "

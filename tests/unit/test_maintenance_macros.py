@@ -329,6 +329,74 @@ class TestHealOrphansGates:
             maintenance.heal_orphans(lake_con, dry_run=True)
 
 
+class TestB1GateS3Paths:
+    """Direct tests of _heal_orphans_b1_counts with literal s3:// URIs.
+
+    The macro and gate tests above use local-filesystem paths because real
+    S3 access is out of scope for unit tests; that means the
+    ``LIKE 's3://%'`` branch of the gate's CASE expression was untested.
+    These tests populate the stub schema with literal s3:// paths and call
+    the helper directly so a regression to the s3:// branch fails here.
+    """
+
+    def _populate_orphans(self, lake_con, rows):
+        """Manually create the _orphans temp table that heal-orphans builds
+        from find_catalog_orphans. Lets us test the gate query without
+        invoking the macro (which would require a real S3 LIST)."""
+        lake_con.execute("CREATE OR REPLACE TEMP TABLE _orphans (data_file_id BIGINT, path VARCHAR)")
+        lake_con.executemany("INSERT INTO _orphans VALUES (?, ?)", rows)
+
+    def test_s3_absolute_match_caught_by_b1(self, lake_con):
+        # Both queue and data_file store the s3:// absolute form. The gate's
+        # `LIKE 's3://%'` branch must short-circuit normalization on both
+        # sides and recognize the same file.
+        self._populate_orphans(lake_con, [(1, "s3://bucket/lake/data/a.parquet")])
+        _seed_data_files(lake_con, [(1, "s3://bucket/lake/data/a.parquet", None)])
+        total_live, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
+        assert total_live == 1
+        assert would_be_live == 1
+
+    def test_s3_relative_queue_vs_s3_absolute_data_file(self, lake_con):
+        # Queue stores the data_path-relative form (just the key, e.g.
+        # 'a.parquet'); data_file stores the s3:// form. B1 must normalize
+        # the queue side to s3:// and match. The relative form is relative
+        # to ``data_path`` (the lake root), not to the bucket — that's what
+        # we observed in the canary: with DUCKLAKE_DATA_PATH=s3://b/data
+        # the queue stores keys like 'main/events/.../X.parquet'.
+        self._populate_orphans(lake_con, [(1, "a.parquet")])
+        _seed_data_files(lake_con, [(1, "s3://bucket/lake/data/a.parquet", None)])
+        _, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
+        assert would_be_live == 1, "s3 absolute live row must match relative-queue orphan after normalization"
+
+    def test_s3_absolute_queue_vs_s3_relative_data_file(self, lake_con):
+        # Symmetric: queue absolute, data_file relative.
+        self._populate_orphans(lake_con, [(1, "s3://bucket/lake/data/a.parquet")])
+        _seed_data_files(lake_con, [(1, "a.parquet", None)])
+        _, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
+        assert would_be_live == 1
+
+    def test_s3_with_trailing_slash_still_matches(self, lake_con):
+        self._populate_orphans(lake_con, [(1, "a.parquet")])
+        _seed_data_files(lake_con, [(1, "s3://bucket/lake/data/a.parquet", None)])
+        _, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data/")
+        assert would_be_live == 1, "trailing-slash data_path on s3:// must not produce double-slash mismatch"
+
+    def test_s3_expired_data_file_does_not_block(self, lake_con):
+        # data_file has the matching path but it's expired (end_snapshot != NULL).
+        # B1 must NOT count it as live.
+        self._populate_orphans(lake_con, [(1, "s3://bucket/lake/data/a.parquet")])
+        _seed_data_files(
+            lake_con,
+            [
+                (1, "s3://bucket/lake/data/a.parquet", 100),  # expired match
+                (2, "s3://bucket/lake/data/live.parquet", None),  # live, different
+            ],
+        )
+        total_live, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
+        assert total_live == 1
+        assert would_be_live == 0, "expired s3:// row must not block heal-orphans"
+
+
 class TestSchemaConsistency:
     def test_macros_match_metadata_schema_constant(self):
         """The .sql file hardcodes `__ducklake_metadata_lake` (verbatim load

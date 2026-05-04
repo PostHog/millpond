@@ -70,29 +70,39 @@ class TestBytesToHuman:
 
 
 class TestLogCleanupThroughput:
+    """The throughput line is keyed off ``files_processed`` (rows the
+    operation actually returned) rather than a queue-depth delta — concurrent
+    writers can change the queue mid-run, making any delta misleading or
+    even negative."""
+
     def test_typical(self, caplog):
         with caplog.at_level(logging.INFO, logger="maintenance"):
-            maintenance._log_cleanup_throughput("cleanup-all", 1000, 950, 10.0)
+            maintenance._log_cleanup_throughput(
+                "cleanup-all", files_processed=50, elapsed_s=10.0, queue_depth_after=950
+            )
         msg = caplog.records[0].getMessage()
         assert "cleanup-all throughput" in msg
         assert "files_processed=50" in msg
-        assert "queue_depth_before=1000" in msg
-        assert "queue_depth_after=950" in msg
         assert "elapsed_s=10.0" in msg
         assert "rate_obj_s=5.0" in msg
+        assert "queue_depth_after=950" in msg
+        # No before-snapshot in the new shape — explicit assertion that the
+        # racy field is gone, in case anyone re-introduces it.
+        assert "queue_depth_before" not in msg
 
     def test_zero_elapsed_does_not_divide_by_zero(self, caplog):
         with caplog.at_level(logging.INFO, logger="maintenance"):
-            maintenance._log_cleanup_throughput("cleanup", 0, 0, 0.0)
+            maintenance._log_cleanup_throughput("cleanup", 0, 0.0, 0)
         msg = caplog.records[0].getMessage()
         assert "rate_obj_s=0.0" in msg
 
     def test_full_drain(self, caplog):
         with caplog.at_level(logging.INFO, logger="maintenance"):
-            maintenance._log_cleanup_throughput("cleanup-all", 47023, 0, 9405.0)
+            maintenance._log_cleanup_throughput("cleanup-all", 47023, 9405.0, 0)
         msg = caplog.records[0].getMessage()
         assert "files_processed=47023" in msg
         assert "rate_obj_s=5.0" in msg
+        assert "queue_depth_after=0" in msg
 
 
 class TestArgparse:
