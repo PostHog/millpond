@@ -491,18 +491,15 @@ def fsck(conn: duckdb.DuckDBPyConnection, dry_run: bool, max_iterations: int) ->
     from any prior interrupted writes. Tiered compaction is intentionally
     out of scope for this recipe; run `compact-to-tier-N` separately.
 
-    Dry-run reports the work each step would do without mutating anything.
+    Dry-run delegates to the dry-run forms of each step rather than counting
+    queue rows manually, so the B1/B3 safety gates inside heal-orphans
+    actually run. A real fsck that would abort because of a failed gate
+    aborts the dry-run too — operators see the same outcome.
     """
     if dry_run:
         log.info("fsck dry-run: starting")
-        dups = conn.execute("SELECT count_pending_dups()").fetchone()[0]
-        log.info("fsck dry-run: %d duplicate rows in pending-deletion queue", dups)
-        data_path = _require("DUCKLAKE_DATA_PATH")
-        n_orphans = conn.execute(
-            "SELECT COUNT(*) FROM find_catalog_orphans(?)",
-            [data_path],
-        ).fetchone()[0]
-        log.info("fsck dry-run: %d catalog-side orphan rows", n_orphans)
+        dedup_deletions(conn, dry_run=True)
+        heal_orphans(conn, dry_run=True)
         orphans(conn, dry_run=True)
         log.info("fsck dry-run: done")
         return
