@@ -78,6 +78,13 @@ PG_ATTACH_NAME = "pg"
 # Companion SQL file: header conventions plus runtime-loadable macros.
 MAINTENANCE_SQL_PATH = Path(__file__).resolve().parent / "maintenance.sql"
 
+# Stable identifier for `pg_try_advisory_lock`. The lock guards mutual
+# exclusion *between maintenance invocations*: it is held by the `pg`
+# ATTACH connection, not by the catalog connection DuckLake uses
+# internally for ducklake_* function calls, so it does NOT serialize
+# against arbitrary other writers (e.g. the millpond ingest pods).
+ADVISORY_LOCK_KEY_SQL = "hashtext('millpond-ducklake-maintenance')::bigint"
+
 
 def _setup_logging(verbose: bool = False) -> None:
     level = "DEBUG" if verbose else os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -268,6 +275,27 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     _log_cleanup_throughput("cleanup-all", before, after, elapsed)
 
 
+def _acquire_advisory_lock(conn: duckdb.DuckDBPyConnection) -> None:
+    """Take the maintenance advisory lock or raise if another session holds it.
+
+    The lock is taken on the `pg` ATTACH and released automatically when that
+    connection closes (including on crash); no explicit release needed for
+    single-subcommand invocations. Any subcommand that mutates the catalog
+    should call this before doing so.
+    """
+    inner_sql = f"SELECT pg_try_advisory_lock({ADVISORY_LOCK_KEY_SQL}) AS acquired"
+    held = conn.execute(
+        f"SELECT acquired FROM postgres_query('{PG_ATTACH_NAME}', '{inner_sql}')"
+    ).fetchone()[0]
+    if not held:
+        raise RuntimeError(
+            "Another maintenance session is holding the advisory lock; aborting. "
+            "If you're sure no other invocation is running, the previous holder's "
+            "connection may not have closed cleanly — wait a few seconds and retry."
+        )
+    log.info("Acquired advisory lock %s", ADVISORY_LOCK_KEY_SQL)
+
+
 def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     """Drop duplicate rows from ducklake_files_scheduled_for_deletion.
 
@@ -283,6 +311,7 @@ def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     log.info("dedup-deletions: %d duplicate rows in queue (dry_run=%s)", dups, dry_run)
     if dry_run or dups == 0:
         return
+    _acquire_advisory_lock(conn)
     delete_sql = (
         f"DELETE FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion "
         f"WHERE ctid NOT IN ("
