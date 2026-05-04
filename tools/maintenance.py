@@ -176,7 +176,8 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     s3_key = os.environ.get("DUCKDB_S3_ACCESS_KEY_ID", "")
     s3_secret = os.environ.get("DUCKDB_S3_SECRET_ACCESS_KEY", "")
     for v in (s3_endpoint_val, s3_use_ssl_val, s3_url_style_val, s3_key, s3_secret, s3_region):
-        _sanitize_setting_value(v) if v else None
+        if v:
+            _sanitize_setting_value(v)
     conn.execute(
         f"CREATE OR REPLACE SECRET s3 ("
         f"TYPE s3, PROVIDER config, "
@@ -610,17 +611,24 @@ def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
         f"SELECT value FROM ducklake_options('{ATTACH_NAME}') "
         f"WHERE option_name = 'target_file_size' AND scope = 'GLOBAL'"
     ).fetchone()
-    if prior_row and prior_row[0]:
-        restore = _bytes_to_human(prior_row[0]) or DEFAULT_TARGET_FILE_SIZE
-        if restore == DEFAULT_TARGET_FILE_SIZE:
+    # Distinguish three cases so we only warn on a genuine conversion failure
+    # (a prior GLOBAL value of 134217728 converts to '128MiB' which equals
+    # DEFAULT_TARGET_FILE_SIZE — without this distinction we'd emit a noisy
+    # warning on every compaction in a healthy default install).
+    if prior_row is None or not prior_row[0]:
+        restore = DEFAULT_TARGET_FILE_SIZE
+    else:
+        converted = _bytes_to_human(prior_row[0])
+        if converted is None:
             log.warning(
                 "target_file_size GLOBAL value %r could not be converted to a "
                 "units-suffixed form; falling back to %s on restore",
                 prior_row[0],
                 DEFAULT_TARGET_FILE_SIZE,
             )
-    else:
-        restore = DEFAULT_TARGET_FILE_SIZE
+            restore = DEFAULT_TARGET_FILE_SIZE
+        else:
+            restore = converted
     _sanitize_setting_value(restore)
     conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{value}')")
     try:

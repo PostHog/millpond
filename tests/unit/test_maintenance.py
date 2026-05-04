@@ -282,6 +282,78 @@ class TestSetCompactionTuning:
         conn.execute.assert_not_called()
 
 
+class TestScopedTargetFileSize:
+    """Read-and-restore round-trip for target_file_size; warns only on real failure."""
+
+    def _conn(self, prior_value):
+        """A duckdb-conn shaped MagicMock that returns ``prior_value`` from the
+        ducklake_options read and accepts the ducklake_set_option calls."""
+        conn = MagicMock()
+        # Each conn.execute() returns a result object whose fetchone() is
+        # configured per call. We only care about the first fetchone (the
+        # ducklake_options read); the set_option CALLs return result objects
+        # that are never .fetchone()'d.
+        result = MagicMock()
+        result.fetchone.return_value = (prior_value,) if prior_value is not None else None
+        conn.execute.return_value = result
+        return conn
+
+    def test_no_warning_when_prior_converts_cleanly_to_default(self, caplog):
+        # 134217728 bytes == 128 MiB == DEFAULT_TARGET_FILE_SIZE. The conversion
+        # succeeded; the warning must NOT fire just because the converted form
+        # equals the default — that's a healthy install, not a failure.
+        conn = self._conn("134217728")
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            with maintenance._scoped_target_file_size(conn, "5MiB"):
+                pass
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [], "no warning expected on a clean default-value round-trip"
+
+    def test_no_warning_when_prior_converts_cleanly_to_non_default(self, caplog):
+        # 64 MiB — operator value, not the default.
+        conn = self._conn("67108864")
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            with maintenance._scoped_target_file_size(conn, "5MiB"):
+                pass
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_warning_when_conversion_fails(self, caplog):
+        # 12345678 isn't a clean power of 1024; _bytes_to_human returns None,
+        # and we genuinely lose the operator's value — that's the case where
+        # the warning is informative.
+        conn = self._conn("12345678")
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            with maintenance._scoped_target_file_size(conn, "5MiB"):
+                pass
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "could not be converted" in warnings[0]
+        assert "12345678" in warnings[0]
+
+    def test_no_warning_when_prior_unset(self, caplog):
+        conn = self._conn(None)
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            with maintenance._scoped_target_file_size(conn, "5MiB"):
+                pass
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_restores_to_converted_prior(self):
+        conn = self._conn("67108864")
+        with maintenance._scoped_target_file_size(conn, "5MiB"):
+            pass
+        # The last execute call should be the restore SET to '64MiB'.
+        last_sql = conn.execute.call_args_list[-1].args[0]
+        assert "target_file_size" in last_sql
+        assert "'64MiB'" in last_sql
+
+    def test_restores_to_default_when_prior_unset(self):
+        conn = self._conn(None)
+        with maintenance._scoped_target_file_size(conn, "5MiB"):
+            pass
+        last_sql = conn.execute.call_args_list[-1].args[0]
+        assert f"'{maintenance.DEFAULT_TARGET_FILE_SIZE}'" in last_sql
+
+
 class TestAcquireAdvisoryLock:
     """The lock-helper SQL must use single quotes around the inner literal."""
 
