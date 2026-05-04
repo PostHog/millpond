@@ -1,23 +1,17 @@
 -- DuckLake catalog maintenance recipes.
 --
--- Loaded at session start by `tools/maintenance.py` and by the `shell` recipe
--- in `tools/justfile`, so every macro defined here is callable from an
--- interactive `just shell` and from any maintenance subcommand.
---
--- This file is rendered with Python str.format() at load time: the
--- placeholder `{{schema}}` (the DuckLake metadata schema, derived from
--- `ATTACH_NAME`) is substituted before the SQL is executed. Any literal
--- `{{` / `}}` you add must be doubled (`{{{{` / `}}}}`) to survive that
--- pass. We deliberately do NOT template the data path: a literal
--- `glob('s3://...')` inside a CREATE MACRO body is evaluated eagerly by
--- DuckDB 1.4, which would S3-LIST the lake on every connect(). Macros
--- that need a path take it as a parameter instead.
+-- Loaded at session start by `tools/maintenance.py` (via `conn.execute`) and
+-- by the `shell` recipe in `tools/justfile` (via the duckdb CLI's `.read`
+-- meta-command). Both paths execute the file verbatim, so the file itself
+-- must be valid SQL — no templating, no placeholders.
 --
 -- Conventions
 -- -----------
 -- * Schema name. DuckLake stores its catalog tables in
---   `__ducklake_metadata_<attach_name>`. Use the `{{schema}}` placeholder
---   so the file stays in sync with maintenance.py's `ATTACH_NAME` constant.
+--   `__ducklake_metadata_<attach_name>`. We attach as `lake` everywhere
+--   (the `ATTACH_NAME` constant in `maintenance.py`), so this file
+--   references `__ducklake_metadata_lake.<table>` directly. If you ever
+--   change the ATTACH alias, the references here must change with it.
 --
 -- * No `LEFT ANTI JOIN`. DuckDB 1.4 does not support that syntax. Use
 --   `LEFT JOIN ... WHERE rhs IS NULL` or `NOT EXISTS (...)` instead.
@@ -27,6 +21,12 @@
 --   that touches `ctid` must run via `postgres_execute` / `postgres_query`
 --   against the `pg (TYPE postgres)` ATTACH — see `dedup_deletions` in
 --   `maintenance.py` for the working pattern.
+--
+-- * No literal `glob('s3://...')` inside `CREATE MACRO` bodies. DuckDB 1.4
+--   evaluates a literal glob eagerly at macro creation time, which would
+--   S3-LIST the lake on every connect (even for subcommands that don't
+--   care). Macros that need an S3 path take it as a parameter — see
+--   `find_catalog_orphans` below.
 --
 -- * Advisory lock. Maintenance jobs that mutate the catalog acquire
 --   `pg_try_advisory_lock(hashtext('millpond-ducklake-maintenance')::bigint)`
@@ -39,7 +39,7 @@
 -- A non-zero value will self-poison the next `cleanup-all` per DuckLake bug c5.
 CREATE OR REPLACE TEMP MACRO count_pending_dups() AS (
   SELECT COUNT(*) - COUNT(DISTINCT path)
-  FROM {schema}.ducklake_files_scheduled_for_deletion
+  FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion
 );
 
 -- Catalog rows in ducklake_files_scheduled_for_deletion whose S3 key no
@@ -61,7 +61,7 @@ CREATE OR REPLACE TEMP MACRO find_catalog_orphans(data_path) AS TABLE (
     SELECT file FROM glob(data_path || '/**/*.parquet')
   )
   SELECT s.data_file_id, s.path
-  FROM {schema}.ducklake_files_scheduled_for_deletion s
+  FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion s
   LEFT JOIN live l
     ON  s.path = l.file
      OR l.file = data_path || '/' || s.path
