@@ -104,6 +104,11 @@ def connect() -> duckdb.DuckDBPyConnection:
     """Connect to DuckLake using environment variables."""
     conn = duckdb.connect()
 
+    # DuckDB defaults to spilling under '.tmp' relative to CWD; in the millpond
+    # image that path is on the read-only rootfs, so any compaction that needs
+    # to spill crashes. /tmp is the writable emptyDir in the cron pod.
+    conn.execute("SET temp_directory = '/tmp/duckdb_spill'")
+
     # S3 config from env vars
     s3_region = os.environ.get("DUCKDB_S3_REGION", "us-east-1")
     s3_defaults = {
