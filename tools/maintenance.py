@@ -275,6 +275,11 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     _log_cleanup_throughput("cleanup-all", before, after, elapsed)
 
 
+def _sql_string_literal(s: str) -> str:
+    """Quote a Python string as a SQL string literal (single-quote-doubled)."""
+    return "'" + s.replace("'", "''") + "'"
+
+
 def _acquire_advisory_lock(conn: duckdb.DuckDBPyConnection) -> None:
     """Take the maintenance advisory lock or raise if another session holds it.
 
@@ -318,9 +323,102 @@ def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         f"SELECT MIN(ctid) FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion GROUP BY path"
         f")"
     )
-    conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', '{delete_sql}')")
+    conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(delete_sql)})")
     after = conn.execute("SELECT count_pending_dups()").fetchone()[0]
     log.info("dedup-deletions: queue now has %d duplicate rows", after)
+
+
+def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
+    """Delete catalog rows whose S3 key no longer exists.
+
+    Five-step gated procedure (addresses lead-QE punch list B1/B2/B3/H1/H4):
+
+      1. Take the advisory lock.
+      2. Materialize the orphan set into a TEMP TABLE so subsequent
+         safety gates and the final DELETE all see the same snapshot.
+      3. Safety gate B1: prove `ducklake_data_file` is non-empty AND that
+         none of the orphan paths are referenced as live data files. A
+         vacuous pass (gate succeeds because the lake is empty) is not
+         allowed.
+      4. Safety gate B3: prove no positional delete vector
+         (`ducklake_delete_file`) points at an orphan `data_file_id`.
+         If one does, the file is still live for vector lookups — abort.
+      5. One `postgres_execute` DELETE matching on `path` (UUIDv7-unique
+         per quirk r3); single statement, atomic at the Postgres layer.
+    """
+    data_path = _require("DUCKLAKE_DATA_PATH")
+    log.info("heal-orphans: scanning for catalog-side orphans (dry_run=%s)", dry_run)
+
+    conn.execute(
+        "CREATE OR REPLACE TEMP TABLE _orphans AS "
+        "SELECT data_file_id, path FROM find_catalog_orphans(?)",
+        [data_path],
+    )
+    n_orphans = conn.execute("SELECT COUNT(*) FROM _orphans").fetchone()[0]
+    log.info("heal-orphans: %d catalog rows reference S3 paths that no longer exist", n_orphans)
+    if n_orphans == 0:
+        return
+
+    # B1: positive-proof gate. Both clauses must hold.
+    total_data_files, would_be_live = conn.execute(
+        f"""
+        SELECT
+            (SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_data_file) AS total,
+            (SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_data_file
+             WHERE path IN (SELECT path FROM _orphans)) AS would_be_live
+        """
+    ).fetchone()
+    if total_data_files == 0:
+        raise RuntimeError(
+            "heal-orphans safety gate B1 failed: ducklake_data_file is empty. "
+            "Refusing to operate on a vacuous catalog."
+        )
+    if would_be_live > 0:
+        raise RuntimeError(
+            f"heal-orphans safety gate B1 failed: {would_be_live} of the "
+            f"{n_orphans} 'orphan' paths still appear in ducklake_data_file. "
+            "Aborting — these are not orphans."
+        )
+
+    # B3: any positional-delete vector pointing at an orphan id is a hard abort.
+    # The delete-vector table references the data file by data_file_id, so a
+    # match here means the file is still live for vector lookups.
+    delete_vector_refs = conn.execute(
+        f"SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_delete_file "
+        f"WHERE data_file_id IN (SELECT data_file_id FROM _orphans)"
+    ).fetchone()[0]
+    if delete_vector_refs > 0:
+        raise RuntimeError(
+            f"heal-orphans safety gate B3 failed: {delete_vector_refs} positional "
+            "delete vector(s) reference 'orphan' data_file_ids. Aborting — those "
+            "files are still live for delete-vector lookups."
+        )
+
+    log.info("heal-orphans: safety gates B1+B3 passed; %d rows queued for delete", n_orphans)
+    if dry_run:
+        return
+
+    _acquire_advisory_lock(conn)
+    # Materialize the path list out of the temp table and ship it as a single
+    # DELETE through postgres_execute. The duckdb postgres extension
+    # autocommits per statement, so this one DELETE is atomic at the upstream
+    # Postgres layer (per quirk r4).
+    paths = [row[0] for row in conn.execute("SELECT path FROM _orphans").fetchall()]
+    path_list = ", ".join(_sql_string_literal(p) for p in paths)
+    delete_sql = (
+        f"DELETE FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion "
+        f"WHERE path IN ({path_list})"
+    )
+    conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(delete_sql)})")
+
+    after = conn.execute(
+        "SELECT COUNT(*) FROM _orphans o "
+        f"JOIN {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion s ON o.path = s.path"
+    ).fetchone()[0]
+    if after != 0:
+        log.warning("heal-orphans: %d orphan rows remain in the queue after DELETE", after)
+    else:
+        log.info("heal-orphans: %d orphan rows removed from the queue", n_orphans)
 
 
 def find_orphans(conn: duckdb.DuckDBPyConnection) -> None:
@@ -527,6 +625,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="List ducklake_files_scheduled_for_deletion rows whose S3 key no longer exists",
     )
 
+    # heal-orphans
+    p = sub.add_parser(
+        "heal-orphans",
+        help="Delete catalog rows whose S3 key no longer exists (gated; see B1/B3 safety checks)",
+    )
+    p.add_argument("--dry-run", action="store_true")
+
     # orphans
     p = sub.add_parser("orphans", help="Delete orphaned S3 files")
     p.add_argument("--dry-run", action="store_true")
@@ -616,6 +721,8 @@ def main(argv: list[str] | None = None) -> None:
                 dedup_deletions(conn, args.dry_run)
             case "find-orphans":
                 find_orphans(conn)
+            case "heal-orphans":
+                heal_orphans(conn, args.dry_run)
             case "orphans":
                 orphans(conn, args.dry_run)
             case "maintain":

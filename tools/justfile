@@ -82,6 +82,16 @@ dedup-deletions:
 find-orphans:
     python {{ maintenance }} find-orphans
 
+# Preview heal-orphans (run safety gates, skip the DELETE)
+[group('lifecycle')]
+heal-orphans-dry-run:
+    python {{ maintenance }} heal-orphans --dry-run
+
+# Delete catalog rows whose S3 key no longer exists (gated B1/B3 safety checks)
+[group('lifecycle')]
+heal-orphans:
+    python {{ maintenance }} heal-orphans
+
 # Preview orphaned files
 [group('lifecycle')]
 orphans-dry-run:
