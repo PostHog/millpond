@@ -94,7 +94,7 @@ Requires Docker (uses `keytool` from the Kafka container image for cert generati
 
 ### DuckLake Maintenance
 
-`tools/maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint, tiered compaction, deletion-queue dedup). It is baked into the Docker image at `/app/tools/maintenance.py` and designed to run as a K8s CronJob reusing the same image and credentials as the main application.
+`tools/maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint, tiered compaction, deletion-queue dedup, catalog-side orphan recovery). It is baked into the Docker image at `/app/tools/maintenance.py` and designed to run as a K8s CronJob reusing the same image and credentials as the main application.
 
 ```bash
 python /app/tools/maintenance.py maintain --days 7           # expire snapshots + cleanup files
@@ -103,8 +103,12 @@ python /app/tools/maintenance.py expire --days 3             # expire snapshots 
 python /app/tools/maintenance.py cleanup --days 1            # cleanup scheduled files only
 python /app/tools/maintenance.py cleanup-all                 # cleanup all scheduled files regardless of age
 python /app/tools/maintenance.py dedup-deletions             # drop duplicate rows in the pending-deletion queue
+python /app/tools/maintenance.py find-orphans                # list catalog rows whose S3 key no longer exists
+python /app/tools/maintenance.py heal-orphans                # delete those catalog rows (gated B1/B3 safety checks)
+python /app/tools/maintenance.py cleanup-all-safe            # dedup + heal-orphans + cleanup-all in a loop until clean
+python /app/tools/maintenance.py fsck                        # cleanup-all-safe + ducklake_delete_orphaned_files
 python /app/tools/maintenance.py checkpoint                  # integrated merge + expire + cleanup
-python /app/tools/maintenance.py orphans                     # delete orphaned S3 files
+python /app/tools/maintenance.py orphans                     # delete S3-side orphaned files (catalog has no row)
 python /app/tools/maintenance.py compact --tier 1            # tiered compaction (see "When to add a merge job")
 ```
 
@@ -112,7 +116,20 @@ The script logs `cleanup throughput: files_processed=N queue_depth_before=A queu
 
 If `PUSHGATEWAY_URL` is set, the script pushes `maintenance_start_time` (on start) and `maintenance_duration_seconds` (on completion) to a Prometheus Pushgateway, enabling Grafana annotation queries for maintenance windows.
 
-`tools/maintenance.sql` is loaded at every session start (both by `maintenance.py` and by the `just shell` recipe) and defines small DuckDB macros for ad-hoc inspection — e.g. `SELECT count_pending_dups()` to see how many duplicate rows are sitting in the pending-deletion queue. The header documents the conventions (no `LEFT ANTI JOIN`, no duckdb-side `ctid`, advisory-lock key) that any new recipe must follow.
+#### Catalog-side orphan recovery
+
+If a `cleanup-all` run is interrupted (DuckLake bug: an S3 NoSuchKey on DELETE rolls back the whole transaction, but the S3 deletes already-completed are permanent), the catalog ends up with rows in `ducklake_files_scheduled_for_deletion` that point at S3 keys that no longer exist. Every subsequent `cleanup-all` will crash on those orphans until they're cleaned up. The catalog-recovery subcommands handle this without manual SQL surgery:
+
+| Subcommand | Action |
+|---|---|
+| `find-orphans` | List orphan rows on stdout (read-only). |
+| `heal-orphans` | Delete the orphan rows. Two safety gates: B1 proves `ducklake_data_file` is non-empty AND no orphan path is still live; B3 aborts if any positional-delete vector references an orphan id. `--dry-run` runs the gates but skips the DELETE. |
+| `cleanup-all-safe` | Loop dedup-deletions + heal-orphans + cleanup-all under one advisory lock until cleanup-all exits clean. Caps at `--max-iterations` (default 10). |
+| `fsck` | `cleanup-all-safe` followed by `ducklake_delete_orphaned_files` (S3-side orphan sweep). The end-to-end "lake catalog is healthy" recipe. |
+
+Mutual exclusion comes from `pg_try_advisory_lock(hashtext('millpond-ducklake-maintenance')::bigint)` taken on the `pg` ATTACH; concurrent maintenance invocations bail with a clear error rather than racing each other's DELETEs.
+
+`tools/maintenance.sql` is loaded at every session start (both by `maintenance.py` and by the `just shell` recipe) and defines small DuckDB macros for ad-hoc inspection — `SELECT count_pending_dups()` for queue dup count, `SELECT * FROM find_catalog_orphans('s3://bucket/lake/data')` for the orphan list. The header documents the conventions (no `LEFT ANTI JOIN`, no duckdb-side `ctid`, advisory-lock key) that any new recipe must follow.
 
 `tools/justfile` wraps the script and is also baked into the image at `/justfile` for interactive use:
 
@@ -122,9 +139,15 @@ just maintain-dry-run 3      # preview: expire >3 day snapshots + cleanup
 just maintain 3              # execute it
 just dedup-deletions-dry-run # preview duplicate rows in the pending-deletion queue
 just dedup-deletions         # drop them
-just shell                   # interactive DuckDB shell with the lake + pg ATTACHed and macros loaded
+just find-orphans            # list catalog-side orphan rows
+just heal-orphans-dry-run    # preview heal-orphans (gates only, no DELETE)
+just heal-orphans            # delete catalog-side orphan rows
+just cleanup-all-safe        # dedup + heal + cleanup-all in a loop
+just fsck-dry-run            # preview fsck end-to-end
+just fsck                    # bring catalog to known-good state
+just shell                   # interactive DuckDB shell with lake + pg ATTACHed and macros loaded
 just drop events             # drop a table (data files remain until cleanup)
-just orphans-dry-run         # preview orphaned S3 files
+just orphans-dry-run         # preview S3-side orphaned files
 ```
 
 All commands use the pod's existing env vars (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`).
