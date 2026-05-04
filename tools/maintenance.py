@@ -390,14 +390,27 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     if n_orphans == 0:
         return
 
-    # B1: positive-proof gate. Both clauses must hold.
+    # B1: positive-proof gate. Both clauses must hold. Per quirk r1, `path`
+    # can be stored as an absolute s3:// URI OR a bucket-relative key in
+    # either ducklake_files_scheduled_for_deletion (which feeds _orphans) and
+    # in ducklake_data_file. A naive `df.path IN (...)` match misses the live
+    # row whenever the two tables use opposite forms for the same file, so
+    # normalize both sides to absolute form before comparing.
     total_data_files, would_be_live = conn.execute(
         f"""
+        WITH orphan_abs AS (
+            SELECT CASE WHEN path LIKE 's3://%' THEN path ELSE ? || '/' || path END AS abs_path
+            FROM _orphans
+        ),
+        data_abs AS (
+            SELECT CASE WHEN path LIKE 's3://%' THEN path ELSE ? || '/' || path END AS abs_path
+            FROM {METADATA_SCHEMA}.ducklake_data_file
+        )
         SELECT
             (SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_data_file) AS total,
-            (SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_data_file
-             WHERE path IN (SELECT path FROM _orphans)) AS would_be_live
-        """
+            (SELECT COUNT(*) FROM data_abs WHERE abs_path IN (SELECT abs_path FROM orphan_abs)) AS would_be_live
+        """,
+        [data_path, data_path],
     ).fetchone()
     if total_data_files == 0:
         raise RuntimeError(
