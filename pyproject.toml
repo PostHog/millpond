@@ -33,7 +33,7 @@ millpond = "millpond.main:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0.3",
     "ruff>=0.8",
     "testcontainers>=4.14.2",
 ]
