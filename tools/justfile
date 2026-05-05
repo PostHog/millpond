@@ -82,11 +82,6 @@ default:
 shell:
     {{ duckdb }} -cmd "{{ _setup }}" -cmd ".read {{ maintenance_sql }}"
 
-# Drop a table
-[group('interactive')]
-drop table:
-    {{ duckdb }} -c "{{ _setup }} DROP TABLE lake.{{ table }};"
-
 # ----------------------------------------------------------------------------
 # snapshot + file lifecycle
 # ----------------------------------------------------------------------------
@@ -216,3 +211,11 @@ compact-to-tier-3 table="":
 [group('compaction')]
 compact-to-tier-3-dry-run table="":
     python {{ maintenance }} compact --tier 3 --table "{{ table }}" --dry-run
+
+# Run all tiered compactions sequentially (tier 1 -> 2 -> 3)
+[group('compaction')]
+compact-all-tiers table="": compact-to-tier-1 compact-to-tier-2 compact-to-tier-3
+
+# Dry-run all tiered compactions sequentially (tier 1 -> 2 -> 3)
+[group('compaction')]
+compact-all-tiers-dry-run table="": compact-to-tier-1-dry-run compact-to-tier-2-dry-run compact-to-tier-3-dry-run
