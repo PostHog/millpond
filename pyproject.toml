@@ -16,7 +16,7 @@ license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",
-    "duckdb>=1.4,<1.5",
+    "duckdb==1.5.1",
     "pyarrow>=18.0",
     "orjson>=3.10",
     "prometheus-client>=0.21",

@@ -12,8 +12,9 @@ ARG MILLPOND_VERSION=0.0.0.dev0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=$MILLPOND_VERSION
 RUN uv sync --frozen --no-dev --extra msk-iam
 
-# Install DuckDB CLI (pinned to match the Python package version)
-RUN uv tool install "duckdb-cli>=1.4,<1.5"
+# Install DuckDB CLI (pinned to match the Python package version from pyproject.toml)
+RUN V=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print(next(x.split('==')[1] for x in d if x.startswith('duckdb==')))") \
+    && uv tool install "duckdb-cli==$V"
 
 FROM python:3.12-slim
 
