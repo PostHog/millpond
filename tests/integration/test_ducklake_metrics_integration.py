@@ -62,6 +62,10 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
     c.execute(
         "CREATE TABLE __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion (path TEXT)"
     )
+    c.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_metadata ("
+        "key VARCHAR, value VARCHAR, scope VARCHAR, scope_id BIGINT)"
+    )
     # Seed: enough rows that every metric has a non-zero value.
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
@@ -82,6 +86,10 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion "
         "VALUES ('s3://b/x'), ('s3://b/x'), ('s3://b/y')"
+    )
+    c.execute(
+        "INSERT INTO __ducklake_metadata_lake.ducklake_metadata "
+        "VALUES ('version', '0.4', NULL, NULL)"
     )
 
 
@@ -175,6 +183,8 @@ class TestDaemonHTTP:
                     "ducklake_snapshots_newest_seconds_ago",
                     # b6
                     "ducklake_files_per_partition_top20_count",
+                    # catalog version
+                    "ducklake_catalog_format_version",
                     # self-metrics
                     "ducklake_metrics_up",
                     "ducklake_metrics_query_duration_seconds",

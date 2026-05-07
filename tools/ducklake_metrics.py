@@ -151,6 +151,25 @@ queries:
       GROUP BY partition
       ORDER BY count DESC
       LIMIT 20
+
+  - name: ducklake_catalog
+    help: |
+      DuckLake catalog format version. The numeric major.minor lands in the
+      gauge value (1.0, 1.1, 2.0…); any trailing non-numeric tag DuckLake
+      attaches (currently '-dev1' on main after MigrateV10, future '-rcN' /
+      '-betaN' shapes welcome) lands in the `suffix` label so dashboards
+      can flag dev/pre-release builds without losing PromQL ordering on
+      the value. Empty `suffix=""` means a clean release. Pure-junk values
+      like 'foo' fail loudly via the error counter — the correct signal.
+    interval_mins: 60
+    labels: [suffix]
+    values: [format_version]
+    sql: |
+      SELECT
+        CAST(regexp_extract(value, '^[0-9]+(\\.[0-9]+)?') AS DOUBLE) AS format_version,
+        regexp_replace(value, '^[0-9]+(\\.[0-9]+)?', '') AS suffix
+      FROM __ducklake_metadata_lake.ducklake_metadata
+      WHERE key = 'version' AND scope IS NULL
 """
 
 # Intervals are specified in whole minutes via the YAML field `interval_mins`
