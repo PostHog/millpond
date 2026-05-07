@@ -25,6 +25,7 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import heapq
 import itertools
 import logging
@@ -64,7 +65,7 @@ BUILTIN_YAML = """
 queries:
   - name: ducklake_pending_deletes
     help: Pending-deletion queue depth and duplicate-row pathology.
-    interval: 1m
+    interval_mins: 1
     values: [total, unique_paths, dup_rows]
     sql: |
       SELECT
@@ -75,7 +76,7 @@ queries:
 
   - name: ducklake_files_per_band
     help: Live data files grouped into byte-size bands.
-    interval: 1m
+    interval_mins: 1
     labels: [band]
     values: [count, bytes]
     sql: |
@@ -97,7 +98,7 @@ queries:
 
   - name: ducklake_compaction_candidates
     help: Live file counts bucketed to match maintenance.py's TIERS spec.
-    interval: 1m
+    interval_mins: 1
     labels: [tier]
     values: [count]
     sql: |
@@ -120,7 +121,7 @@ queries:
 
   - name: ducklake_snapshots
     help: Snapshot count plus age of oldest/newest snapshot in seconds.
-    interval: 1m
+    interval_mins: 1
     values: [count, oldest_seconds_ago, newest_seconds_ago]
     sql: |
       SELECT
@@ -131,7 +132,7 @@ queries:
 
   - name: ducklake_files_per_partition_top20
     help: Twenty heaviest partitions by live data-file count (composite values joined with '/').
-    interval: 1m
+    interval_mins: 1
     labels: [partition]
     values: [count]
     sql: |
@@ -152,11 +153,11 @@ queries:
       LIMIT 20
 """
 
-# Intervals are constrained to whole minutes (suffix "m") with a 1-minute
-# floor. Catalog reads are cheap but not free — sub-minute polling buys
-# nothing for the signals this daemon publishes.
-_INTERVAL_RE = re.compile(r"^(\d+)m$")
-_MIN_INTERVAL_MIN = 1
+# Intervals are specified in whole minutes via the YAML field `interval_mins`
+# (integer, >= 1). The unit is encoded in the field name so the value is just
+# a number — no "1m" suffix parsing, no ambiguity. Sub-minute polling buys
+# nothing for the catalog signals this daemon publishes.
+_MIN_INTERVAL_MINS = 1
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -171,15 +172,17 @@ class Query:
     values: list[str] = field(default_factory=list)
 
 
-def parse_interval(s: str) -> int:
-    """Parse a "Nm" interval string to seconds; only minutes, minimum 1."""
-    m = _INTERVAL_RE.match(s.strip())
-    if not m:
-        raise ValueError(f"interval must match '<n>m' (whole minutes), got {s!r}")
-    minutes = int(m.group(1))
-    if minutes < _MIN_INTERVAL_MIN:
-        raise ValueError(f"interval must be >= {_MIN_INTERVAL_MIN}m, got {s!r}")
-    return minutes * 60
+def _validate_interval_mins(v: object) -> int:
+    """Validate the YAML ``interval_mins`` field; return seconds.
+
+    Must be a positive integer. ``bool`` is rejected explicitly because
+    it's an ``int`` subclass and would otherwise sneak through.
+    """
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError(f"interval_mins must be an integer (whole minutes), got {type(v).__name__}: {v!r}")
+    if v < _MIN_INTERVAL_MINS:
+        raise ValueError(f"interval_mins must be >= {_MIN_INTERVAL_MINS}, got {v!r}")
+    return v * 60
 
 
 def _load_yaml_doc(text: str, source: str) -> list[dict]:
@@ -195,7 +198,7 @@ def _load_yaml_doc(text: str, source: str) -> list[dict]:
 
 
 def _query_from_dict(d: dict, source: str) -> Query:
-    for key in ("name", "help", "interval", "sql"):
+    for key in ("name", "help", "interval_mins", "sql"):
         if key not in d:
             raise ValueError(f"{source}: query missing required key {key!r}")
     name = d["name"]
@@ -211,7 +214,7 @@ def _query_from_dict(d: dict, source: str) -> Query:
         name=name,
         help=d["help"],
         sql=d["sql"],
-        interval_seconds=parse_interval(d["interval"]),
+        interval_seconds=_validate_interval_mins(d["interval_mins"]),
         labels=labels,
         values=values,
     )
@@ -265,7 +268,7 @@ def _build_self_metrics(registry: CollectorRegistry | None = None) -> SelfMetric
         ),
         up=Gauge(
             "ducklake_metrics_up",
-            "1 once the daemon's scheduler has started.",
+            "1 while the daemon has a live catalog connection; 0 during reconnect.",
             **kwargs,
         ),
     )
@@ -291,18 +294,31 @@ def _build_query_gauges(
     return out
 
 
+class _ReconnectNeeded(Exception):
+    """Raised by the scheduler when it wants the outer loop to drop and re-establish the catalog connection."""
+
+
+# When this many query runs in a row fail, assume the connection is
+# wedged (vs. a single bad query) and force a reconnect. Tuned higher
+# than the number of built-in queries so a single sticky query name
+# can't trip the reset on its own.
+CONSECUTIVE_FAILURE_THRESHOLD = 10
+
+
 def _run_query(
     conn: duckdb.DuckDBPyConnection,
     q: Query,
     gauges: dict[str, Gauge],
     self_metrics: SelfMetrics,
-) -> None:
-    """Execute one query and update its gauges.
+) -> bool:
+    """Execute one query and update its gauges. Returns True on success.
 
     On success: clears each value gauge before re-populating so label
     combinations that drop out between runs don't linger as stale series.
     On failure: increments the error counter and logs; the daemon stays
-    up. Catalog flap is the expected steady-state failure mode.
+    up. Catalog flap is the expected steady-state failure mode. The
+    outer scheduler watches the sequence of return values to decide
+    whether to escalate to a reconnect.
     """
     t0 = time.monotonic()
     try:
@@ -337,9 +353,11 @@ def _run_query(
         self_metrics.duration.labels(q.name).set(elapsed)
         self_metrics.last_success.labels(q.name).set_to_current_time()
         log.debug("query %s: %d rows in %.3fs", q.name, len(rows), elapsed)
+        return True
     except Exception:
         log.exception("query %s failed", q.name)
         self_metrics.errors.labels(q.name).inc()
+        return False
 
 
 def _scheduler_loop(
@@ -357,12 +375,20 @@ def _scheduler_loop(
     populates as quickly as the catalog will respond. Catalog reads are
     short and serial — no need for parallel execution; one duckdb
     connection isn't safe for concurrent calls anyway.
+
+    Tracks consecutive query failures across all queries; once the
+    threshold is reached the scheduler raises ``_ReconnectNeeded`` so
+    the outer loop can drop and re-establish the connection. Any
+    successful run resets the counter — a single misbehaving query
+    won't trip the reset on its own (threshold is well above the
+    number of built-in queries).
     """
     seq = itertools.count()
     heap: list[tuple[float, int, int]] = []
     now = time.monotonic()
     for idx in range(len(queries)):
         heapq.heappush(heap, (now, next(seq), idx))
+    consecutive_failures = 0
     while not stop.is_set():
         next_ts, _, idx = heap[0]
         wait_for = next_ts - time.monotonic()
@@ -370,7 +396,15 @@ def _scheduler_loop(
             return
         heapq.heappop(heap)
         q = queries[idx]
-        _run_query(conn, q, gauges[q.name], self_metrics)
+        ok = _run_query(conn, q, gauges[q.name], self_metrics)
+        if ok:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            if consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD:
+                raise _ReconnectNeeded(
+                    f"{consecutive_failures} consecutive query failures; reconnecting"
+                )
         heapq.heappush(heap, (time.monotonic() + q.interval_seconds, next(seq), idx))
 
 
@@ -415,6 +449,37 @@ def _start_http(port: int) -> ThreadingHTTPServer:
     threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()
     log.info("HTTP server listening on :%d", port)
     return srv
+
+
+_BACKOFF_INITIAL_SECONDS = 1.0
+_BACKOFF_MAX_SECONDS = 60.0
+
+
+def _connect_with_backoff(
+    stop: threading.Event,
+    self_metrics: SelfMetrics,
+) -> duckdb.DuckDBPyConnection | None:
+    """Call maintenance.connect() with exponential backoff until it succeeds or stop is set.
+
+    Returns the new connection on success, or None if the daemon was asked
+    to shut down before connect succeeded. ``self_metrics.up`` is held at 0
+    while we're trying. Backoff starts at 1s and caps at 60s; the cap is
+    intentional so that a long catalog outage doesn't grow into 30-minute
+    sleeps that miss the recovery window.
+    """
+    delay = _BACKOFF_INITIAL_SECONDS
+    self_metrics.up.set(0)
+    while not stop.is_set():
+        try:
+            conn = maintenance.connect()
+            log.info("Connected to DuckLake catalog")
+            return conn
+        except Exception:
+            log.exception("connect to DuckLake failed; retrying in %.0fs", delay)
+            if stop.wait(delay):
+                return None
+            delay = min(delay * 2, _BACKOFF_MAX_SECONDS)
+    return None
 
 
 def _setup_logging() -> None:
@@ -478,15 +543,28 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGINT, _handle_signal)
 
     srv = _start_http(args.port)
-    conn = maintenance.connect()
-    try:
+    log.info("Scheduler starting; %d query(ies) registered", len(queries))
+
+    # Outer reconnect loop: every iteration establishes a fresh connection
+    # (with backoff) and runs the scheduler against it. The scheduler exits
+    # cleanly only on stop; on _ReconnectNeeded we drop the connection and
+    # loop again. Readiness flips true after the first successful connect
+    # and stays true thereafter — k8s shouldn't yank metrics traffic on
+    # transient catalog flap, and there's no real "traffic" anyway.
+    while not stop.is_set():
+        conn = _connect_with_backoff(stop, self_metrics)
+        if conn is None:
+            break
         self_metrics.up.set(1)
         srv.ready = True  # type: ignore[attr-defined]
-        log.info("Scheduler starting; %d query(ies) registered", len(queries))
-        _scheduler_loop(conn, queries, gauges, self_metrics, stop)
-    finally:
-        self_metrics.up.set(0)
-        conn.close()
+        try:
+            _scheduler_loop(conn, queries, gauges, self_metrics, stop)
+        except _ReconnectNeeded as e:
+            log.warning("%s", e)
+        finally:
+            self_metrics.up.set(0)
+            with contextlib.suppress(Exception):
+                conn.close()
 
 
 if __name__ == "__main__":

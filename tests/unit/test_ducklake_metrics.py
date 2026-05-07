@@ -10,40 +10,49 @@ Coverage:
 
 from __future__ import annotations
 
+import threading
+
 import duckdb
 import ducklake_metrics as dm
 import pytest
 from prometheus_client import CollectorRegistry
 
 # ---------------------------------------------------------------------------
-# parse_interval
+# interval_mins validation
 # ---------------------------------------------------------------------------
 
 
-class TestParseInterval:
+class TestValidateIntervalMins:
     def test_one_minute(self):
-        assert dm.parse_interval("1m") == 60
+        assert dm._validate_interval_mins(1) == 60
 
     def test_arbitrary_minutes(self):
-        assert dm.parse_interval("5m") == 300
-        assert dm.parse_interval("60m") == 3600
+        assert dm._validate_interval_mins(5) == 300
+        assert dm._validate_interval_mins(60) == 3600
 
-    def test_seconds_rejected(self):
-        with pytest.raises(ValueError, match="whole minutes"):
-            dm.parse_interval("30s")
+    def test_string_rejected(self):
+        # The whole point of the rename: the unit is in the field name,
+        # so values are integers — no "1m" / "30s" suffix parsing.
+        with pytest.raises(ValueError, match="must be an integer"):
+            dm._validate_interval_mins("1m")
 
     def test_zero_rejected(self):
-        with pytest.raises(ValueError, match=">= 1m"):
-            dm.parse_interval("0m")
+        with pytest.raises(ValueError, match=">= 1"):
+            dm._validate_interval_mins(0)
 
-    def test_naked_number_rejected(self):
-        with pytest.raises(ValueError, match="whole minutes"):
-            dm.parse_interval("60")
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match=">= 1"):
+            dm._validate_interval_mins(-1)
 
-    def test_hours_rejected(self):
-        # only 'm' suffix supported (D9 in the plan)
-        with pytest.raises(ValueError, match="whole minutes"):
-            dm.parse_interval("1h")
+    def test_float_rejected(self):
+        with pytest.raises(ValueError, match="must be an integer"):
+            dm._validate_interval_mins(1.5)
+
+    def test_bool_rejected(self):
+        # bool is technically an int subclass but isn't a sensible
+        # interval; reject explicitly.
+        with pytest.raises(ValueError, match="must be an integer"):
+            dm._validate_interval_mins(True)
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +76,7 @@ class TestLoadQueries:
             "queries:\n"
             "  - name: my_custom\n"
             "    help: Custom counter\n"
-            "    interval: 2m\n"
+            "    interval_mins: 2\n"
             "    values: [n]\n"
             "    sql: SELECT 1 AS n\n"
         )
@@ -82,7 +91,7 @@ class TestLoadQueries:
             "queries:\n"
             "  - name: ducklake_pending_deletes\n"
             "    help: overridden\n"
-            "    interval: 5m\n"
+            "    interval_mins: 5\n"
             "    values: [total]\n"
             "    sql: SELECT 0 AS total\n"
         )
@@ -93,12 +102,16 @@ class TestLoadQueries:
 
     def test_missing_required_key(self):
         with pytest.raises(ValueError, match="missing required key"):
-            dm._query_from_dict({"name": "x", "help": "h", "interval": "1m"}, "test")
+            dm._query_from_dict({"name": "x", "help": "h", "interval_mins": 1}, "test")
+
+    def test_missing_interval_mins_specifically(self):
+        with pytest.raises(ValueError, match="'interval_mins'"):
+            dm._query_from_dict({"name": "x", "help": "h", "sql": "SELECT 1"}, "test")
 
     def test_bad_name_rejected(self):
         with pytest.raises(ValueError, match="must match"):
             dm._query_from_dict(
-                {"name": "1bad-name", "help": "h", "interval": "1m", "sql": "SELECT 1"},
+                {"name": "1bad-name", "help": "h", "interval_mins": 1, "sql": "SELECT 1"},
                 "test",
             )
 
@@ -193,6 +206,15 @@ class TestRunQuery:
         assert _gauge_value(registry, "t_per_band_n", {"band": "a"}) == 10
         assert _gauge_value(registry, "t_per_band_n", {"band": "b"}) is None
 
+    def test_returns_true_on_success(self, conn, registry):
+        # Outer scheduler distinguishes by return value; verify the contract.
+        conn.execute("CREATE TABLE t (n BIGINT)")
+        conn.execute("INSERT INTO t VALUES (5)")
+        q = dm.Query(name="t_ok", help="t", sql="SELECT n FROM t", interval_seconds=60, labels=[], values=["n"])
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        assert dm._run_query(conn, q, gauges[q.name], sm) is True
+
     def test_sql_error_increments_counter(self, conn, registry):
         q = dm.Query(
             name="t_broken",
@@ -206,7 +228,7 @@ class TestRunQuery:
         sm = dm._build_self_metrics(registry=registry)
 
         # Must not raise — daemon stays up across catalog flap.
-        dm._run_query(conn, q, gauges[q.name], sm)
+        assert dm._run_query(conn, q, gauges[q.name], sm) is False
 
         assert _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "t_broken"}) == 1
         # last_success not set on failure.
@@ -445,3 +467,97 @@ class TestBuiltinFilesPerPartitionTop20:
         dm._run_query(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026/05-01"}) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reconnect path: backoff + scheduler-driven escalation.
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerReconnect:
+    """The scheduler escalates to _ReconnectNeeded only on sustained failure."""
+
+    def _build_one_query(self, registry):
+        # interval_seconds=0 fires every iteration with no sleep, so a
+        # threshold-many run-failures completes in microseconds.
+        q = dm.Query(name="q", help="h", sql="SELECT 1 AS n", interval_seconds=0, labels=[], values=["n"])
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        return q, gauges, sm
+
+    def test_threshold_consecutive_failures_raises(self, registry, monkeypatch):
+        q, gauges, sm = self._build_one_query(registry)
+        monkeypatch.setattr(dm, "_run_query", lambda *a, **kw: False)
+        stop = threading.Event()
+        with pytest.raises(dm._ReconnectNeeded):
+            dm._scheduler_loop(None, [q], gauges, sm, stop)
+
+    def test_success_resets_counter(self, registry, monkeypatch):
+        # Pattern: repeatedly fail (THRESHOLD-1) times then succeed once;
+        # success resets the streak so the loop runs forever (here: until
+        # we set stop manually). Without the reset the second batch of
+        # failures would trip the threshold.
+        q, gauges, sm = self._build_one_query(registry)
+        stop = threading.Event()
+        results: list[bool] = []
+        for _ in range(3):
+            results += [False] * (dm.CONSECUTIVE_FAILURE_THRESHOLD - 1)
+            results.append(True)
+        it = iter(results)
+
+        def fake_run(*_a, **_kw):
+            try:
+                return next(it)
+            except StopIteration:
+                stop.set()
+                return True
+
+        monkeypatch.setattr(dm, "_run_query", fake_run)
+        # Must not raise: each run of (THRESHOLD-1) failures is followed
+        # by a success that resets the counter back to 0.
+        dm._scheduler_loop(None, [q], gauges, sm, stop)
+
+
+class TestConnectWithBackoff:
+    """maintenance.connect() retries with exponential backoff until success or stop."""
+
+    def test_eventually_returns_connection(self, registry, monkeypatch):
+        sm = dm._build_self_metrics(registry=registry)
+        # Fail twice, then succeed.
+        sentinel = object()
+        attempts = {"n": 0}
+
+        def fake_connect():
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise RuntimeError("transient")
+            return sentinel
+
+        monkeypatch.setattr(dm.maintenance, "connect", fake_connect)
+        # Speed test up: Event.wait returns immediately if stop is already
+        # set, but here we don't want that. Instead patch the constants so
+        # delays are in ms, not seconds.
+        monkeypatch.setattr(dm, "_BACKOFF_INITIAL_SECONDS", 0.001)
+        monkeypatch.setattr(dm, "_BACKOFF_MAX_SECONDS", 0.001)
+
+        stop = threading.Event()
+        result = dm._connect_with_backoff(stop, sm)
+        assert result is sentinel
+        assert attempts["n"] == 3
+        # up was held at 0 throughout; the caller flips it to 1 once it
+        # owns the returned connection.
+        assert _gauge_value(registry, "ducklake_metrics_up") == 0
+
+    def test_returns_none_when_stop_set_during_backoff(self, registry, monkeypatch):
+        sm = dm._build_self_metrics(registry=registry)
+        stop = threading.Event()
+
+        def fake_connect():
+            # Set stop on the first failure so the next stop.wait() exits.
+            stop.set()
+            raise RuntimeError("never recovers")
+
+        monkeypatch.setattr(dm.maintenance, "connect", fake_connect)
+        monkeypatch.setattr(dm, "_BACKOFF_INITIAL_SECONDS", 0.001)
+
+        assert dm._connect_with_backoff(stop, sm) is None

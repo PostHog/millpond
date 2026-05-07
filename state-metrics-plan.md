@@ -22,7 +22,7 @@ Single file. Connects once via `maintenance.connect()` — that already configur
 queries:
   - name: ducklake_files_per_band
     help: Live data files grouped by size band
-    interval: 1m            # minimum 1m, only "m" suffix supported
+    interval_mins: 1        # whole minutes only; minimum 1
     labels: [band]          # column names → Prom labels
     values: [file_count, total_bytes]
     sql: |
@@ -101,4 +101,4 @@ Catalog unreachable: log + retry forever with exponential backoff; `state_metric
 | D6 | First-scrape semantics | open Prom port immediately; do not block on slow queries |
 | D7 | Failure mode if catalog unreachable | retry with backoff; `up = 0`; don't exit |
 | D8 | Per-table breakdown | built-ins are lake-wide; user YAML may go table-specific |
-| D9 | Interval format | minimum `1m`, only `m` suffix supported |
+| D9 | Interval format | YAML field `interval_mins` (positive integer, whole minutes; minimum 1). Unit is encoded in the field name — no suffix parsing. |
