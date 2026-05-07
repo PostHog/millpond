@@ -307,6 +307,10 @@ def _stub_catalog(conn):
         "CREATE TABLE __ducklake_metadata_lake.ducklake_snapshot ("
         "snapshot_id BIGINT, snapshot_time VARCHAR, schema_version BIGINT)"
     )
+    conn.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_metadata ("
+        "key VARCHAR, value VARCHAR, scope VARCHAR, scope_id BIGINT)"
+    )
 
 
 def _builtin(name):
@@ -467,6 +471,112 @@ class TestBuiltinFilesPerPartitionTop20:
         dm._run_query(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026/05-01"}) == 1
+
+
+class TestBuiltinCatalog:
+    """ducklake_metadata.value (VARCHAR) parses to a numeric format-version gauge."""
+
+    def _seed(self, conn, version: str):
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_metadata VALUES "
+            f"('version', '{version}', NULL, NULL),"
+            "('created_by', 'DuckDB testfixture', NULL, NULL),"
+            "('encrypted', 'false', NULL, NULL)"
+        )
+
+    @pytest.mark.parametrize(
+        "version,expected_value,expected_suffix",
+        [
+            # Released versions seen in DuckLake's MigrateV0X / V10 paths.
+            ("0.3", 0.3, ""),
+            ("0.4", 0.4, ""),
+            ("1.0", 1.0, ""),
+            # Dev tag currently on DuckLake main (after MigrateV10): the
+            # leading numeric portion lands in the gauge value, the rest
+            # in the `suffix` label so dashboards can flag dev builds
+            # without losing PromQL ordering.
+            ("1.1-dev1", 1.1, "-dev1"),
+            # Hypothetical future shapes — don't be brittle to whatever
+            # -rcN / -betaN convention DuckLake settles on.
+            ("2.0-rc7", 2.0, "-rc7"),
+            ("2.0-beta", 2.0, "-beta"),
+        ],
+    )
+    def test_parses_each_known_version(self, conn, registry, version, expected_value, expected_suffix):
+        _stub_catalog(conn)
+        self._seed(conn, version)
+        q = _builtin("ducklake_catalog")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert (
+            _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": expected_suffix})
+            == expected_value
+        )
+
+    def test_ignores_other_metadata_keys(self, conn, registry):
+        # The query filters on key='version' AND scope IS NULL. Other keys
+        # (created_by, data_path, encrypted) and any future scoped rows
+        # must not bleed into the metric.
+        _stub_catalog(conn)
+        self._seed(conn, "0.4")
+        q = _builtin("ducklake_catalog")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": ""}) == 0.4
+
+    def test_pure_junk_version_raises_through_error_path(self, conn, registry):
+        # The major.minor regex is intentionally permissive about the suffix
+        # (it strips '-dev1', '-rc7', etc.) but a pure-junk value with no
+        # leading digits has no useful numeric reading. Let CAST raise and
+        # land in the error path so operators see the dashboard go stale
+        # plus a non-zero error counter — better than silently coalescing.
+        _stub_catalog(conn)
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_metadata VALUES "
+            "('version', 'totally-not-a-version', NULL, NULL)"
+        )
+        q = _builtin("ducklake_catalog")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert (
+            _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "ducklake_catalog"}) == 1
+        )
+
+    def test_label_clears_on_upgrade(self, conn, registry):
+        # When a lake upgrades from a release ('') to a dev tag ('-dev1'),
+        # the previous {suffix=""} time series must clear so dashboards
+        # don't see two simultaneous "current versions". Relies on the
+        # scheduler's clear-and-set on labeled gauges.
+        _stub_catalog(conn)
+        q = _builtin("ducklake_catalog")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        self._seed(conn, "1.0")
+        dm._run_query(conn, q, gauges[q.name], sm)
+        assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": ""}) == 1.0
+
+        conn.execute("DELETE FROM __ducklake_metadata_lake.ducklake_metadata WHERE key = 'version'")
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_metadata VALUES "
+            "('version', '1.1-dev1', NULL, NULL)"
+        )
+        dm._run_query(conn, q, gauges[q.name], sm)
+        assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": "-dev1"}) == 1.1
+        assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": ""}) is None
+
+    def test_interval_is_60_minutes(self):
+        # Catalog version changes only on a DuckLake upgrade — there's no
+        # value polling it more often, and any human-noticeable change
+        # window is far longer than 60 minutes anyway.
+        q = _builtin("ducklake_catalog")
+        assert q.interval_seconds == 60 * 60
 
 
 # ---------------------------------------------------------------------------

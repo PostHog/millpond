@@ -173,6 +173,7 @@ Built-in queries:
 | `ducklake_compaction_candidates` | `tier` (`tier1` / `tier2` / `tier3` / `large` / `total`) | `count` | `ducklake_data_file` |
 | `ducklake_snapshots` | — | `count`, `oldest_seconds_ago`, `newest_seconds_ago` | `ducklake_snapshot` |
 | `ducklake_files_per_partition_top20` | `partition` | `count` | `ducklake_data_file` ⨝ `ducklake_file_partition_value` |
+| `ducklake_catalog` | `suffix` | `format_version` | `ducklake_metadata` (key=`version`); numeric `major.minor` lands in the value, any trailing tag (e.g. `-dev1`, `-rc7`) lands in the `suffix` label so dev/pre-release builds stay distinguishable. Empty `suffix=""` for clean releases |
 
 Plus self-metrics: `ducklake_metrics_up`, `ducklake_metrics_query_duration_seconds{query}`, `ducklake_metrics_query_last_success_timestamp{query}`, `ducklake_metrics_query_errors_total{query}`.
 
