@@ -252,9 +252,7 @@ class TestBuiltinPendingDeletes:
             "VALUES ('s3://b/x'), ('s3://b/x'), ('s3://b/y'), ('s3://b/z')"
         )
 
-        q = next(
-            q for q in dm.load_queries(None, set()) if q.name == "ducklake_pending_deletes"
-        )
+        q = next(q for q in dm.load_queries(None, set()) if q.name == "ducklake_pending_deletes")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
         dm._run_query(conn, q, gauges[q.name], sm)
@@ -262,3 +260,188 @@ class TestBuiltinPendingDeletes:
         assert _gauge_value(registry, "ducklake_pending_deletes_total") == 4
         assert _gauge_value(registry, "ducklake_pending_deletes_unique_paths") == 3
         assert _gauge_value(registry, "ducklake_pending_deletes_dup_rows") == 1
+
+
+# ---------------------------------------------------------------------------
+# Built-ins: b2/b3/b5/b6 against stub catalog tables.
+# Stub schemas mirror just the columns each query reads — the real DuckLake
+# catalog has wider tables; column drift on the read columns would make
+# these tests fail loudly, which is the point.
+# ---------------------------------------------------------------------------
+
+
+def _stub_catalog(conn):
+    conn.execute("CREATE SCHEMA __ducklake_metadata_lake")
+    conn.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_data_file ("
+        "data_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "
+        "path VARCHAR, file_size_bytes BIGINT, partition_id BIGINT)"
+    )
+    conn.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_file_partition_value ("
+        "data_file_id BIGINT, table_id BIGINT, partition_key_index BIGINT, partition_value VARCHAR)"
+    )
+    conn.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_snapshot ("
+        "snapshot_id BIGINT, snapshot_time VARCHAR, schema_version BIGINT)"
+    )
+
+
+def _builtin(name):
+    return next(q for q in dm.load_queries(None, set()) if q.name == name)
+
+
+class TestBuiltinFilesPerBand:
+    def test_buckets_live_files_only(self, conn, registry):
+        _stub_catalog(conn)
+        # Live files (end_snapshot IS NULL) span four bands; one expired
+        # row must be filtered out.
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
+            "(1, 1, 0, NULL, 'a', 500000, 100),"        # lt1mib
+            "(2, 1, 0, NULL, 'b', 1500000, 100),"       # 1to5mib
+            "(3, 1, 0, NULL, 'c', 8000000, 200),"       # 5to10mib
+            "(4, 1, 0, NULL, 'd', 50000000, 200),"      # 32to64mib
+            "(5, 1, 0, NULL, 'e', 200000000, 300),"     # gt128mib
+            "(6, 1, 0, 5,    'f', 100, 300)"            # expired — must NOT be counted
+        )
+        q = _builtin("ducklake_files_per_band")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "lt1mib"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "1to5mib"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "5to10mib"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "32to64mib"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "gt128mib"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_bytes", {"band": "lt1mib"}) == 500000
+        assert _gauge_value(registry, "ducklake_files_per_band_bytes", {"band": "gt128mib"}) == 200000000
+
+    def test_band_boundaries_inclusive_lower_exclusive_upper(self, conn, registry):
+        # Exactly 1 MiB (1048576) must land in 1to5mib, not lt1mib —
+        # matches DuckLake's own bin semantics (min inclusive, max
+        # exclusive) so this metric's bands compose with maintenance.py's
+        # tiered compaction.
+        _stub_catalog(conn)
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
+            "(1, 1, 0, NULL, 'a', 1048576, 100),"
+            "(2, 1, 0, NULL, 'b', 1048575, 100)"
+        )
+        q = _builtin("ducklake_files_per_band")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "lt1mib"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "1to5mib"}) == 1
+
+
+class TestBuiltinCompactionCandidates:
+    def test_per_tier_plus_total(self, conn, registry):
+        _stub_catalog(conn)
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
+            "(1, 1, 0, NULL, 'a', 500000, 100),"        # tier1
+            "(2, 1, 0, NULL, 'b', 1500000, 100),"       # tier2
+            "(3, 1, 0, NULL, 'c', 8000000, 200),"       # tier2
+            "(4, 1, 0, NULL, 'd', 50000000, 200),"      # tier3
+            "(5, 1, 0, NULL, 'e', 200000000, 300),"     # large
+            "(6, 1, 0, 5,    'f', 100, 300)"            # expired
+        )
+        q = _builtin("ducklake_compaction_candidates")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "tier1"}) == 1
+        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "tier2"}) == 2
+        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "tier3"}) == 1
+        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "large"}) == 1
+        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "total"}) == 5
+
+
+class TestBuiltinSnapshots:
+    def test_count_and_ages(self, conn, registry):
+        _stub_catalog(conn)
+        # snapshot_time is VARCHAR in the real catalog; the query CASTs to
+        # TIMESTAMPTZ. Use literal offsets so the cast is unambiguous.
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_snapshot VALUES "
+            "(0, '2026-05-01 12:00:00+00', 0),"
+            "(1, '2026-05-07 12:00:00+00', 1)"
+        )
+        q = _builtin("ducklake_snapshots")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, "ducklake_snapshots_count") == 2
+        oldest = _gauge_value(registry, "ducklake_snapshots_oldest_seconds_ago")
+        newest = _gauge_value(registry, "ducklake_snapshots_newest_seconds_ago")
+        # oldest >= newest, both positive (now() > snapshot times in the past).
+        assert oldest >= newest > 0
+
+    def test_empty_table_returns_zeros_not_errors(self, conn, registry):
+        _stub_catalog(conn)
+        q = _builtin("ducklake_snapshots")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, "ducklake_snapshots_count") == 0
+        assert _gauge_value(registry, "ducklake_snapshots_oldest_seconds_ago") == 0
+        assert _gauge_value(registry, "ducklake_snapshots_newest_seconds_ago") == 0
+
+
+class TestBuiltinFilesPerPartitionTop20:
+    def test_groups_by_composite_value(self, conn, registry):
+        _stub_catalog(conn)
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
+            "(1, 1, 0, NULL, 'a', 100, 100),"
+            "(2, 1, 0, NULL, 'b', 100, 100),"
+            "(3, 1, 0, NULL, 'c', 100, 200),"
+            "(4, 1, 0, NULL, 'd', 100, 200),"
+            "(5, 1, 0, NULL, 'e', 100, 300),"
+            "(6, 1, 0, NULL, 'no_part', 100, NULL)"  # live file with no partition_value rows
+        )
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_file_partition_value VALUES "
+            "(1, 1, 0, '2026-05-01'),"
+            "(2, 1, 0, '2026-05-01'),"
+            "(3, 1, 0, '2026-05-02'),"
+            "(4, 1, 0, '2026-05-02'),"
+            "(5, 1, 0, '2026-05-03')"
+        )
+        q = _builtin("ducklake_files_per_partition_top20")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026-05-01"}) == 2
+        assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026-05-02"}) == 2
+        assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026-05-03"}) == 1
+        # Live file without any partition_value rows surfaces as '<none>'.
+        assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "<none>"}) == 1
+
+    def test_composite_partition_keys_joined_with_slash(self, conn, registry):
+        _stub_catalog(conn)
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
+            "(1, 1, 0, NULL, 'a', 100, 100)"
+        )
+        # Two-column partition: index 0 = year, index 1 = day. The query
+        # joins them in key-index order with '/'.
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_file_partition_value VALUES "
+            "(1, 1, 1, '05-01'),"
+            "(1, 1, 0, '2026')"
+        )
+        q = _builtin("ducklake_files_per_partition_top20")
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        dm._run_query(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026/05-01"}) == 1

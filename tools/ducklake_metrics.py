@@ -72,6 +72,84 @@ queries:
         COUNT(DISTINCT path) AS unique_paths,
         COUNT(*) - COUNT(DISTINCT path) AS dup_rows
       FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion
+
+  - name: ducklake_files_per_band
+    help: Live data files grouped into byte-size bands.
+    interval: 1m
+    labels: [band]
+    values: [count, bytes]
+    sql: |
+      SELECT
+        CASE
+          WHEN file_size_bytes < 1048576    THEN 'lt1mib'
+          WHEN file_size_bytes < 5242880    THEN '1to5mib'
+          WHEN file_size_bytes < 10485760   THEN '5to10mib'
+          WHEN file_size_bytes < 33554432   THEN '10to32mib'
+          WHEN file_size_bytes < 67108864   THEN '32to64mib'
+          WHEN file_size_bytes < 134217728  THEN '64to128mib'
+          ELSE 'gt128mib'
+        END AS band,
+        COUNT(*) AS count,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes
+      FROM __ducklake_metadata_lake.ducklake_data_file
+      WHERE end_snapshot IS NULL
+      GROUP BY band
+
+  - name: ducklake_compaction_candidates
+    help: Live file counts bucketed to match maintenance.py's TIERS spec.
+    interval: 1m
+    labels: [tier]
+    values: [count]
+    sql: |
+      SELECT tier, COUNT(*) AS count
+      FROM (
+        SELECT CASE
+          WHEN file_size_bytes < 1048576   THEN 'tier1'
+          WHEN file_size_bytes < 10485760  THEN 'tier2'
+          WHEN file_size_bytes < 67108864  THEN 'tier3'
+          ELSE 'large'
+        END AS tier
+        FROM __ducklake_metadata_lake.ducklake_data_file
+        WHERE end_snapshot IS NULL
+      ) t
+      GROUP BY tier
+      UNION ALL
+      SELECT 'total' AS tier, COUNT(*) AS count
+      FROM __ducklake_metadata_lake.ducklake_data_file
+      WHERE end_snapshot IS NULL
+
+  - name: ducklake_snapshots
+    help: Snapshot count plus age of oldest/newest snapshot in seconds.
+    interval: 1m
+    values: [count, oldest_seconds_ago, newest_seconds_ago]
+    sql: |
+      SELECT
+        COUNT(*) AS count,
+        COALESCE(EXTRACT(EPOCH FROM (now() - MIN(CAST(snapshot_time AS TIMESTAMPTZ)))), 0) AS oldest_seconds_ago,
+        COALESCE(EXTRACT(EPOCH FROM (now() - MAX(CAST(snapshot_time AS TIMESTAMPTZ)))), 0) AS newest_seconds_ago
+      FROM __ducklake_metadata_lake.ducklake_snapshot
+
+  - name: ducklake_files_per_partition_top20
+    help: Twenty heaviest partitions by live data-file count (composite values joined with '/').
+    interval: 1m
+    labels: [partition]
+    values: [count]
+    sql: |
+      WITH labels AS (
+        SELECT data_file_id,
+               string_agg(partition_value, '/' ORDER BY partition_key_index) AS partition
+        FROM __ducklake_metadata_lake.ducklake_file_partition_value
+        GROUP BY data_file_id
+      )
+      SELECT
+        COALESCE(l.partition, '<none>') AS partition,
+        COUNT(*) AS count
+      FROM __ducklake_metadata_lake.ducklake_data_file df
+      LEFT JOIN labels l USING (data_file_id)
+      WHERE df.end_snapshot IS NULL
+      GROUP BY partition
+      ORDER BY count DESC
+      LIMIT 20
 """
 
 # Intervals are constrained to whole minutes (suffix "m") with a 1-minute
