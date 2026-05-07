@@ -432,7 +432,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
         if self.path == "/metrics":
-            body = generate_latest(REGISTRY)
+            reg = getattr(self.server, "registry", REGISTRY)
+            body = generate_latest(reg)
             self._send(200, body, CONTENT_TYPE_LATEST)
         elif self.path == "/-/healthy":
             self._send(200, b"ok\n", "text/plain; charset=utf-8")
@@ -443,11 +444,16 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
 
 
-def _start_http(port: int) -> ThreadingHTTPServer:
-    srv = ThreadingHTTPServer(("", port), _HealthHandler)
+def _start_http(
+    port: int,
+    registry: CollectorRegistry | None = None,
+    host: str = "",
+) -> ThreadingHTTPServer:
+    srv = ThreadingHTTPServer((host, port), _HealthHandler)
     srv.ready = False  # type: ignore[attr-defined]
+    srv.registry = registry if registry is not None else REGISTRY  # type: ignore[attr-defined]
     threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()
-    log.info("HTTP server listening on :%d", port)
+    log.info("HTTP server listening on %s:%d", host or "*", port)
     return srv
 
 
