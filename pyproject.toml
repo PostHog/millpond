@@ -23,6 +23,7 @@ dependencies = [
     # Required by duckdb's Python conversion for TIMESTAMPTZ columns; the
     # stdlib zoneinfo module isn't accepted as a substitute as of 1.4.x.
     "pytz>=2024.1",
+    "pyyaml>=6.0.3",
 ]
 
 [project.optional-dependencies]
