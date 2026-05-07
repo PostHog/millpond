@@ -152,6 +152,57 @@ just orphans-dry-run         # preview S3-side orphaned files
 
 All commands use the pod's existing env vars (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`).
 
+### DuckLake state metrics
+
+`tools/ducklake_metrics.py` is a small long-running daemon that runs catalog-side queries against the DuckLake on a schedule and exposes results as Prometheus gauges over HTTP. Same Docker image as `maintenance.py`; intended to run as a single-replica Deployment so a Prometheus scraper can watch lake shape, compaction backlog, snapshot age, partition skew, and the pending-deletion queue without S3 round trips.
+
+```bash
+just ducklake-metrics                       # built-ins only, listens on :9100
+just ducklake-metrics-with-config queries.yaml   # extend built-ins from user YAML
+just ducklake-metrics-list                  # print resolved query list and exit (no connection needed)
+```
+
+Endpoints: `/metrics` (Prometheus exposition), `/-/healthy` (k8s liveness), `/-/ready` (k8s readiness). The daemon reconnects to the catalog with exponential backoff (1s → 60s cap) on connect failure, and forces a reconnect after 10 consecutive query failures across all queries; transient SQL errors in a single query log + increment `ducklake_metrics_query_errors_total` without killing the process.
+
+Built-in queries:
+
+| Metric prefix | Labels | Values | Source |
+|---|---|---|---|
+| `ducklake_pending_deletes` | — | `total`, `unique_paths`, `dup_rows` | `ducklake_files_scheduled_for_deletion` |
+| `ducklake_files_per_band` | `band` (`lt1mib` / `1to5mib` / `5to10mib` / `10to32mib` / `32to64mib` / `64to128mib` / `gt128mib`) | `count`, `bytes` | `ducklake_data_file` |
+| `ducklake_compaction_candidates` | `tier` (`tier1` / `tier2` / `tier3` / `large` / `total`) | `count` | `ducklake_data_file` |
+| `ducklake_snapshots` | — | `count`, `oldest_seconds_ago`, `newest_seconds_ago` | `ducklake_snapshot` |
+| `ducklake_files_per_partition_top20` | `partition` | `count` | `ducklake_data_file` ⨝ `ducklake_file_partition_value` |
+
+Plus self-metrics: `ducklake_metrics_up`, `ducklake_metrics_query_duration_seconds{query}`, `ducklake_metrics_query_last_success_timestamp{query}`, `ducklake_metrics_query_errors_total{query}`.
+
+User YAML schema (extends or overrides built-ins by name):
+
+```yaml
+queries:
+  - name: events_files_per_table
+    help: Live data file count by table (custom example)
+    interval_mins: 5            # positive integer; minimum 1
+    labels: [table_name]
+    values: [count]
+    sql: |
+      SELECT t.table_name, COUNT(*) AS count
+      FROM __ducklake_metadata_lake.ducklake_data_file df
+      JOIN __ducklake_metadata_lake.ducklake_table t USING (table_id)
+      WHERE df.end_snapshot IS NULL
+      GROUP BY t.table_name
+```
+
+Built-ins are intentionally lake-wide (no `table_name` label); per-table breakdowns belong in user YAML when needed.
+
+Configuration env vars (in addition to the standard `DUCKLAKE_*` / `DUCKDB_*` set used by `maintenance.py`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `DUCKLAKE_METRICS_PORT` | `9100` | HTTP listen port |
+| `DUCKLAKE_METRICS_CONFIG` | unset | Path to user-supplied queries YAML |
+| `DUCKLAKE_METRICS_DISABLE` | unset | Comma-separated query names to skip from built-ins |
+
 ## Configuration
 
 All configuration via environment variables:
