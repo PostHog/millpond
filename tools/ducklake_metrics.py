@@ -25,26 +25,53 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import heapq
+import itertools
 import logging
 import os
 import re
+import signal
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import duckdb
 import maintenance
 import yaml
-from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    REGISTRY,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    generate_latest,
+)
 
 log = logging.getLogger("ducklake_metrics")
 
 
 # Built-in queries are embedded so the binary is self-contained; they parse
 # through the same loader as user YAML so the two paths can't diverge.
+#
+# SQL refers to the metadata schema by its literal name. maintenance.connect()
+# always ATTACHes the lake as ``lake``, which fixes the schema as
+# ``__ducklake_metadata_lake`` (per maintenance.py's METADATA_SCHEMA). Built-in
+# queries hardcode that name; user-supplied queries are passed through verbatim
+# and may reference whatever schema they like.
 BUILTIN_YAML = """
-queries: []
+queries:
+  - name: ducklake_pending_deletes
+    help: Pending-deletion queue depth and duplicate-row pathology.
+    interval: 1m
+    values: [total, unique_paths, dup_rows]
+    sql: |
+      SELECT
+        COUNT(*) AS total,
+        COUNT(DISTINCT path) AS unique_paths,
+        COUNT(*) - COUNT(DISTINCT path) AS dup_rows
+      FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion
 """
 
 # Intervals are constrained to whole minutes (suffix "m") with a 1-minute
@@ -127,6 +154,146 @@ def load_queries(user_yaml_path: str | None, disable: set[str]) -> list[Query]:
     for name in disable:
         by_name.pop(name, None)
     return list(by_name.values())
+
+
+@dataclass
+class SelfMetrics:
+    duration: Gauge
+    errors: Counter
+    last_success: Gauge
+    up: Gauge
+
+
+def _build_self_metrics(registry: CollectorRegistry | None = None) -> SelfMetrics:
+    kwargs = {"registry": registry} if registry is not None else {}
+    return SelfMetrics(
+        duration=Gauge(
+            "ducklake_metrics_query_duration_seconds",
+            "Wall-clock duration of the most recent run for each query.",
+            ["query"],
+            **kwargs,
+        ),
+        errors=Counter(
+            "ducklake_metrics_query_errors_total",
+            "Cumulative count of failed query runs.",
+            ["query"],
+            **kwargs,
+        ),
+        last_success=Gauge(
+            "ducklake_metrics_query_last_success_timestamp",
+            "Unix timestamp of the most recent successful run for each query.",
+            ["query"],
+            **kwargs,
+        ),
+        up=Gauge(
+            "ducklake_metrics_up",
+            "1 once the daemon's scheduler has started.",
+            **kwargs,
+        ),
+    )
+
+
+def _build_query_gauges(
+    queries: list[Query],
+    registry: CollectorRegistry | None = None,
+) -> dict[str, dict[str, Gauge]]:
+    """For each query, register one Gauge per value column.
+
+    Metric name is ``<query_name>_<value>``. Labels come from ``query.labels``.
+    Always suffixes (no special-case for single-value queries) so the metric
+    name shape is uniform across the daemon.
+    """
+    kwargs = {"registry": registry} if registry is not None else {}
+    out: dict[str, dict[str, Gauge]] = {}
+    for q in queries:
+        gs: dict[str, Gauge] = {}
+        for v in q.values:
+            gs[v] = Gauge(f"{q.name}_{v}", q.help, q.labels, **kwargs)
+        out[q.name] = gs
+    return out
+
+
+def _run_query(
+    conn: duckdb.DuckDBPyConnection,
+    q: Query,
+    gauges: dict[str, Gauge],
+    self_metrics: SelfMetrics,
+) -> None:
+    """Execute one query and update its gauges.
+
+    On success: clears each value gauge before re-populating so label
+    combinations that drop out between runs don't linger as stale series.
+    On failure: increments the error counter and logs; the daemon stays
+    up. Catalog flap is the expected steady-state failure mode.
+    """
+    t0 = time.monotonic()
+    try:
+        cur = conn.execute(q.sql)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        try:
+            label_idx = [cols.index(name) for name in q.labels]
+            value_idx = [cols.index(name) for name in q.values]
+        except ValueError as e:
+            raise RuntimeError(
+                f"query {q.name}: SQL must return columns named in labels+values; "
+                f"got cols={cols} labels={q.labels} values={q.values}"
+            ) from e
+        if q.labels:
+            # Only labeled gauges support clear(); for unlabeled the .set()
+            # below is itself the full state update.
+            for g in gauges.values():
+                g.clear()
+        for row in rows:
+            label_vals = [str(row[i]) if row[i] is not None else "" for i in label_idx]
+            for v_name, v_i in zip(q.values, value_idx):
+                v = row[v_i]
+                if v is None:
+                    continue
+                g = gauges[v_name]
+                if q.labels:
+                    g.labels(*label_vals).set(float(v))
+                else:
+                    g.set(float(v))
+        elapsed = time.monotonic() - t0
+        self_metrics.duration.labels(q.name).set(elapsed)
+        self_metrics.last_success.labels(q.name).set_to_current_time()
+        log.debug("query %s: %d rows in %.3fs", q.name, len(rows), elapsed)
+    except Exception:
+        log.exception("query %s failed", q.name)
+        self_metrics.errors.labels(q.name).inc()
+
+
+def _scheduler_loop(
+    conn: duckdb.DuckDBPyConnection,
+    queries: list[Query],
+    gauges: dict[str, dict[str, Gauge]],
+    self_metrics: SelfMetrics,
+    stop: threading.Event,
+) -> None:
+    """Run queries on per-query intervals until stop is set.
+
+    Min-heap of ``(next_monotonic_ts, seq, idx)``. ``seq`` is a strict
+    tiebreaker so the heap never compares Query objects (which would
+    fail). Initial schedule fires every query at startup so /metrics
+    populates as quickly as the catalog will respond. Catalog reads are
+    short and serial — no need for parallel execution; one duckdb
+    connection isn't safe for concurrent calls anyway.
+    """
+    seq = itertools.count()
+    heap: list[tuple[float, int, int]] = []
+    now = time.monotonic()
+    for idx in range(len(queries)):
+        heapq.heappush(heap, (now, next(seq), idx))
+    while not stop.is_set():
+        next_ts, _, idx = heap[0]
+        wait_for = next_ts - time.monotonic()
+        if wait_for > 0 and stop.wait(wait_for):
+            return
+        heapq.heappop(heap)
+        q = queries[idx]
+        _run_query(conn, q, gauges[q.name], self_metrics)
+        heapq.heappush(heap, (time.monotonic() + q.interval_seconds, next(seq), idx))
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -220,16 +387,27 @@ def main(argv: list[str] | None = None) -> None:
             print(f"{q.name}\t{q.interval_seconds}s\t{q.help}")
         return
 
+    self_metrics = _build_self_metrics()
+    gauges = _build_query_gauges(queries)
+
+    stop = threading.Event()
+
+    def _handle_signal(signum: int, _frame: object) -> None:
+        log.info("Received signal %d; shutting down", signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     srv = _start_http(args.port)
     conn = maintenance.connect()
     try:
+        self_metrics.up.set(1)
         srv.ready = True  # type: ignore[attr-defined]
-        # Scheduler loop lands in a follow-up commit; for now just block so
-        # the HTTP server stays up and serves /metrics + health endpoints.
-        log.info("Daemon ready (scheduler not yet wired)")
-        while True:
-            time.sleep(60)
+        log.info("Scheduler starting; %d query(ies) registered", len(queries))
+        _scheduler_loop(conn, queries, gauges, self_metrics, stop)
     finally:
+        self_metrics.up.set(0)
         conn.close()
 
 
