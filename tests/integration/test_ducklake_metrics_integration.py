@@ -26,8 +26,11 @@ from prometheus_client import CollectorRegistry
 
 
 def _free_port() -> int:
+    # Bind loopback only — we just need an unused port number, not actual
+    # all-interfaces exposure. Avoids the security-audit "bind to 0.0.0.0"
+    # finding, and matches the host the test connects back to.
     with socket.socket() as s:
-        s.bind(("", 0))
+        s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
