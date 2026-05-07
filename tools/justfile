@@ -69,6 +69,7 @@ _setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD
 
 maintenance := env("MAINTENANCE_SCRIPT", "/app/tools/maintenance.py")
 maintenance_sql := env("MAINTENANCE_SQL", "/app/tools/maintenance.sql")
+ducklake_metrics := env("DUCKLAKE_METRICS_SCRIPT", "/app/tools/ducklake_metrics.py")
 
 default:
     @just --list
@@ -219,3 +220,22 @@ compact-all-tiers table="": compact-to-tier-1 compact-to-tier-2 compact-to-tier-
 # Dry-run all tiered compactions sequentially (tier 1 -> 2 -> 3)
 [group('compaction')]
 compact-all-tiers-dry-run table="": compact-to-tier-1-dry-run compact-to-tier-2-dry-run compact-to-tier-3-dry-run
+
+# ----------------------------------------------------------------------------
+# state-metrics daemon
+# ----------------------------------------------------------------------------
+
+# Run the ducklake-metrics daemon (Prometheus exposition on :$port)
+[group('metrics')]
+ducklake-metrics port="9100":
+    python {{ ducklake_metrics }} --port {{ port }}
+
+# Run the daemon with a user-supplied queries YAML extending the built-ins
+[group('metrics')]
+ducklake-metrics-with-config config port="9100":
+    python {{ ducklake_metrics }} --port {{ port }} --config "{{ config }}"
+
+# Print the resolved query list (built-ins + user config) and exit; validates config without connecting
+[group('metrics')]
+ducklake-metrics-list config="":
+    python {{ ducklake_metrics }} --list-queries {{ if config != "" { "--config " + config } else { "" } }}
