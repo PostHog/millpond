@@ -178,16 +178,7 @@ def _ensure_table(
         # partition spec.
         iceberg_schema = assign_fresh_schema_ids(_pyarrow_to_schema_without_ids(sample.schema))
         spec = _build_partition_spec(iceberg_schema)
-        try:
-            catalog.create_namespace_if_not_exists(namespace)
-        except AttributeError:
-            # Pre-0.7 PyIceberg didn't expose create_namespace_if_not_exists;
-            # tolerate either path so the module works against older REST
-            # servers without forcing a PyIceberg pin.
-            try:
-                catalog.create_namespace(namespace)
-            except Exception:
-                pass
+        catalog.create_namespace_if_not_exists(namespace)
         create_kwargs: dict[str, object] = {"partition_spec": spec}
         if location:
             create_kwargs["location"] = location

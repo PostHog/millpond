@@ -20,7 +20,12 @@ dependencies = [
     "orjson>=3.10",
     "prometheus-client>=0.21",
     "pyyaml>=6.0.3",
-    "pyiceberg[pyarrow]>=0.11.1",
+    # Pinned exactly. millpond/iceberg.py depends on two private symbols
+    # (_pyarrow_to_schema_without_ids, assign_fresh_schema_ids) and PyIceberg
+    # is pre-1.0 — minor-version bumps reshuffle internals. The canary test
+    # tests/unit/test_pyiceberg_pin.py imports both and will fail loudly on
+    # any upgrade; treat that as the signal to revisit this module.
+    "pyiceberg[pyarrow]==0.11.1",
 ]
 
 [project.optional-dependencies]

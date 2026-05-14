@@ -336,7 +336,7 @@ requires-dist = [
     { name = "orjson", specifier = ">=3.10" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "pyarrow", specifier = ">=18.0" },
-    { name = "pyiceberg", extras = ["pyarrow"], specifier = ">=0.11.1" },
+    { name = "pyiceberg", extras = ["pyarrow"], specifier = "==0.11.1" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
 provides-extras = ["msk-iam"]
