@@ -84,9 +84,8 @@ class TestAddMetadataColumns:
         assert ts_type.tz == "UTC"
 
     def test_all_rows_share_one_timestamp(self):
-        # Mirrors DuckLake's NOW() per-statement semantics — operators
-        # rely on a single batch landing in one partition, not getting
-        # split by the microsecond drift of sequential row timestamps.
+        # A flush must land in exactly one partition, not get split by
+        # the microsecond drift of sequential per-row timestamps.
         out = iceberg._add_metadata_columns(_sample_batch())
         ts_values = out.column("_inserted_at").to_pylist()
         assert len(set(ts_values)) == 1

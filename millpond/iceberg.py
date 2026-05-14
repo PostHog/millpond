@@ -1,18 +1,16 @@
 """Iceberg write path.
 
-Replaces the DuckLake module. Same call shape as the old surface — ``connect()``
-returns a long-lived handle, ``write()`` appends an Arrow batch — but the
-handle is a PyIceberg ``Catalog`` and the append goes through a REST commit
-rather than a DuckDB ``INSERT``.
+``connect()`` returns a long-lived PyIceberg ``Catalog`` handle, ``write()``
+appends an Arrow batch via a REST commit.
 
 Partition layout is fixed: identity transforms on ``year`` / ``month`` /
-``day`` / ``hour`` derived from ``_inserted_at`` at write time. This keeps
-the on-disk Hive-style layout (``year=2026/month=5/day=13/hour=14/*.parquet``)
-that downstream tooling expects, at the cost of reader ergonomics — Iceberg
-doesn't know the four columns are derived from the timestamp, so queries
-need to filter on the partition columns explicitly for pruning. If reader
-ergonomics ever bite, we can layer a second hidden-partitioning spec on
-top via Iceberg's spec evolution; not needed today.
+``day`` / ``hour`` derived from ``_inserted_at`` at write time. This produces
+a Hive-style layout (``year=2026/month=5/day=13/hour=14/*.parquet``) on S3
+that downstream tooling can prefix-filter, at the cost of reader ergonomics
+— Iceberg doesn't know the four columns are derived from the timestamp, so
+queries need to filter on the partition columns explicitly for pruning. If
+reader ergonomics ever bite, we can layer a second hidden-partitioning spec
+on top via Iceberg's spec evolution; not needed today.
 """
 
 from __future__ import annotations
@@ -98,10 +96,10 @@ def _now_utc_us() -> datetime.datetime:
 def _add_metadata_columns(batch: pa.Table) -> pa.Table:
     """Append ``_inserted_at`` plus the four partition columns.
 
-    All rows in a single batch share the same ``_inserted_at`` value
-    (matching DuckLake's ``NOW()`` per-statement semantics). Year/month/
-    day/hour are derived from that timestamp via PyArrow compute; cast
-    to int32 explicitly because pc.year/month/day/hour all return int64.
+    All rows in a single batch share the same ``_inserted_at`` value so
+    a flush always lands in exactly one partition. Year/month/day/hour
+    are derived from that timestamp via PyArrow compute; cast to int32
+    explicitly because pc.year/month/day/hour all return int64.
     """
     now = _now_utc_us()
     ts_type = pa.timestamp("us", tz="UTC")
@@ -217,7 +215,7 @@ def write(
     Adds ``_inserted_at`` plus the four partition columns derived from
     it, then calls ``Table.append(...)``. ``schema_mgr`` (when supplied)
     evolves the catalog schema to accommodate any new source columns in
-    the batch — same contract as the old DuckLake path.
+    the batch.
     """
     if len(source_batch) == 0:
         return  # nothing to write; skip the commit round trip

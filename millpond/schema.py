@@ -56,8 +56,7 @@ def _arrow_to_iceberg(arrow_type: pa.DataType) -> IcebergType:
 
     Source data has already had nested types (struct/list/map) JSON-stringified
     upstream in arrow_converter, so by the time a field reaches us its type
-    should be flat. Anything we don't recognise falls back to ``StringType``,
-    same as the old DuckLake VARCHAR fallback.
+    should be flat. Anything we don't recognise falls back to ``StringType``.
     """
     if pa.types.is_boolean(arrow_type):
         return BooleanType()

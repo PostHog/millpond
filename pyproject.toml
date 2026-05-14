@@ -11,18 +11,14 @@ version-file = "millpond/_version.py"
 [project]
 name = "millpond"
 dynamic = ["version"]
-description = "Kafka to DuckLake"
+description = "Kafka to Iceberg"
 license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",
-    "duckdb==1.5.1",
     "pyarrow>=18.0",
     "orjson>=3.10",
     "prometheus-client>=0.21",
-    # Required by duckdb's Python conversion for TIMESTAMPTZ columns; the
-    # stdlib zoneinfo module isn't accepted as a substitute as of 1.4.x.
-    "pytz>=2024.1",
     "pyyaml>=6.0.3",
     "pyiceberg[pyarrow]>=0.11.1",
 ]
@@ -53,7 +49,6 @@ markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
     "e2e: marks tests as E2E tests requiring docker-compose stack",
 ]
-pythonpath = ["tools"]
 
 [tool.uv]
 constraint-dependencies = [

@@ -1,4 +1,4 @@
-# Millpond — Kafka to DuckLake
+# Millpond — Kafka to Iceberg
 
 # Default recipe: list all available recipes
 default:
@@ -91,11 +91,6 @@ down:
 down-ssl:
     docker compose -f docker-compose.yaml -f docker-compose.ssl.yaml down -v
 
-# Open a DuckDB shell attached to the local DuckLake (requires `just up` first)
-[group('docker')]
-duck:
-    duckdb -init test/ducklake-init.sql
-
 # Open the Grafana dashboard (requires `just up` first)
 [group('docker')]
 dashboard:
@@ -125,34 +120,3 @@ clean:
 
 # === Metrics ===
 
-# Compare LOC against ducklake-kafka-connect
-[group('dev')]
-loc:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    tmpdir=$(mktemp -d)
-    trap "rm -rf $tmpdir" EXIT
-    git clone --quiet --depth 1 https://github.com/PostHog/ducklake-kafka-connect.git "$tmpdir/dkc" 2>/dev/null
-    echo ""
-    echo "┌─────────────────────────────────────────────────────────────────┐"
-    echo "│              LOC Comparison: Millpond vs Kafka Connect         │"
-    echo "└─────────────────────────────────────────────────────────────────┘"
-    echo ""
-    echo "=== Millpond (Python) ==="
-    cloc --quiet millpond/ tests/
-    echo ""
-    echo "=== ducklake-kafka-connect (Java) ==="
-    cloc --quiet "$tmpdir/dkc/src/"
-    echo ""
-    # Summary table
-    mp_prod=$(cloc --csv --quiet millpond/ | tail -1 | cut -d, -f5)
-    mp_test=$(cloc --csv --quiet tests/ | tail -1 | cut -d, -f5)
-    dkc_prod=$(cloc --csv --quiet "$tmpdir/dkc/src/main/" | tail -1 | cut -d, -f5)
-    dkc_test=$(cloc --csv --quiet "$tmpdir/dkc/src/test/" "$tmpdir/dkc/src/integrationTest/" | tail -1 | cut -d, -f5)
-    echo "┌──────────────────┬──────────────────┬──────────────┬───────┐"
-    echo "│                  │ Kafka Connect    │ Millpond     │ Ratio │"
-    echo "├──────────────────┼──────────────────┼──────────────┼───────┤"
-    printf "│ Production       │ %'16d │ %'12d │ %4.1fx │\n" "$dkc_prod" "$mp_prod" "$(echo "$dkc_prod/$mp_prod" | bc -l)"
-    printf "│ Tests            │ %'16d │ %'12d │ %4.1fx │\n" "$dkc_test" "$mp_test" "$(echo "$dkc_test/$mp_test" | bc -l)"
-    printf "│ Total            │ %'16d │ %'12d │ %4.1fx │\n" "$((dkc_prod+dkc_test))" "$((mp_prod+mp_test))" "$(echo "($dkc_prod+$dkc_test)/($mp_prod+$mp_test)" | bc -l)"
-    echo "└──────────────────┴──────────────────┴──────────────┴───────┘"
