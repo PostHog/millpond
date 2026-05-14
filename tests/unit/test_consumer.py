@@ -4,8 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from confluent_kafka import OFFSET_STORED
 
-from confluent_kafka import OFFSET_STORED
-
+from millpond.config import Config
 from millpond.consumer import (
     _base_kafka_config,
     _maybe_attach_oauth_cb,
@@ -14,7 +13,6 @@ from millpond.consumer import (
     create,
     discover_partition_count,
 )
-from millpond.config import Config
 
 
 class TestComputeAssignment:
@@ -137,17 +135,18 @@ def _make_cfg(**overrides) -> Config:
         group_id="test-group",
         replica_count=4,
         ordinal=1,
-        ducklake_table="events",
-        ducklake_data_path="s3://bucket/data",
-        ducklake_connection=":memory:",
-        rds_host="localhost",
-        rds_port="5432",
-        rds_database="ducklake",
-        rds_username="ducklake",
-        rds_password="pass",
+        iceberg_catalog_uri="https://catalog.example/v1",
+        iceberg_warehouse="production",
+        iceberg_namespace="millpond",
+        iceberg_table="events",
+        iceberg_table_location=None,
+        iceberg_catalog_token=None,
+        s3_access_key_id="AKIA0000",
+        s3_secret_access_key="secret0",
+        s3_region="us-east-1",
+        s3_endpoint=None,
         flush_size=100,
         flush_interval_ms=1000,
-        partition_by=None,
         fetch_min_bytes=1,
         fetch_max_wait_ms=500,
         consume_batch_size=1000,

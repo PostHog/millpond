@@ -22,7 +22,7 @@ _records_consumed_total = Counter(
 )
 _records_written_total = Counter(
     "millpond_records_written_total",
-    "Records written to DuckLake",
+    "Records written to the lake",
     ["pipeline", "broker_source"],
 )
 _batches_flushed_total = Counter(
@@ -43,7 +43,7 @@ _errors_total = Counter(
 
 _flush_duration_seconds = Histogram(
     "millpond_flush_duration_seconds",
-    "Time per DuckLake write",
+    "Time per lake write",
     ["pipeline", "broker_source"],
 )
 _arrow_conversion_seconds = Histogram(

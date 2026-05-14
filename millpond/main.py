@@ -7,7 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 import pyarrow as pa
 from confluent_kafka import TopicPartition
 
-from millpond import arrow_converter, backpressure, config, consumer, ducklake, logging_config, metrics, schema, server
+from millpond import arrow_converter, backpressure, config, consumer, iceberg, logging_config, metrics, schema, server
 
 log = logging.getLogger(__name__)
 
@@ -29,11 +29,18 @@ def _convert_batch(values: list[bytes]) -> pa.Table | None:
     return table
 
 
-def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=None):
-    """Write to DuckLake with exponential backoff on transient failures."""
+def _write_with_retry(catalog, cfg, consolidated, schema_mgr):
+    """Write to Iceberg with exponential backoff on transient failures."""
     for attempt in range(_WRITE_MAX_RETRIES):
         try:
-            ducklake.write(db, table_name, consolidated, schema_mgr, partition_by)
+            iceberg.write(
+                catalog,
+                cfg.iceberg_namespace,
+                cfg.iceberg_table,
+                consolidated,
+                schema_mgr,
+                cfg.iceberg_table_location,
+            )
             return
         except Exception:
             metrics.errors_total.labels(type="write_retry").inc()
@@ -49,16 +56,18 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=Non
             )
             # Invalidate caches so retry re-checks table existence and schema —
             # another pod may have created the table or changed columns.
-            ducklake.reset_table_cache()
+            iceberg.reset_table_cache()
             if schema_mgr is not None:
                 schema_mgr.invalidate()
             time.sleep(delay)
 
 
-def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr, trigger="time"):
-    """Write to DuckLake, commit offsets, update metrics."""
+def _flush(
+    catalog, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr, trigger="time"
+):
+    """Write to Iceberg, commit offsets, update metrics."""
     t0 = time.monotonic()
-    _write_with_retry(db, cfg.ducklake_table, consolidated, schema_mgr, cfg.partition_by)
+    _write_with_retry(catalog, cfg, consolidated, schema_mgr)
     write_duration = time.monotonic() - t0
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded
@@ -129,17 +138,25 @@ def main():
     log.info("millpond %s starting", __version__)
 
     cfg = config.load()
-    metrics.init(f"{cfg.topic}-{cfg.ducklake_table}", broker_source=cfg.broker_source)
+    metrics.init(f"{cfg.topic}-{cfg.iceberg_table}", broker_source=cfg.broker_source)
     http = server.start()
     server.health.mark_started()
     log.info("Health server started, probes passing")
 
-    # No connection recovery logic — if DuckLake/Postgres fails, the pod crashes
-    # and K8s restarts it. Reconnection adds complexity for no benefit when the
-    # restart path already handles offset replay correctly.
-    db = ducklake.connect(cfg)
-    schema_mgr = schema.SchemaManager(db, cfg.ducklake_table)
-    log.info("DuckLake connected, schema manager initialized")
+    # No connection recovery logic — if the catalog/S3 path fails, the pod
+    # crashes and K8s restarts it. Reconnection adds complexity for no
+    # benefit when the restart path already handles offset replay correctly.
+    catalog = iceberg.connect(
+        catalog_uri=cfg.iceberg_catalog_uri,
+        warehouse=cfg.iceberg_warehouse,
+        s3_access_key_id=cfg.s3_access_key_id,
+        s3_secret_access_key=cfg.s3_secret_access_key,
+        s3_region=cfg.s3_region,
+        catalog_token=cfg.iceberg_catalog_token,
+        s3_endpoint=cfg.s3_endpoint,
+    )
+    schema_mgr = schema.SchemaManager(catalog, cfg.iceberg_namespace, cfg.iceberg_table)
+    log.info("Iceberg catalog connected, schema manager initialized")
     kafka = consumer.create(cfg)
     log.info("Kafka consumer created, partitions assigned")
     backpressure.init(cfg.consume_batch_size)
@@ -221,7 +238,7 @@ def main():
                 trigger = "size" if size_triggered else "time"
                 consolidated = pa.concat_tables(pending, promote_options="default")
                 _flush(
-                    db,
+                    catalog,
                     cfg,
                     kafka,
                     consolidated,
@@ -258,13 +275,13 @@ def main():
                 consolidated = pa.concat_tables(pending, promote_options="default")
                 elapsed = time.monotonic() - last_flush
                 log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
-                _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
+                _flush(catalog, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
             except Exception:
                 log.exception("Final flush failed — data safe in Kafka, will replay on restart")
 
         log.info("Closing consumer")
         kafka.close()
-        db.close()
+        # PyIceberg REST catalog has no persistent connection to close.
         http.shutdown()
         log.info("millpond shutdown complete")
 

@@ -4,9 +4,7 @@ import re
 from dataclasses import dataclass
 
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-
-# Shared with ducklake._validate_partition_expr — keep in sync or import from here.
-SAFE_PARTITION_EXPR = re.compile(r"^[a-zA-Z0-9_(),\s]+$")
+_SAFE_NAMESPACE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 log = logging.getLogger(__name__)
 
@@ -22,24 +20,23 @@ class Config:
     replica_count: int
     ordinal: int
 
-    # DuckLake
-    ducklake_table: str
-    ducklake_data_path: str
-    ducklake_connection: str
+    # Iceberg
+    iceberg_catalog_uri: str  # REST endpoint
+    iceberg_warehouse: str
+    iceberg_namespace: str
+    iceberg_table: str
+    iceberg_table_location: str | None  # explicit s3:// path; None lets the catalog decide
+    iceberg_catalog_token: str | None  # bearer / OAuth token, optional
 
-    # RDS (DuckLake metadata store)
-    rds_host: str
-    rds_port: str
-    rds_database: str
-    rds_username: str
-    rds_password: str
+    # S3 (data files)
+    s3_access_key_id: str
+    s3_secret_access_key: str
+    s3_region: str
+    s3_endpoint: str | None
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
     flush_interval_ms: int  # ms since last flush
-
-    # Partitioning
-    partition_by: str | None  # e.g. "year(timestamp),month(timestamp),day(timestamp),hour(timestamp)"
 
     # Consumer tuning
     fetch_min_bytes: int
@@ -75,10 +72,17 @@ def _require(name: str) -> str:
 
 def load() -> Config:
     topic = _require("KAFKA_TOPIC")
-    ducklake_table = _require("DUCKLAKE_TABLE")
-    if not _SAFE_TABLE_NAME.match(ducklake_table):
+
+    iceberg_table = _require("ICEBERG_TABLE")
+    if not _SAFE_TABLE_NAME.match(iceberg_table):
         raise RuntimeError(
-            f"DUCKLAKE_TABLE {ducklake_table!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+            f"ICEBERG_TABLE {iceberg_table!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+        )
+
+    iceberg_namespace = _require("ICEBERG_NAMESPACE")
+    if not _SAFE_NAMESPACE.match(iceberg_namespace):
+        raise RuntimeError(
+            f"ICEBERG_NAMESPACE {iceberg_namespace!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
         )
 
     pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME", "millpond-0")
@@ -88,13 +92,7 @@ def load() -> Config:
     if ordinal >= replica_count:
         raise RuntimeError(f"Ordinal {ordinal} >= REPLICA_COUNT {replica_count}")
 
-    group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{ducklake_table}")
-
-    partition_by = os.environ.get("DUCKLAKE_PARTITION_BY", "").strip() or None
-    if partition_by and not SAFE_PARTITION_EXPR.match(partition_by):
-        raise RuntimeError(
-            f"DUCKLAKE_PARTITION_BY {partition_by!r} contains unsafe characters (must match [a-zA-Z0-9_(),\\s]+)"
-        )
+    group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{iceberg_table}")
 
     # Collect KAFKA_CONSUMER_* env vars as librdkafka config overrides.
     # e.g. KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL -> security.protocol=SASL_SSL
@@ -111,15 +109,16 @@ def load() -> Config:
         group_id=group_id,
         replica_count=replica_count,
         ordinal=ordinal,
-        ducklake_table=ducklake_table,
-        ducklake_data_path=_require("DUCKLAKE_DATA_PATH"),
-        ducklake_connection=_require("DUCKLAKE_CONNECTION"),
-        rds_host=_require("DUCKLAKE_RDS_HOST"),
-        rds_port=os.environ.get("DUCKLAKE_RDS_PORT", "5432"),
-        rds_database=os.environ.get("DUCKLAKE_RDS_DATABASE", "ducklake"),
-        rds_username=os.environ.get("DUCKLAKE_RDS_USERNAME", "ducklake"),
-        rds_password=_require("DUCKLAKE_RDS_PASSWORD"),
-        partition_by=partition_by,
+        iceberg_catalog_uri=_require("ICEBERG_CATALOG_URI"),
+        iceberg_warehouse=_require("ICEBERG_WAREHOUSE"),
+        iceberg_namespace=iceberg_namespace,
+        iceberg_table=iceberg_table,
+        iceberg_table_location=os.environ.get("ICEBERG_TABLE_LOCATION") or None,
+        iceberg_catalog_token=os.environ.get("ICEBERG_CATALOG_TOKEN") or None,
+        s3_access_key_id=_require("MILLPOND_S3_ACCESS_KEY_ID"),
+        s3_secret_access_key=_require("MILLPOND_S3_SECRET_ACCESS_KEY"),
+        s3_region=_require("MILLPOND_S3_REGION"),
+        s3_endpoint=os.environ.get("MILLPOND_S3_ENDPOINT") or None,
         flush_size=int(os.environ.get("FLUSH_SIZE", "104857600")),
         flush_interval_ms=int(os.environ.get("FLUSH_INTERVAL_MS", "60000")),
         fetch_min_bytes=int(os.environ.get("FETCH_MIN_BYTES", "1048576")),
@@ -131,9 +130,10 @@ def load() -> Config:
     )
 
     log.info(
-        "Config: topic=%s table=%s ordinal=%d/%d group_id=%s",
+        "Config: topic=%s table=%s.%s ordinal=%d/%d group_id=%s",
         topic,
-        ducklake_table,
+        iceberg_namespace,
+        iceberg_table,
         ordinal,
         replica_count,
         cfg.group_id,

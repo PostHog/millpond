@@ -55,7 +55,7 @@ def _base_kafka_config(cfg: Config) -> dict:
     """Base config shared by all Kafka clients (AdminClient, Consumer)."""
     base = {
         "bootstrap.servers": cfg.bootstrap_servers,
-        "client.id": f"millpond-{cfg.topic}-{cfg.ducklake_table}-{cfg.ordinal}",
+        "client.id": f"millpond-{cfg.topic}-{cfg.iceberg_table}-{cfg.ordinal}",
     }
     for key, val in cfg.kafka_config_overrides:
         base[key] = val
