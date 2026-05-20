@@ -5,12 +5,15 @@
 Always run before pushing:
 
 ```bash
-just lint       # ruff check
-just fmt-check  # ruff format --check
-just test       # unit tests
+just lint              # ruff check
+just fmt-check         # ruff format --check
+just test              # unit tests
+just test-integration  # MinIO + iceberg-rest via testcontainers (~10s)
+just test-e2e          # full DuckLake stack (~1m)
+just test-e2e-iceberg  # full Iceberg stack (~1m)
 ```
 
-All three must pass. Do not push with lint or test failures.
+All must pass. Do not push with any lint, test, integration, or e2e failures — CI runs all of these on every push and PR (`.github/workflows/ci.yaml`), and the integration/e2e jobs are gating. Catch failures locally rather than on the runner.
 
 For changes to Kafka client code or config handling, also verify with SSL Kafka:
 

@@ -30,6 +30,12 @@ def compose():
 def conn(compose):
     """DuckDB connection to the local DuckLake instance."""
     c = duckdb.connect()
+    # INSTALL is idempotent — required on fresh DuckDB user dirs (e.g. CI
+    # runners). Local dev machines usually have these from prior LOADs so
+    # this used to seem to work without INSTALL; CI exposed the gap.
+    c.execute("INSTALL httpfs")
+    c.execute("INSTALL ducklake")
+    c.execute("INSTALL postgres")
     c.execute("LOAD httpfs")
     c.execute("LOAD ducklake")
     c.execute("LOAD postgres")

@@ -50,3 +50,37 @@ jobs:
 
     - name: Build Docker image
       run: docker build --build-arg MILLPOND_VERSION=0.0.0.dev0 -t millpond .
+
+  integration:
+    # Integration suite: MinIO + iceberg-rest via testcontainers. No Kafka,
+    # no millpond container — drives the library directly. ~10s runtime.
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+    - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+
+    - name: Integration tests
+      run: uv run pytest tests/integration -v
+
+  e2e:
+    # E2E suites: full docker-compose stacks for both destinations.
+    # Each builds the millpond image, brings up Kafka/MinIO/(Postgres|iceberg-rest),
+    # runs the producer, and verifies records land. ~1 minute per stack.
+    runs-on: ubuntu-latest
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - { name: ducklake, path: tests/e2e/test_e2e.py }
+          - { name: iceberg,  path: tests/e2e/test_e2e_iceberg.py }
+    name: e2e (${{ matrix.suite.name }})
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+    - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+
+    - name: E2E tests
+      run: uv run pytest ${{ matrix.suite.path }} -v -s

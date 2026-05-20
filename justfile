@@ -53,10 +53,15 @@ test:
 test-integration:
     uv run python -m pytest tests/integration
 
-# Run E2E test (brings up docker-compose stack automatically)
+# Run E2E test against the DuckLake stack (docker-compose.yaml).
 [group('test')]
 test-e2e:
-    uv run python -m pytest tests/e2e -v -s
+    uv run python -m pytest tests/e2e/test_e2e.py -v -s
+
+# Run E2E test against the Iceberg stack (docker-compose.iceberg.yaml).
+[group('test')]
+test-e2e-iceberg:
+    uv run python -m pytest tests/e2e/test_e2e_iceberg.py -v -s
 
 # Full CI check
 [group('test')]
