@@ -461,6 +461,16 @@ Related issues:
 - [aws-msk-iam-auth #143](https://github.com/aws/aws-msk-iam-auth/issues/143) — re-authentication fails with OAUTHBEARER
 - [aws-msk-iam-auth #176](https://github.com/aws/aws-msk-iam-auth/issues/176) — second re-authentication fails with default credentials
 
+## Next steps
+
+### Iceberg multi-writer commit contention
+
+The Iceberg sink can't currently sustain two pods committing to the same table at typical flush cadence. PyIceberg's REST commit attaches a branch-snapshot requirement (`expected id != actual id`); when a second writer commits between when we loaded the table and when we send the commit, the catalog rejects with `CommitFailedException: branch main has changed`. `_write_with_retry` in `main.py` invalidates caches and retries up to 3 times with exponential backoff (1s, 2s, 4s), but under sustained dual-writer load with `FLUSH_INTERVAL_MS=5000`, the retries collide with the *next* round of commits and exhaust the budget — the pod exits.
+
+This is why `docker-compose.iceberg.yaml` runs a single millpond pod while `docker-compose.yaml` (DuckLake) runs two. The DuckLake path serialises writes through Postgres-backed catalog locks; Iceberg's optimistic concurrency control needs more retry headroom and jittered backoff to avoid retry-storms, or the writers need partition-aware table layouts so they aren't contending on the same snapshot.
+
+Surfaced by the e2e suite when first wired up — see `tests/e2e/test_e2e_iceberg.py` and the comment in `docker-compose.iceberg.yaml`.
+
 ## Note
 This project should absolutely be called TableFowl, but that would be an [SEO](https://www.confluent.io/product/tableflow/) and linguistic palaver.
 
