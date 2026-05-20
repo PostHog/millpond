@@ -63,6 +63,12 @@ test-e2e:
 test-e2e-iceberg:
     uv run python -m pytest tests/e2e/test_e2e_iceberg.py -v -s
 
+# Stress-test Lakekeeper under concurrent commits (manual; not in CI).
+# Brings up tests/stress/compose.lakekeeper.yaml, sweeps writer counts.
+[group('test')]
+stress-lakekeeper:
+    uv run python -m pytest tests/stress/test_lakekeeper_concurrent.py -v -s -m stress
+
 # Full CI check
 [group('test')]
 ci: fmt-check lint test
