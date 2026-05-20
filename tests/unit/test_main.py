@@ -204,6 +204,301 @@ class TestArrowConversionTiming:
         """If convert() returns None, no timing should be observed."""
         mock_converter.convert.return_value = None
 
-        table = _convert_batch([b'garbage'])
+        table = _convert_batch([b"garbage"])
         assert table is None
         mock_metrics.arrow_conversion_seconds.observe.assert_not_called()
+
+
+def _capture_skip_calls(mock_metrics):
+    """Bind (reason, count) pairs from records_skipped_total inc() calls.
+
+    The default MagicMock pattern memoizes labels(...) to a single inner
+    mock, so inc() calls across distinct reason values land in a flat
+    list and the reason→count binding is lost. This helper installs a
+    side_effect on labels() so each call returns a fresh counter that
+    appends (reason, n) into a shared log. Tests assert on the log
+    directly — both ordering and pairing are observable.
+    """
+    skip_calls: list[tuple[str, int]] = []
+
+    def _counter_for(reason):
+        counter = MagicMock()
+        counter.inc.side_effect = lambda n, r=reason: skip_calls.append((r, n))
+        return counter
+
+    mock_metrics.records_skipped_total.labels.side_effect = _counter_for
+    return skip_calls
+
+
+class TestApplyFilter:
+    """Hot-path keep-filter behaviour. Mocks the metrics module so the
+    skipped-record counter calls are visible without setting up a real
+    Prometheus registry. Each test constructs a Config-shaped object only
+    with the fields _apply_filter reads."""
+
+    def _cfg(self, *, keep=None, values=None):
+        cfg = MagicMock()
+        cfg.filter_keep_field = keep
+        cfg.filter_values = values
+        return cfg
+
+    def test_no_op_when_filter_unconfigured(self):
+        from millpond.main import _apply_filter
+
+        table = pa.table({"team_id": [1, 2, 3]})
+        result = _apply_filter(table, self._cfg())
+        # Same object: no slicing or filtering — short-circuit at the top.
+        assert result is table
+
+    @patch("millpond.main.metrics")
+    def test_int_allowlist_keeps_matching_rows(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [1, 2, 3, 4, 5], "event": ["a", "b", "c", "d", "e"]})
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(2, 4)))
+
+        assert result.num_rows == 2
+        assert result.column("team_id").to_pylist() == [2, 4]
+        assert result.column("event").to_pylist() == ["b", "d"]
+        # 3 of 5 rows fail the allowlist; exactly one increment, bound to
+        # the correct reason.
+        assert skip_calls == [("filter_excluded", 3)]
+
+    @patch("millpond.main.metrics")
+    def test_string_allowlist_keeps_matching_rows(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"region": ["us-east-1", "us-west-2", "eu-central-1"]})
+        result = _apply_filter(table, self._cfg(keep="region", values=("us-east-1", "eu-central-1")))
+
+        assert result.column("region").to_pylist() == ["us-east-1", "eu-central-1"]
+        assert skip_calls == [("filter_excluded", 1)]
+
+    @patch("millpond.main.metrics")
+    def test_int_values_coerce_to_string_column(self, mock_metrics):
+        # When the column is string-typed and values parsed as int, the
+        # values get cast to their canonical string form ("2") and matched
+        # against the column. JSON ints sometimes deserialise as Arrow
+        # strings; this is the supported path. Leading-zero strings like
+        # "02" deliberately do NOT match a configured value of 2 — strict
+        # string equality after coercion. See
+        # `test_leading_zero_strings_do_not_match_int_values` for the
+        # adjacent contract.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": ["1", "2", "3"]})
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(2,)))
+
+        assert result.num_rows == 1
+        assert result.column("team_id").to_pylist() == ["2"]
+        # Two excluded rows ("1", "3"); pin the (reason, count) binding.
+        assert skip_calls == [("filter_excluded", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_leading_zero_strings_do_not_match_int_values(self, mock_metrics):
+        # Documents the strict-string-equality semantic. An operator who
+        # wants to match leading-zero IDs must configure them as strings
+        # (`MILLPOND_FILTER_VALUES=02`).
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": ["02", "2", "003"]})
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(2,)))
+
+        # Only the unambiguous "2" matches; the leading-zero strings don't.
+        assert result.column("team_id").to_pylist() == ["2"]
+        assert skip_calls == [("filter_excluded", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_missing_field_drops_whole_batch(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"event": ["a", "b", "c"]})
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+
+        # Column not in schema → whole batch lands in filter_field_missing.
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_field_missing", 3)]
+
+    @patch("millpond.main.metrics")
+    def test_null_values_counted_as_field_missing(self, mock_metrics):
+        # Distinguishing the two skip-reason buckets is the whole point of
+        # the dual-counter design: missing/null is anomalous, excluded is
+        # expected steady-state behaviour. The assertion pins the bucket
+        # *and* the count, not just the sorted set of counts.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": pa.array([1, None, 2, None, 3], type=pa.int64())})
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+
+        assert result.num_rows == 2
+        assert result.column("team_id").to_pylist() == [1, 2]
+        # 2 nulls → field_missing; 1 row (team_id=3) → excluded.
+        assert sorted(skip_calls) == [("filter_excluded", 1), ("filter_field_missing", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_all_rows_kept_emits_no_skip_metric(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [1, 2, 1]})
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+
+        assert result.num_rows == 3
+        assert skip_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_all_rows_dropped_returns_empty_table_with_same_schema(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [9, 10, 11], "event": ["a", "b", "c"]})
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+
+        assert result.num_rows == 0
+        # Schema is preserved — important so a downstream concat doesn't trip
+        # on a column mismatch when a batch happens to filter to empty.
+        assert result.schema == table.schema
+
+    @patch("millpond.main.metrics")
+    def test_empty_input_batch_is_no_op(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": pa.array([], type=pa.int64())})
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+
+        assert result.num_rows == 0
+        assert skip_calls == []
+
+    # --- Schema variance / cast failure paths --------------------------------
+
+    @patch("millpond.main.metrics")
+    def test_multi_chunk_column_is_handled(self, mock_metrics):
+        # Defensive against the case where a column ends up multi-chunk
+        # (a fresh `_convert_batch` output is single-chunk, but anything
+        # that goes through ChunkedArray-producing arrow surgery later
+        # could pass one in). The compute kernels we use must work on
+        # multi-chunk inputs and `column.null_count` must aggregate
+        # across chunks correctly.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        team_ids = pa.chunked_array([[1, 2], [3, 4, 5], [2]])
+        events = pa.chunked_array([["a", "b"], ["c", "d", "e"], ["f"]])
+        table = pa.table({"team_id": team_ids, "event": events})
+
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(2,)))
+
+        # Two rows match (the two 2s spread across chunks 0 and 2).
+        assert result.column("team_id").to_pylist() == [2, 2]
+        assert result.column("event").to_pylist() == ["b", "f"]
+        assert skip_calls == [("filter_excluded", 4)]
+
+    # --- Unsupported column types (must skip, not silently match) ----------
+    #
+    # The filter restricts itself to integer and string columns. Everything
+    # else lands the batch in `filter_field_missing` so the operator sees
+    # a clear signal in the skip-reason metric rather than a quiet,
+    # semantically-wrong match. Each of the tests below pins one specific
+    # column type the explicit allowlist rejects — bool, float, timestamp,
+    # struct, list — plus the cast-overflow case for in-range types.
+
+    @patch("millpond.main.metrics")
+    def test_bool_column_rejected_as_unsupported(self, mock_metrics):
+        # PyArrow happily casts ints to bool (0→False, non-zero→True),
+        # which would otherwise mean `MILLPOND_FILTER_VALUES=2` keeps
+        # every `True` row regardless of the configured value. The
+        # column-type allowlist explicitly rejects bool to prevent that.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"flag": pa.array([True, False, True, False], type=pa.bool_())})
+
+        result = _apply_filter(table, self._cfg(keep="flag", values=(1,)))
+
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_field_missing", 4)]
+
+    @patch("millpond.main.metrics")
+    def test_float_column_rejected_as_unsupported(self, mock_metrics):
+        # Without the allowlist, `(2,)` would cast to `2.0` and silently
+        # match floating rows that happen to equal 2.0. We don't want
+        # equality-on-float-columns semantics to be a hidden feature.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"score": pa.array([1.0, 2.0, 3.0], type=pa.float64())})
+
+        result = _apply_filter(table, self._cfg(keep="score", values=(2,)))
+
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_field_missing", 3)]
+
+    @patch("millpond.main.metrics")
+    def test_timestamp_column_rejected_as_unsupported(self, mock_metrics):
+        # Without the allowlist, ints cast to timestamp as
+        # microseconds-since-epoch — a wildly surprising match. Reject.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        ts_col = pa.array([1700000000_000000, 1700000001_000000], type=pa.timestamp("us"))
+        table = pa.table({"ts": ts_col})
+
+        result = _apply_filter(table, self._cfg(keep="ts", values=(1700000000_000000,)))
+
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_field_missing", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_struct_column_rejected_as_unsupported(self, mock_metrics):
+        # Struct columns hit the same allowlist rejection — critical
+        # because a struct-cast was the previous crash hazard, and the
+        # column-type check fires *before* the cast attempt.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        struct_col = pa.array(
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            type=pa.struct([pa.field("a", pa.int64())]),
+        )
+        table = pa.table({"team_id": struct_col})
+
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_field_missing", 3)]
+
+    @patch("millpond.main.metrics")
+    def test_list_column_rejected_as_unsupported(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        list_col = pa.array([[1, 2], [3], [4, 5, 6]], type=pa.list_(pa.int64()))
+        table = pa.table({"team_id": list_col})
+
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_field_missing", 3)]
+
+    @patch("millpond.main.metrics")
+    def test_int_values_overflowing_int32_column_skip_batch(self, mock_metrics):
+        # Integer column type passes the allowlist; the cast itself
+        # raises on width overflow under `safe=True`, and that lands in
+        # the cast-failure branch (still `filter_field_missing`, but a
+        # different code path from the unsupported-type case above).
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": pa.array([1, 2, 3], type=pa.int32())})
+        # 2**40 is well outside int32 range.
+        result = _apply_filter(table, self._cfg(keep="team_id", values=(2**40,)))
+
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_field_missing", 3)]

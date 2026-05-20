@@ -76,6 +76,21 @@ class Config:
     # Broker source label for metrics (e.g. "msk", "warpstream")
     broker_source: str
 
+    # Optional record filter. Exactly one of `filter_keep_field` /
+    # `filter_drop_field` may be set; whichever is set names the column to
+    # check against `filter_values`. Keep = allowlist (keep records whose
+    # value is in filter_values, drop the rest). Drop = denylist (drop
+    # records whose value is in filter_values, keep the rest). Only the
+    # keep direction is implemented today; the drop slot reserves the
+    # namespace and the mutual-exclusion contract for a future add.
+    # `filter_values` is parsed at load time and is homogeneous — either a
+    # tuple of ints (if all comma-separated tokens parsed as int) or a tuple
+    # of strings (otherwise). main.py applies this after JSON→Arrow but
+    # before the pending buffer.
+    filter_keep_field: str | None
+    filter_drop_field: str | None
+    filter_values: tuple[int, ...] | tuple[str, ...] | None
+
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
@@ -105,6 +120,67 @@ def _require(name: str) -> str:
     if not val:
         raise RuntimeError(f"Required environment variable {name} is not set")
     return val
+
+
+_SAFE_COLUMN_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _parse_filter_values(raw: str) -> tuple[int, ...] | tuple[str, ...]:
+    """Parse MILLPOND_FILTER_VALUES into a homogeneous tuple.
+
+    Try int-tuple first; fall back to string-tuple if any token fails to
+    parse. Whitespace is trimmed; empty tokens (e.g. trailing commas) are
+    dropped. An empty input raises — callers should validate the env var
+    is non-empty before calling.
+    """
+    tokens = tuple(t.strip() for t in raw.split(",") if t.strip())
+    if not tokens:
+        raise RuntimeError("MILLPOND_FILTER_VALUES must contain at least one value")
+    try:
+        return tuple(int(t) for t in tokens)
+    except ValueError:
+        return tokens
+
+
+def _load_filter_fields() -> tuple[str | None, str | None, tuple[int, ...] | tuple[str, ...] | None]:
+    """Read MILLPOND_FILTER_{KEEP,DROP}_FIELD_NAME + MILLPOND_FILTER_VALUES.
+
+    At most one of keep/drop may be set. If either is set, FILTER_VALUES is
+    required. Field names must be safe identifiers so misconfigurations
+    surface at startup rather than under load. Drop is reserved for a
+    future change — config rejects it explicitly with a clear message
+    rather than silently accepting and doing nothing.
+    """
+    keep = os.environ.get("MILLPOND_FILTER_KEEP_FIELD_NAME", "").strip() or None
+    drop = os.environ.get("MILLPOND_FILTER_DROP_FIELD_NAME", "").strip() or None
+    values_raw = os.environ.get("MILLPOND_FILTER_VALUES", "").strip()
+
+    if keep and drop:
+        raise RuntimeError("MILLPOND_FILTER_KEEP_FIELD_NAME and MILLPOND_FILTER_DROP_FIELD_NAME are mutually exclusive")
+
+    active = keep or drop
+    if bool(active) != bool(values_raw):
+        raise RuntimeError(
+            "MILLPOND_FILTER_VALUES must be set together with "
+            "MILLPOND_FILTER_KEEP_FIELD_NAME (or MILLPOND_FILTER_DROP_FIELD_NAME)"
+        )
+
+    if active is None:
+        return None, None, None
+
+    if not _SAFE_COLUMN_NAME.match(active):
+        raise RuntimeError(
+            f"Filter field name {active!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+        )
+
+    if drop:
+        # Reserved for a future change; rejecting explicitly today keeps the
+        # env-var namespace and the keep/drop mutual-exclusion contract
+        # stable so a later commit can flip the implementation on without
+        # any operator-facing config rename.
+        raise RuntimeError("MILLPOND_FILTER_DROP_FIELD_NAME is reserved for a future release; not implemented yet")
+
+    return keep, None, _parse_filter_values(values_raw)
 
 
 def _load_ducklake_fields() -> dict[str, str | None]:
@@ -227,6 +303,8 @@ def load() -> Config:
         if k.startswith(_KAFKA_CONSUMER_PREFIX)
     )
 
+    filter_keep_field, filter_drop_field, filter_values = _load_filter_fields()
+
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
         topic=topic,
@@ -243,6 +321,9 @@ def load() -> Config:
         consume_batch_size=int(os.environ.get("CONSUME_BATCH_SIZE", "1000")),
         stats_interval_ms=int(os.environ.get("STATS_INTERVAL_MS", "5000")),
         broker_source=os.environ.get("BROKER_SOURCE", "").strip().lower(),
+        filter_keep_field=filter_keep_field,
+        filter_drop_field=filter_drop_field,
+        filter_values=filter_values,
         kafka_config_overrides=kafka_overrides,
     )
 
@@ -255,4 +336,6 @@ def load() -> Config:
         replica_count,
         cfg.group_id,
     )
+    if cfg.filter_keep_field is not None:
+        log.info("Filter (keep): %s in %s", cfg.filter_keep_field, cfg.filter_values)
     return cfg
