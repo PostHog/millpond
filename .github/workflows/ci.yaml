@@ -35,7 +35,12 @@ jobs:
     - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
       with:
         fail-on-severity: moderate
-        allow-licenses: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, Python-2.0
+        # SPDX atoms our transitive deps actually declare. Notes:
+        #   Python-2.0  — canonical SPDX id for the PSF License (pyparsing uses this form)
+        #   PSF-2.0     — informal alias for the same license (greenlet, typing_extensions use this form)
+        #   MPL-2.0     — certifi, and the MPL portion of orjson's "MPL-2.0 AND (Apache-2.0 OR MIT)"
+        # SPDX `AND` is conjunction: every atom in an expression must be on this list.
+        allow-licenses: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, Python-2.0, PSF-2.0, MPL-2.0
 
   build:
     runs-on: ubuntu-latest
