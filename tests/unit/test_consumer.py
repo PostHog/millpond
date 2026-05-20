@@ -4,8 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from confluent_kafka import OFFSET_STORED
 
-from confluent_kafka import OFFSET_STORED
-
+from millpond.config import Config
 from millpond.consumer import (
     _base_kafka_config,
     _maybe_attach_oauth_cb,
@@ -14,7 +13,6 @@ from millpond.consumer import (
     create,
     discover_partition_count,
 )
-from millpond.config import Config
 
 
 class TestComputeAssignment:
@@ -137,6 +135,7 @@ def _make_cfg(**overrides) -> Config:
         group_id="test-group",
         replica_count=4,
         ordinal=1,
+        destination="ducklake",
         ducklake_table="events",
         ducklake_data_path="s3://bucket/data",
         ducklake_connection=":memory:",
@@ -145,9 +144,19 @@ def _make_cfg(**overrides) -> Config:
         rds_database="ducklake",
         rds_username="ducklake",
         rds_password="pass",
+        partition_by=None,
+        iceberg_catalog_uri=None,
+        iceberg_warehouse=None,
+        iceberg_namespace=None,
+        iceberg_table=None,
+        iceberg_table_location=None,
+        iceberg_catalog_token=None,
+        s3_access_key_id=None,
+        s3_secret_access_key=None,
+        s3_region=None,
+        s3_endpoint=None,
         flush_size=100,
         flush_interval_ms=1000,
-        partition_by=None,
         fetch_min_bytes=1,
         fetch_max_wait_ms=500,
         consume_batch_size=1000,
@@ -169,6 +178,20 @@ class TestBaseKafkaConfig:
         cfg = _make_cfg(ordinal=3)
         base = _base_kafka_config(cfg)
         assert base["client.id"] == "millpond-test-topic-events-3"
+
+    def test_includes_client_id_for_iceberg_destination(self):
+        # When the destination is iceberg, table_label is "namespace.table"
+        # rather than the bare ducklake_table. Lock the formatting so a
+        # future cfg refactor doesn't silently change the client.id shape.
+        cfg = _make_cfg(
+            ordinal=2,
+            destination="iceberg",
+            ducklake_table=None,
+            iceberg_namespace="millpond",
+            iceberg_table="ice_events",
+        )
+        base = _base_kafka_config(cfg)
+        assert base["client.id"] == "millpond-test-topic-millpond.ice_events-2"
 
     def test_includes_overrides(self):
         cfg = _make_cfg(kafka_config_overrides=(("security.protocol", "SSL"), ("sasl.mechanisms", "PLAIN")))

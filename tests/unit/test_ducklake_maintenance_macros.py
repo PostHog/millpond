@@ -1,4 +1,4 @@
-"""Tier C: SQL macros in tools/maintenance.sql against a stub schema.
+"""Tier C: SQL macros in tools/ducklake_maintenance.sql against a stub schema.
 
 In-process DuckDB with stub catalog tables and a real local-filesystem glob.
 Exercises path-normalization logic where the same physical file may be
@@ -15,12 +15,12 @@ historical entries.
 import re
 
 import duckdb
-import maintenance
+import ducklake_maintenance
 import pytest
 
 
 def _make_stub_lake(con):
-    """Mirror the DuckLake catalog tables maintenance.py / maintenance.sql touch.
+    """Mirror the DuckLake catalog tables ducklake_maintenance.py / ducklake_maintenance.sql touch.
 
     Includes the ``end_snapshot`` column on data_file and delete_file even
     though the existing macro tests don't read it — heal-orphans's safety
@@ -50,7 +50,7 @@ def _seed_queue(con, rows):
 
 
 def _load_macros(con):
-    con.execute(maintenance.MAINTENANCE_SQL_PATH.read_text())
+    con.execute(ducklake_maintenance.MAINTENANCE_SQL_PATH.read_text())
 
 
 @pytest.fixture
@@ -253,7 +253,7 @@ class TestHealOrphansGates:
         _load_macros(lake_con)
         # heal_orphans creates _orphans via find_catalog_orphans(?) then
         # runs B1/B3. dry_run=True returns before the DELETE.
-        maintenance.heal_orphans(lake_con, dry_run=True)
+        ducklake_maintenance.heal_orphans(lake_con, dry_run=True)
 
     def test_b1_passes_when_only_expired_rows_match_queue(self, lake_con, data_dir, monkeypatch):
         # data_file_id=1 was once live (path 'a') but is now expired (snapshot 100).
@@ -326,7 +326,7 @@ class TestHealOrphansGates:
         monkeypatch.setenv("DUCKLAKE_DATA_PATH", str(data_dir) + "/")
         _load_macros(lake_con)
         with pytest.raises(RuntimeError, match="safety gate B1 failed.*still appear as live"):
-            maintenance.heal_orphans(lake_con, dry_run=True)
+            ducklake_maintenance.heal_orphans(lake_con, dry_run=True)
 
 
 class TestB1GateS3Paths:
@@ -352,7 +352,7 @@ class TestB1GateS3Paths:
         # sides and recognize the same file.
         self._populate_orphans(lake_con, [(1, "s3://bucket/lake/data/a.parquet")])
         _seed_data_files(lake_con, [(1, "s3://bucket/lake/data/a.parquet", None)])
-        total_live, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
+        total_live, would_be_live = ducklake_maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
         assert total_live == 1
         assert would_be_live == 1
 
@@ -365,20 +365,20 @@ class TestB1GateS3Paths:
         # the queue stores keys like 'main/events/.../X.parquet'.
         self._populate_orphans(lake_con, [(1, "a.parquet")])
         _seed_data_files(lake_con, [(1, "s3://bucket/lake/data/a.parquet", None)])
-        _, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
+        _, would_be_live = ducklake_maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
         assert would_be_live == 1, "s3 absolute live row must match relative-queue orphan after normalization"
 
     def test_s3_absolute_queue_vs_s3_relative_data_file(self, lake_con):
         # Symmetric: queue absolute, data_file relative.
         self._populate_orphans(lake_con, [(1, "s3://bucket/lake/data/a.parquet")])
         _seed_data_files(lake_con, [(1, "a.parquet", None)])
-        _, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
+        _, would_be_live = ducklake_maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
         assert would_be_live == 1
 
     def test_s3_with_trailing_slash_still_matches(self, lake_con):
         self._populate_orphans(lake_con, [(1, "a.parquet")])
         _seed_data_files(lake_con, [(1, "s3://bucket/lake/data/a.parquet", None)])
-        _, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data/")
+        _, would_be_live = ducklake_maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data/")
         assert would_be_live == 1, "trailing-slash data_path on s3:// must not produce double-slash mismatch"
 
     def test_s3_expired_data_file_does_not_block(self, lake_con):
@@ -392,7 +392,7 @@ class TestB1GateS3Paths:
                 (2, "s3://bucket/lake/data/live.parquet", None),  # live, different
             ],
         )
-        total_live, would_be_live = maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
+        total_live, would_be_live = ducklake_maintenance._heal_orphans_b1_counts(lake_con, "s3://bucket/lake/data")
         assert total_live == 1
         assert would_be_live == 0, "expired s3:// row must not block heal-orphans"
 
@@ -404,14 +404,14 @@ class TestSchemaConsistency:
         ever changes ATTACH_NAME, this test fails loudly — the constraint
         is documented in the .sql header but the assertion is what makes it
         load-bearing."""
-        sql = maintenance.MAINTENANCE_SQL_PATH.read_text()
+        sql = ducklake_maintenance.MAINTENANCE_SQL_PATH.read_text()
         # Strip line comments so we don't catch the cautionary references in
         # the header.
         without_comments = "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
         refs = set(re.findall(r"__ducklake_metadata_\w+", without_comments))
-        unexpected = refs - {maintenance.METADATA_SCHEMA}
+        unexpected = refs - {ducklake_maintenance.METADATA_SCHEMA}
         assert not unexpected, (
-            f"maintenance.sql references {sorted(unexpected)} but METADATA_SCHEMA "
-            f"is {maintenance.METADATA_SCHEMA!r}. If you change ATTACH_NAME in "
-            "maintenance.py, update the schema references in maintenance.sql to match."
+            f"ducklake_maintenance.sql references {sorted(unexpected)} but METADATA_SCHEMA "
+            f"is {ducklake_maintenance.METADATA_SCHEMA!r}. If you change ATTACH_NAME in "
+            "ducklake_maintenance.py, update the schema references in ducklake_maintenance.sql to match."
         )

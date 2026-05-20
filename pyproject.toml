@@ -11,7 +11,7 @@ version-file = "millpond/_version.py"
 [project]
 name = "millpond"
 dynamic = ["version"]
-description = "Kafka to DuckLake"
+description = "Kafka to DuckLake or Iceberg"
 license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
@@ -24,6 +24,12 @@ dependencies = [
     # stdlib zoneinfo module isn't accepted as a substitute as of 1.4.x.
     "pytz>=2024.1",
     "pyyaml>=6.0.3",
+    # Pinned exactly. millpond/iceberg.py depends on two private symbols
+    # (_pyarrow_to_schema_without_ids, assign_fresh_schema_ids) and PyIceberg
+    # is pre-1.0 — minor-version bumps reshuffle internals. The canary test
+    # tests/unit/test_pyiceberg_pin.py imports both and will fail loudly on
+    # any upgrade; treat that as the signal to revisit this module.
+    "pyiceberg[pyarrow]==0.11.1",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +42,7 @@ millpond = "millpond.main:main"
 dev = [
     "pytest>=9.0.3",
     "ruff>=0.8",
+    "sqlalchemy>=2.0.49",
     "testcontainers>=4.14.2",
 ]
 

@@ -1,85 +1,127 @@
 from unittest.mock import MagicMock, patch
 
+import duckdb
 import pyarrow as pa
 import pytest
 from confluent_kafka import KafkaException
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    CommitStateUnknownException,
+    ServerError,
+    ServiceUnavailableError,
+)
 
 from millpond.main import _convert_batch, _flush, _write_with_retry
 
 
+def _make_sink() -> MagicMock:
+    """Mock Sink — just needs `write`, `reset_caches`, and `close`."""
+    return MagicMock(spec=["write", "reset_caches", "close"])
+
+
+# Realistic failure modes the broad `except Exception` in _write_with_retry
+# must catch. If somebody narrows that handler later, these parametrizations
+# fail in CI before the regression reaches production. Includes:
+#   - OSError: S3 / network
+#   - duckdb.Error: DuckLake local execution
+#   - CommitFailedException: Iceberg optimistic-concurrency conflict
+#   - CommitStateUnknownException: REST 5xx after commit submission
+#   - ServerError / ServiceUnavailableError: catalog 5xx, transient
+#   - KafkaException: broker disconnect during a write (rare but possible
+#     if the same Kafka client surfaces an error mid-flush)
+#   - RuntimeError: catch-all for backend-internal surprises
+_RETRYABLE_EXCEPTIONS = [
+    OSError("S3 timeout"),
+    duckdb.Error("serialization conflict"),
+    CommitFailedException("optimistic-concurrency clash"),
+    CommitStateUnknownException("REST 5xx after submit"),
+    ServerError("catalog 500"),
+    ServiceUnavailableError("catalog 503"),
+    KafkaException("broker disconnect"),
+    RuntimeError("unexpected"),
+]
+
+
 class TestWriteWithRetry:
     def test_succeeds_first_try(self):
-        db = MagicMock()
-        schema_mgr = MagicMock()
+        sink = _make_sink()
         table = pa.table({"a": [1]})
-        with patch("millpond.main.ducklake") as mock_dl:
-            _write_with_retry(db, "test", table, schema_mgr)
-            assert mock_dl.write.call_count == 1
+        _write_with_retry(sink, table)
+        assert sink.write.call_count == 1
+        sink.reset_caches.assert_not_called()
 
-    def test_retries_on_failure(self):
-        db = MagicMock()
-        schema_mgr = MagicMock()
+    @pytest.mark.parametrize("exc", _RETRYABLE_EXCEPTIONS)
+    def test_retries_on_failure(self, exc):
+        sink = _make_sink()
+        sink.write.side_effect = [exc, None]
         table = pa.table({"a": [1]})
-        with patch("millpond.main.ducklake") as mock_dl, patch("millpond.main.time") as mock_time:
-            mock_dl.write.side_effect = [OSError("S3 timeout"), None]
-            _write_with_retry(db, "test", table, schema_mgr)
-            assert mock_dl.write.call_count == 2
-            mock_time.sleep.assert_called_once_with(1.0)
+        with patch("millpond.main.time") as mock_time:
+            _write_with_retry(sink, table)
+        assert sink.write.call_count == 2
+        mock_time.sleep.assert_called_once_with(1.0)
 
-    def test_raises_after_max_retries(self):
-        db = MagicMock()
-        schema_mgr = MagicMock()
+    @pytest.mark.parametrize(
+        "exc_cls",
+        [
+            OSError,
+            duckdb.Error,
+            CommitFailedException,
+            CommitStateUnknownException,
+            ServerError,
+            ServiceUnavailableError,
+            KafkaException,
+            RuntimeError,
+        ],
+    )
+    def test_raises_after_max_retries(self, exc_cls):
+        sink = _make_sink()
+        sink.write.side_effect = exc_cls("persistent failure")
         table = pa.table({"a": [1]})
-        with patch("millpond.main.ducklake") as mock_dl, patch("millpond.main.time"):
-            mock_dl.write.side_effect = OSError("persistent failure")
-            with pytest.raises(OSError):
-                _write_with_retry(db, "test", table, schema_mgr)
-            assert mock_dl.write.call_count == 3
+        with patch("millpond.main.time"), pytest.raises(exc_cls):
+            _write_with_retry(sink, table)
+        assert sink.write.call_count == 3
 
     def test_exponential_backoff(self):
-        db = MagicMock()
-        schema_mgr = MagicMock()
+        sink = _make_sink()
+        sink.write.side_effect = [OSError(), OSError(), None]
         table = pa.table({"a": [1]})
-        with patch("millpond.main.ducklake") as mock_dl, patch("millpond.main.time") as mock_time:
-            mock_dl.write.side_effect = [OSError(), OSError(), None]
-            _write_with_retry(db, "test", table, schema_mgr)
-            calls = [c.args[0] for c in mock_time.sleep.call_args_list]
-            assert calls == [1.0, 2.0]
+        with patch("millpond.main.time") as mock_time:
+            _write_with_retry(sink, table)
+        calls = [c.args[0] for c in mock_time.sleep.call_args_list]
+        assert calls == [1.0, 2.0]
 
-    def test_invalidates_schema_on_retry(self):
-        db = MagicMock()
-        schema_mgr = MagicMock()
+    @pytest.mark.parametrize("exc", _RETRYABLE_EXCEPTIONS)
+    def test_resets_caches_on_retry(self, exc):
+        sink = _make_sink()
+        sink.write.side_effect = [exc, None]
         table = pa.table({"a": [1]})
-        with patch("millpond.main.ducklake") as mock_dl, patch("millpond.main.time"):
-            mock_dl.write.side_effect = [OSError("schema conflict"), None]
-            _write_with_retry(db, "test", table, schema_mgr)
-            schema_mgr.invalidate.assert_called_once()
+        with patch("millpond.main.time"):
+            _write_with_retry(sink, table)
+        sink.reset_caches.assert_called_once()
 
 
 class TestFlushErrorDistinction:
     """Offset commit failures must be distinguishable from write failures in metrics and logs."""
 
     def _make_flush_args(self):
-        db = MagicMock()
+        sink = _make_sink()
         cfg = MagicMock()
-        cfg.ducklake_table = "test_table"
+        cfg.table_label = "test_table"
         kafka = MagicMock()
         table = pa.table({"a": [1, 2]})
         offsets = {("topic", 0): 42}
-        schema_mgr = MagicMock()
-        return db, cfg, kafka, table, offsets, schema_mgr
+        return sink, cfg, kafka, table, offsets
 
     @patch("millpond.main.time")
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")
-    @patch("millpond.main.ducklake")
-    def test_commit_failure_raises_after_retries(self, mock_dl, mock_metrics, mock_server, mock_time):
+    def test_commit_failure_raises_after_retries(self, mock_metrics, mock_server, mock_time):
         mock_time.monotonic.return_value = 0.0
-        db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
+        sink, cfg, kafka, table, offsets = self._make_flush_args()
         kafka.commit.side_effect = KafkaException("broker unavailable")
 
         with pytest.raises(KafkaException):
-            _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
+            _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
 
         assert kafka.commit.call_count == 3
         # Each failed attempt increments the offset_commit error counter
@@ -91,39 +133,36 @@ class TestFlushErrorDistinction:
     @patch("millpond.main.time")
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")
-    @patch("millpond.main.ducklake")
-    def test_commit_succeeds_after_retry(self, mock_dl, mock_metrics, mock_server, mock_time):
+    def test_commit_succeeds_after_retry(self, mock_metrics, mock_server, mock_time):
         mock_time.monotonic.return_value = 0.0
-        db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
+        sink, cfg, kafka, table, offsets = self._make_flush_args()
         kafka.commit.side_effect = [KafkaException("transient"), None]
 
         # Should not raise — commit succeeds on second attempt
-        _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
+        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
         assert kafka.commit.call_count == 2
 
     @patch("millpond.main.time")
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")
-    @patch("millpond.main.ducklake")
-    def test_commit_retry_exponential_backoff(self, mock_dl, mock_metrics, mock_server, mock_time):
+    def test_commit_retry_exponential_backoff(self, mock_metrics, mock_server, mock_time):
         mock_time.monotonic.return_value = 0.0
-        db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
+        sink, cfg, kafka, table, offsets = self._make_flush_args()
         kafka.commit.side_effect = [KafkaException("fail"), KafkaException("fail"), None]
 
-        _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
+        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
         delays = [c.args[0] for c in mock_time.sleep.call_args_list]
         assert delays == [0.5, 1.0]
 
     @patch("millpond.main.time")
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")
-    @patch("millpond.main.ducklake")
-    def test_write_failure_does_not_increment_offset_commit_error(self, mock_dl, mock_metrics, mock_server, mock_time):
-        db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
-        mock_dl.write.side_effect = OSError("S3 timeout")
+    def test_write_failure_does_not_increment_offset_commit_error(self, mock_metrics, mock_server, mock_time):
+        sink, cfg, kafka, table, offsets = self._make_flush_args()
+        sink.write.side_effect = OSError("S3 timeout")
 
         with pytest.raises(OSError):
-            _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr)
+            _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
 
         # offset_commit error should NOT have been incremented
         commit_calls = [
@@ -133,11 +172,10 @@ class TestFlushErrorDistinction:
 
     @patch("millpond.main.server")
     @patch("millpond.main.metrics")
-    @patch("millpond.main.ducklake")
-    def test_successful_flush_records_write_metrics(self, mock_dl, mock_metrics, mock_server):
-        db, cfg, kafka, table, offsets, schema_mgr = self._make_flush_args()
+    def test_successful_flush_records_write_metrics(self, mock_metrics, mock_server):
+        sink, cfg, kafka, table, offsets = self._make_flush_args()
 
-        _flush(db, cfg, kafka, table, 100, 2, offsets, 1.0, schema_mgr, trigger="size")
+        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, trigger="size")
 
         mock_metrics.records_written_total.inc.assert_called_once_with(2)
         mock_metrics.batches_flushed_total.labels.assert_called_once_with(trigger="size")

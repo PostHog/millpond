@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 import re
@@ -7,10 +9,20 @@ import pyarrow as pa
 
 from millpond import schema
 from millpond.config import Config
+from millpond.sink import check_reserved_collision
 
 log = logging.getLogger(__name__)
 
 _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
+
+# Column names reserved as metadata. DuckLake itself only writes
+# `_inserted_at`, but the set is kept identical to
+# `millpond.iceberg.RESERVED_COLUMNS` so a deployment-time switch between
+# destinations doesn't suddenly start rejecting (or quietly accepting)
+# batches based on user-column collisions. The shared set is the union of
+# both backends' actual managed columns; DuckLake reserves the extras
+# defensively even though it doesn't produce them itself.
+RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at", "year", "month", "day", "hour"})
 
 
 def _escape_libpq(value: str | None) -> str:
@@ -103,15 +115,6 @@ def _validate_partition_expr(expr: str) -> str:
     return expr
 
 
-# Assumes single connection for pod lifetime. Must be cleared if connection is ever recycled.
-_tables_ensured: set[str] = set()
-
-
-def reset_table_cache() -> None:
-    """Clear the table creation cache. Call when the DuckDB connection is recycled."""
-    _tables_ensured.clear()
-
-
 def _table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     """Check if a table exists in the DuckLake catalog."""
     result = conn.execute(
@@ -126,20 +129,30 @@ def _ensure_table(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
     batch: pa.Table,
+    tables_ensured: set[str],
     partition_by: str | None = None,
 ) -> None:
-    """Create the DuckLake table if it doesn't exist. Cached after first call.
+    """Create the DuckLake table if it doesn't exist. Caller-owned cache.
 
     Handles concurrent creation by multiple pods: if CREATE or ALTER fails
     with a serialization/catalog error, we check if the table now exists
-    and treat that as success.
+    and treat that as success. `tables_ensured` is owned by the caller
+    (a Sink instance) so cache lifetime tracks the connection's.
+
+    Multi-writer DDL safety: `CREATE TABLE IF NOT EXISTS` and the
+    `_table_exists` re-check on error make CREATE idempotent across pods.
+    `ADD COLUMN IF NOT EXISTS` in schema.SchemaManager makes evolution
+    idempotent too. A pod with a stale `_known_columns` view that races
+    against another writer's ADD COLUMN will either succeed (the INSERT
+    `BY NAME` tolerates the extra column existing) or fail and trip the
+    write-retry path that invalidates the schema cache.
     """
-    if table_name in _tables_ensured:
+    if table_name in tables_ensured:
         return
 
     if _table_exists(conn, table_name):
         log.info("Table %s already exists", table_name)
-        _tables_ensured.add(table_name)
+        tables_ensured.add(table_name)
         return
 
     conn.register("_schema_batch", batch.slice(0, 0))  # empty batch, just schema
@@ -169,18 +182,20 @@ def _ensure_table(
             else:
                 raise RuntimeError(f"Failed to partition table {table_name}: {e}") from e
 
-    _tables_ensured.add(table_name)
+    tables_ensured.add(table_name)
 
 
 def write(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
     batch: pa.Table,
-    schema_mgr: "schema.SchemaManager | None" = None,
+    tables_ensured: set[str],
+    schema_mgr: schema.SchemaManager | None = None,
     partition_by: str | None = None,
 ) -> None:
     """Write an Arrow table to DuckLake with _inserted_at timestamp."""
-    _ensure_table(conn, table_name, batch, partition_by)
+    check_reserved_collision(batch.schema, RESERVED_COLUMNS, "DuckLake")
+    _ensure_table(conn, table_name, batch, tables_ensured, partition_by)
     if schema_mgr is not None:
         schema_mgr.evolve(batch.schema)
     conn.register("_arrow_batch", batch)
@@ -188,3 +203,52 @@ def write(
         conn.execute(f"INSERT INTO lake.main.{table_name} BY NAME (SELECT *, NOW() AS _inserted_at FROM _arrow_batch)")
     finally:
         conn.unregister("_arrow_batch")
+
+
+class DuckLakeSink:
+    """`Sink` implementation for DuckLake.
+
+    Thin wrapper around the module-level `connect`/`write` helpers and the
+    existing `schema.SchemaManager`. main.py only sees the Sink protocol;
+    whether schema evolution happens via DuckLake DDL or Iceberg
+    `update_schema()` is none of its business.
+
+    The table cache and SchemaManager are instance state — each Sink owns
+    its own — so multiple Sink instances in the same process (tests, future
+    features) don't trample one another.
+    """
+
+    def __init__(self, cfg: Config):
+        # Explicit guards rather than assert: `python -O` strips asserts and
+        # would forward None to connect(), producing a cryptic libpq
+        # "host=None" failure instead of a clear startup error. Symmetric
+        # with IcebergSink. All fields below are read either by connect()
+        # building the Postgres connstring or by this constructor.
+        for name in (
+            "ducklake_table",
+            "ducklake_connection",
+            "ducklake_data_path",
+            "rds_host",
+            "rds_port",
+            "rds_database",
+            "rds_username",
+            "rds_password",
+        ):
+            if getattr(cfg, name) is None:
+                raise RuntimeError(f"DuckLakeSink requires cfg.{name}; config.load() should have enforced this")
+        self._cfg = cfg
+        self._conn = connect(cfg)
+        self._table_name = cfg.ducklake_table
+        self._partition_by = cfg.partition_by
+        self._tables_ensured: set[str] = set()
+        self._schema_mgr = schema.SchemaManager(self._conn, self._table_name)
+
+    def write(self, batch: pa.Table) -> None:
+        write(self._conn, self._table_name, batch, self._tables_ensured, self._schema_mgr, self._partition_by)
+
+    def reset_caches(self) -> None:
+        self._tables_ensured.clear()
+        self._schema_mgr.invalidate()
+
+    def close(self) -> None:
+        self._conn.close()

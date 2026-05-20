@@ -24,8 +24,8 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/millpond /app/millpond
 COPY --from=builder /root/.local/bin/duckdb /usr/local/bin/duckdb
 COPY tools/justfile /justfile
-COPY tools/maintenance.py /app/tools/maintenance.py
-COPY tools/maintenance.sql /app/tools/maintenance.sql
+COPY tools/ducklake_maintenance.py /app/tools/ducklake_maintenance.py
+COPY tools/ducklake_maintenance.sql /app/tools/ducklake_maintenance.sql
 COPY tools/ducklake_metrics.py /app/tools/ducklake_metrics.py
 
 ENV PATH="/app/.venv/bin:$PATH"

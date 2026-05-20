@@ -347,7 +347,7 @@ class TestBuiltinFilesPerBand:
     def test_band_boundaries_inclusive_lower_exclusive_upper(self, conn, registry):
         # Exactly 1 MiB (1048576) must land in 1to5mib, not lt1mib —
         # matches DuckLake's own bin semantics (min inclusive, max
-        # exclusive) so this metric's bands compose with maintenance.py's
+        # exclusive) so this metric's bands compose with ducklake_maintenance.py's
         # tiered compaction.
         _stub_catalog(conn)
         conn.execute(
@@ -629,7 +629,7 @@ class TestSchedulerReconnect:
 
 
 class TestConnectWithBackoff:
-    """maintenance.connect() retries with exponential backoff until success or stop."""
+    """ducklake_maintenance.connect() retries with exponential backoff until success or stop."""
 
     def test_eventually_returns_connection(self, registry, monkeypatch):
         sm = dm._build_self_metrics(registry=registry)
@@ -643,7 +643,7 @@ class TestConnectWithBackoff:
                 raise RuntimeError("transient")
             return sentinel
 
-        monkeypatch.setattr(dm.maintenance, "connect", fake_connect)
+        monkeypatch.setattr(dm.ducklake_maintenance, "connect", fake_connect)
         # Speed test up: Event.wait returns immediately if stop is already
         # set, but here we don't want that. Instead patch the constants so
         # delays are in ms, not seconds.
@@ -667,7 +667,7 @@ class TestConnectWithBackoff:
             stop.set()
             raise RuntimeError("never recovers")
 
-        monkeypatch.setattr(dm.maintenance, "connect", fake_connect)
+        monkeypatch.setattr(dm.ducklake_maintenance, "connect", fake_connect)
         monkeypatch.setattr(dm, "_BACKOFF_INITIAL_SECONDS", 0.001)
 
         assert dm._connect_with_backoff(stop, sm) is None

@@ -5,17 +5,17 @@ Operational utilities that ship in the millpond Docker image but live outside th
 In the image:
 
 ```
-/app/tools/maintenance.py
-/app/tools/maintenance.sql
+/app/tools/ducklake_maintenance.py
+/app/tools/ducklake_maintenance.sql
 /app/tools/ducklake_metrics.py
 /justfile                        (copy of tools/justfile)
 ```
 
-For local dev, the `MAINTENANCE_SCRIPT`, `MAINTENANCE_SQL`, and `DUCKLAKE_METRICS_SCRIPT` env vars override the in-image paths so `just …` recipes work from a checkout.
+For local dev, the `DUCKLAKE_MAINTENANCE_SCRIPT`, `DUCKLAKE_MAINTENANCE_SQL`, and `DUCKLAKE_METRICS_SCRIPT` env vars override the in-image paths so `just …` recipes work from a checkout.
 
 ---
 
-## maintenance.py
+## ducklake_maintenance.py
 
 Self-contained CLI for DuckLake catalog and storage maintenance. Designed to run as a K8s CronJob reusing the same image and credentials as the main app. Subcommands:
 
@@ -41,9 +41,9 @@ Every `cleanup` / `cleanup-all` (skipped on `--dry-run`) logs a single structure
 
 If `PUSHGATEWAY_URL` is set, the script pushes `maintenance_start_time{operation}` (on start) and `maintenance_duration_seconds{operation, status}` (on completion) to a Prometheus Pushgateway, enabling Grafana annotation queries for maintenance windows.
 
-## maintenance.sql
+## ducklake_maintenance.sql
 
-Executed verbatim at every session start by both `maintenance.py`'s `connect()` and the `just shell` recipe. No templating — `__ducklake_metadata_lake` and friends are written literally so both load paths stay consistent. Defines runtime macros:
+Executed verbatim at every session start by both `ducklake_maintenance.py`'s `connect()` and the `just shell` recipe. No templating — `__ducklake_metadata_lake` and friends are written literally so both load paths stay consistent. Defines runtime macros:
 
 - `count_pending_dups()` — duplicate-row count in the pending-deletion queue
 - `find_catalog_orphans(data_path)` — catalog rows whose S3 key no longer exists, scanned via `glob()` against the live S3 listing
@@ -57,7 +57,7 @@ The header documents the constraints any new recipe must follow:
 
 ## ducklake_metrics.py
 
-Long-running Prometheus-exposition daemon for catalog-side lake-state metrics. Single Python file. Single thread for queries (one DuckDB connection isn't safe for concurrent calls anyway), separate thread for the HTTP server. Reuses `maintenance.connect()`.
+Long-running Prometheus-exposition daemon for catalog-side lake-state metrics. Single Python file. Single thread for queries (one DuckDB connection isn't safe for concurrent calls anyway), separate thread for the HTTP server. Reuses `ducklake_maintenance.connect()`.
 
 Endpoints: `/metrics`, `/-/healthy` (k8s liveness — always 200 while the process answers), `/-/ready` (k8s readiness — 200 after the first successful connect; never gated on individual query completion so slow queries can't block rollout).
 
@@ -82,7 +82,7 @@ Built-in queries (lake-wide; no `table_name` label by design):
 |---|---|---|---|
 | `ducklake_pending_deletes` | — | `total`, `unique_paths`, `dup_rows` | `ducklake_files_scheduled_for_deletion` |
 | `ducklake_files_per_band` | `band` | `count`, `bytes` | `ducklake_data_file` |
-| `ducklake_compaction_candidates` | `tier` | `count` | `ducklake_data_file`; tier buckets match `maintenance.py`'s `TIERS` (`tier1` < 1 MiB, `tier2` [1, 10) MiB, `tier3` [10, 64) MiB, `large` ≥ 64 MiB, plus `total`) |
+| `ducklake_compaction_candidates` | `tier` | `count` | `ducklake_data_file`; tier buckets match `ducklake_maintenance.py`'s `TIERS` (`tier1` < 1 MiB, `tier2` [1, 10) MiB, `tier3` [10, 64) MiB, `large` ≥ 64 MiB, plus `total`) |
 | `ducklake_snapshots` | — | `count`, `oldest_seconds_ago`, `newest_seconds_ago` | `ducklake_snapshot`; CASTs `snapshot_time` (VARCHAR) to TIMESTAMPTZ before time arithmetic |
 | `ducklake_files_per_partition_top20` | `partition` | `count` | Composite partition values joined with `/`; live files without partition_value rows surface as `<none>` |
 | `ducklake_catalog` | `suffix` | `format_version` | `ducklake_metadata` row with `key='version'` and `scope IS NULL`. Numeric `major.minor` (extracted via `regexp_extract`) lands in the gauge value; any trailing tag DuckLake attaches (`-dev1` on main after `MigrateV10`, future `-rcN`/`-betaN` shapes) lands in the `suffix` label. Empty `suffix=""` for clean releases. Polled every 60 minutes — value changes only on a DuckLake upgrade |
@@ -98,7 +98,7 @@ Self-metrics (always on):
 
 Reconnect: connect failures retry with exponential backoff (1s → 60s cap). Once connected, transient query failures only increment the per-query error counter and log; the daemon stays up. After `CONSECUTIVE_FAILURE_THRESHOLD` (default 10) runs in a row across all queries fail, the scheduler raises `_ReconnectNeeded` and the outer loop drops the connection and reconnects via the same backoff. Any successful run resets the streak.
 
-Env vars (in addition to the `DUCKLAKE_*` / `DUCKDB_*` set used by `maintenance.py`):
+Env vars (in addition to the `DUCKLAKE_*` / `DUCKDB_*` set used by `ducklake_maintenance.py`):
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -112,14 +112,14 @@ Recipe wrapper for both maintenance and metrics. Copied to `/justfile` in the im
 
 Groups visible in `just --list`:
 
-- `[interactive]` — `shell` opens a DuckDB session with `lake` and `pg` ATTACHed, S3 SECRET configured, `maintenance.sql` macros loaded
-- `[lifecycle]` — every snapshot/file maintenance subcommand of `maintenance.py`, both `*` and `*-dry-run` variants
+- `[interactive]` — `shell` opens a DuckDB session with `lake` and `pg` ATTACHed, S3 SECRET configured, `ducklake_maintenance.sql` macros loaded
+- `[lifecycle]` — every snapshot/file maintenance subcommand of `ducklake_maintenance.py`, both `*` and `*-dry-run` variants
 - `[compaction]` — tiered compaction recipes plus `compact-probe`
 - `[metrics]` — `ducklake-metrics`, `ducklake-metrics-with-config`, `ducklake-metrics-list`
 
-Path overrides for dev use: `DUCKDB` (binary path), `MAINTENANCE_SCRIPT`, `MAINTENANCE_SQL`, `DUCKLAKE_METRICS_SCRIPT`.
+Path overrides for dev use: `DUCKDB` (binary path), `DUCKLAKE_MAINTENANCE_SCRIPT`, `DUCKLAKE_MAINTENANCE_SQL`, `DUCKLAKE_METRICS_SCRIPT`.
 
-The `_setup` constant mirrors what `maintenance.connect()` does (S3 secret, ATTACH lake + pg, `temp_directory`) so an interactive `just shell` ends up with the same wired-up session as a maintenance subcommand. The two-layer escaping for the Postgres connection string is documented inline.
+The `_setup` constant mirrors what `ducklake_maintenance.connect()` does (S3 secret, ATTACH lake + pg, `temp_directory`) so an interactive `just shell` ends up with the same wired-up session as a maintenance subcommand. The two-layer escaping for the Postgres connection string is documented inline.
 
 ## sizing-calculator.html
 

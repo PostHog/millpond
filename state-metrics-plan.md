@@ -4,7 +4,7 @@ Goes in `tools/` as a single Python file, `ducklake_metrics.py`. Small Python da
 
 ## Shape
 
-Single file. Connects once via `maintenance.connect()` — that already configures the lake ATTACH, the Postgres extension ATTACH, the S3 secret, `temp_directory`, and the `enable_http_logging` / `pg_debug_show_queries` quiets from a14. Reusing it means the daemon inherits all that without duplication. Queries run sequentially on per-query schedules. Prometheus served via `prometheus_client.start_http_server`.
+Single file. Connects once via `ducklake_maintenance.connect()` — that already configures the lake ATTACH, the Postgres extension ATTACH, the S3 secret, `temp_directory`, and the `enable_http_logging` / `pg_debug_show_queries` quiets from a14. Reusing it means the daemon inherits all that without duplication. Queries run sequentially on per-query schedules. Prometheus served via `prometheus_client.start_http_server`.
 
 ## Layout (one file)
 
@@ -71,7 +71,7 @@ Built-ins are lake-wide — no `table_name` label. User-supplied YAML may emit t
 
 Readiness must NOT wait for slow queries. The Prom port opens immediately at startup; `/metrics` may briefly return only self-metrics until the first scheduled queries run.
 
-## Config (env-driven, matches `maintenance.py`)
+## Config (env-driven, matches `ducklake_maintenance.py`)
 
 | Var | Purpose |
 |---|---|

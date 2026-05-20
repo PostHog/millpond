@@ -7,7 +7,8 @@ from importlib.metadata import PackageNotFoundError, version
 import pyarrow as pa
 from confluent_kafka import TopicPartition
 
-from millpond import arrow_converter, backpressure, config, consumer, ducklake, logging_config, metrics, schema, server
+from millpond import arrow_converter, backpressure, config, consumer, logging_config, metrics, server
+from millpond import sink as sink_mod
 
 log = logging.getLogger(__name__)
 
@@ -29,11 +30,11 @@ def _convert_batch(values: list[bytes]) -> pa.Table | None:
     return table
 
 
-def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=None):
-    """Write to DuckLake with exponential backoff on transient failures."""
+def _write_with_retry(sink, consolidated):
+    """Write to the sink with exponential backoff on transient failures."""
     for attempt in range(_WRITE_MAX_RETRIES):
         try:
-            ducklake.write(db, table_name, consolidated, schema_mgr, partition_by)
+            sink.write(consolidated)
             return
         except Exception:
             metrics.errors_total.labels(type="write_retry").inc()
@@ -49,16 +50,14 @@ def _write_with_retry(db, table_name, consolidated, schema_mgr, partition_by=Non
             )
             # Invalidate caches so retry re-checks table existence and schema —
             # another pod may have created the table or changed columns.
-            ducklake.reset_table_cache()
-            if schema_mgr is not None:
-                schema_mgr.invalidate()
+            sink.reset_caches()
             time.sleep(delay)
 
 
-def _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr, trigger="time"):
-    """Write to DuckLake, commit offsets, update metrics."""
+def _flush(sink, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, trigger="time"):
+    """Write to the sink, commit offsets, update metrics."""
     t0 = time.monotonic()
-    _write_with_retry(db, cfg.ducklake_table, consolidated, schema_mgr, cfg.partition_by)
+    _write_with_retry(sink, consolidated)
     write_duration = time.monotonic() - t0
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded
@@ -128,33 +127,14 @@ def main():
         __version__ = "0.0.0+unknown"
     log.info("millpond %s starting", __version__)
 
+    # Initialize close-targets to None so the finally block doesn't NameError
+    # if a startup step (make_sink, kafka.create, server.start) raises.
+    http = None
+    sink = None
+    kafka = None
+
     cfg = config.load()
-    metrics.init(f"{cfg.topic}-{cfg.ducklake_table}", broker_source=cfg.broker_source)
-    http = server.start()
-    server.health.mark_started()
-    log.info("Health server started, probes passing")
-
-    # No connection recovery logic — if DuckLake/Postgres fails, the pod crashes
-    # and K8s restarts it. Reconnection adds complexity for no benefit when the
-    # restart path already handles offset replay correctly.
-    db = ducklake.connect(cfg)
-    schema_mgr = schema.SchemaManager(db, cfg.ducklake_table)
-    log.info("DuckLake connected, schema manager initialized")
-    kafka = consumer.create(cfg)
-    log.info("Kafka consumer created, partitions assigned")
-    backpressure.init(cfg.consume_batch_size)
-
-    shutdown = False
-
-    def on_signal(signum, _frame):
-        nonlocal shutdown
-        log.info("Received signal %s, shutting down", signal.Signals(signum).name)
-        shutdown = True
-
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGINT, on_signal)
-
-    log.info("millpond ready, entering main loop")
+    metrics.init(f"{cfg.topic}-{cfg.table_label}", broker_source=cfg.broker_source)
 
     pending: list[pa.Table] = []
     pending_bytes = 0
@@ -165,6 +145,31 @@ def main():
     last_heartbeat = time.monotonic()
 
     try:
+        http = server.start()
+        server.health.mark_started()
+        log.info("Health server started, probes passing")
+
+        # No connection recovery logic — if the destination fails, the pod
+        # crashes and K8s restarts it. Reconnection adds complexity for no
+        # benefit when the restart path already handles offset replay correctly.
+        sink = sink_mod.make_sink(cfg)
+        log.info("Sink ready: destination=%s", cfg.destination)
+        kafka = consumer.create(cfg)
+        log.info("Kafka consumer created, partitions assigned")
+        backpressure.init(cfg.consume_batch_size)
+
+        shutdown = False
+
+        def on_signal(signum, _frame):
+            nonlocal shutdown
+            log.info("Received signal %s, shutting down", signal.Signals(signum).name)
+            shutdown = True
+
+        signal.signal(signal.SIGTERM, on_signal)
+        signal.signal(signal.SIGINT, on_signal)
+
+        log.info("millpond ready, entering main loop")
+
         while not shutdown:
             remaining = cfg.flush_interval_s - (time.monotonic() - last_flush)
             timeout = max(remaining, 0.1)
@@ -221,7 +226,7 @@ def main():
                 trigger = "size" if size_triggered else "time"
                 consolidated = pa.concat_tables(pending, promote_options="default")
                 _flush(
-                    db,
+                    sink,
                     cfg,
                     kafka,
                     consolidated,
@@ -229,7 +234,6 @@ def main():
                     pending_records,
                     offsets,
                     elapsed,
-                    schema_mgr,
                     trigger,
                 )
 
@@ -253,19 +257,35 @@ def main():
         log.exception("Fatal error in main loop")
         raise
     finally:
-        if pending_records > 0:
+        # Final flush only makes sense if both sink and kafka were created;
+        # if startup failed earlier, there's no consumed data to flush.
+        if pending_records > 0 and sink is not None and kafka is not None:
             try:
                 consolidated = pa.concat_tables(pending, promote_options="default")
                 elapsed = time.monotonic() - last_flush
                 log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
-                _flush(db, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, schema_mgr)
+                _flush(sink, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed)
             except Exception:
                 log.exception("Final flush failed — data safe in Kafka, will replay on restart")
 
-        log.info("Closing consumer")
-        kafka.close()
-        db.close()
-        http.shutdown()
+        # Close in reverse-startup order. Each close is guarded so a partial
+        # startup (e.g. make_sink raised) doesn't NameError its way through here.
+        if kafka is not None:
+            log.info("Closing consumer")
+            try:
+                kafka.close()
+            except Exception:
+                log.exception("Kafka consumer close failed")
+        if sink is not None:
+            try:
+                sink.close()
+            except Exception:
+                log.exception("Sink close failed")
+        if http is not None:
+            try:
+                http.shutdown()
+            except Exception:
+                log.exception("HTTP server shutdown failed")
         log.info("millpond shutdown complete")
 
     return 0

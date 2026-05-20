@@ -9,9 +9,7 @@ from millpond.ducklake import (
     _escape_libpq,
     _sanitize_setting_value,
     _table_exists,
-    _tables_ensured,
     _validate_partition_expr,
-    reset_table_cache,
 )
 
 
@@ -92,24 +90,14 @@ class TestEscapeLibpq:
         assert _escape_libpq(None) == "''"
 
 
-class TestResetTableCache:
-    def test_reset_clears_ensured_tables(self):
-        _tables_ensured.add("test_table")
-        assert "test_table" in _tables_ensured
-        reset_table_cache()
-        assert len(_tables_ensured) == 0
-
-
-@pytest.fixture(autouse=True)
-def _clear_table_cache():
-    """Ensure table cache is clean before and after each test."""
-    reset_table_cache()
-    yield
-    reset_table_cache()
-
-
 def _sample_batch() -> pa.Table:
     return pa.table({"col_a": [1], "col_b": ["x"]})
+
+
+@pytest.fixture
+def cache() -> set[str]:
+    """A fresh caller-owned ensure cache, one per test."""
+    return set()
 
 
 class TestTableExists:
@@ -125,33 +113,33 @@ class TestTableExists:
 
 
 class TestEnsureTable:
-    def test_skips_if_cached(self):
+    def test_skips_if_cached(self, cache):
         conn = MagicMock()
-        _tables_ensured.add("events")
-        _ensure_table(conn, "events", _sample_batch())
+        cache.add("events")
+        _ensure_table(conn, "events", _sample_batch(), cache)
         conn.execute.assert_not_called()
 
     @patch("millpond.ducklake._table_exists", return_value=True)
-    def test_skips_create_if_table_exists(self, mock_exists):
+    def test_skips_create_if_table_exists(self, mock_exists, cache):
         conn = MagicMock()
-        _ensure_table(conn, "events", _sample_batch())
+        _ensure_table(conn, "events", _sample_batch(), cache)
         conn.execute.assert_not_called()
-        assert "events" in _tables_ensured
+        assert "events" in cache
 
     @patch("millpond.ducklake._table_exists", return_value=False)
-    def test_creates_table_and_caches(self, mock_exists):
+    def test_creates_table_and_caches(self, mock_exists, cache):
         conn = MagicMock()
-        _ensure_table(conn, "events", _sample_batch())
+        _ensure_table(conn, "events", _sample_batch(), cache)
         # Should have called register, execute (CREATE), unregister
         assert conn.execute.call_count >= 1
         create_sql = conn.execute.call_args_list[0][0][0]
         assert "CREATE TABLE IF NOT EXISTS" in create_sql
-        assert "events" in _tables_ensured
+        assert "events" in cache
 
     @patch("millpond.ducklake._table_exists", return_value=False)
-    def test_creates_table_with_partitioning(self, mock_exists):
+    def test_creates_table_with_partitioning(self, mock_exists, cache):
         conn = MagicMock()
-        _ensure_table(conn, "events", _sample_batch(), partition_by="team_id,year(ts)")
+        _ensure_table(conn, "events", _sample_batch(), cache, partition_by="team_id,year(ts)")
         # Find the ALTER PARTITIONED BY call
         alter_calls = [
             call for call in conn.execute.call_args_list if "PARTITIONED BY" in str(call)
@@ -160,7 +148,7 @@ class TestEnsureTable:
         assert "team_id,year(ts)" in str(alter_calls[0])
 
     @patch("millpond.ducklake._table_exists")
-    def test_concurrent_create_recovers(self, mock_exists):
+    def test_concurrent_create_recovers(self, mock_exists, cache):
         """If CREATE fails but another pod created the table, continue."""
         # First call: table doesn't exist. Second call (after error): table exists.
         mock_exists.side_effect = [False, True]
@@ -168,11 +156,11 @@ class TestEnsureTable:
         conn.register = MagicMock()
         conn.unregister = MagicMock()
         conn.execute.side_effect = duckdb.Error("serialization conflict")
-        _ensure_table(conn, "events", _sample_batch())
-        assert "events" in _tables_ensured
+        _ensure_table(conn, "events", _sample_batch(), cache)
+        assert "events" in cache
 
     @patch("millpond.ducklake._table_exists")
-    def test_create_fails_and_table_still_missing_raises(self, mock_exists):
+    def test_create_fails_and_table_still_missing_raises(self, mock_exists, cache):
         """If CREATE fails and table doesn't exist, raise."""
         mock_exists.return_value = False
         conn = MagicMock()
@@ -180,10 +168,10 @@ class TestEnsureTable:
         conn.unregister = MagicMock()
         conn.execute.side_effect = duckdb.Error("connection lost")
         with pytest.raises(RuntimeError, match="Failed to create table"):
-            _ensure_table(conn, "events", _sample_batch())
+            _ensure_table(conn, "events", _sample_batch(), cache)
 
     @patch("millpond.ducklake._table_exists")
-    def test_concurrent_partition_alter_recovers(self, mock_exists):
+    def test_concurrent_partition_alter_recovers(self, mock_exists, cache):
         """If ALTER PARTITIONED BY fails but table exists, continue."""
         mock_exists.side_effect = [False, True]
         conn = MagicMock()
@@ -195,5 +183,5 @@ class TestEnsureTable:
                 raise duckdb.Error("serialization conflict")
 
         conn.execute.side_effect = execute_side_effect
-        _ensure_table(conn, "events", _sample_batch(), partition_by="team_id")
-        assert "events" in _tables_ensured
+        _ensure_table(conn, "events", _sample_batch(), cache, partition_by="team_id")
+        assert "events" in cache
