@@ -99,6 +99,13 @@ def connect(
         "s3.access-key-id": s3_access_key_id,
         "s3.secret-access-key": s3_secret_access_key,
         "s3.region": s3_region,
+        # Pin the FileIO implementation. Without this, some catalog
+        # implementations (Lakekeeper) return responses that lead PyIceberg
+        # to route writes through `FsspecFileIO`, which depends on `s3fs`
+        # — not a dependency we want to carry. PyArrowFileIO uses PyArrow's
+        # S3 client, which is already pulled in transitively and respects
+        # the `s3.access-key-id` / `s3.endpoint` properties above.
+        "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
     }
     if catalog_token:
         props["token"] = catalog_token

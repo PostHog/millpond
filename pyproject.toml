@@ -57,8 +57,14 @@ select = ["E", "F", "I", "UP"]
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
     "e2e: marks tests as E2E tests requiring docker-compose stack",
+    "stress: characterisation tests that drive a docker-compose stack under contention (manual, not run in CI)",
 ]
 pythonpath = ["tools"]
+testpaths = ["tests"]
+# Keep collection scoped to `tests/` only — the repo also contains a
+# cloned `lakekeeper/` source tree for cross-reference, and its own
+# tests/ import deps (pydantic_settings, etc.) we don't carry.
+norecursedirs = ["lakekeeper", ".venv", "node_modules"]
 
 [tool.uv]
 constraint-dependencies = [
