@@ -65,8 +65,11 @@ _PARTITION_FIELD_ID_BASE = 1000
 
 # Columns IcebergSink manages itself; source schemas must not shadow them.
 # `_inserted_at` is added at write time; the four partition cols are derived
-# from it. Shared structure with `millpond.ducklake.RESERVED_COLUMNS` (which
-# is a smaller set — DuckLake doesn't derive partition columns).
+# from it. `millpond.ducklake.RESERVED_COLUMNS` holds the same five names
+# today — DuckLake reserves the partition cols defensively even though it
+# doesn't produce them itself, so a deployment-time switch between
+# destinations can't suddenly start accepting or rejecting batches based on
+# user-column collisions.
 RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at", *PARTITION_COLS})
 
 
@@ -107,8 +110,14 @@ def connect(
 
 
 def _now_utc_us() -> datetime.datetime:
-    """Microsecond-precision UTC now, matching the timestamp type Iceberg expects."""
-    return datetime.datetime.now(datetime.UTC).replace(microsecond=0)
+    """Microsecond-precision UTC now, matching the timestamp type Iceberg expects.
+
+    `datetime.datetime.now(UTC)` is microsecond-precision on every platform
+    we support; the Arrow `pa.timestamp("us", tz="UTC")` type carried in
+    `_inserted_at` is also microsecond, so no rounding happens on the
+    way through PyIceberg's append path.
+    """
+    return datetime.datetime.now(datetime.UTC)
 
 
 def _add_metadata_columns(batch: pa.Table) -> pa.Table:

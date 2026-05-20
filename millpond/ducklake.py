@@ -219,8 +219,23 @@ class DuckLakeSink:
     """
 
     def __init__(self, cfg: Config):
-        if cfg.ducklake_table is None:
-            raise RuntimeError("DuckLakeSink requires cfg.ducklake_table; config.load() should have enforced this")
+        # Explicit guards rather than assert: `python -O` strips asserts and
+        # would forward None to connect(), producing a cryptic libpq
+        # "host=None" failure instead of a clear startup error. Symmetric
+        # with IcebergSink. All fields below are read either by connect()
+        # building the Postgres connstring or by this constructor.
+        for name in (
+            "ducklake_table",
+            "ducklake_connection",
+            "ducklake_data_path",
+            "rds_host",
+            "rds_port",
+            "rds_database",
+            "rds_username",
+            "rds_password",
+        ):
+            if getattr(cfg, name) is None:
+                raise RuntimeError(f"DuckLakeSink requires cfg.{name}; config.load() should have enforced this")
         self._cfg = cfg
         self._conn = connect(cfg)
         self._table_name = cfg.ducklake_table

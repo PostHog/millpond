@@ -28,6 +28,13 @@ def _ducklake_cfg(**overrides) -> MagicMock:
     cfg = MagicMock()
     cfg.destination = "ducklake"
     cfg.ducklake_table = "events"
+    cfg.ducklake_connection = ":memory:"
+    cfg.ducklake_data_path = "s3://bucket/data"
+    cfg.rds_host = "localhost"
+    cfg.rds_port = "5432"
+    cfg.rds_database = "ducklake"
+    cfg.rds_username = "ducklake"
+    cfg.rds_password = "pass"
     cfg.partition_by = None
     for k, v in overrides.items():
         setattr(cfg, k, v)
@@ -64,9 +71,27 @@ class TestDuckLakeSinkInit:
             assert sink._partition_by is None
             assert sink._tables_ensured == set()
 
-    def test_missing_ducklake_table_raises_runtimeerror(self):
-        with pytest.raises(RuntimeError, match="ducklake_table"):
-            DuckLakeSink(_ducklake_cfg(ducklake_table=None))
+    @pytest.mark.parametrize(
+        "missing_field",
+        [
+            "ducklake_table",
+            "ducklake_connection",
+            "ducklake_data_path",
+            "rds_host",
+            "rds_port",
+            "rds_database",
+            "rds_username",
+            "rds_password",
+        ],
+    )
+    def test_missing_required_field_raises_runtimeerror(self, missing_field):
+        # Each field connect() touches must be guarded. Without the guard,
+        # a missing rds_* field would surface as a cryptic libpq
+        # "host=None" or similar deep in the stack. Symmetric with the
+        # IcebergSink test below.
+        cfg = _ducklake_cfg(**{missing_field: None})
+        with pytest.raises(RuntimeError, match=missing_field):
+            DuckLakeSink(cfg)
 
     def test_runtimeerror_survives_python_optimize(self):
         # `assert` would silently pass under `python -O`. Confirm the guard
