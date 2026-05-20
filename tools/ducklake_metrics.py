@@ -8,9 +8,9 @@ compaction-tier candidate counts, pending-deletion queue depth, snapshot
 age). Operators can supply additional queries via a YAML file referenced
 by ``DUCKLAKE_METRICS_CONFIG``.
 
-Reuses ``maintenance.connect()`` so the daemon inherits the same lake +
-postgres ATTACH, S3 secret, and session tunables that maintenance.py runs
-under. Same env vars as the maintenance script:
+Reuses ``ducklake_maintenance.connect()`` so the daemon inherits the same lake +
+postgres ATTACH, S3 secret, and session tunables that ducklake_maintenance.py runs
+under. Same env vars as the ducklake_maintenance script:
   DUCKLAKE_RDS_HOST, DUCKLAKE_RDS_PORT, DUCKLAKE_RDS_DATABASE,
   DUCKLAKE_RDS_USERNAME, DUCKLAKE_RDS_PASSWORD, DUCKLAKE_DATA_PATH,
   DUCKDB_S3_REGION, DUCKDB_S3_ACCESS_KEY_ID, DUCKDB_S3_SECRET_ACCESS_KEY
@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import duckdb
-import maintenance
+import ducklake_maintenance
 import yaml
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -56,9 +56,9 @@ log = logging.getLogger("ducklake_metrics")
 # Built-in queries are embedded so the binary is self-contained; they parse
 # through the same loader as user YAML so the two paths can't diverge.
 #
-# SQL refers to the metadata schema by its literal name. maintenance.connect()
+# SQL refers to the metadata schema by its literal name. ducklake_maintenance.connect()
 # always ATTACHes the lake as ``lake``, which fixes the schema as
-# ``__ducklake_metadata_lake`` (per maintenance.py's METADATA_SCHEMA). Built-in
+# ``__ducklake_metadata_lake`` (per ducklake_maintenance.py's METADATA_SCHEMA). Built-in
 # queries hardcode that name; user-supplied queries are passed through verbatim
 # and may reference whatever schema they like.
 BUILTIN_YAML = """
@@ -97,7 +97,7 @@ queries:
       GROUP BY band
 
   - name: ducklake_compaction_candidates
-    help: Live file counts bucketed to match maintenance.py's TIERS spec.
+    help: Live file counts bucketed to match ducklake_maintenance.py's TIERS spec.
     interval_mins: 1
     labels: [tier]
     values: [count]
@@ -484,7 +484,7 @@ def _connect_with_backoff(
     stop: threading.Event,
     self_metrics: SelfMetrics,
 ) -> duckdb.DuckDBPyConnection | None:
-    """Call maintenance.connect() with exponential backoff until it succeeds or stop is set.
+    """Call ducklake_maintenance.connect() with exponential backoff until it succeeds or stop is set.
 
     Returns the new connection on success, or None if the daemon was asked
     to shut down before connect succeeded. ``self_metrics.up`` is held at 0
@@ -496,7 +496,7 @@ def _connect_with_backoff(
     self_metrics.up.set(0)
     while not stop.is_set():
         try:
-            conn = maintenance.connect()
+            conn = ducklake_maintenance.connect()
             log.info("Connected to DuckLake catalog")
             return conn
         except Exception:

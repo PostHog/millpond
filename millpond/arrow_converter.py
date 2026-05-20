@@ -6,6 +6,27 @@ import pyarrow as pa
 log = logging.getLogger(__name__)
 
 
+def _drop_null_typed_columns(table: pa.Table) -> pa.Table:
+    """Drop columns whose Arrow type is ``pa.null()`` before they reach a Sink.
+
+    In normal use ``_build_schema`` falls back to ``pa.string()`` for keys
+    where every record has None across the whole batch, so ``pa.null()``
+    shouldn't appear via this path. This filter is defensive: if a
+    ``pa.null()`` column ever slips through (e.g. via a future inference
+    change), both backends would diverge — DuckLake silently accepts it,
+    Iceberg rejects with ``ValueError("Null type ... is not supported in
+    Iceberg format version 2")``. Dropping at the converter keeps the
+    Sink contract uniform across backends: a column with no schema info
+    is a column with no data, and it'll be re-introduced with a real
+    type on the next batch that has a non-null value.
+    """
+    null_cols = [field.name for field in table.schema if pa.types.is_null(field.type)]
+    if not null_cols:
+        return table
+    log.info("Dropping all-null columns with pa.null() type: %s", null_cols)
+    return table.drop_columns(null_cols)
+
+
 def _normalize_numeric_types(table: pa.Table) -> pa.Table:
     """Normalize numeric columns: integers→int64, floats→float64.
 
@@ -165,4 +186,5 @@ def convert(messages: list[bytes]) -> pa.Table | None:
         schema = _build_schema(patched)
     table = pa.Table.from_pylist(patched, schema=schema)
     table = _normalize_numeric_types(table)
+    table = _drop_null_typed_columns(table)
     return table

@@ -1,4 +1,4 @@
-# Millpond — Kafka to DuckLake
+# Millpond — Kafka to DuckLake or Iceberg
 
 # Default recipe: list all available recipes
 default:
@@ -69,7 +69,8 @@ ci: fmt-check lint test
 ssl-certs:
     ./test/generate-ssl-certs.sh
 
-# Start the docker-compose dev environment (Kafka, Postgres, MinIO, producer, 2 millpond pods)
+# Start the docker-compose dev environment (DuckLake stack — Kafka, Postgres, MinIO, producer, 2 millpond pods).
+# For Iceberg-flavored local dev, use the tests/integration/compose.yaml stack (MinIO + iceberg-rest) directly.
 [group('docker')]
 up:
     docker compose build
@@ -91,7 +92,7 @@ down:
 down-ssl:
     docker compose -f docker-compose.yaml -f docker-compose.ssl.yaml down -v
 
-# Open a DuckDB shell attached to the local DuckLake (requires `just up` first)
+# Open a DuckDB shell attached to the local DuckLake (DuckLake stack only; requires `just up` first)
 [group('docker')]
 duck:
     duckdb -init test/ducklake-init.sql

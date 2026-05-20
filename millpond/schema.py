@@ -10,16 +10,14 @@ Schema is cached per table to avoid repeated PRAGMA round-trips.
 """
 
 import logging
-import re
 
 import duckdb
 import pyarrow as pa
 
 from millpond import metrics
+from millpond.sink import SAFE_IDENTIFIER
 
 log = logging.getLogger(__name__)
-
-_SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # PyArrow type → DuckDB SQL type
 _ARROW_TO_DUCKDB: dict[str, str] = {
@@ -115,7 +113,7 @@ class SchemaManager:
             if field.name == "_inserted_at":
                 continue
 
-            if not _SAFE_IDENTIFIER.match(field.name):
+            if not SAFE_IDENTIFIER.match(field.name):
                 log.warning("Skipping unsafe field name: %r", field.name)
                 metrics.records_skipped_total.labels(reason="unsafe_field_name").inc()
                 continue

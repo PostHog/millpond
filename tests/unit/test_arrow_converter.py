@@ -1,7 +1,7 @@
 import orjson
 import pyarrow as pa
 
-from millpond.arrow_converter import convert
+from millpond.arrow_converter import _drop_null_typed_columns, convert
 
 
 class TestConvert:
@@ -164,6 +164,14 @@ class TestConvert:
         assert table is not None
         assert table.schema.field("price").type == pa.float64()
 
+    def test_all_null_field_does_not_produce_pa_null_column(self):
+        # In normal use _build_schema falls back to pa.string() for keys
+        # that are None in every record — so convert() should never emit
+        # a pa.null() column. Lock that.
+        table = convert([orjson.dumps({"x": None, "y": "data"})])
+        assert table is not None
+        assert all(not pa.types.is_null(f.type) for f in table.schema)
+
     def test_cross_batch_concat_with_promote(self):
         """Tables from separate convert() calls may have different schemas.
         pa.concat_tables must use promote_options to handle this."""
@@ -175,3 +183,37 @@ class TestConvert:
         assert len(merged) == 2
         assert "b" in merged.schema.names
         assert merged.column("b").to_pylist() == [None, "new"]
+
+
+class TestDropNullTypedColumns:
+    """Defensive filter against pa.null() columns slipping through to a Sink.
+
+    Backends diverge on pa.null() — DuckLake stores nulls; Iceberg raises
+    `ValueError("Null type ... is not supported in Iceberg format version
+    2")`. Dropping at the converter keeps the Sink contract uniform.
+    """
+
+    def test_drops_pa_null_column(self):
+        table = pa.table(
+            {"a": pa.array([None, None], pa.null()), "b": ["x", "y"]}
+        )
+        out = _drop_null_typed_columns(table)
+        assert out.column_names == ["b"]
+
+    def test_passthrough_when_no_null_columns(self):
+        table = pa.table({"a": [1, 2], "b": ["x", "y"]})
+        out = _drop_null_typed_columns(table)
+        # No re-allocation when there's nothing to do.
+        assert out is table
+
+    def test_drops_only_null_typed_columns_not_columns_with_nulls(self):
+        # A regular string column with all-None values is NOT pa.null() —
+        # it's a string column with nulls. Must not be dropped.
+        table = pa.table(
+            {
+                "actually_null_type": pa.array([None], pa.null()),
+                "string_with_nulls": pa.array([None], pa.string()),
+            }
+        )
+        out = _drop_null_typed_columns(table)
+        assert out.column_names == ["string_with_nulls"]

@@ -76,7 +76,7 @@ METADATA_SCHEMA = f"__ducklake_metadata_{ATTACH_NAME}"
 PG_ATTACH_NAME = "pg"
 
 # Companion SQL file: header conventions plus runtime-loadable macros.
-MAINTENANCE_SQL_PATH = Path(__file__).resolve().parent / "maintenance.sql"
+MAINTENANCE_SQL_PATH = Path(__file__).resolve().parent / "ducklake_maintenance.sql"
 
 # Stable identifier for `pg_try_advisory_lock`. The lock guards mutual
 # exclusion *between maintenance invocations*: it is held by the `pg`
@@ -217,14 +217,14 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     conn.execute(f"ATTACH '{pg_connstr_sql}' AS {PG_ATTACH_NAME} (TYPE postgres)")
 
     if MAINTENANCE_SQL_PATH.exists():
-        # File is executed verbatim by both maintenance.py and the duckdb CLI's
+        # File is executed verbatim by both ducklake_maintenance.py and the duckdb CLI's
         # `.read` meta-command (the `just shell` recipe), so it must contain no
         # templating placeholders — references to `__ducklake_metadata_lake`
         # are written literally to keep both paths consistent.
         conn.execute(MAINTENANCE_SQL_PATH.read_text())
         log.debug("Loaded SQL macros from %s", MAINTENANCE_SQL_PATH)
     else:
-        log.warning("maintenance.sql not found at %s; macros unavailable", MAINTENANCE_SQL_PATH)
+        log.warning("ducklake_maintenance.sql not found at %s; macros unavailable", MAINTENANCE_SQL_PATH)
 
     log.info(
         "Connected: metadata=%s:%s/%s data=%s",

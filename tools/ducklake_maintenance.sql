@@ -1,6 +1,6 @@
 -- DuckLake catalog maintenance recipes.
 --
--- Loaded at session start by `tools/maintenance.py` (via `conn.execute`) and
+-- Loaded at session start by `tools/ducklake_maintenance.py` (via `conn.execute`) and
 -- by the `shell` recipe in `tools/justfile` (via the duckdb CLI's `.read`
 -- meta-command). Both paths execute the file verbatim, so the file itself
 -- must be valid SQL — no templating, no placeholders.
@@ -9,7 +9,7 @@
 -- -----------
 -- * Schema name. DuckLake stores its catalog tables in
 --   `__ducklake_metadata_<attach_name>`. We attach as `lake` everywhere
---   (the `ATTACH_NAME` constant in `maintenance.py`), so this file
+--   (the `ATTACH_NAME` constant in `ducklake_maintenance.py`), so this file
 --   references `__ducklake_metadata_lake.<table>` directly. If you ever
 --   change the ATTACH alias, the references here must change with it.
 --
@@ -20,7 +20,7 @@
 --   does not expose Postgres system columns to duckdb-side queries. Anything
 --   that touches `ctid` must run via `postgres_execute` / `postgres_query`
 --   against the `pg (TYPE postgres)` ATTACH — see `dedup_deletions` in
---   `maintenance.py` for the working pattern.
+--   `ducklake_maintenance.py` for the working pattern.
 --
 -- * No literal `glob('s3://...')` inside `CREATE MACRO` bodies. DuckDB 1.4
 --   evaluates a literal glob eagerly at macro creation time, which would
@@ -51,7 +51,7 @@ CREATE OR REPLACE TEMP MACRO count_pending_dups() AS (
 --
 -- Pass the lake's bucket-relative root as `data_path` (e.g.
 -- `'s3://bucket/lake/data'` or `'s3://bucket/lake/data/'`);
--- maintenance.py's `find-orphans` subcommand supplies it from
+-- ducklake_maintenance.py's `find-orphans` subcommand supplies it from
 -- `DUCKLAKE_DATA_PATH` for you. We `rtrim(data_path, '/')` everywhere it
 -- appears so an operator-configured trailing slash doesn't produce
 -- `.../data//file.parquet` from the relative-form join (which would

@@ -129,3 +129,164 @@ class TestLoad:
     def test_kafka_consumer_overrides_default_empty(self):
         cfg = load()
         assert cfg.kafka_config_overrides == ()
+
+    def test_destination_defaults_to_ducklake(self):
+        cfg = load()
+        assert cfg.destination == "ducklake"
+        assert cfg.table_label == "events"
+
+    def test_iceberg_fields_none_when_destination_ducklake(self):
+        cfg = load()
+        assert cfg.iceberg_catalog_uri is None
+        assert cfg.iceberg_namespace is None
+        assert cfg.s3_access_key_id is None
+
+
+class TestLoadIcebergDestination:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        # Strip any DUCKLAKE_* so a leak doesn't make this test pass by accident.
+        for key in list(__import__("os").environ):
+            if key.startswith("DUCKLAKE_"):
+                monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("MILLPOND_DESTINATION", "iceberg")
+        monkeypatch.setenv("ICEBERG_TABLE", "events")
+        monkeypatch.setenv("ICEBERG_NAMESPACE", "millpond")
+        monkeypatch.setenv("ICEBERG_CATALOG_URI", "http://catalog:8181")
+        monkeypatch.setenv("ICEBERG_WAREHOUSE", "s3://warehouse/")
+        monkeypatch.setenv("MILLPOND_S3_ACCESS_KEY_ID", "akid")
+        monkeypatch.setenv("MILLPOND_S3_SECRET_ACCESS_KEY", "secret")
+        monkeypatch.setenv("MILLPOND_S3_REGION", "us-east-1")
+
+    def test_loads_iceberg(self, monkeypatch):
+        # Use a distinct iceberg_table name from the KAFKA_TOPIC so we can
+        # actually prove dispatch — not just rely on both happening to be
+        # "events". (Prior version of this test was a false-positive.)
+        monkeypatch.setenv("ICEBERG_TABLE", "ice_events")
+        cfg = load()
+        assert cfg.destination == "iceberg"
+        assert cfg.iceberg_table == "ice_events"
+        assert cfg.iceberg_namespace == "millpond"
+        assert cfg.iceberg_catalog_uri == "http://catalog:8181"
+        assert cfg.iceberg_warehouse == "s3://warehouse/"
+        assert cfg.s3_access_key_id == "akid"
+        assert cfg.table_label == "millpond.ice_events"
+
+    def test_default_group_id_uses_iceberg_table(self, monkeypatch):
+        # Distinct table name so the assertion proves we're reading
+        # iceberg_table (not ducklake_table or KAFKA_TOPIC).
+        monkeypatch.setenv("ICEBERG_TABLE", "ice_events")
+        cfg = load()
+        assert cfg.group_id == "millpond-test-topic-ice_events"
+
+    @pytest.mark.parametrize("raw", ["ICEBERG", "Iceberg", "iceberg", "IceBERG"])
+    def test_iceberg_destination_is_case_insensitive(self, raw, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", raw)
+        cfg = load()
+        assert cfg.destination == "iceberg"
+
+    def test_ducklake_fields_none_when_destination_iceberg(self):
+        cfg = load()
+        assert cfg.ducklake_table is None
+        assert cfg.rds_host is None
+        assert cfg.partition_by is None
+
+    def test_stray_ducklake_env_vars_are_ignored(self, monkeypatch):
+        # An operator who flipped MILLPOND_DESTINATION to iceberg may still
+        # have DUCKLAKE_* set from the prior config. Those should be silently
+        # ignored, not validated, not pulled into Config.
+        monkeypatch.setenv("DUCKLAKE_TABLE", "leftover")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "leftover")
+        cfg = load()
+        assert cfg.destination == "iceberg"
+        assert cfg.ducklake_table is None  # ignored, not propagated
+
+    def test_optional_s3_endpoint_and_token(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_S3_ENDPOINT", "http://minio:9000")
+        monkeypatch.setenv("ICEBERG_CATALOG_TOKEN", "bearer-xyz")
+        cfg = load()
+        assert cfg.s3_endpoint == "http://minio:9000"
+        assert cfg.iceberg_catalog_token == "bearer-xyz"
+
+    @pytest.mark.parametrize(
+        "missing_var",
+        [
+            "ICEBERG_CATALOG_URI",
+            "ICEBERG_WAREHOUSE",
+            "ICEBERG_NAMESPACE",
+            "ICEBERG_TABLE",
+            "MILLPOND_S3_ACCESS_KEY_ID",
+            "MILLPOND_S3_SECRET_ACCESS_KEY",
+            "MILLPOND_S3_REGION",
+        ],
+    )
+    def test_missing_iceberg_required_field_raises(self, missing_var, monkeypatch):
+        monkeypatch.delenv(missing_var)
+        with pytest.raises(RuntimeError, match=missing_var):
+            load()
+
+    def test_unsafe_iceberg_table_name_rejected(self, monkeypatch):
+        monkeypatch.setenv("ICEBERG_TABLE", "events; DROP TABLE x")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+    def test_unsafe_iceberg_namespace_rejected(self, monkeypatch):
+        monkeypatch.setenv("ICEBERG_NAMESPACE", "evil-ns")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+
+class TestLoadDestinationValidation:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+
+    def test_unknown_destination_raises(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "snowflake")
+        with pytest.raises(RuntimeError, match="MILLPOND_DESTINATION"):
+            load()
+
+    @pytest.mark.parametrize("raw", ["DUCKLAKE", "DuckLake", "ducklake", "DuckLAKE"])
+    def test_ducklake_destination_is_case_insensitive(self, raw, monkeypatch):
+        # `.lower()` in load() accepts any casing operators might helm-template in.
+        monkeypatch.setenv("MILLPOND_DESTINATION", raw)
+        cfg = load()
+        assert cfg.destination == "ducklake"
+
+    def test_destination_whitespace_tolerated(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "  ducklake  ")
+        cfg = load()
+        assert cfg.destination == "ducklake"
+
+    def test_destination_empty_string_defaults_to_ducklake(self, monkeypatch):
+        # Common helm-template gotcha: unset variable renders as "" rather
+        # than being absent. Treat empty/whitespace as fall-back to default.
+        monkeypatch.setenv("MILLPOND_DESTINATION", "")
+        cfg = load()
+        assert cfg.destination == "ducklake"
+
+    def test_destination_only_whitespace_defaults_to_ducklake(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "   ")
+        cfg = load()
+        assert cfg.destination == "ducklake"
+
+    def test_stray_iceberg_env_vars_ignored_when_destination_ducklake(self, monkeypatch):
+        # Symmetric to the iceberg-side test: stray ICEBERG_* should not
+        # affect a DuckLake deployment.
+        monkeypatch.setenv("ICEBERG_TABLE", "ice_events")
+        monkeypatch.setenv("ICEBERG_NAMESPACE", "millpond")
+        cfg = load()
+        assert cfg.destination == "ducklake"
+        assert cfg.iceberg_table is None
