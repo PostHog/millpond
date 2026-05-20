@@ -39,12 +39,14 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     command: server /data --console-address ":9001"
-    # Ephemeral host port — the e2e test resolves it via
-    # `DockerCompose.get_service_host_and_port` to read parquet files back
-    # through pyiceberg's S3 client. Avoids hardcoded host ports so this
-    # stack can coexist with docker-compose.yaml.
+    # Ephemeral host port bound to loopback only — the e2e test resolves it
+    # via `DockerCompose.get_service_host_and_port` to read parquet files
+    # back through pyiceberg's S3 client. Avoids hardcoded host ports so
+    # this stack can coexist with docker-compose.yaml. The `127.0.0.1::`
+    # prefix (double colon = ephemeral host port) keeps the binding off
+    # non-loopback interfaces, per the trailofbits semgrep rule.
     ports:
-      - "9000"
+      - "127.0.0.1::9000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 2s
@@ -77,8 +79,9 @@ services:
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    # Loopback-only ephemeral host port — see comment on minio.ports.
     ports:
-      - "8181"
+      - "127.0.0.1::8181"
 
   # --- Topic Setup ---
 
