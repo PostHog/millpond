@@ -111,6 +111,10 @@ def _make_cfg(table_name: str) -> Config:
         consume_batch_size=1,
         stats_interval_ms=1,
         broker_source="",
+        filter_keep_field=None,
+        filter_drop_field=None,
+        filter_values=None,
+        sort_by=None,
         kafka_config_overrides=(),
     )
 

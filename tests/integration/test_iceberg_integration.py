@@ -124,6 +124,10 @@ def _make_iceberg_cfg(catalog_uri: str, minio_endpoint: str, table_name: str) ->
         consume_batch_size=1,
         stats_interval_ms=1,
         broker_source="",
+        filter_keep_field=None,
+        filter_drop_field=None,
+        filter_values=None,
+        sort_by=None,
         kafka_config_overrides=(),
     )
 

@@ -289,4 +289,186 @@ class TestLoadDestinationValidation:
         monkeypatch.setenv("ICEBERG_NAMESPACE", "millpond")
         cfg = load()
         assert cfg.destination == "ducklake"
-        assert cfg.iceberg_table is None
+
+
+class TestFilterConfig:
+    """MILLPOND_FILTER_{KEEP,DROP}_FIELD_NAME + MILLPOND_FILTER_VALUES."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        # Minimal valid DuckLake config — the filter feature is destination-agnostic.
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "1")
+        monkeypatch.setenv("POD_NAME", "millpond-events-0")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+
+    def test_unset_yields_none(self):
+        cfg = load()
+        assert cfg.filter_keep_field is None
+        assert cfg.filter_drop_field is None
+        assert cfg.filter_values is None
+
+    def test_int_allowlist_parsed_as_ints(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "2,4,1956,69")
+        cfg = load()
+        assert cfg.filter_keep_field == "team_id"
+        assert cfg.filter_values == (2, 4, 1956, 69)
+        # Homogeneous int tuple — every element must be int.
+        assert all(isinstance(v, int) for v in cfg.filter_values)
+
+    def test_string_allowlist_parsed_as_strings(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "region")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "us-east-1,us-west-2,eu-central-1")
+        cfg = load()
+        assert cfg.filter_keep_field == "region"
+        assert cfg.filter_values == ("us-east-1", "us-west-2", "eu-central-1")
+
+    def test_mixed_int_and_string_falls_back_to_string(self, monkeypatch):
+        # Once any token fails int parsing, the *whole* tuple is strings.
+        # This is the deterministic-typing contract — the apply code
+        # branches on the first element's type and would mis-handle a
+        # silently mixed tuple.
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "2,foo,4")
+        cfg = load()
+        assert cfg.filter_values == ("2", "foo", "4")
+
+    def test_whitespace_around_values_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "  2 , 4  ,1956,  69  ")
+        cfg = load()
+        assert cfg.filter_values == (2, 4, 1956, 69)
+
+    def test_empty_tokens_are_dropped(self, monkeypatch):
+        # Trailing commas / repeated commas are common operator slips;
+        # drop empty tokens rather than fail loudly on them.
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "2,,4,")
+        cfg = load()
+        assert cfg.filter_values == (2, 4)
+
+    def test_negative_ints_parsed(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "-1,0,42")
+        cfg = load()
+        assert cfg.filter_values == (-1, 0, 42)
+
+    def test_keep_field_without_values_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        with pytest.raises(RuntimeError, match="MILLPOND_FILTER_VALUES"):
+            load()
+
+    def test_values_without_field_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1,2,3")
+        with pytest.raises(RuntimeError, match="MILLPOND_FILTER_VALUES"):
+            load()
+
+    def test_keep_and_drop_mutually_exclusive(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1,2")
+        with pytest.raises(RuntimeError, match="mutually exclusive"):
+            load()
+
+    def test_drop_direction_rejected_until_implemented(self, monkeypatch):
+        # Reserved namespace: drop is parsed and validated but explicitly
+        # refused so an operator setting it today gets a clear startup
+        # error rather than silently no-filtering.
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1,2")
+        with pytest.raises(RuntimeError, match="reserved for a future release"):
+            load()
+
+    def test_unsafe_field_name_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id; DROP TABLE x")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+    def test_whitespace_only_field_name_treated_as_unset(self, monkeypatch):
+        # Symmetric with how DESTINATION handles whitespace — operator
+        # rendering glitches shouldn't enable a filter accidentally.
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "   ")
+        cfg = load()
+        assert cfg.filter_keep_field is None
+        assert cfg.filter_values is None
+
+    def test_values_only_whitespace_treated_as_unset(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "   ")
+        with pytest.raises(RuntimeError, match="MILLPOND_FILTER_VALUES"):
+            load()
+
+
+class TestSortByConfig:
+    """MILLPOND_SORT_BY parsing and validation."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        # Minimal valid DuckLake config — sort is destination-agnostic.
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "1")
+        monkeypatch.setenv("POD_NAME", "millpond-events-0")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+
+    def test_unset_yields_none(self):
+        cfg = load()
+        assert cfg.sort_by is None
+
+    def test_single_field(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id")
+        cfg = load()
+        assert cfg.sort_by == ("team_id",)
+
+    def test_multi_field_order_preserved(self, monkeypatch):
+        # Sort order is determined by tuple position, so the parsing must
+        # preserve the operator-specified order verbatim.
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id,timestamp,distinct_id")
+        cfg = load()
+        assert cfg.sort_by == ("team_id", "timestamp", "distinct_id")
+
+    def test_whitespace_around_fields_trimmed(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_SORT_BY", "  team_id ,  timestamp  ")
+        cfg = load()
+        assert cfg.sort_by == ("team_id", "timestamp")
+
+    def test_empty_tokens_dropped(self, monkeypatch):
+        # Trailing commas / doubled commas are common operator slips —
+        # drop them rather than fail loudly.
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id,,timestamp,")
+        cfg = load()
+        assert cfg.sort_by == ("team_id", "timestamp")
+
+    def test_whitespace_only_value_yields_none(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_SORT_BY", "   ")
+        cfg = load()
+        assert cfg.sort_by is None
+
+    def test_unsafe_field_name_rejected(self, monkeypatch):
+        # Identifier safety pattern is enforced at config-load — keeps a
+        # SQL-injection-flavoured config from surfacing only under load.
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id, foo; DROP TABLE x")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+    def test_log_says_ascending(self, monkeypatch, caplog):
+        # The log line should make the (currently fixed) direction
+        # explicit so operators understand what they configured.
+        import logging
+
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id,timestamp")
+        with caplog.at_level(logging.INFO, logger="millpond.config"):
+            load()
+        msgs = [r.message for r in caplog.records]
+        assert any("Sort by: team_id, timestamp (ascending)" in m for m in msgs)

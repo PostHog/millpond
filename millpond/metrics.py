@@ -100,6 +100,15 @@ _schema_columns_widened_total = Counter(
     "Columns widened via schema evolution",
     ["pipeline", "broker_source"],
 )
+# Counts records that should have been sorted but weren't, broken down by
+# why. Distinct from `records_skipped_total` because the records still
+# land in the sink — only the sort was skipped, so the operational
+# signal is "sort coverage is degraded," not "data is missing."
+_sort_skipped_total = Counter(
+    "millpond_sort_skipped_total",
+    "Records in a flush whose sort step was skipped",
+    ["pipeline", "broker_source", "reason"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -146,6 +155,7 @@ consumer_lag = _consumer_lag
 last_committed_offset = _last_committed_offset
 schema_columns_added_total = _schema_columns_added_total
 schema_columns_widened_total = _schema_columns_widened_total
+sort_skipped_total = _sort_skipped_total
 rdkafka_replyq = _rdkafka_replyq
 rdkafka_msg_cnt = _rdkafka_msg_cnt
 rdkafka_msg_size = _rdkafka_msg_size
@@ -160,7 +170,7 @@ def init(pipeline: str, broker_source: str = ""):
     global flush_duration_seconds, arrow_conversion_seconds
     global flush_size_bytes, flush_size_records
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
-    global schema_columns_added_total, schema_columns_widened_total
+    global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global rdkafka_replyq, rdkafka_msg_cnt, rdkafka_msg_size
     global rdkafka_broker_rtt_avg, rdkafka_broker_rtt_p99
 
@@ -170,6 +180,7 @@ def init(pipeline: str, broker_source: str = ""):
     records_consumed_total = _AutoCommonLabels(_records_consumed_total, pipeline, bs)
     batches_flushed_total = _AutoCommonLabels(_batches_flushed_total, pipeline, bs)
     records_skipped_total = _AutoCommonLabels(_records_skipped_total, pipeline, bs)
+    sort_skipped_total = _AutoCommonLabels(_sort_skipped_total, pipeline, bs)
     errors_total = _AutoCommonLabels(_errors_total, pipeline, bs)
     consumer_lag = _AutoCommonLabels(_consumer_lag, pipeline, bs)
     last_committed_offset = _AutoCommonLabels(_last_committed_offset, pipeline, bs)

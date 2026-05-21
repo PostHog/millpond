@@ -29,12 +29,13 @@ Single thread, single loop. Kafka is the buffer. Offset commit is explicit (afte
 ```
 K8s StatefulSet (N replicas)
   └─ Pod (ordinal 0..N-1)
-       └─ Single loop: consume → convert → accumulate → flush → commit
+       └─ Single loop: consume → convert → [filter] → accumulate → [sort] → flush → commit
 ```
 
 - One topic and one table per deployment
 - Static partition assignment via pod ordinal — no consumer groups
 - If a pod dies, its partitions stop being consumed until K8s restarts it
+- Optional filter and sort stages — see [Record Handling](#record-handling) below
 
 ## Destinations
 
@@ -52,6 +53,42 @@ Millpond writes to one of two lake formats, selected at startup by `MILLPOND_DES
 | Multi-pod concurrent writes | Native; idempotent DDL handles races | Native; PyIceberg optimistic concurrency + retry loop handles races |
 
 The selection is a thin Protocol-based abstraction (`millpond/sink.py`) — `main.py` only sees `Sink.write(batch)`, `reset_caches()`, `close()`. Both implementations are in their own module (`ducklake.py`, `iceberg.py`).
+
+## Record Handling
+
+Two optional stages sit between Kafka conversion and the sink. Both are disabled when their env vars are unset.
+
+### Allowlist filter
+
+Drops records whose value in a configured field is not in a configured allowlist. Applied immediately after JSON→Arrow conversion, before records enter the pending buffer.
+
+```
+MILLPOND_FILTER_KEEP_FIELD_NAME=team_id
+MILLPOND_FILTER_VALUES=2,4,1956,69
+```
+
+Values auto-detect: tokens that all parse as integers become an int allowlist; otherwise the whole list is treated as strings.
+
+Two skip reasons are tracked on `millpond_records_skipped_total`:
+
+- `filter_field_missing` — column absent from this batch's schema, null for that row, or column type is not filterable (only integer and string columns are supported; bool, float, timestamp, struct, list, etc. are rejected explicitly to avoid silent surprising matches under PyArrow's `safe=True` cast semantics).
+- `filter_excluded` — column present and non-null but value not in the allowlist. Expected steady-state drop reason.
+
+`MILLPOND_FILTER_DROP_FIELD_NAME` is reserved at the config layer (mutex with keep) and currently rejected at startup. It will become a denylist filter in a future release without env-var churn.
+
+### Pre-write sort
+
+Sorts the consolidated batch by one or more columns ascending, right before `sink.write()`. Both DuckLake and Iceberg sinks see pre-sorted data, which improves Parquet compression (especially for low-cardinality keys like `team_id`) and downstream reader predicate pushdown.
+
+```
+MILLPOND_SORT_BY=team_id,timestamp
+```
+
+Sort order is left-to-right (`team_id` primary, `timestamp` secondary). Direction is ascending only today; if you need descending, file an issue. PyArrow's sort is stable, so equal-key rows preserve their consume order.
+
+If any sort field is missing from a batch's schema, the sort is skipped (records still flow through, just unsorted), `millpond_sort_skipped_total{reason="field_missing"}` increments by the record count, and a warning logs once per distinct missing-fields pattern (per pod lifetime — prevents log floods under sustained misconfiguration).
+
+Per-flush cost is ~50–200 ms on a 256 MB / 30k-row batch. Peak memory roughly doubles during the sort because `pa.Table.take()` rewrites a fresh copy of every column; budget accordingly relative to the pod's memory limit.
 
 ## Adaptive Backpressure
 
@@ -280,6 +317,17 @@ All configuration via environment variables.
 | `MILLPOND_S3_ENDPOINT` | no | | S3 endpoint override (MinIO, etc.) |
 
 `MILLPOND_S3_*` is a separate env var family from `DUCKDB_S3_*` deliberately — they target different client libraries, and a deployment switch from DuckLake to Iceberg should be a clean swap of env vars rather than re-using the DuckDB-specific names.
+
+### Optional record handling
+
+See [Record Handling](#record-handling) for context. All four variables below are optional; unset means the corresponding stage is disabled.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `MILLPOND_FILTER_KEEP_FIELD_NAME` | no | | Column name to check against the allowlist. Must be set with `MILLPOND_FILTER_VALUES`. Validated as a safe identifier. |
+| `MILLPOND_FILTER_DROP_FIELD_NAME` | no | | Reserved for a future denylist filter; setting it today raises at startup. Mutually exclusive with `MILLPOND_FILTER_KEEP_FIELD_NAME`. |
+| `MILLPOND_FILTER_VALUES` | no | | Comma-separated allowed values. Auto-detected as int if every token parses as an integer, string otherwise. Required when either filter field name is set. |
+| `MILLPOND_SORT_BY` | no | | Comma-separated column names; the batch is sorted ascending by these in tuple order before each write. Missing fields cause the sort to be skipped (records still flow). |
 
 ## Releases
 
