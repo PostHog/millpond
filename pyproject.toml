@@ -16,7 +16,15 @@ license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",
-    "duckdb==1.5.1",
+    # Pinned exactly. 1.5.2 is the DuckDB release that ships DuckLake 1.0,
+    # the breaking-change rev of the ducklake extension that millpond/ducklake.py
+    # has been aligned against. The DuckLake 1.x line is pre-stable, and the
+    # extension repository does not expose installable version specifiers for
+    # ducklake — INSTALL ducklake VERSION '...' returns 404. To compensate,
+    # tests/unit/test_ducklake_pin.py asserts the build SHA of the loaded
+    # extension as a drift canary. Bumping this DuckDB pin (or letting the
+    # extension SHA move) requires updating that canary explicitly.
+    "duckdb==1.5.2",
     "pyarrow>=18.0",
     "orjson>=3.10",
     "prometheus-client>=0.21",
