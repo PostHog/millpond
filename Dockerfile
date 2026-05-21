@@ -37,6 +37,12 @@ USER millpond
 # Must run as millpond user so extensions land in ~/.duckdb/extensions/ (not /root/).
 # httpfs must be installed before ducklake — there's a race condition with S3 access
 # if ducklake loads first and tries to use httpfs before it's available.
+#
+# The DuckLake extension cannot be version-pinned at install time — the extension
+# repository doesn't expose pinned versions for it (INSTALL ducklake VERSION '...'
+# returns 404). The DuckDB Python pin (1.5.2 in pyproject.toml) locks the
+# DuckLake major line, and tests/unit/test_ducklake_pin.py asserts the loaded
+# extension's build SHA at runtime so a drift trips in CI rather than in prod.
 RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres')"
 
 # Health check for non-K8s environments (K8s uses liveness/readiness probes in statefulset.yaml)
