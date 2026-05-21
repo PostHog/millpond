@@ -2,6 +2,9 @@
 
 A standalone Python app that consumes from a Kafka topic and writes to a lake table. Single thread, single loop, no Kafka Connect. One deployment writes to exactly one destination — either [DuckLake](https://github.com/duckdb/ducklake) or [Apache Iceberg](https://iceberg.apache.org/), selected via `MILLPOND_DESTINATION`.
 
+**Contents:**
+[Naming](#naming) | [Why](#why) | [Architecture](#architecture) | [Destinations](#destinations) | [Record Handling](#record-handling) | [Adaptive Backpressure](#adaptive-backpressure) | [Performance](#performance) | [Resource Footprint](#resource-footprint) | [Setup](#setup) | [Development](#development) | [Configuration](#configuration) | [Releases](#releases) | [Deployment](#deployment) | [Partitioning](#partitioning) | [Object Sizing](#object-sizing) | [Error Handling](#error-handling-and-retries) | [Multiple Pipelines](#multiple-pipelines) | [AWS Credential Isolation](#aws-credential-isolation) | [Operational Notes](#operational-notes) | [Next steps](#next-steps)
+
 ## Naming
 
 <img src="imgs/500px-Hagley_mill_race.jpeg" alt="A mill pond" width="300" align="right">
