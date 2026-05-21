@@ -91,6 +91,12 @@ class Config:
     filter_drop_field: str | None
     filter_values: tuple[int, ...] | tuple[str, ...] | None
 
+    # Optional pre-write sort. Tuple of column names; sort is ascending
+    # in tuple order. Applied to the consolidated batch right before
+    # sink.write() so both DuckLake and Iceberg paths see pre-sorted
+    # data. None disables the sort entirely.
+    sort_by: tuple[str, ...] | None
+
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
@@ -181,6 +187,28 @@ def _load_filter_fields() -> tuple[str | None, str | None, tuple[int, ...] | tup
         raise RuntimeError("MILLPOND_FILTER_DROP_FIELD_NAME is reserved for a future release; not implemented yet")
 
     return keep, None, _parse_filter_values(values_raw)
+
+
+def _load_sort_by() -> tuple[str, ...] | None:
+    """Parse MILLPOND_SORT_BY into a tuple of column names.
+
+    Comma-separated; whitespace trimmed; empty tokens dropped. Each name
+    must match the safe-identifier pattern (`[a-zA-Z_][a-zA-Z0-9_]*`) so
+    a misconfiguration surfaces at startup, not at the first flush.
+    Returns None when the env var is absent or whitespace-only.
+    """
+    raw = os.environ.get("MILLPOND_SORT_BY", "").strip()
+    if not raw:
+        return None
+    fields = tuple(t.strip() for t in raw.split(",") if t.strip())
+    if not fields:
+        return None
+    for field in fields:
+        if not _SAFE_COLUMN_NAME.match(field):
+            raise RuntimeError(
+                f"MILLPOND_SORT_BY field {field!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+            )
+    return fields
 
 
 def _load_ducklake_fields() -> dict[str, str | None]:
@@ -304,6 +332,7 @@ def load() -> Config:
     )
 
     filter_keep_field, filter_drop_field, filter_values = _load_filter_fields()
+    sort_by = _load_sort_by()
 
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
@@ -324,6 +353,7 @@ def load() -> Config:
         filter_keep_field=filter_keep_field,
         filter_drop_field=filter_drop_field,
         filter_values=filter_values,
+        sort_by=sort_by,
         kafka_config_overrides=kafka_overrides,
     )
 
@@ -338,4 +368,6 @@ def load() -> Config:
     )
     if cfg.filter_keep_field is not None:
         log.info("Filter (keep): %s in %s", cfg.filter_keep_field, cfg.filter_values)
+    if cfg.sort_by is not None:
+        log.info("Sort by: %s (ascending)", ", ".join(cfg.sort_by))
     return cfg

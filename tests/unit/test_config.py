@@ -404,3 +404,71 @@ class TestFilterConfig:
         monkeypatch.setenv("MILLPOND_FILTER_VALUES", "   ")
         with pytest.raises(RuntimeError, match="MILLPOND_FILTER_VALUES"):
             load()
+
+
+class TestSortByConfig:
+    """MILLPOND_SORT_BY parsing and validation."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        # Minimal valid DuckLake config — sort is destination-agnostic.
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "1")
+        monkeypatch.setenv("POD_NAME", "millpond-events-0")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+
+    def test_unset_yields_none(self):
+        cfg = load()
+        assert cfg.sort_by is None
+
+    def test_single_field(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id")
+        cfg = load()
+        assert cfg.sort_by == ("team_id",)
+
+    def test_multi_field_order_preserved(self, monkeypatch):
+        # Sort order is determined by tuple position, so the parsing must
+        # preserve the operator-specified order verbatim.
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id,timestamp,distinct_id")
+        cfg = load()
+        assert cfg.sort_by == ("team_id", "timestamp", "distinct_id")
+
+    def test_whitespace_around_fields_trimmed(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_SORT_BY", "  team_id ,  timestamp  ")
+        cfg = load()
+        assert cfg.sort_by == ("team_id", "timestamp")
+
+    def test_empty_tokens_dropped(self, monkeypatch):
+        # Trailing commas / doubled commas are common operator slips —
+        # drop them rather than fail loudly.
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id,,timestamp,")
+        cfg = load()
+        assert cfg.sort_by == ("team_id", "timestamp")
+
+    def test_whitespace_only_value_yields_none(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_SORT_BY", "   ")
+        cfg = load()
+        assert cfg.sort_by is None
+
+    def test_unsafe_field_name_rejected(self, monkeypatch):
+        # Identifier safety pattern is enforced at config-load — keeps a
+        # SQL-injection-flavoured config from surfacing only under load.
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id, foo; DROP TABLE x")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+    def test_log_says_ascending(self, monkeypatch, caplog):
+        # The log line should make the (currently fixed) direction
+        # explicit so operators understand what they configured.
+        import logging
+
+        monkeypatch.setenv("MILLPOND_SORT_BY", "team_id,timestamp")
+        with caplog.at_level(logging.INFO, logger="millpond.config"):
+            load()
+        msgs = [r.message for r in caplog.records]
+        assert any("Sort by: team_id, timestamp (ascending)" in m for m in msgs)

@@ -107,6 +107,11 @@ class TestFlushErrorDistinction:
         sink = _make_sink()
         cfg = MagicMock()
         cfg.table_label = "test_table"
+        # Pin sort_by to None so _apply_sort() short-circuits — otherwise
+        # the bare MagicMock returns a MagicMock for cfg.sort_by which
+        # _apply_sort treats as a configured (truthy, iterable) value and
+        # pyarrow's sort_keys validation raises.
+        cfg.sort_by = None
         kafka = MagicMock()
         table = pa.table({"a": [1, 2]})
         offsets = {("topic", 0): 42}
@@ -502,3 +507,242 @@ class TestApplyFilter:
 
         assert result.num_rows == 0
         assert skip_calls == [("filter_field_missing", 3)]
+
+
+def _capture_sort_skip_calls(mock_metrics):
+    """Bind (reason, count) pairs from sort_skipped_total inc() calls.
+
+    Mirrors `_capture_skip_calls` but for the sort-skip metric so the
+    sort tests don't have to do `labels.return_value.inc.call_args_list`
+    introspection and risk the same MagicMock memoisation pitfall the
+    filter tests hit.
+    """
+    sort_calls: list[tuple[str, int]] = []
+
+    def _counter_for(reason):
+        counter = MagicMock()
+        counter.inc.side_effect = lambda n, r=reason: sort_calls.append((r, n))
+        return counter
+
+    mock_metrics.sort_skipped_total.labels.side_effect = _counter_for
+    return sort_calls
+
+
+class TestApplySort:
+    """Hot-path pre-write sort behaviour.
+
+    `_apply_sort` runs inside `_flush()` between consolidate and write;
+    the unit tests here drive it directly with handcrafted tables.
+    `cfg` is a MagicMock with `sort_by` (and any other field we read)
+    pinned explicitly — see filter-test rationale for why the bare
+    MagicMock pattern is a trap.
+    """
+
+    def _cfg(self, sort_by=None):
+        cfg = MagicMock()
+        cfg.sort_by = sort_by
+        return cfg
+
+    def _clear_warned(self):
+        # Module-level dedup set leaks between tests if not reset.
+        import millpond.main as _main
+
+        _main._sort_missing_fields_warned.clear()
+
+    def test_no_op_when_unconfigured(self):
+        from millpond.main import _apply_sort
+
+        table = pa.table({"team_id": [3, 1, 2]})
+        result = _apply_sort(table, self._cfg(sort_by=None))
+        # Same object: short-circuit at top.
+        assert result is table
+
+    @patch("millpond.main.metrics")
+    def test_single_field_ascending(self, mock_metrics):
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [3, 1, 2], "event": ["c", "a", "b"]})
+        result = _apply_sort(table, self._cfg(sort_by=("team_id",)))
+
+        assert result.column("team_id").to_pylist() == [1, 2, 3]
+        # event column must reorder consistently — full-row reordering.
+        assert result.column("event").to_pylist() == ["a", "b", "c"]
+        assert sort_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_multi_field_sort_left_to_right(self, mock_metrics):
+        # First field is primary key, second is secondary, etc. The
+        # multi-field test pins this ordering: equal team_id rows are
+        # sub-sorted by timestamp.
+        from millpond.main import _apply_sort
+
+        _capture_sort_skip_calls(mock_metrics)
+        table = pa.table(
+            {
+                "team_id": [2, 1, 2, 1],
+                "timestamp": [200, 100, 100, 200],
+                "event": ["d", "b", "c", "a"],
+            }
+        )
+        result = _apply_sort(table, self._cfg(sort_by=("team_id", "timestamp")))
+
+        assert result.column("team_id").to_pylist() == [1, 1, 2, 2]
+        assert result.column("timestamp").to_pylist() == [100, 200, 100, 200]
+        # "b" had (team_id=1, timestamp=100) → first row in sort order; etc.
+        assert result.column("event").to_pylist() == ["b", "a", "c", "d"]
+
+    @patch("millpond.main.metrics")
+    def test_sort_is_stable(self, mock_metrics):
+        # PyArrow's sort_indices is stable. Equal keys preserve input order;
+        # this lets operators reason about secondary attributes without
+        # naming them in the sort key.
+        from millpond.main import _apply_sort
+
+        _capture_sort_skip_calls(mock_metrics)
+        # Two rows share team_id=1; input order: (event=alpha) before (event=beta).
+        # After ascending sort by team_id, alpha must still precede beta.
+        table = pa.table({"team_id": [1, 2, 1], "event": ["alpha", "x", "beta"]})
+        result = _apply_sort(table, self._cfg(sort_by=("team_id",)))
+
+        assert result.column("team_id").to_pylist() == [1, 1, 2]
+        assert result.column("event").to_pylist() == ["alpha", "beta", "x"]
+
+    @patch("millpond.main.metrics")
+    def test_nulls_placed_at_end(self, mock_metrics):
+        # Default null_placement="at_end" — null rows still ride through
+        # the sink, just sorted to the tail. They are NOT counted as
+        # sort-skipped (the sort applied; some rows just happened to be
+        # null in the key).
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"team_id": pa.array([3, None, 1, None, 2], type=pa.int64())})
+        result = _apply_sort(table, self._cfg(sort_by=("team_id",)))
+
+        assert result.column("team_id").to_pylist() == [1, 2, 3, None, None]
+        assert sort_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_missing_field_skips_sort_and_increments_metric(self, mock_metrics):
+        # Critical contract: a missing sort field MUST NOT drop records.
+        # The data still rides through to the sink in its existing
+        # (unsorted) order; only the sort step was skipped.
+        self._clear_warned()
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"event": ["c", "a", "b"]})
+        result = _apply_sort(table, self._cfg(sort_by=("team_id",)))
+
+        # Order unchanged — proves the records weren't filtered or sorted
+        # by a different key when the configured key was unavailable.
+        assert result.column("event").to_pylist() == ["c", "a", "b"]
+        assert sort_calls == [("field_missing", 3)]
+
+    @patch("millpond.main.metrics")
+    def test_partial_missing_fields_skip_sort(self, mock_metrics):
+        # Multi-field sort: if ANY configured field is absent, the whole
+        # sort is skipped (rather than partially sorting on the available
+        # fields, which would silently differ from the operator's intent).
+        self._clear_warned()
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [2, 1, 3]})  # has team_id, missing timestamp
+        result = _apply_sort(table, self._cfg(sort_by=("team_id", "timestamp")))
+
+        assert result.column("team_id").to_pylist() == [2, 1, 3]
+        assert sort_calls == [("field_missing", 3)]
+
+    @patch("millpond.main.metrics")
+    def test_missing_field_warning_logged_once_per_pattern(self, mock_metrics, caplog):
+        # The metric increments every flush; the *log* is once per
+        # missing-fields pattern. This is what keeps a misconfigured
+        # high-volume topic from spamming logs.
+        self._clear_warned()
+        import logging
+
+        from millpond.main import _apply_sort
+
+        _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"event": ["a"]})
+        cfg = self._cfg(sort_by=("team_id",))
+
+        with caplog.at_level(logging.WARNING, logger="millpond.main"):
+            for _ in range(5):
+                _apply_sort(table, cfg)
+
+        warnings_for_pattern = [
+            r for r in caplog.records if "Sort field(s) missing" in r.message and "team_id" in r.message
+        ]
+        assert len(warnings_for_pattern) == 1
+
+    @patch("millpond.main.metrics")
+    def test_distinct_missing_patterns_each_log_once(self, mock_metrics, caplog):
+        # If a deployment somehow sees two different missing-fields
+        # patterns (e.g. schema drift), each gets its own warning so the
+        # operator sees both signals.
+        self._clear_warned()
+        import logging
+
+        from millpond.main import _apply_sort
+
+        _capture_sort_skip_calls(mock_metrics)
+        cfg_a = self._cfg(sort_by=("team_id",))
+        cfg_b = self._cfg(sort_by=("distinct_id",))
+        table = pa.table({"event": ["a"]})
+
+        with caplog.at_level(logging.WARNING, logger="millpond.main"):
+            _apply_sort(table, cfg_a)
+            _apply_sort(table, cfg_a)  # already-warned pattern
+            _apply_sort(table, cfg_b)
+            _apply_sort(table, cfg_b)  # already-warned pattern
+
+        warnings = [r for r in caplog.records if "Sort field(s) missing" in r.message]
+        # One per distinct pattern.
+        assert len(warnings) == 2
+
+    @patch("millpond.main.metrics")
+    def test_empty_input_batch_is_no_op(self, mock_metrics):
+        # Edge case: a fully-filtered-out batch reaches the sort step
+        # with zero rows. sort_indices on empty returns empty; take()
+        # returns an empty table with the same schema. No metric.
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"team_id": pa.array([], type=pa.int64())})
+        result = _apply_sort(table, self._cfg(sort_by=("team_id",)))
+
+        assert result.num_rows == 0
+        assert sort_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_multi_chunk_column_sorted_correctly(self, mock_metrics):
+        # Defensive: sort_indices must aggregate across chunks correctly
+        # (it does in PyArrow). Pin this so a future regression doesn't
+        # ship a per-chunk sort that looks correct only on single-chunk
+        # tables.
+        from millpond.main import _apply_sort
+
+        _capture_sort_skip_calls(mock_metrics)
+        team_ids = pa.chunked_array([[3, 1], [4, 1], [2]])
+        events = pa.chunked_array([["a", "b"], ["c", "d"], ["e"]])
+        table = pa.table({"team_id": team_ids, "event": events})
+
+        result = _apply_sort(table, self._cfg(sort_by=("team_id",)))
+        assert result.column("team_id").to_pylist() == [1, 1, 2, 3, 4]
+        # Stable sort preserves the two team_id=1 rows' relative order.
+        assert result.column("event").to_pylist() == ["b", "d", "e", "a", "c"]
+
+    @patch("millpond.main.metrics")
+    def test_sorts_by_string_column(self, mock_metrics):
+        # Sort keys aren't limited to integers — string columns sort
+        # lexically, also ascending.
+        from millpond.main import _apply_sort
+
+        _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"region": ["us-west-2", "eu-central-1", "us-east-1"]})
+        result = _apply_sort(table, self._cfg(sort_by=("region",)))
+
+        assert result.column("region").to_pylist() == ["eu-central-1", "us-east-1", "us-west-2"]

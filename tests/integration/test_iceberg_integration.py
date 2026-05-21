@@ -127,6 +127,7 @@ def _make_iceberg_cfg(catalog_uri: str, minio_endpoint: str, table_name: str) ->
         filter_keep_field=None,
         filter_drop_field=None,
         filter_values=None,
+        sort_by=None,
         kafka_config_overrides=(),
     )
 

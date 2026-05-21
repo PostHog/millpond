@@ -114,6 +114,7 @@ def _make_cfg(table_name: str) -> Config:
         filter_keep_field=None,
         filter_drop_field=None,
         filter_values=None,
+        sort_by=None,
         kafka_config_overrides=(),
     )
 

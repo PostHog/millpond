@@ -165,6 +165,7 @@ def _make_cfg(**overrides) -> Config:
         filter_keep_field=None,
         filter_drop_field=None,
         filter_values=None,
+        sort_by=None,
         kafka_config_overrides=(("security.protocol", "SSL"),),
     )
     defaults.update(overrides)

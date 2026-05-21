@@ -20,6 +20,16 @@ _WRITE_BASE_DELAY_S = 1.0
 _COMMIT_MAX_RETRIES = 3
 _COMMIT_BASE_DELAY_S = 0.5
 
+# Module-level set tracking which "missing sort fields" patterns we've
+# already warned about. Without this, a misconfigured sort against a
+# high-volume topic would log once per flush — at production cadence,
+# tens of thousands of log lines / hour. The key is the comma-joined
+# missing-fields tuple, so distinct misconfigurations still each get
+# one warning. Pod restart resets the set (the lifetime tied to the
+# process is intentional — operators get a fresh warning on each
+# restart, which signals a likely persistent misconfiguration).
+_sort_missing_fields_warned: set[str] = set()
+
 
 def _convert_batch(values: list[bytes]) -> pa.Table | None:
     """Convert raw message values to Arrow, timing the conversion."""
@@ -127,6 +137,50 @@ def _apply_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
     return filtered
 
 
+def _apply_sort(table: pa.Table, cfg: config.Config) -> pa.Table:
+    """Sort the consolidated batch by `cfg.sort_by` (ascending) before write.
+
+    Returns the input unchanged when sort is unconfigured or when one or
+    more sort fields are missing from the batch schema. In the missing-
+    field case:
+      - Log a warning *once per distinct missing-fields pattern* (the
+        pod-lifetime dedup guards against per-flush log floods at
+        production cadence).
+      - Increment `sort_skipped_total{reason="field_missing"}` by the
+        record count so operators can detect missing-field sort gaps
+        from metrics alone.
+
+    Apply order matters: this runs in `_flush()` after `pa.concat_tables`
+    consolidates the pending buffer but before `sink.write()`. Both
+    DuckLake and Iceberg paths see pre-sorted data; sink-side partition
+    columns (year/month/day/hour added by IcebergSink, computed by the
+    ducklake extension) are not yet present and so are not in scope for
+    the sort, which is by design — operators specify sort keys against
+    the source schema, not the lake's derived columns.
+    """
+    if cfg.sort_by is None:
+        return table
+
+    missing = [f for f in cfg.sort_by if f not in table.column_names]
+    if missing:
+        key = ",".join(missing)
+        if key not in _sort_missing_fields_warned:
+            log.warning("Sort field(s) missing from batch schema: %s; skipping sort for affected flushes", missing)
+            _sort_missing_fields_warned.add(key)
+        metrics.sort_skipped_total.labels(reason="field_missing").inc(len(table))
+        return table
+
+    # PyArrow's sort_indices is stable; null_placement defaults to "at_end"
+    # which is the sensible default for ascending sort by a key with null
+    # values. Take() rewrites the table once — a full copy at flush size
+    # (~256 MB at production batches). That's the cost we pay for the
+    # write-side layout improvement; it's expected to be small relative
+    # to the sink.write() that follows.
+    sort_keys = [(field, "ascending") for field in cfg.sort_by]
+    indices = pc.sort_indices(table, sort_keys=sort_keys)
+    return table.take(indices)
+
+
 def _write_with_retry(sink, consolidated):
     """Write to the sink with exponential backoff on transient failures."""
     for attempt in range(_WRITE_MAX_RETRIES):
@@ -153,6 +207,7 @@ def _write_with_retry(sink, consolidated):
 
 def _flush(sink, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, trigger="time"):
     """Write to the sink, commit offsets, update metrics."""
+    consolidated = _apply_sort(consolidated, cfg)
     t0 = time.monotonic()
     _write_with_retry(sink, consolidated)
     write_duration = time.monotonic() - t0

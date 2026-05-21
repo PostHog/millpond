@@ -97,10 +97,13 @@ while not shutdown:
     records = consumer.consume(num_messages=N, timeout=remaining_until_flush)
     if records:
         batch = convert_to_arrow(records)
+        batch = apply_filter(batch, cfg)                 # optional allowlist (no-op if unconfigured)
         pending.append(batch)
 
     if should_flush(pending):
-        sink.write(pending)                              # destination-agnostic
+        consolidated = pa.concat_tables(pending)
+        consolidated = apply_sort(consolidated, cfg)     # optional ascending sort (no-op if unconfigured)
+        sink.write(consolidated)                         # destination-agnostic
         consumer.commit(offsets, asynchronous=False)
         pending.clear()
 ```
@@ -206,6 +209,33 @@ Empty-batch contract: callers must not invoke `write()` with a zero-row batch. `
 Reserved-column contract: source-schema columns must not collide with backend-managed metadata column names. `sink.py` exports a shared `check_reserved_collision(batch_schema, reserved, backend_name)` helper that each backend calls at the top of its module-level `write()` — raises `ValueError("Source schema column(s) [...] collide with X-reserved metadata column names...")` at the Sink boundary before any backend-specific work. The per-backend `RESERVED_COLUMNS` constants currently hold the same set (`{"_inserted_at", "year", "month", "day", "hour"}`) — DuckLake reserves the four partition cols defensively even though it doesn't produce them itself, so a deployment-time destination switch doesn't suddenly start accepting or rejecting batches based on column-name collisions. `SAFE_IDENTIFIER` (the regex for column names safe to embed in generated SQL / pass to PyIceberg's schema constructor) also lives in `sink.py` and is shared by both schema managers.
 
 Cross-backend behaviour and performance are locked by `tests/unit/test_backend_equivalence.py` — same Arrow batch through both Sinks, parametrized assertions over the documented divergences (empty-batch, partition cols, `_inserted_at` provenance), pathological value/name coverage, schema-evolution metric parity, and conservative performance smoke contracts. The suite catches a future "let's silently align these" or "let's silently diverge these" change before merge.
+
+### Optional record handling (filter + sort)
+
+Two optional pre-sink stages, both backend-agnostic, both implemented in `main.py` so the Sink Protocol stays a pure write surface.
+
+**Filter** (`_apply_filter` in `main.py`) runs immediately after `_convert_batch` and before records enter the pending buffer. Drops records whose value in `cfg.filter_keep_field` is not in `cfg.filter_values`. Tracks two skip reasons distinctly on `records_skipped_total`:
+
+- `filter_field_missing` — column absent from batch schema, null for that row, or column type is not in the allowlist (integer / string / large_string only)
+- `filter_excluded` — column present, value not in the allowlist
+
+The column-type allowlist exists because PyArrow's `safe=True` cast happily coerces ints to bool/float/timestamp/date and silently produces semantically-wrong matches. Rejecting non-integer/non-string columns up front turns "silent surprising match" into "explicit `filter_field_missing` signal."
+
+Cast direction is values → column (the small array to the big one's type), not column → fixed type. Three properties fall out of that:
+
+1. Schema drift across batches is handled by construction (the cast is re-evaluated against the live column type each call, not against a type chosen at config load).
+2. The hot path makes one pass over the column (the final `table.filter`) — `pc.is_in` returns null for null inputs natively, and `column.null_count` is O(num_chunks).
+3. The cast site is wrapped in `try/except (ArrowInvalid, ArrowNotImplementedError, ArrowTypeError)` so an unexpected column shape lands a batch in `filter_field_missing` rather than killing the consume loop.
+
+`MILLPOND_FILTER_DROP_FIELD_NAME` is reserved at the config layer (mutex with keep, both empty or exactly one set) and explicitly rejected at startup. The denylist implementation lives in a future commit; the namespace is locked today so that change doesn't require operator env-var churn.
+
+**Sort** (`_apply_sort` in `main.py`) runs inside `_flush()` after `pa.concat_tables` but before `sink.write()`. Both backends see pre-sorted data; sink-side partition columns (year/month/day/hour added by IcebergSink, computed by the ducklake extension) are not in scope by design — operators specify sort keys against the source schema.
+
+Missing-field handling: if any `cfg.sort_by` field is absent from the batch, the whole sort is skipped (rather than partially sorting on available keys, which would silently differ from intent). Records still flow through unsorted. The metric is `sort_skipped_total{reason="field_missing"}`, deliberately distinct from `records_skipped_total` because no data is being dropped — only the layout improvement is.
+
+Log dedup: `_sort_missing_fields_warned` (module-level set) prevents per-flush log floods under sustained misconfiguration. One warning per distinct missing-fields pattern per pod lifetime; the metric is the always-on signal.
+
+Cost: ~50–200 ms per flush at production batch sizes (mostly `pa.Table.take()`'s full-column rewrite); peak memory ~2× the flush buffer during the take. Sort coverage lives in `TestApplySort` in `tests/unit/test_main.py` — the backend-equivalence suite is currently filter/sort-agnostic since both stages run upstream of the Sink boundary; if either feature ever gets per-backend variants (e.g. ORDER BY pushdown into the DuckLake INSERT), the equivalence suite should grow a parameterisation to lock the symmetry.
 
 ### DuckLake Initialization
 
