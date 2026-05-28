@@ -75,6 +75,7 @@ testpaths = ["tests"]
 norecursedirs = ["lakekeeper", ".venv", "node_modules"]
 
 [tool.uv]
+exclude-newer = "7 days"
 constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",
