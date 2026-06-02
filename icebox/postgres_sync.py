@@ -341,6 +341,63 @@ def release_cycle_claim(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
         cur.execute(RELEASE_CYCLE_CLAIM_SQL, {"cycle_id": cycle_id})
 
 
+# Advisory-lock key for "only one committer per icebox-PG database".
+# PG advisory locks are 64-bit signed ints; we pick a fixed magic value
+# so any committer connecting to this DB tries the same lock. Single
+# committer == single producer of cycle rows == OCC-free Iceberg commits.
+#
+# Per the icebox plan, the deployment uses Recreate strategy + replicas=1.
+# This lock is the secondary defense: even if K8s briefly runs both old
+# and new pods during a chart upgrade, only one of them holds the lock
+# at any time. The other blocks on lock acquisition until the holder
+# disconnects.
+#
+# Magic value: SHA-256 prefix of "posthog.icebox.committer.singleton.v1"
+# folded to 63 bits (PG advisory_lock takes signed int8). Bumping this
+# constant means an old-pod-holding-stale-lock would NOT block a new
+# pod — only do that during a deliberate migration.
+COMMITTER_ADVISORY_LOCK_ID = 0x4F6E1C3E_5B7A8D90  # arbitrary 64-bit
+
+TRY_ADVISORY_LOCK_SQL = "SELECT pg_try_advisory_lock(%(key)s)"
+UNLOCK_ADVISORY_LOCK_SQL = "SELECT pg_advisory_unlock(%(key)s)"
+
+
+def try_acquire_committer_lock(
+    conn: psycopg.Connection,
+    *,
+    lock_id: int = COMMITTER_ADVISORY_LOCK_ID,
+) -> bool:
+    """Try to acquire the singleton committer advisory lock.
+
+    Returns True on success (caller now holds the lock until the
+    connection closes or pg_advisory_unlock is called). Returns False
+    if another committer already holds it.
+
+    Use on the committer thread's PG connection. The lock is
+    session-scoped: it's automatically released when this connection
+    is closed (e.g., pool eviction, process exit). That's the
+    primary recovery mechanism — a dead committer's lock evaporates
+    with its TCP connection.
+    """
+    with conn.cursor() as cur:
+        cur.execute(TRY_ADVISORY_LOCK_SQL, {"key": lock_id})
+        row = cur.fetchone()
+    return bool(row and row[0])
+
+
+def release_committer_lock(
+    conn: psycopg.Connection,
+    *,
+    lock_id: int = COMMITTER_ADVISORY_LOCK_ID,
+) -> None:
+    """Explicit release. Optional — closing the connection releases
+    automatically — but exposing this lets the committer call it on
+    graceful shutdown so a fast pod restart doesn't have to wait for
+    TCP timeout on the dead connection."""
+    with conn.cursor() as cur:
+        cur.execute(UNLOCK_ADVISORY_LOCK_SQL, {"key": lock_id})
+
+
 def delete_cycle_row(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
     """Delete a commit_cycles row that never produced a snapshot. Used
     in the released-no-iceberg recovery branch: the cycle didn't

@@ -58,8 +58,19 @@ log = logging.getLogger(__name__)
 
 # Floor on the sleep between cycles in committer_loop, even if the
 # last cycle ran longer than the configured cadence. Prevents a tight
-# failure loop from hammering Lakekeeper. Set to 1s for v1.
-MIN_INTER_CYCLE_SLEEP_SECONDS = 1.0
+# failure loop from hammering Lakekeeper.
+#
+# 5s default: at the 60s baseline cadence, that's 12 attempts/min in
+# failure mode — plenty for Lakekeeper to recover or for ops to notice,
+# and the cost of cycle thrashing at prod scale (PG conn churn, manifest
+# writes that may partially commit before failing) is non-trivial.
+MIN_INTER_CYCLE_SLEEP_SECONDS = 5.0
+
+# How long to wait between attempts to acquire the committer advisory
+# lock at startup. Short enough that a normal Helm rollout transition
+# (old pod terminating, new pod starting) doesn't make the new pod look
+# stuck; long enough that the lock check doesn't busy-loop.
+ADVISORY_LOCK_RETRY_SECONDS = 5.0
 
 
 @dataclass
@@ -418,6 +429,36 @@ def committer_loop(
     """
     log.info("committer_loop: starting")
 
+    # PG advisory lock — singleton guarantee for the committer. Acquire
+    # on a DEDICATED connection that we hold for the lifetime of this
+    # thread; pool acquisitions for cycle work go through pg_pool
+    # separately. Session-scoped advisory locks die with the connection,
+    # so a dead committer's lock evaporates with TCP timeout.
+    #
+    # We loop with a small sleep so a Helm rollout (old pod terminating
+    # holds the lock until its connection closes; new pod waits) is a
+    # graceful handoff, not a startup crash.
+    lock_conn: psycopg.Connection | None = None
+    while not stop_event.is_set():
+        lock_conn = pg_pool.getconn()
+        if ps.try_acquire_committer_lock(lock_conn):
+            log.info("committer_loop: acquired singleton advisory lock")
+            break
+        pg_pool.putconn(lock_conn)
+        lock_conn = None
+        log.info(
+            "committer_loop: advisory lock held by another committer; "
+            "retrying in %.1fs",
+            ADVISORY_LOCK_RETRY_SECONDS,
+        )
+        stop_event.wait(ADVISORY_LOCK_RETRY_SECONDS)
+
+    if lock_conn is None:
+        # Lock was never acquired — exited the while loop because
+        # stop_event fired during the wait-for-lock retry sleep.
+        log.info("committer_loop: stop requested before lock acquired")
+        return
+
     # Stamp the heartbeat BEFORE recovery so the API doesn't accept POSTs
     # against an icebox where the committer thread might be dead. Without
     # this, last_committer_heartbeat=NULL is treated as "not stale" and
@@ -470,4 +511,20 @@ def committer_loop(
             cfg.committer_cadence_seconds - elapsed,
         )
         stop_event.wait(sleep_for)
+
+    # Release the advisory lock explicitly on graceful shutdown so a fast
+    # pod restart doesn't have to wait for the kernel-level TCP timeout
+    # on the dying connection. Best-effort: any failure here is logged
+    # but doesn't keep the loop from returning.
+    if lock_conn is not None:
+        try:
+            ps.release_committer_lock(lock_conn)
+            log.info("committer_loop: released advisory lock")
+        except Exception:
+            log.exception("committer_loop: error releasing advisory lock")
+        finally:
+            try:
+                pg_pool.putconn(lock_conn)
+            except Exception:
+                log.exception("committer_loop: error returning lock conn to pool")
     log.info("committer_loop: stop_event set, exiting")

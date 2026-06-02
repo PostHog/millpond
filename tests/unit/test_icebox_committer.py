@@ -62,6 +62,16 @@ class FakePool:
 
     Records every call on the connection's cursor so tests can assert
     which SQL ran and in what order.
+
+    Supports both:
+      - context-managed `with pool.connection() as conn:` (cycle work)
+      - explicit `getconn()` / `putconn()` (committer_loop's dedicated
+        advisory-lock connection)
+
+    For the advisory-lock path: by default, the cursor's fetchone returns
+    (True,) so try_acquire_committer_lock succeeds on first attempt.
+    Tests that want to exercise the "lock held by another committer"
+    path can override.
     """
 
     def __init__(self):
@@ -77,10 +87,19 @@ class FakePool:
         def cur_ctx():
             yield self.cursor
         self.conn.cursor.side_effect = cur_ctx
+        # Default lock-acquire: True (first attempt succeeds)
+        self.cursor.fetchone.return_value = (True,)
 
     @contextmanager
     def connection(self):
         yield self.conn
+
+    def getconn(self):
+        return self.conn
+
+    def putconn(self, conn):
+        # No-op for the fake — the connection is shared
+        pass
 
 
 def _file_row(
@@ -535,21 +554,34 @@ def test_recover_one_pumps_heartbeat_on_completion():
 
 
 def test_committer_loop_stamps_heartbeat_before_recovery(monkeypatch):
-    """The first thing committer_loop does — before recovery, before
-    any cycle — is stamp the heartbeat. Without this, dead-committer
-    accept-writes window extends past cadence × stale_multiple. PE #15."""
+    """The first thing committer_loop does AFTER lock acquisition — before
+    recovery, before any cycle — is stamp the heartbeat. Without this,
+    dead-committer accept-writes window extends past cadence ×
+    stale_multiple. PE-review #15.
+
+    Note: the lock-acquire-then-stop pattern below uses the advisory
+    lock's True return to also trip the stop event, so the loop runs
+    just enough to stamp the heartbeat then exits."""
     import threading
     from icebox.postgres_sync import UPDATE_HEARTBEAT_SQL
 
     deps, pool = _deps(claimed_ids=[])
-    pool.cursor.fetchall.return_value = []
-    pool.cursor.fetchall.side_effect = None
 
     # Recovery is a no-op
     monkeypatch.setattr(cm, "recover_in_flight_cycles", MagicMock(return_value=[]))
 
     stop = threading.Event()
-    stop.set()
+
+    # Trip stop_event from inside the advisory-lock acquisition so the
+    # loop runs through: lock → heartbeat stamp → recovery (mocked) →
+    # `while not stop` check (already set) → exit.
+    original_try_lock = cm.ps.try_acquire_committer_lock
+    def lock_then_stop(conn, **kwargs):
+        result = True  # acquire succeeds
+        stop.set()
+        return result
+    monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_then_stop)
+
     cfg = _cfg()
     cfg = Config(**{**cfg.__dict__, "committer_cadence_seconds": 1})
     cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
@@ -557,6 +589,55 @@ def test_committer_loop_stamps_heartbeat_before_recovery(monkeypatch):
     # Heartbeat MUST appear in the SQL log even though no cycle ran
     executed = [c[0][0] for c in pool.cursor.execute.call_args_list]
     assert UPDATE_HEARTBEAT_SQL in executed
+
+
+def test_committer_loop_exits_if_stop_set_during_lock_acquisition():
+    """PE #10 acquire path: if stop_event fires while the lock is held
+    by another committer, the loop exits cleanly without ever stamping
+    a heartbeat or running a cycle. Used during graceful shutdown of a
+    still-waiting pod."""
+    import threading
+
+    deps, pool = _deps(claimed_ids=[])
+    # Make the lock acquisition always fail (lock held elsewhere)
+    pool.cursor.fetchone.return_value = (False,)
+
+    stop = threading.Event()
+    stop.set()
+    cfg = _cfg()
+    cfg = Config(**{**cfg.__dict__, "committer_cadence_seconds": 1})
+    # Must not hang
+    cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
+
+
+def test_committer_loop_releases_advisory_lock_on_exit(monkeypatch):
+    """Graceful shutdown calls pg_advisory_unlock so a fast pod restart
+    doesn't have to wait for TCP timeout on the dying connection."""
+    import threading
+    from icebox.postgres_sync import UNLOCK_ADVISORY_LOCK_SQL
+
+    deps, pool = _deps(claimed_ids=[])
+    monkeypatch.setattr(cm, "recover_in_flight_cycles", MagicMock(return_value=[]))
+
+    stop = threading.Event()
+    # Acquire succeeds; stop fires on first iteration via cycle-loop
+    # entry — simplest is to make claim return empty so the loop is
+    # a no-op then set stop.
+    pool.cursor.fetchall.return_value = []
+    pool.cursor.fetchall.side_effect = None
+
+    original = cm.ps.try_acquire_committer_lock
+    def lock_then_arm_stop(conn, **kwargs):
+        stop.set()
+        return True
+    monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_then_arm_stop)
+
+    cfg = _cfg()
+    cfg = Config(**{**cfg.__dict__, "committer_cadence_seconds": 1})
+    cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
+
+    executed = [c[0][0] for c in pool.cursor.execute.call_args_list]
+    assert UNLOCK_ADVISORY_LOCK_SQL in executed
 
 
 # ---------------------------------------------------------------------------
@@ -610,11 +691,14 @@ def test_run_cycle_merges_disjoint_partition_offsets():
 def test_min_inter_cycle_sleep_constant_floors_loop_wait():
     """Even if a cycle takes longer than cadence, the loop sleeps at
     least MIN_INTER_CYCLE_SLEEP_SECONDS so a tight failure loop doesn't
-    hammer Lakekeeper. PE #23."""
+    hammer Lakekeeper. PE-review #23.
+
+    Bumped from 1.0s to 5.0s for prod-us: at the 60s baseline cadence,
+    that's 12 attempts/min in failure mode — plenty for Lakekeeper to
+    recover or for ops to notice, and the cost of cycle thrashing at
+    prod scale is non-trivial."""
     assert cm.MIN_INTER_CYCLE_SLEEP_SECONDS > 0
-    # Pin the current default; bumping it requires evaluating the
-    # latency impact on healthy steady-state.
-    assert cm.MIN_INTER_CYCLE_SLEEP_SECONDS == 1.0
+    assert cm.MIN_INTER_CYCLE_SLEEP_SECONDS == 5.0
 
 
 # ---------------------------------------------------------------------------

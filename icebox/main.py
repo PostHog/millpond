@@ -129,7 +129,23 @@ def main() -> None:
 
     log.info("icebox: uvicorn exited, waiting for committer thread")
     stop_event.set()
-    committer_thread.join(timeout=cfg.committer_cadence_seconds + 5)
+    # Drain budget = cadence × 5. A 60s cadence becomes a 300s drain.
+    # The committer's longest blocking step is the PyIceberg commit
+    # (Lakekeeper REST + S3 PUTs for metadata + manifests). Empirically
+    # this is sub-second in mw-dev; PE-review recommended cadence × 5 as
+    # the prod-us budget to cover Lakekeeper-slow tail latency without
+    # leaving the daemon thread mid-commit when uvicorn returns.
+    drain_budget_s = cfg.committer_cadence_seconds * 5
+    committer_thread.join(timeout=drain_budget_s)
+    if committer_thread.is_alive():
+        log.error(
+            "icebox: committer thread did not drain within %.0fs — "
+            "process will exit with daemon thread still running mid-cycle. "
+            "Recovery on next boot will rationalize via cycle_id.",
+            drain_budget_s,
+        )
+    else:
+        log.info("icebox: committer thread drained cleanly")
     sync_pool.close()
     log.info("icebox: shutdown complete")
 

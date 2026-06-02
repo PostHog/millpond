@@ -257,6 +257,65 @@ def test_delete_cycle_row_passes_cycle_id():
 
 
 # ---------------------------------------------------------------------------
+# Advisory lock — singleton-committer guarantee
+# ---------------------------------------------------------------------------
+
+
+def test_committer_advisory_lock_id_is_stable_constant():
+    """The lock id is part of the deployment contract — any change
+    means an old pod holding the lock would NOT block a new pod, which
+    breaks the single-committer guarantee."""
+    assert isinstance(ps.COMMITTER_ADVISORY_LOCK_ID, int)
+    # 64-bit value; rolling it forces a deliberate review
+    assert ps.COMMITTER_ADVISORY_LOCK_ID == 0x4F6E1C3E_5B7A8D90
+
+
+def test_try_acquire_advisory_lock_returns_true_when_pg_returns_true():
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchone.return_value = (True,)
+    assert ps.try_acquire_committer_lock(conn) is True
+    cur.execute.assert_called_once_with(
+        ps.TRY_ADVISORY_LOCK_SQL,
+        {"key": ps.COMMITTER_ADVISORY_LOCK_ID},
+    )
+
+
+def test_try_acquire_advisory_lock_returns_false_when_pg_returns_false():
+    """Another committer is holding the lock."""
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchone.return_value = (False,)
+    assert ps.try_acquire_committer_lock(conn) is False
+
+
+def test_try_acquire_advisory_lock_returns_false_on_empty_result():
+    """Defensive: PG should always return a row from pg_try_advisory_lock
+    but if it didn't we'd rather treat it as 'not acquired' than crash."""
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchone.return_value = None
+    assert ps.try_acquire_committer_lock(conn) is False
+
+
+def test_try_acquire_advisory_lock_accepts_explicit_key():
+    """The lock id is overridable for tests; production passes the
+    default constant."""
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchone.return_value = (True,)
+    ps.try_acquire_committer_lock(conn, lock_id=42)
+    cur.execute.assert_called_once_with(
+        ps.TRY_ADVISORY_LOCK_SQL, {"key": 42}
+    )
+
+
+def test_release_committer_lock_calls_pg_advisory_unlock():
+    conn, cur = _mock_conn_with_cursor()
+    ps.release_committer_lock(conn)
+    cur.execute.assert_called_once_with(
+        ps.UNLOCK_ADVISORY_LOCK_SQL,
+        {"key": ps.COMMITTER_ADVISORY_LOCK_ID},
+    )
+
+
+# ---------------------------------------------------------------------------
 # apply_migrations — runs ALL_DDL statements one at a time
 # ---------------------------------------------------------------------------
 
