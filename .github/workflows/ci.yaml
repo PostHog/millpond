@@ -41,6 +41,37 @@ jobs:
         #   MPL-2.0     — certifi, and the MPL portion of orjson's "MPL-2.0 AND (Apache-2.0 OR MIT)"
         # SPDX `AND` is conjunction: every atom in an expression must be on this list.
         allow-licenses: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, Python-2.0, PSF-2.0, MPL-2.0
+        # Packages whose license metadata uses PEP 639 (License-Expression
+        # field) that the dependency-review action's parser doesn't
+        # currently understand, so it reports "could not detect a
+        # license" and fails the check even when the actual SPDX
+        # expression is in our allow-list above. We whitelist by purl
+        # for the specific packages we know are fine:
+        #   - fastapi              MIT
+        #   - googleapis-common-*  Apache-2.0
+        #   - opentelemetry-*      Apache-2.0
+        #   - protobuf             BSD-3-Clause
+        #   - psycopg, *-binary, *-pool  LGPL-3.0-or-later (we link;
+        #     don't modify; LGPL terms are satisfied — accepted as a
+        #     PostHog-cloud-infra precedent).
+        #   - starlette            BSD-3-Clause
+        #   - uvicorn              BSD-3-Clause
+        # Remove entries here as the action's PEP 639 parser catches up.
+        allow-dependencies-licenses: >-
+          pkg:pypi/fastapi,
+          pkg:pypi/googleapis-common-protos,
+          pkg:pypi/opentelemetry-api,
+          pkg:pypi/opentelemetry-exporter-otlp-proto-common,
+          pkg:pypi/opentelemetry-exporter-otlp-proto-http,
+          pkg:pypi/opentelemetry-proto,
+          pkg:pypi/opentelemetry-sdk,
+          pkg:pypi/opentelemetry-semantic-conventions,
+          pkg:pypi/protobuf,
+          pkg:pypi/psycopg,
+          pkg:pypi/psycopg-binary,
+          pkg:pypi/psycopg-pool,
+          pkg:pypi/starlette,
+          pkg:pypi/uvicorn
 
   build:
     runs-on: ubuntu-latest
