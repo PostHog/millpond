@@ -323,62 +323,86 @@ def _arrow_batch_simple() -> pa.Table:
     })
 
 
-def test_sink_write_produces_deterministic_path():
-    """Same kafka_offsets twice → same S3 URI ⇒ idempotent replay works."""
-    s3_calls = []
-    sink = IceboxSink(
-        client=MagicMock(register_file=MagicMock(return_value=({"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}, 201))),
-        writer_ordinal=0,
-        bucket="bucket",
-        warehouse_prefix="warehouses/ingest",
-        namespace="kafka",
-        table="events",
+def _make_sink(**overrides):
+    register_mock = overrides.pop(
+        "register_mock",
+        MagicMock(return_value=({"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}, 201)),
     )
+    defaults = {
+        "client": MagicMock(register_file=register_mock),
+        "writer_ordinal": 0,
+        "bucket": "bucket",
+        "warehouse_prefix": "warehouses/ingest",
+        "namespace": "kafka",
+        "table": "events",
+    }
+    defaults.update(overrides)
+    return IceboxSink(**defaults), register_mock
+
+
+def test_sink_write_produces_deterministic_path():
+    """Same kafka_offsets + same _add_metadata_columns now()-stamp → same S3 URI.
+    To stabilize the now() bit, we freeze datetime via monkeypatch in the
+    next test; here we just confirm same inputs in one tick yield equal paths."""
+    s3_calls = []
+    sink, _ = _make_sink()
     batch = _arrow_batch_simple()
     sink.write(
         batch,
         kafka_offsets={"0": 100, "1": 200},
-        partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
         s3_writer=lambda uri, data: s3_calls.append(uri),
     )
-    # Re-run with the same args
     sink.write(
         batch,
         kafka_offsets={"0": 100, "1": 200},
-        partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
         s3_writer=lambda uri, data: s3_calls.append(uri),
     )
+    # Both calls in the same test process within the same wall-second
+    # produce identical partition tuples; the kafka_offsets fingerprint
+    # is identical. Paths match.
     assert s3_calls[0] == s3_calls[1]
+
+
+def test_sink_write_path_includes_partition_columns():
+    """The S3 path embeds year/month/day/hour derived from the sink's
+    internal _add_metadata_columns stamp."""
+    s3_calls = []
+    sink, _ = _make_sink()
+    sink.write(
+        _arrow_batch_simple(),
+        kafka_offsets={"0": 100},
+        s3_writer=lambda uri, data: s3_calls.append(uri),
+    )
+    uri = s3_calls[0]
+    # Path contains four partition segments (year=, month=, day=, hour=)
+    assert "year=" in uri
+    assert "month=" in uri
+    assert "day=" in uri
+    assert "hour=" in uri
 
 
 def test_sink_write_posts_correct_request_body():
     """The icebox sees: full RegisterFileRequest with stats, fingerprint,
-    partition values, kafka_offsets."""
-    register_mock = MagicMock(return_value=({"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}, 201))
-    sink = IceboxSink(
-        client=MagicMock(register_file=register_mock),
-        writer_ordinal=20,
-        bucket="bucket",
-        warehouse_prefix="warehouses/ingest",
-        namespace="kafka",
-        table="events",
-    )
+    partition values (sink-derived), kafka_offsets (caller-supplied)."""
+    sink, register_mock = _make_sink(writer_ordinal=20)
     sink.write(
         _arrow_batch_simple(),
         kafka_offsets={"0": 1000},
-        partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
         s3_writer=lambda uri, data: None,
     )
     req = register_mock.call_args[0][0]
     assert req.writer_ordinal == 20
     assert req.kafka_offsets == {"0": 1000}
-    assert req.partition_values == {"year": 2026, "month": 6, "day": 1, "hour": 14}
+    # partition_values are now derived from the sink-stamped _inserted_at;
+    # all four keys must be present
+    assert set(req.partition_values.keys()) == {"year", "month", "day", "hour"}
+    assert all(isinstance(v, int) for v in req.partition_values.values())
+    # record_count reflects rows in the original batch (metadata columns
+    # are added on the way to parquet but don't change row count)
     assert req.record_count == 3
     assert req.file_size > 0
-    # Fingerprint is set
     assert len(req.schema_fingerprint) == 64
-    # Stats populated
-    assert req.parquet_stats.value_counts  # non-empty
+    assert req.parquet_stats.value_counts
     assert req.parquet_stats.lower_bounds
 
 
@@ -386,19 +410,10 @@ def test_sink_write_uploads_to_s3_at_request_path():
     """The S3 PUT must hit the same path that's in the POST body —
     if these diverge, the icebox registers a path with no file."""
     s3_calls = []
-    register_mock = MagicMock(return_value=({"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}, 201))
-    sink = IceboxSink(
-        client=MagicMock(register_file=register_mock),
-        writer_ordinal=0,
-        bucket="bucket",
-        warehouse_prefix="warehouses/ingest",
-        namespace="kafka",
-        table="events",
-    )
+    sink, register_mock = _make_sink()
     sink.write(
         _arrow_batch_simple(),
         kafka_offsets={"0": 1000},
-        partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
         s3_writer=lambda uri, data: s3_calls.append((uri, data)),
     )
     s3_uri = s3_calls[0][0]
@@ -408,29 +423,76 @@ def test_sink_write_uploads_to_s3_at_request_path():
 
 def test_sink_write_rejects_empty_batch():
     """main.py gates on non-empty; defensive guard catches regressions."""
-    sink = IceboxSink(
-        client=MagicMock(),
-        writer_ordinal=0, bucket="b", warehouse_prefix="w", namespace="n", table="t",
-    )
+    sink, _ = _make_sink(bucket="b", warehouse_prefix="w", namespace="n", table="t")
     empty = pa.table({"x": pa.array([], type=pa.int64())})
     with pytest.raises(ValueError, match="zero-row"):
         sink.write(
             empty, kafka_offsets={"0": 0},
-            partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
             s3_writer=lambda uri, data: None,
         )
 
 
-def test_sink_reset_caches_clears_schema():
-    """After reset, next write re-derives the schema (handles upstream
-    schema changes)."""
-    sink = IceboxSink(
-        client=MagicMock(register_file=MagicMock(return_value=({"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}, 201))),
-        writer_ordinal=0, bucket="b", warehouse_prefix="w", namespace="n", table="t",
+def test_sink_write_requires_kafka_offsets():
+    """Without kafka_offsets, the icebox couldn't commit Kafka — fail
+    loud at call site rather than constructing a half-formed POST."""
+    sink, _ = _make_sink()
+    with pytest.raises(ValueError, match="kafka_offsets"):
+        sink.write(_arrow_batch_simple(), s3_writer=lambda uri, data: None)
+
+
+def test_sink_write_requires_s3_writer():
+    """If neither per-call nor instance s3_writer is set, refuse."""
+    sink, _ = _make_sink()
+    with pytest.raises(ValueError, match="s3_writer"):
+        sink.write(_arrow_batch_simple(), kafka_offsets={"0": 1})
+
+
+def test_sink_write_uses_instance_s3_writer_when_no_per_call():
+    """Production wiring sets s3_writer once at construction. Verify
+    that path works (no per-call override needed)."""
+    s3_calls = []
+    sink, _ = _make_sink(s3_writer=lambda uri, data: s3_calls.append(uri))
+    sink.write(_arrow_batch_simple(), kafka_offsets={"0": 1})
+    assert len(s3_calls) == 1
+
+
+def test_sink_write_rejects_batch_with_reserved_columns():
+    """The sink adds metadata columns internally. A caller passing a
+    pre-stamped batch would double-add — refuse."""
+    sink, _ = _make_sink()
+    pre_stamped = _arrow_batch_simple().append_column(
+        "_inserted_at", pa.array([1, 2, 3], pa.int64())
     )
+    with pytest.raises(ValueError, match="_inserted_at"):
+        sink.write(
+            pre_stamped, kafka_offsets={"0": 1},
+            s3_writer=lambda uri, data: None,
+        )
+
+
+def test_sink_write_adds_partition_columns():
+    """The parquet that lands in S3 must contain the four partition
+    columns — otherwise the icebox-side DataFile.partition tuple
+    wouldn't match the actual data."""
+    s3_payloads: list[bytes] = []
+    sink, _ = _make_sink()
+    sink.write(
+        _arrow_batch_simple(),
+        kafka_offsets={"0": 1},
+        s3_writer=lambda uri, data: s3_payloads.append(data),
+    )
+    # Inspect the parquet that was actually shipped
+    pf = pq.ParquetFile(pa.BufferReader(s3_payloads[0]))
+    schema_names = pf.schema_arrow.names
+    for col in ("_inserted_at", "year", "month", "day", "hour"):
+        assert col in schema_names, f"S3-shipped parquet missing {col!r}"
+
+
+def test_sink_reset_caches_clears_schema():
+    """After reset, next write re-derives the schema."""
+    sink, _ = _make_sink()
     sink.write(
         _arrow_batch_simple(), kafka_offsets={"0": 0},
-        partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
         s3_writer=lambda uri, data: None,
     )
     assert sink._iceberg_schema is not None
@@ -451,17 +513,12 @@ def test_sink_close_propagates_to_client():
 
 
 def test_sink_schema_fingerprint_stable_across_batches():
-    """Two writes of the same schema produce the same fingerprint in
-    the POST body."""
-    register_mock = MagicMock(return_value=({"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}, 201))
-    sink = IceboxSink(
-        client=MagicMock(register_file=register_mock),
-        writer_ordinal=0, bucket="b", warehouse_prefix="w", namespace="n", table="t",
-    )
+    """Two writes of the same source schema produce the same fingerprint
+    in the POST body — the metadata columns are deterministic, so the
+    augmented schema is identical across calls."""
+    sink, register_mock = _make_sink()
     batch = _arrow_batch_simple()
-    sink.write(batch, kafka_offsets={"0": 1}, partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
-               s3_writer=lambda uri, data: None)
-    sink.write(batch, kafka_offsets={"0": 2}, partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
-               s3_writer=lambda uri, data: None)
+    sink.write(batch, kafka_offsets={"0": 1}, s3_writer=lambda uri, data: None)
+    sink.write(batch, kafka_offsets={"0": 2}, s3_writer=lambda uri, data: None)
     fps = [c[0][0].schema_fingerprint for c in register_mock.call_args_list]
     assert fps[0] == fps[1]

@@ -181,11 +181,17 @@ def _apply_sort(table: pa.Table, cfg: config.Config) -> pa.Table:
     return table.take(indices)
 
 
-def _write_with_retry(sink, consolidated):
-    """Write to the sink with exponential backoff on transient failures."""
+def _write_with_retry(sink, consolidated, *, write_kwargs=None):
+    """Write to the sink with exponential backoff on transient failures.
+
+    `write_kwargs` is the icebox path's escape hatch: IceboxSink.write
+    needs kafka_offsets passed in per-call, but DuckLakeSink/IcebergSink
+    don't. The caller decides which kwargs apply based on cfg.destination.
+    """
+    write_kwargs = write_kwargs or {}
     for attempt in range(_WRITE_MAX_RETRIES):
         try:
-            sink.write(consolidated)
+            sink.write(consolidated, **write_kwargs)
             return
         except Exception:
             metrics.errors_total.labels(type="write_retry").inc()
@@ -205,40 +211,86 @@ def _write_with_retry(sink, consolidated):
             time.sleep(delay)
 
 
+def _kafka_offsets_for_icebox(
+    offsets: dict[tuple[str, int], int],
+    topic: str,
+) -> dict[str, int]:
+    """Flatten the consumer's (topic, partition) → offset map into the
+    {partition_id_str: max_offset} shape the icebox wire format wants.
+
+    The icebox runs per (topic, table), so all offsets must be for the
+    same topic. Drop any mismatched entries with a warning — that
+    indicates an upstream consumer-wiring bug.
+    """
+    out: dict[str, int] = {}
+    for (t, partition), offset in offsets.items():
+        if t != topic:
+            log.warning(
+                "_flush: dropping offset for topic=%s (icebox is per-topic; expected %s)",
+                t,
+                topic,
+            )
+            continue
+        out[str(partition)] = offset
+    return out
+
+
 def _flush(sink, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, trigger="time"):
-    """Write to the sink, commit offsets, update metrics."""
+    """Write to the sink, commit offsets, update metrics.
+
+    For DuckLake / Iceberg sinks, this writes the batch then commits
+    Kafka offsets directly. For icebox, the sink POSTs files to the
+    icebox service which commits Kafka offsets atomically with its
+    Iceberg snapshot — so this function MUST NOT call kafka.commit().
+    """
     consolidated = _apply_sort(consolidated, cfg)
     t0 = time.monotonic()
-    _write_with_retry(sink, consolidated)
+    if cfg.destination == "icebox":
+        # Icebox sink path: pass kafka_offsets through; the sink writes
+        # parquet to S3 + POSTs to icebox. No local kafka.commit() — the
+        # icebox owns offset commits atomically with its Iceberg snapshot.
+        _write_with_retry(
+            sink,
+            consolidated,
+            write_kwargs={"kafka_offsets": _kafka_offsets_for_icebox(offsets, cfg.topic)},
+        )
+    else:
+        _write_with_retry(sink, consolidated)
     write_duration = time.monotonic() - t0
 
-    # Commit offsets synchronously — at-least-once requires knowing commit succeeded
-    tp_offsets = [
-        TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
-        for (topic, partition), offset in offsets.items()
-    ]
-    for attempt in range(_COMMIT_MAX_RETRIES):
-        try:
-            kafka.commit(offsets=tp_offsets, asynchronous=False)
-            break
-        except Exception:
-            metrics.errors_total.labels(type="offset_commit").inc()
-            if attempt == _COMMIT_MAX_RETRIES - 1:
-                log.error(
-                    "Offset commit failed after %d attempts — duplicates possible on restart",
+    if cfg.destination == "icebox":
+        # Icebox commits Kafka offsets atomically with its Iceberg
+        # snapshot; skip the local commit. We DO compute tp_offsets for
+        # metric emission below so dashboards keep working.
+        tp_offsets = [TopicPartition(topic, partition, offset + 1) for (topic, partition), offset in offsets.items()]
+    else:
+        # Commit offsets synchronously — at-least-once requires knowing commit succeeded
+        tp_offsets = [
+            TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
+            for (topic, partition), offset in offsets.items()
+        ]
+        for attempt in range(_COMMIT_MAX_RETRIES):
+            try:
+                kafka.commit(offsets=tp_offsets, asynchronous=False)
+                break
+            except Exception:
+                metrics.errors_total.labels(type="offset_commit").inc()
+                if attempt == _COMMIT_MAX_RETRIES - 1:
+                    log.error(
+                        "Offset commit failed after %d attempts — duplicates possible on restart",
+                        _COMMIT_MAX_RETRIES,
+                        exc_info=True,
+                    )
+                    raise
+                delay = _COMMIT_BASE_DELAY_S * (2**attempt)
+                log.warning(
+                    "Offset commit failed (attempt %d/%d), retrying in %.1fs",
+                    attempt + 1,
                     _COMMIT_MAX_RETRIES,
+                    delay,
                     exc_info=True,
                 )
-                raise
-            delay = _COMMIT_BASE_DELAY_S * (2**attempt)
-            log.warning(
-                "Offset commit failed (attempt %d/%d), retrying in %.1fs",
-                attempt + 1,
-                _COMMIT_MAX_RETRIES,
-                delay,
-                exc_info=True,
-            )
-            time.sleep(delay)
+                time.sleep(delay)
 
     log.info(
         "Flush: %d records, %d bytes, %d columns, write=%.2fs, elapsed=%.1fs",
@@ -256,7 +308,11 @@ def _flush(sink, cfg, kafka, consolidated, pending_bytes, pending_records, offse
     metrics.batches_flushed_total.labels(trigger=trigger).inc()
     server.health.record_flush()
 
-    # Always update committed offset metrics (cheap, local)
+    # Always update committed offset metrics (cheap, local). For icebox
+    # this reflects the offset the SINK saw, not necessarily what the
+    # icebox has committed yet — the icebox advances Kafka offsets on
+    # its own cadence. Operators looking for "committed in Iceberg" should
+    # use icebox's GET /v1/status, not this metric.
     for tp in tp_offsets:
         metrics.last_committed_offset.labels(partition=str(tp.partition)).set(tp.offset)
 

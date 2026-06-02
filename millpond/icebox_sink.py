@@ -26,15 +26,16 @@ This module exposes:
 The sink itself doesn't write Arrow → parquet — that's PyArrow's job;
 we wire it into a BytesIO/S3 stream the same way IcebergSink does.
 
-NOTE: wiring into the main consumer loop (main.py:_flush) so kafka
-offsets flow to the sink instead of being committed locally is OUT OF
-SCOPE here. This module defines the sink + its tests; main.py
-integration is a follow-up PR.
+Integration with the main consumer loop (millpond/main.py:_flush) is
+in place: when cfg.destination == "icebox", _flush passes kafka_offsets
+to sink.write and SKIPS the local kafka.commit() — the icebox commits
+offsets atomically with its Iceberg snapshot.
 """
 
 from __future__ import annotations
 
 import base64
+import datetime
 import logging
 import time
 from collections.abc import Mapping
@@ -43,6 +44,7 @@ from typing import Any
 
 import httpx
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.schema import Schema as IcebergSchema
@@ -64,6 +66,54 @@ from shared.models import (
 from shared.paths import staged_file_path
 
 log = logging.getLogger(__name__)
+
+
+def build_s3_writer(
+    *,
+    access_key_id: str | None,
+    secret_access_key: str | None,
+    region: str | None,
+    endpoint: str | None = None,
+):
+    """Build the production s3_writer callable for IceboxSink.
+
+    Uses PyArrow's S3 filesystem rather than boto3 to avoid pulling
+    another dep into millpond (PyArrow is already required).
+
+    Returns a callable with signature `(s3_uri: str, data: bytes) -> None`.
+    The URI must start with "s3://" and contain bucket + key.
+
+    Args mirror the s3_* fields in millpond.config.Config.
+
+    Idempotency:
+      The icebox protocol relies on same kafka_offsets → same S3 path →
+      same bytes. S3 PUT is atomic per object; re-PUT of the same key
+      with the same content overwrites (no-op semantically). Writer
+      crash + replay re-PUTs the same path with identical bytes; the
+      icebox dedups via UNIQUE(file_path).
+    """
+    import pyarrow.fs as pafs
+
+    fs_kwargs: dict[str, Any] = {}
+    if region:
+        fs_kwargs["region"] = region
+    if access_key_id:
+        fs_kwargs["access_key"] = access_key_id
+    if secret_access_key:
+        fs_kwargs["secret_key"] = secret_access_key
+    if endpoint:
+        fs_kwargs["endpoint_override"] = endpoint
+    fs = pafs.S3FileSystem(**fs_kwargs)
+
+    def _writer(s3_uri: str, payload: bytes) -> None:
+        if not s3_uri.startswith("s3://"):
+            raise ValueError(f"expected s3:// URI, got {s3_uri!r}")
+        # PyArrow's S3FileSystem expects "bucket/key" (no scheme).
+        path = s3_uri[len("s3://") :]
+        with fs.open_output_stream(path) as out:
+            out.write(payload)
+
+    return _writer
 
 
 class IceboxResponseError(RuntimeError):
@@ -304,6 +354,43 @@ def _compare(iceberg_type, a, b) -> int:
     return -1 if a < b else 1
 
 
+# Reserved column names mirror millpond/iceberg.py's RESERVED_COLUMNS —
+# kept inline to avoid a millpond/iceberg.py import (which would drag
+# the catalog + S3 dependencies into the writer hot path).
+_PARTITION_COLS: tuple[str, ...] = ("year", "month", "day", "hour")
+_RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at", *_PARTITION_COLS})
+
+
+def _add_metadata_columns(batch: pa.Table) -> pa.Table:
+    """Append ``_inserted_at`` + the four partition columns to the batch.
+
+    Mirror of millpond/iceberg.py:_add_metadata_columns. The same
+    convention is load-bearing for partition-pruning correctness — all
+    rows in a single flush share the same `_inserted_at` value so a
+    batch always lands in exactly one (year, month, day, hour) tuple.
+
+    int32 cast matches the partition spec's IntegerType (PyArrow's
+    pc.year/month/day/hour return int64).
+    """
+    now = datetime.datetime.now(datetime.UTC)
+    ts_type = pa.timestamp("us", tz="UTC")
+    ts_array = pa.array([now] * len(batch), ts_type)
+    batch = batch.append_column("_inserted_at", ts_array)
+    ts = batch.column("_inserted_at")
+    batch = batch.append_column("year", pc.cast(pc.year(ts), pa.int32()))
+    batch = batch.append_column("month", pc.cast(pc.month(ts), pa.int32()))
+    batch = batch.append_column("day", pc.cast(pc.day(ts), pa.int32()))
+    batch = batch.append_column("hour", pc.cast(pc.hour(ts), pa.int32()))
+    return batch
+
+
+def _partition_values_from_batch(batch: pa.Table) -> dict[str, int]:
+    """Read the partition tuple from a batch produced by
+    _add_metadata_columns. All rows share the same (y,m,d,h) so taking
+    row 0 is sufficient."""
+    return {name: batch.column(name)[0].as_py() for name in _PARTITION_COLS}
+
+
 @dataclass
 class IceboxSink:
     """Sink that POSTs parquet files to the icebox service instead of
@@ -313,15 +400,15 @@ class IceboxSink:
       - The Iceberg schema (for field IDs + fingerprint).
       - The IceboxClient (HTTP).
       - The deterministic-path constants (bucket, warehouse prefix).
+      - An s3_writer callable for shipping parquet bytes to S3.
 
-    It does NOT own the Kafka offsets — those flow in per-batch from the
-    caller. The Sink protocol's write(batch) signature is extended via a
-    second kwarg `kafka_offsets`; the main.py wiring is a follow-up.
+    Per-batch state (kafka_offsets) flows in via kwargs on write().
 
     Field-ID resolution: on first non-empty batch, derive the Iceberg
-    schema from the batch's Arrow schema via the same helpers
-    millpond/iceberg.py uses. The icebox-side table must have the same
-    fingerprint or the icebox will reject our POSTs with 400.
+    schema from the batch's Arrow schema (after metadata columns are
+    added) via the same helpers millpond/iceberg.py uses. The icebox-
+    side table must have the same fingerprint or the icebox will
+    reject our POSTs with 400.
     """
 
     client: IceboxClient
@@ -330,13 +417,15 @@ class IceboxSink:
     warehouse_prefix: str
     namespace: str
     table: str
+    s3_writer: Any = None  # callable (s3_uri: str, data: bytes) -> None
     schema_version: str = "v1"
     _iceberg_schema: IcebergSchema | None = None
     _fingerprint: str | None = None
     _field_id_by_name: dict[str, int] | None = None
 
     def _ensure_schema(self, batch_schema: pa.Schema) -> None:
-        """Resolve Iceberg schema + fingerprint on first batch."""
+        """Resolve Iceberg schema + fingerprint on first batch. Caller
+        must have already added metadata columns to the batch."""
         if self._iceberg_schema is not None:
             return
         ice_schema = assign_fresh_schema_ids(_pyarrow_to_schema_without_ids(batch_schema))
@@ -348,32 +437,67 @@ class IceboxSink:
         self,
         batch: pa.Table,
         *,
-        kafka_offsets: Mapping[str, int],
-        partition_values: Mapping[str, int],
-        s3_writer,
+        kafka_offsets: Mapping[str, int] | None = None,
+        s3_writer: Any = None,
     ) -> tuple[dict, int]:
         """Write the batch's parquet bytes to S3 at the deterministic
         path, register with icebox, return (response_body, status_code).
 
+        The sink internally:
+          1. Adds _inserted_at + (year, month, day, hour) columns.
+          2. Derives partition_values from the appended columns (all
+             rows share one tuple since _add_metadata_columns stamps
+             a single now() for the whole batch).
+          3. Computes the deterministic S3 path.
+          4. Writes parquet to a BytesIO buffer, extracts stats.
+          5. Ships bytes to S3 via the writer callable.
+          6. POSTs RegisterFileRequest to icebox.
+
         Args:
-            batch: non-empty Arrow table.
-            kafka_offsets: {partition_id (str): max_offset_in_batch}
-            partition_values: {year/month/day/hour: int}.
-            s3_writer: an injectable callable with signature
-                `(s3_uri: str, data: bytes) -> None`. Injection makes
-                the sink unit-testable without an S3 stub.
+            batch: non-empty Arrow table WITHOUT metadata columns. The
+                sink adds them — callers MUST NOT pre-stamp.
+            kafka_offsets: {partition_id (str): max_offset_in_batch}.
+                Required when called from production; main.py:_flush
+                computes it from the consumer's per-partition offsets.
+            s3_writer: per-call override for the instance attribute.
+                Used by tests; production wires it once at construction.
 
         Returns:
-            (body, status) where status is 201 or 409.
+            (body, status) where status is 201 (new) or 409 (replay).
 
         Raises:
+            ValueError: zero-row batch, or kafka_offsets / s3_writer
+                missing.
             IceboxResponseError, IceboxBackpressureExhausted: see
                 IceboxClient.register_file.
         """
         if len(batch) == 0:
             raise ValueError("IceboxSink.write called with zero-row batch")
+        if kafka_offsets is None:
+            raise ValueError(
+                "IceboxSink.write requires kafka_offsets; the icebox "
+                "commits Kafka offsets atomically with the Iceberg snapshot"
+            )
+        writer = s3_writer if s3_writer is not None else self.s3_writer
+        if writer is None:
+            raise ValueError(
+                "IceboxSink.write requires an s3_writer (either passed per-call or set on the sink at construction)"
+            )
 
-        self._ensure_schema(batch.schema)
+        # Defense in depth: catch operators piping a pre-stamped batch
+        # to the icebox sink — would double-add and break schema/fingerprint.
+        for col in _RESERVED_COLUMNS:
+            if col in batch.schema.names:
+                raise ValueError(
+                    f"IceboxSink.write received a batch with reserved column "
+                    f"{col!r} already present; metadata columns are added "
+                    f"by the sink, not the caller"
+                )
+
+        batch_with_meta = _add_metadata_columns(batch)
+        partition_values = _partition_values_from_batch(batch_with_meta)
+
+        self._ensure_schema(batch_with_meta.schema)
         s3_uri = staged_file_path(
             bucket=self.bucket,
             warehouse_prefix=self.warehouse_prefix,
@@ -381,13 +505,13 @@ class IceboxSink:
             table=self.table,
             writer_ordinal=self.writer_ordinal,
             kafka_offsets={int(k): v for k, v in kafka_offsets.items()},
-            partition_values=dict(partition_values),
+            partition_values=partition_values,
         )
 
         # Write parquet to in-memory buffer, then ship to S3 + extract stats
         buf = pa.BufferOutputStream()
-        with pq.ParquetWriter(buf, batch.schema) as writer:
-            writer.write_table(batch)
+        with pq.ParquetWriter(buf, batch_with_meta.schema) as pq_writer:
+            pq_writer.write_table(batch_with_meta)
         parquet_bytes = buf.getvalue().to_pybytes()
 
         # Extract stats BEFORE shipping — they're a function of the
@@ -400,14 +524,14 @@ class IceboxSink:
         )
 
         # Ship parquet to S3. Idempotent: same path = same bytes (replay-safe).
-        s3_writer(s3_uri, parquet_bytes)
+        writer(s3_uri, parquet_bytes)
 
         req = RegisterFileRequest(
             protocol_version=PROTOCOL_VERSION,
             file_path=s3_uri,
             writer_ordinal=self.writer_ordinal,
             kafka_offsets=dict(kafka_offsets),
-            partition_values=dict(partition_values),
+            partition_values=partition_values,
             record_count=meta.num_rows,
             file_size=len(parquet_bytes),
             schema_version=self.schema_version,

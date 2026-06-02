@@ -121,13 +121,19 @@ def make_sink(cfg: Config) -> Sink:
     if cfg.destination == "icebox":
         # Lazy import: pulls httpx + fastapi-adjacent transitive deps that
         # DuckLake-only deployments don't need.
-        from millpond.icebox_sink import IceboxClient, IceboxSink
+        from millpond.icebox_sink import IceboxClient, IceboxSink, build_s3_writer
 
         client = IceboxClient(
             base_url=cfg.icebox_url,
             max_attempts=cfg.icebox_max_attempts,
             max_backoff_s=cfg.icebox_max_backoff_s,
             timeout_s=cfg.icebox_timeout_s,
+        )
+        s3_writer = build_s3_writer(
+            access_key_id=cfg.s3_access_key_id,
+            secret_access_key=cfg.s3_secret_access_key,
+            region=cfg.s3_region,
+            endpoint=cfg.s3_endpoint,
         )
         return IceboxSink(
             client=client,
@@ -136,6 +142,7 @@ def make_sink(cfg: Config) -> Sink:
             warehouse_prefix=cfg.icebox_warehouse_prefix,
             namespace=cfg.iceberg_namespace,
             table=cfg.iceberg_table,
+            s3_writer=s3_writer,
         )
     # ValueError, not RuntimeError — this is an unknown-enum input, the
     # idiomatic Python exception for "the value I got isn't in the set

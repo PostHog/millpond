@@ -11,7 +11,12 @@ from pyiceberg.exceptions import (
     ServiceUnavailableError,
 )
 
-from millpond.main import _convert_batch, _flush, _write_with_retry
+from millpond.main import (
+    _convert_batch,
+    _flush,
+    _kafka_offsets_for_icebox,
+    _write_with_retry,
+)
 
 
 def _make_sink() -> MagicMock:
@@ -746,3 +751,100 @@ class TestApplySort:
         result = _apply_sort(table, self._cfg(sort_by=("region",)))
 
         assert result.column("region").to_pylist() == ["eu-central-1", "us-east-1", "us-west-2"]
+
+
+class TestKafkaOffsetsForIcebox:
+    """The icebox dispatch in _flush flattens the consumer's
+    (topic, partition) → offset map into the {partition_id_str: offset}
+    shape the icebox wire format expects."""
+
+    def test_single_topic_passthrough(self):
+        offsets = {("events", 0): 100, ("events", 1): 200}
+        result = _kafka_offsets_for_icebox(offsets, topic="events")
+        assert result == {"0": 100, "1": 200}
+
+    def test_dropped_mismatched_topic(self):
+        """Defensive: an unrelated topic appearing in the offsets dict
+        (shouldn't happen, but the consumer's invariant isn't enforced
+        at this seam) gets dropped with a warning, NOT committed against
+        the icebox's configured topic."""
+        offsets = {("events", 0): 100, ("wrong", 0): 999}
+        result = _kafka_offsets_for_icebox(offsets, topic="events")
+        assert result == {"0": 100}
+        assert "wrong" not in result.values()
+
+    def test_empty_offsets_yields_empty(self):
+        assert _kafka_offsets_for_icebox({}, topic="events") == {}
+
+    def test_partition_keys_are_strings(self):
+        """The icebox wire format requires string keys (jsonb encoding)."""
+        result = _kafka_offsets_for_icebox({("events", 42): 1234}, topic="events")
+        assert "42" in result
+        assert 42 not in result
+
+
+class TestFlushIceboxDispatch:
+    """When cfg.destination == 'icebox', _flush must:
+      1. Pass kafka_offsets to sink.write
+      2. NOT call kafka.commit() — the icebox commits offsets atomically
+         with the Iceberg snapshot
+      3. Still emit committed-offset metrics for dashboards
+    """
+
+    def _icebox_args(self):
+        sink = _make_sink()
+        cfg = MagicMock()
+        cfg.destination = "icebox"
+        cfg.topic = "events"
+        cfg.table_label = "kafka.events"
+        cfg.sort_by = None
+        kafka = MagicMock()
+        table = pa.table({"a": [1, 2]})
+        offsets = {("events", 0): 100, ("events", 1): 200}
+        return sink, cfg, kafka, table, offsets
+
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_icebox_path_passes_kafka_offsets_to_sink(self, mock_metrics, mock_server):
+        sink, cfg, kafka, table, offsets = self._icebox_args()
+        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
+        # write was called with kafka_offsets kwarg
+        call = sink.write.call_args
+        assert "kafka_offsets" in call.kwargs
+        assert call.kwargs["kafka_offsets"] == {"0": 100, "1": 200}
+
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_icebox_path_does_not_call_kafka_commit(self, mock_metrics, mock_server):
+        sink, cfg, kafka, table, offsets = self._icebox_args()
+        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
+        kafka.commit.assert_not_called()
+
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_icebox_path_still_emits_last_committed_offset_metric(self, mock_metrics, mock_server):
+        """Dashboards expect this metric per partition even though the
+        local process didn't commit — it reflects what the sink saw."""
+        sink, cfg, kafka, table, offsets = self._icebox_args()
+        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
+        # Two partitions in the offsets dict
+        labels_calls = mock_metrics.last_committed_offset.labels.call_args_list
+        partitions = sorted(c.kwargs["partition"] for c in labels_calls)
+        assert partitions == ["0", "1"]
+
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_non_icebox_path_still_calls_kafka_commit(self, mock_metrics, mock_server):
+        """Regression guard for the ducklake/iceberg path — make sure
+        the icebox dispatch didn't accidentally short-circuit the
+        existing commit path."""
+        sink = _make_sink()
+        cfg = MagicMock()
+        cfg.destination = "ducklake"
+        cfg.table_label = "test_table"
+        cfg.sort_by = None
+        kafka = MagicMock()
+        table = pa.table({"a": [1, 2]})
+        offsets = {("events", 0): 100}
+        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
+        kafka.commit.assert_called_once()
