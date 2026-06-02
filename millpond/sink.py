@@ -118,6 +118,25 @@ def make_sink(cfg: Config) -> Sink:
         from millpond.ducklake import DuckLakeSink
 
         return DuckLakeSink(cfg)
+    if cfg.destination == "icebox":
+        # Lazy import: pulls httpx + fastapi-adjacent transitive deps that
+        # DuckLake-only deployments don't need.
+        from millpond.icebox_sink import IceboxClient, IceboxSink
+
+        client = IceboxClient(
+            base_url=cfg.icebox_url,
+            max_attempts=cfg.icebox_max_attempts,
+            max_backoff_s=cfg.icebox_max_backoff_s,
+            timeout_s=cfg.icebox_timeout_s,
+        )
+        return IceboxSink(
+            client=client,
+            writer_ordinal=cfg.ordinal,
+            bucket=cfg.icebox_bucket,
+            warehouse_prefix=cfg.icebox_warehouse_prefix,
+            namespace=cfg.iceberg_namespace,
+            table=cfg.iceberg_table,
+        )
     # ValueError, not RuntimeError — this is an unknown-enum input, the
     # idiomatic Python exception for "the value I got isn't in the set
     # I accept." config.load() should have already rejected this at

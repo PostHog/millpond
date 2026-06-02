@@ -10,3 +10,4 @@ dist/
 session-*.md
 test/ssl/
 FOLLOWUPS.md
+**/.DS_Store

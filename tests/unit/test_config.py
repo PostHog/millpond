@@ -291,6 +291,106 @@ class TestLoadDestinationValidation:
         assert cfg.destination == "ducklake"
 
 
+class TestLoadIcebox:
+    """destination == "icebox" — writer ships parquet to the icebox
+    service instead of committing PyIceberg directly. Still needs the
+    iceberg namespace+table for the deterministic file path."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("MILLPOND_DESTINATION", "icebox")
+        # Iceberg target (for path construction; catalog lives in icebox)
+        monkeypatch.setenv("ICEBERG_TABLE", "events")
+        monkeypatch.setenv("ICEBERG_NAMESPACE", "kafka")
+        monkeypatch.setenv("ICEBERG_CATALOG_URI", "http://catalog:8181")
+        monkeypatch.setenv("ICEBERG_WAREHOUSE", "s3://warehouse/")
+        monkeypatch.setenv("MILLPOND_S3_ACCESS_KEY_ID", "akid")
+        monkeypatch.setenv("MILLPOND_S3_SECRET_ACCESS_KEY", "secret")
+        monkeypatch.setenv("MILLPOND_S3_REGION", "us-east-1")
+        # Icebox-specific fields
+        monkeypatch.setenv("ICEBOX_URL", "http://icebox-events.megaberg.svc:8000")
+        monkeypatch.setenv("ICEBOX_BUCKET", "posthog-megaberg-mw-prod-us")
+        monkeypatch.setenv("ICEBOX_WAREHOUSE_PREFIX", "warehouses/ingest")
+
+    def test_loads_icebox_with_defaults(self):
+        cfg = load()
+        assert cfg.destination == "icebox"
+        assert cfg.icebox_url == "http://icebox-events.megaberg.svc:8000"
+        assert cfg.icebox_bucket == "posthog-megaberg-mw-prod-us"
+        assert cfg.icebox_warehouse_prefix == "warehouses/ingest"
+        # Defaults from IceboxClient mirrored into config
+        assert cfg.icebox_max_attempts == 6
+        assert cfg.icebox_max_backoff_s == 30.0
+        assert cfg.icebox_timeout_s == 10.0
+
+    def test_icebox_table_label_uses_iceberg_namespace(self):
+        """table_label is used in metrics + Kafka client.id. Icebox
+        writers share the same iceberg-style table identifier as the
+        iceberg destination."""
+        cfg = load()
+        assert cfg.table_label == "kafka.events"
+
+    def test_icebox_url_required(self, monkeypatch):
+        monkeypatch.delenv("ICEBOX_URL")
+        with pytest.raises(RuntimeError, match="ICEBOX_URL"):
+            load()
+
+    def test_icebox_bucket_required(self, monkeypatch):
+        monkeypatch.delenv("ICEBOX_BUCKET")
+        with pytest.raises(RuntimeError, match="ICEBOX_BUCKET"):
+            load()
+
+    def test_icebox_warehouse_prefix_required(self, monkeypatch):
+        monkeypatch.delenv("ICEBOX_WAREHOUSE_PREFIX")
+        with pytest.raises(RuntimeError, match="ICEBOX_WAREHOUSE_PREFIX"):
+            load()
+
+    def test_icebox_iceberg_namespace_required(self, monkeypatch):
+        """The deterministic file path uses iceberg_namespace, so even
+        though the catalog lives on the icebox side, the writer needs
+        the namespace to build the path."""
+        monkeypatch.delenv("ICEBERG_NAMESPACE")
+        with pytest.raises(RuntimeError, match="ICEBERG_NAMESPACE"):
+            load()
+
+    def test_icebox_iceberg_table_required(self, monkeypatch):
+        monkeypatch.delenv("ICEBERG_TABLE")
+        with pytest.raises(RuntimeError, match="ICEBERG_TABLE"):
+            load()
+
+    def test_icebox_retry_knobs_overridable(self, monkeypatch):
+        monkeypatch.setenv("ICEBOX_MAX_ATTEMPTS", "10")
+        monkeypatch.setenv("ICEBOX_MAX_BACKOFF_S", "60")
+        monkeypatch.setenv("ICEBOX_TIMEOUT_S", "5")
+        cfg = load()
+        assert cfg.icebox_max_attempts == 10
+        assert cfg.icebox_max_backoff_s == 60.0
+        assert cfg.icebox_timeout_s == 5.0
+
+    def test_icebox_destination_is_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "IceBox")
+        cfg = load()
+        assert cfg.destination == "icebox"
+
+    def test_icebox_ducklake_fields_none(self):
+        """Icebox writers don't speak DuckLake at all."""
+        cfg = load()
+        assert cfg.ducklake_table is None
+        assert cfg.rds_host is None
+        assert cfg.partition_by is None
+
+    def test_icebox_default_group_id_uses_iceberg_table(self):
+        """GROUP_ID semantics: writer's group_id matches the icebox's
+        kafka_group_id config so the icebox can commit offsets on the
+        writers' behalf. Same default scheme as the iceberg destination."""
+        cfg = load()
+        assert cfg.group_id == "millpond-test-topic-events"
+
+
 class TestFilterConfig:
     """MILLPOND_FILTER_{KEEP,DROP}_FIELD_NAME + MILLPOND_FILTER_VALUES."""
 

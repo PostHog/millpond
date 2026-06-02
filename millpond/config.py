@@ -12,8 +12,8 @@ SAFE_PARTITION_EXPR = re.compile(r"^[a-zA-Z0-9_(),\s]+$")
 
 log = logging.getLogger(__name__)
 
-Destination = Literal["ducklake", "iceberg"]
-_DESTINATIONS: tuple[Destination, ...] = ("ducklake", "iceberg")
+Destination = Literal["ducklake", "iceberg", "icebox"]
+_DESTINATIONS: tuple[Destination, ...] = ("ducklake", "iceberg", "icebox")
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,22 @@ class Config:
     s3_region: str | None
     s3_endpoint: str | None
 
+    # Icebox — required when destination == "icebox", else None.
+    # icebox_url is the in-cluster HTTP base URL of the icebox service
+    # (e.g. "http://icebox-events.megaberg.svc:8000").
+    # icebox_bucket + icebox_warehouse_prefix are the deterministic-path
+    # components the sink uses when writing staged parquet to S3 — they
+    # MUST match the icebox-side warehouse config or files land where
+    # the catalog can't find them.
+    icebox_url: str | None
+    icebox_bucket: str | None
+    icebox_warehouse_prefix: str | None
+    # Sink-side HTTP retry knobs. Defaults inherited from IceboxClient if
+    # not set via env.
+    icebox_max_attempts: int
+    icebox_max_backoff_s: float
+    icebox_timeout_s: float
+
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
     flush_interval_ms: int  # ms since last flush
@@ -108,7 +124,7 @@ class Config:
     def table_label(self) -> str:
         """Single human-readable identifier for the destination table.
         Used in metrics pipeline labels and the Kafka client.id."""
-        if self.destination == "iceberg":
+        if self.destination in ("iceberg", "icebox"):
             return f"{self.iceberg_namespace}.{self.iceberg_table}"
         return self.ducklake_table or "unknown"
 
@@ -313,11 +329,25 @@ def load() -> Config:
         None,
     )
 
+    icebox_kwargs: dict[str, str | None] = dict.fromkeys(
+        ("icebox_url", "icebox_bucket", "icebox_warehouse_prefix"),
+        None,
+    )
+
     if destination == "ducklake":
         ducklake_kwargs.update(_load_ducklake_fields())
         table_label_part = ducklake_kwargs["ducklake_table"]
-    else:
+    elif destination == "iceberg":
         iceberg_kwargs.update(_load_iceberg_fields())
+        table_label_part = iceberg_kwargs["iceberg_table"]
+    else:  # icebox: writer ships parquet + POSTs to the icebox service
+        # Icebox writers still need to know the Iceberg target (namespace
+        # + table) so the deterministic file path matches what the icebox
+        # registers. The catalog handle itself lives on the icebox side.
+        iceberg_kwargs.update(_load_iceberg_fields())
+        icebox_kwargs["icebox_url"] = _require("ICEBOX_URL")
+        icebox_kwargs["icebox_bucket"] = _require("ICEBOX_BUCKET")
+        icebox_kwargs["icebox_warehouse_prefix"] = _require("ICEBOX_WAREHOUSE_PREFIX")
         table_label_part = iceberg_kwargs["iceberg_table"]
 
     group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{table_label_part}")
@@ -343,6 +373,10 @@ def load() -> Config:
         destination=destination,
         **ducklake_kwargs,
         **iceberg_kwargs,
+        **icebox_kwargs,
+        icebox_max_attempts=int(os.environ.get("ICEBOX_MAX_ATTEMPTS", "6")),
+        icebox_max_backoff_s=float(os.environ.get("ICEBOX_MAX_BACKOFF_S", "30")),
+        icebox_timeout_s=float(os.environ.get("ICEBOX_TIMEOUT_S", "10")),
         flush_size=int(os.environ.get("FLUSH_SIZE", "104857600")),
         flush_interval_ms=int(os.environ.get("FLUSH_INTERVAL_MS", "60000")),
         fetch_min_bytes=int(os.environ.get("FETCH_MIN_BYTES", "1048576")),
