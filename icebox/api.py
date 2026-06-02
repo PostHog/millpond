@@ -119,6 +119,40 @@ async def _handle_register_file(
             },
         )
 
+    # Validation-only check: per-schema topology means each icebox
+    # serves exactly one (namespace, table). Writers SHOULD declare
+    # which table they think they're targeting; we 400 on mismatch.
+    # Catches a misconfigured writer POSTing to the wrong icebox URL —
+    # without this check the file would land in the wrong Iceberg
+    # table and UNIQUE(file_path) wouldn't catch it (paths are still
+    # globally unique).
+    if (
+        req.expected_iceberg_namespace is not None
+        and req.expected_iceberg_namespace != cfg.iceberg_namespace
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "iceberg_namespace_mismatch",
+                "writer_expected": req.expected_iceberg_namespace,
+                "icebox_serves": cfg.iceberg_namespace,
+                "hint": "writer is POSTing to the wrong icebox URL",
+            },
+        )
+    if (
+        req.expected_iceberg_table is not None
+        and req.expected_iceberg_table != cfg.iceberg_table
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "iceberg_table_mismatch",
+                "writer_expected": req.expected_iceberg_table,
+                "icebox_serves": cfg.iceberg_table,
+                "hint": "writer is POSTing to the wrong icebox URL",
+            },
+        )
+
     # Backpressure checks, in priority order:
     #   1. heartbeat — the LIVENESS signal. Without a fresh heartbeat
     #      the committer might be silently dead and our other counters

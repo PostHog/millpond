@@ -36,10 +36,10 @@ def _cfg() -> Config:
     cadence/budget/group_id/topic fields."""
     return Config(
         pg_host="x", pg_port=5432, pg_database="x", pg_username="x", pg_password="x",
-        pg_sslmode="disable",
+        pg_sslmode="disable", pg_schema="icebox",
         asyncpg_pool_min=1, asyncpg_pool_max=2,
         psycopg_pool_min=1, psycopg_pool_max=1,
-        iceberg_catalog_uri="x", iceberg_warehouse="x",
+        iceberg_catalog_uri="x", iceberg_warehouse="x", iceberg_namespace="kafka", iceberg_table="events",
         kafka_bootstrap_servers="x", kafka_topic="events",
         kafka_group_id="grp", kafka_extra_config_json="{}",
         committer_cadence_seconds=60,
@@ -1035,23 +1035,30 @@ def test_committer_loop_recovers_from_getconn_exception(monkeypatch):
     assert call_count["n"] >= 2, "expected getconn to be retried after the raise"
 
 
-def test_committer_advisory_lock_uses_correct_lock_id():
-    """QE review T10: the lock-id constant is pinned in a separate
-    test, but no test verifies the ACTUAL value passed at the call
-    site. Catch a regression where someone hardcodes a different id."""
+def test_committer_advisory_lock_uses_schema_derived_lock_id(monkeypatch):
+    """The lock id at the call site MUST be derived from cfg.pg_schema
+    via committer_advisory_lock_id. A regression that hardcodes a
+    constant — or uses a stale schema name — silently breaks the
+    per-deployment lock isolation we rely on for multi-icebox-on-one-PG."""
     import threading
-    from icebox.postgres_sync import COMMITTER_ADVISORY_LOCK_ID
 
+    from icebox.postgres_sync import committer_advisory_lock_id
+
+    cfg = _cfg()
     deps, pool = _deps(claimed_ids=[])
+
     stop = threading.Event()
-    stop.set()  # exit before reaching cycle work
-    cm.committer_loop(cfg=_cfg(), pg_pool=pool, deps=deps, stop_event=stop)
-    # No call yet because stop is pre-set — instead, call the helper
-    # directly with the production conn and check what got passed.
-    pool.lock_cursor.reset_mock()
-    cm.ps.try_acquire_committer_lock(pool.lock_conn)
-    call = pool.lock_cursor.execute.call_args
-    assert call.args[1] == {"key": COMMITTER_ADVISORY_LOCK_ID}
+    original_try = cm.ps.try_acquire_committer_lock
+
+    captured_key = {"value": None}
+    def lock_capturing(conn, **kwargs):
+        captured_key["value"] = kwargs.get("lock_id")
+        stop.set()
+        return original_try(conn, **kwargs)
+    monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_capturing)
+
+    cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
+    assert captured_key["value"] == committer_advisory_lock_id(cfg.pg_schema)
 
 
 def test_committer_loop_heartbeat_runs_before_recovery(monkeypatch):

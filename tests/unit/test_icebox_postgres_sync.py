@@ -47,7 +47,7 @@ def test_claim_files_sql_orders_by_staged_at():
 def test_claim_files_sql_returns_id():
     """Caller needs the id list for per-cycle bookkeeping."""
     # CTE-form UPDATE uses `RETURNING f.id` (table-qualified) because
-    # the UPDATE references `icebox.files f` with an alias.
+    # the UPDATE references `files f` with an alias.
     assert "returning f.id" in ps.CLAIM_FILES_SQL.lower()
 
 
@@ -58,7 +58,7 @@ def test_claim_files_sql_uses_cte_form():
     fix and what we need for multi-committer correctness."""
     sql = ps.CLAIM_FILES_SQL.lower()
     assert "with candidates as" in sql
-    assert "update icebox.files f" in sql
+    assert "update files f" in sql
     assert "from candidates c" in sql
 
 
@@ -66,7 +66,7 @@ def test_insert_cycle_sql_only_writes_cycle_id():
     """started_at takes the PG default now(); the other state columns
     stay null until the cycle progresses."""
     sql = ps.INSERT_CYCLE_SQL.lower()
-    assert "insert into icebox.commit_cycles (cycle_id)" in sql
+    assert "insert into commit_cycles (cycle_id)" in sql
 
 
 def test_mark_iceberg_committed_sql_updates_only_snapshot_id():
@@ -131,12 +131,42 @@ def test_release_cycle_claim_only_releases_uncommitted_files():
     assert "committed_at is null" in sql
 
 
+def test_no_state_machine_sql_references_table_name():
+    """Permanent per-schema-design invariant: no SQL in the committer's
+    state machine filters by `table_name`. Per-table routing happens at
+    the deployment layer (one icebox per Iceberg table, isolated by PG
+    schema). If a future PR adds `WHERE table_name = ...` to any of
+    these queries, that's a sign someone's trying to fold multiple
+    tables back into one icebox — which the per-schema design
+    deliberately avoids."""
+    state_sqls = (
+        ps.CLAIM_FILES_SQL,
+        ps.INSERT_CYCLE_SQL,
+        ps.MARK_ICEBERG_COMMITTED_SQL,
+        ps.MARK_KAFKA_COMMITTED_SQL,
+        ps.COMPLETE_CYCLE_SQL,
+        ps.MARK_FILES_COMMITTED_SQL,
+        ps.INCOMPLETE_CYCLES_SQL,
+        ps.UPDATE_HEARTBEAT_SQL,
+        ps.RECORD_FAILURE_SQL,
+        ps.RECORD_SUCCESS_SQL,
+        ps.FILES_FOR_CYCLE_SQL,
+        ps.RELEASE_CYCLE_CLAIM_SQL,
+        ps.DELETE_CYCLE_ROW_SQL,
+    )
+    for sql in state_sqls:
+        assert "table_name" not in sql.lower(), (
+            f"state-machine SQL contains 'table_name' — per-schema "
+            f"design expresses per-table routing as deployment topology:\n{sql}"
+        )
+
+
 def test_delete_cycle_row_targets_by_cycle_id():
     """PE re-review #16: zombie cycle rows in the released-no-iceberg
     branch accumulate against the LIMIT=100. DELETE removes them
     cleanly. Verify the SQL is parameterized on cycle_id (not unfiltered)."""
     sql = ps.DELETE_CYCLE_ROW_SQL.lower()
-    assert "delete from icebox.commit_cycles" in sql
+    assert "delete from commit_cycles" in sql
     assert "where cycle_id = %(cycle_id)s" in sql
 
 
@@ -256,10 +286,10 @@ class TestEnsureDatabaseExists:
         from icebox.config import Config
         return Config(
             pg_host="x", pg_port=5432, pg_database="icebox",
-            pg_username="u", pg_password="p", pg_sslmode="disable",
+            pg_username="u", pg_password="p", pg_sslmode="disable", pg_schema="icebox",
             asyncpg_pool_min=1, asyncpg_pool_max=2,
             psycopg_pool_min=1, psycopg_pool_max=2,
-            iceberg_catalog_uri="x", iceberg_warehouse="x",
+            iceberg_catalog_uri="x", iceberg_warehouse="x", iceberg_namespace="kafka", iceberg_table="events",
             kafka_bootstrap_servers="x", kafka_topic="events",
             kafka_group_id="grp", kafka_extra_config_json="{}",
             committer_cadence_seconds=60,
@@ -360,6 +390,88 @@ class TestEnsureDatabaseExists:
         # MUST NOT raise — race is benign.
         ps.ensure_database_exists(cfg)
 
+    def test_propagates_insufficient_privilege_on_create_database(self, monkeypatch):
+        """If the icebox PG user lacks CREATEDB privilege, the
+        bootstrap can't paper over it — the operator needs an
+        actionable error pointing at the GRANT they need. PE-review
+        #5: wrap the raw InsufficientPrivilege with a RuntimeError
+        that names the required GRANT."""
+        import psycopg.errors
+
+        cfg = self._cfg()
+        self._fake_connect_to_postgres(
+            monkeypatch,
+            exists=False,
+            create_raises=psycopg.errors.InsufficientPrivilege(
+                "permission denied to create database"
+            ),
+        )
+        with pytest.raises(RuntimeError, match="CREATEDB"):
+            ps.ensure_database_exists(cfg)
+
+
+class TestEnsureSchemaExists:
+    """Per-schema bootstrap. Mocked at the psycopg.connect boundary;
+    real-PG path covered by tests/integration/test_icebox_e2e.py."""
+
+    def _cfg(self, schema="icebox_events"):
+        from icebox.config import Config
+        return Config(
+            pg_host="x", pg_port=5432, pg_database="icebox",
+            pg_username="u", pg_password="p", pg_sslmode="disable",
+            pg_schema=schema,
+            asyncpg_pool_min=1, asyncpg_pool_max=2,
+            psycopg_pool_min=1, psycopg_pool_max=2,
+            iceberg_catalog_uri="x", iceberg_warehouse="x", iceberg_namespace="kafka", iceberg_table="events",
+            kafka_bootstrap_servers="x", kafka_topic="events",
+            kafka_group_id="grp", kafka_extra_config_json="{}",
+            committer_cadence_seconds=60,
+            committer_max_pending_files=1000,
+            committer_degraded_failure_threshold=2,
+            committer_heartbeat_stale_multiple=3.0,
+            api_host="0.0.0.0", api_port=8000, log_level="INFO",
+        )
+
+    def test_propagates_insufficient_privilege_on_create_schema(self, monkeypatch):
+        """If the icebox PG user lacks CREATE-on-database privilege,
+        the bootstrap can't paper over it — operator needs the clear
+        signal to run `GRANT CREATE ON DATABASE <db> TO <user>`.
+        Wrap the InsufficientPrivilege with a RuntimeError that names
+        the required GRANT (PE-review #5)."""
+        from unittest.mock import MagicMock
+
+        import psycopg
+        import psycopg.errors
+
+        cfg = self._cfg()
+        cursor = MagicMock()
+        cursor.__enter__ = lambda self: cursor
+        cursor.__exit__ = lambda self, *a: None
+        # First execute: the SELECT short-circuit check. Schema doesn't
+        # exist → fetchone returns None → proceed to CREATE.
+        # Second execute: the CREATE SCHEMA, which raises.
+        cursor.fetchone.return_value = None
+
+        def fake_execute(stmt, *a, **kw):
+            if "information_schema" in str(stmt).lower():
+                return None  # SELECT succeeds with no row
+            raise psycopg.errors.InsufficientPrivilege(
+                "permission denied for database"
+            )
+
+        cursor.execute.side_effect = fake_execute
+
+        def fake_connect(conninfo, **kwargs):
+            conn = MagicMock()
+            conn.cursor.return_value = cursor
+            conn.__enter__ = lambda self: conn
+            conn.__exit__ = lambda self, *a: None
+            return conn
+
+        monkeypatch.setattr(psycopg, "connect", fake_connect)
+        with pytest.raises(RuntimeError, match="GRANT CREATE ON DATABASE"):
+            ps.ensure_schema_exists(cfg)
+
 
 def _raise(exc):
     """Helper for side_effect that raises a specific exception."""
@@ -380,22 +492,71 @@ def test_delete_cycle_row_passes_cycle_id():
 # ---------------------------------------------------------------------------
 
 
-def test_committer_advisory_lock_id_is_stable_constant():
-    """The lock id is part of the deployment contract — any change
-    means an old pod holding the lock would NOT block a new pod, which
-    breaks the single-committer guarantee."""
-    assert isinstance(ps.COMMITTER_ADVISORY_LOCK_ID, int)
-    # 64-bit value; rolling it forces a deliberate review
-    assert ps.COMMITTER_ADVISORY_LOCK_ID == 0x4F6E1C3E_5B7A8D90
+def test_committer_advisory_lock_id_is_derived_from_schema():
+    """The lock id is part of the deployment contract — same schema
+    always derives the same lock id, different schemas derive different
+    lock ids. This is what lets events and person iceboxes share a PG
+    instance without lock conflicts."""
+    a = ps.committer_advisory_lock_id("icebox")
+    b = ps.committer_advisory_lock_id("icebox")
+    assert isinstance(a, int)
+    # Stable: same input → same output
+    assert a == b
+    # 64-bit signed range
+    assert -(2**63) <= a < 2**63
+    # Different schemas → different ids
+    assert ps.committer_advisory_lock_id("icebox_events") != ps.committer_advisory_lock_id("icebox_person")
+    assert ps.committer_advisory_lock_id("icebox") != ps.committer_advisory_lock_id("icebox_events")
+
+
+def test_committer_advisory_lock_id_known_values_for_deployed_schemas():
+    """Pin EXACT lock ids for every schema we plan to deploy. Any
+    change to the derivation (algorithm, prefix, version tag, byte
+    order, truncation length) breaks this test loudly.
+
+    Bumping these values is a deliberate migration — an old pod
+    holding the stale-key lock would NOT block a new pod and the
+    singleton-committer invariant collapses for the duration. Don't
+    casually."""
+    expected = {
+        # Default and the 6 PostHog deployment schemas
+        "icebox": 828423287862594287,
+        "icebox_events": -5369055521494626710,
+        "icebox_person": -5406596138296386448,
+        "icebox_person_distinct_id": 307705151288516432,
+        "icebox_groups": 6963762061167329373,
+        "icebox_heatmap_events": 7276092344871654942,
+        "icebox_ai_events": 353718527436049174,
+    }
+    actual = {s: ps.committer_advisory_lock_id(s) for s in expected}
+    assert actual == expected, (
+        f"committer_advisory_lock_id derivation drifted; got:\n{actual}\n"
+        f"expected:\n{expected}"
+    )
+
+
+def test_committer_advisory_lock_id_never_zero_for_deployed_schemas():
+    """`pg_try_advisory_lock(0)` works in PG but `pg_locks` diagnostic
+    queries some operators rely on filter on `objid != 0`. Verify
+    none of our deployed schemas hash to 0."""
+    for schema in (
+        "icebox",
+        "icebox_events", "icebox_person", "icebox_person_distinct_id",
+        "icebox_groups", "icebox_heatmap_events", "icebox_ai_events",
+    ):
+        assert ps.committer_advisory_lock_id(schema) != 0, (
+            f"schema {schema!r} hashes to lock id 0; pick a different name"
+        )
 
 
 def test_try_acquire_advisory_lock_returns_true_when_pg_returns_true():
     conn, cur = _mock_conn_with_cursor()
     cur.fetchone.return_value = (True,)
-    assert ps.try_acquire_committer_lock(conn) is True
+    lock_id = ps.committer_advisory_lock_id("icebox")
+    assert ps.try_acquire_committer_lock(conn, lock_id=lock_id) is True
     cur.execute.assert_called_once_with(
         ps.TRY_ADVISORY_LOCK_SQL,
-        {"key": ps.COMMITTER_ADVISORY_LOCK_ID},
+        {"key": lock_id},
     )
 
 
@@ -403,20 +564,34 @@ def test_try_acquire_advisory_lock_returns_false_when_pg_returns_false():
     """Another committer is holding the lock."""
     conn, cur = _mock_conn_with_cursor()
     cur.fetchone.return_value = (False,)
-    assert ps.try_acquire_committer_lock(conn) is False
+    assert ps.try_acquire_committer_lock(conn, lock_id=42) is False
 
 
-def test_try_acquire_advisory_lock_returns_false_on_empty_result():
-    """Defensive: PG should always return a row from pg_try_advisory_lock
-    but if it didn't we'd rather treat it as 'not acquired' than crash."""
+def test_try_acquire_advisory_lock_raises_on_null_row():
+    """PE-review #6: an empty result or NULL value from
+    pg_try_advisory_lock is a TRANSPORT ERROR, not a 'lock held'
+    signal. The previous behavior coerced it to False, which would
+    make six pods spin on a phantom 'lock held' while PG was actually
+    degraded. RuntimeError so the caller's exception-handler arm
+    catches it as a transient failure rather than mistaking it for a
+    permanent state."""
     conn, cur = _mock_conn_with_cursor()
     cur.fetchone.return_value = None
-    assert ps.try_acquire_committer_lock(conn) is False
+    with pytest.raises(RuntimeError, match="NULL"):
+        ps.try_acquire_committer_lock(conn, lock_id=42)
 
 
-def test_try_acquire_advisory_lock_accepts_explicit_key():
-    """The lock id is overridable for tests; production passes the
-    default constant."""
+def test_try_acquire_advisory_lock_raises_on_null_value_in_row():
+    """Same defense for the row-exists-but-value-is-NULL case."""
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchone.return_value = (None,)
+    with pytest.raises(RuntimeError, match="NULL"):
+        ps.try_acquire_committer_lock(conn, lock_id=42)
+
+
+def test_try_acquire_advisory_lock_passes_through_explicit_key():
+    """Caller-controlled lock id; production derives via
+    committer_advisory_lock_id(cfg.pg_schema), tests pass arbitrary."""
     conn, cur = _mock_conn_with_cursor()
     cur.fetchone.return_value = (True,)
     ps.try_acquire_committer_lock(conn, lock_id=42)
@@ -427,10 +602,10 @@ def test_try_acquire_advisory_lock_accepts_explicit_key():
 
 def test_release_committer_lock_calls_pg_advisory_unlock():
     conn, cur = _mock_conn_with_cursor()
-    ps.release_committer_lock(conn)
+    ps.release_committer_lock(conn, lock_id=42)
     cur.execute.assert_called_once_with(
         ps.UNLOCK_ADVISORY_LOCK_SQL,
-        {"key": ps.COMMITTER_ADVISORY_LOCK_ID},
+        {"key": 42},
     )
 
 

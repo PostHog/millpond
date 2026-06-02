@@ -217,3 +217,27 @@ def test_status_response_oldest_pending_age_floats():
     value — alerts will key on this rather than absolute pending count."""
     resp = StatusResponse(pending_files=10, oldest_pending_age_seconds=42.5)
     assert resp.oldest_pending_age_seconds == 42.5
+
+
+# ---------------------------------------------------------------------------
+# Per-schema-design wire-format invariants
+# ---------------------------------------------------------------------------
+
+
+def test_register_file_request_has_no_iceberg_namespace_or_table_field():
+    """Permanent invariant of the per-schema icebox design: each icebox
+    serves ONE Iceberg table and the writer knows which icebox URL to
+    POST to. The wire format does NOT carry namespace/table fields
+    because each icebox infers them from its own config. A future PR
+    that adds these fields is trying to fold per-table routing into a
+    single icebox process — which the per-schema design avoids."""
+    fields = set(RegisterFileRequest.model_fields.keys())
+    assert "iceberg_namespace" not in fields
+    assert "iceberg_table" not in fields
+
+
+def test_protocol_version_pinned_at_1():
+    """Until the wire format gains backward-incompatible changes,
+    PROTOCOL_VERSION stays at 1. Bumping it is a deploy-coordination
+    event; pin the constant so the bump is a deliberate code change."""
+    assert PROTOCOL_VERSION == 1

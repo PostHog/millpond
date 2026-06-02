@@ -39,6 +39,12 @@ async def build_asyncpg_pool(cfg: Config) -> asyncpg.Pool:
         ssl=cfg.pg_sslmode if cfg.pg_sslmode != "disable" else None,
         min_size=cfg.asyncpg_pool_min,
         max_size=cfg.asyncpg_pool_max,
+        # Pin every connection to the icebox-owned schema so the
+        # unqualified SQL below (e.g., `INSERT INTO files`) resolves
+        # to <schema>.files. Schema name validated as an identifier
+        # at config load (icebox/config.py:_SAFE_PG_IDENTIFIER), so
+        # the f-string here is injection-safe.
+        server_settings={"search_path": cfg.pg_schema},
     )
     return pool
 
@@ -49,7 +55,7 @@ async def build_asyncpg_pool(cfg: Config) -> asyncpg.Pool:
 
 
 INSERT_FILE_SQL = """
-INSERT INTO icebox.files (
+INSERT INTO files (
     file_path, writer_ordinal, kafka_offsets, partition_values,
     record_count, file_size, schema_version, schema_fingerprint,
     parquet_stats
@@ -61,7 +67,7 @@ RETURNING id, staged_at
 """
 
 LOOKUP_EXISTING_SQL = """
-SELECT id, staged_at FROM icebox.files WHERE file_path = $1
+SELECT id, staged_at FROM files WHERE file_path = $1
 """
 
 
@@ -69,7 +75,7 @@ async def insert_file(
     pool: asyncpg.Pool,
     req: RegisterFileRequest,
 ) -> tuple[RegisteredFile, bool]:
-    """Insert a row in icebox.files.
+    """Insert a row in files.
 
     Returns:
         (RegisteredFile, was_new): was_new=True ⇒ 201; False ⇒ 409
@@ -115,20 +121,20 @@ async def insert_file(
 
 # Hot-path status query — runs once per POST (heartbeat-stale check is
 # the FIRST backpressure check, so this is the per-POST gate). Must
-# stay cheap. Specifically: NO subquery against icebox.commit_cycles —
+# stay cheap. Specifically: NO subquery against commit_cycles —
 # that table grows ~1 row per cadence and an unindexed MAX would become
 # a sequential scan over time.
 STATUS_QUERY_SQL = """
 SELECT
-    (SELECT count(*) FROM icebox.files
+    (SELECT count(*) FROM files
         WHERE committed_at IS NULL AND cycle_id IS NULL)
         AS pending_files,
-    (SELECT EXTRACT(EPOCH FROM (now() - min(staged_at))) FROM icebox.files
+    (SELECT EXTRACT(EPOCH FROM (now() - min(staged_at))) FROM files
         WHERE committed_at IS NULL AND cycle_id IS NULL)
         AS oldest_pending_age_seconds,
     s.last_success_at, s.last_cycle_at, s.last_committer_heartbeat,
     s.consecutive_failures
-FROM icebox.status s
+FROM status s
 WHERE s.id = 1
 """
 
@@ -138,7 +144,7 @@ WHERE s.id = 1
 # read_status_full().
 LAST_COMMITTED_SNAPSHOT_SQL = """
 SELECT max(iceberg_snapshot_id) AS last_committed_iceberg_snapshot
-FROM icebox.commit_cycles
+FROM commit_cycles
 WHERE iceberg_snapshot_id IS NOT NULL
 """
 
@@ -156,7 +162,7 @@ async def read_status(pool: asyncpg.Pool) -> StatusResponse:
         row = await conn.fetchrow(STATUS_QUERY_SQL)
     if row is None:
         raise RuntimeError(
-            "icebox.status row missing — DDL migration must run before "
+            "status row missing — DDL migration must run before "
             "the API can serve traffic (apply_migrations seeds row id=1)"
         )
     return StatusResponse(

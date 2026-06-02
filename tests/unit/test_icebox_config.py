@@ -10,6 +10,8 @@ REQUIRED_ENV = {
     "ICEBOX_PG_HOST": "lakekeeper-pg.megaberg",
     "ICEBOX_PG_PASSWORD": "secret",
     "ICEBOX_ICEBERG_CATALOG_URI": "http://megaberg:8181/catalog",
+    "ICEBOX_ICEBERG_NAMESPACE": "kafka",
+    "ICEBOX_ICEBERG_TABLE": "events",
     "ICEBOX_KAFKA_BOOTSTRAP_SERVERS": "warpstream:9092",
     "ICEBOX_KAFKA_TOPIC": "events",
     "ICEBOX_KAFKA_GROUP_ID": "millpond-events-icebox",
@@ -203,6 +205,158 @@ def test_psycopg_pool_max_exactly_2_accepted(monkeypatch):
     _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "2"})
     cfg = icebox_config.load()
     assert cfg.psycopg_pool_max == 2
+
+
+def test_pg_schema_defaults_to_icebox(monkeypatch):
+    _set_env(monkeypatch)
+    cfg = icebox_config.load()
+    assert cfg.pg_schema == "icebox"
+
+
+def test_pg_schema_accepts_underscore_suffix(monkeypatch):
+    """Per-deployment naming convention: events icebox runs against
+    `icebox_events`, person against `icebox_person`, etc."""
+    _set_env(monkeypatch, {"ICEBOX_PG_SCHEMA": "icebox_events"})
+    cfg = icebox_config.load()
+    assert cfg.pg_schema == "icebox_events"
+
+
+@pytest.mark.parametrize("bad", [
+    "1startswithnumber",
+    "has-dashes",
+    "has.dots",
+    "has spaces",
+    "select; drop table",  # classic injection attempt
+    "x" * 64,  # over 63-char identifier limit
+    "",  # empty (would fall to default via _optional, but explicit empty is rejected)
+])
+def test_pg_schema_rejects_invalid_identifiers(monkeypatch, bad):
+    """Schema name gets interpolated into the conninfo `options=-c
+    search_path=...` parameter; PG protocol doesn't allow parameter
+    binding for session options. Strict identifier validation at boot
+    makes injection structurally impossible — and PG itself only
+    accepts these characters in unquoted identifiers."""
+    _set_env(monkeypatch, {"ICEBOX_PG_SCHEMA": bad})
+    with pytest.raises(RuntimeError, match="ICEBOX_PG_SCHEMA"):
+        icebox_config.load()
+
+
+@pytest.mark.parametrize("uppercase_schema", [
+    "Icebox",  # mixed case
+    "ICEBOX",  # all caps
+    "icebox_Events",  # uppercase in suffix
+    "icebox_events_V2",  # camelCase-ish
+])
+def test_pg_schema_rejects_uppercase_identifiers(monkeypatch, uppercase_schema):
+    """QE-review finding: psycopg's `options=-csearch_path=<schema>`
+    sends the schema unquoted, so PG folds it to lowercase. asyncpg's
+    `server_settings={"search_path": <schema>}` sends it as a literal
+    that PRESERVES case. Allowing uppercase would produce a split-brain
+    between the two pools (one resolves to `myicebox`, the other to
+    `MyIcebox`). Lock the whole pipeline to lowercase at config load."""
+    _set_env(monkeypatch, {"ICEBOX_PG_SCHEMA": uppercase_schema})
+    with pytest.raises(RuntimeError, match="ICEBOX_PG_SCHEMA"):
+        icebox_config.load()
+
+
+@pytest.mark.parametrize("reserved_schema", [
+    "pg_catalog",
+    "pg_toast",
+    "pg_temp",
+    "pg_temp_1",
+    "pg_anything",  # any pg_ prefix
+    "information_schema",
+    "public",
+])
+def test_pg_schema_rejects_reserved_pg_names(monkeypatch, reserved_schema):
+    """PG reserves `pg_*` prefix (CREATE SCHEMA refuses these with
+    SQLSTATE 42939) and a handful of well-known schemas. `public`
+    would technically succeed but commingle icebox with whatever else
+    is in `public` — worse than failing fast."""
+    _set_env(monkeypatch, {"ICEBOX_PG_SCHEMA": reserved_schema})
+    with pytest.raises(RuntimeError, match="ICEBOX_PG_SCHEMA"):
+        icebox_config.load()
+
+
+@pytest.mark.parametrize("keyword_schema", [
+    "select",
+    "from",
+    "table",
+    "schema",
+    "database",
+    "create",
+    "commit",
+    "rollback",
+    "user",
+    "group",
+])
+def test_pg_schema_rejects_sql_reserved_words(monkeypatch, keyword_schema):
+    """SQL reserved words would need quoting in every reference; the
+    conninfo `options=-csearch_path=` interpolation can't quote them
+    reliably. Reject at config load."""
+    _set_env(monkeypatch, {"ICEBOX_PG_SCHEMA": keyword_schema})
+    with pytest.raises(RuntimeError, match="ICEBOX_PG_SCHEMA"):
+        icebox_config.load()
+
+
+@pytest.mark.parametrize("bad_db", [
+    "1startswithnumber",
+    "has-dashes",
+    "has.dots",
+    "has spaces",
+    "pg_anything",  # reserved prefix
+    "MyDB",  # uppercase (split-brain prevention)
+])
+def test_pg_database_rejects_invalid_identifiers(monkeypatch, bad_db):
+    """PE review #1: cfg.pg_database flows into psycopg/asyncpg conninfo
+    unquoted. An operator typo otherwise boot-loops the pod with a
+    cryptic libpq error; validate at config-load."""
+    _set_env(monkeypatch, {"ICEBOX_PG_DATABASE": bad_db})
+    with pytest.raises(RuntimeError, match="ICEBOX_PG_DATABASE"):
+        icebox_config.load()
+
+
+def test_iceberg_namespace_required(monkeypatch):
+    """Per-schema topology: each icebox is explicit about which
+    Iceberg (namespace, table) it serves. Previously parsed from
+    kafka_topic; now an explicit env var."""
+    _set_env(monkeypatch)
+    monkeypatch.delenv("ICEBOX_ICEBERG_NAMESPACE")
+    with pytest.raises(RuntimeError, match="ICEBOX_ICEBERG_NAMESPACE"):
+        icebox_config.load()
+
+
+def test_iceberg_table_required(monkeypatch):
+    _set_env(monkeypatch)
+    monkeypatch.delenv("ICEBOX_ICEBERG_TABLE")
+    with pytest.raises(RuntimeError, match="ICEBOX_ICEBERG_TABLE"):
+        icebox_config.load()
+
+
+def test_iceberg_namespace_and_table_loaded(monkeypatch):
+    _set_env(monkeypatch, {
+        "ICEBOX_ICEBERG_NAMESPACE": "kafka",
+        "ICEBOX_ICEBERG_TABLE": "person_distinct_id",
+    })
+    cfg = icebox_config.load()
+    assert cfg.iceberg_namespace == "kafka"
+    assert cfg.iceberg_table == "person_distinct_id"
+
+
+def test_pg_schema_accepts_real_world_names(monkeypatch):
+    """Sanity: the names we actually plan to deploy ALL pass."""
+    for schema in (
+        "icebox",
+        "icebox_events",
+        "icebox_person",
+        "icebox_person_distinct_id",
+        "icebox_groups",
+        "icebox_heatmap_events",
+        "icebox_ai_events",
+    ):
+        _set_env(monkeypatch, {"ICEBOX_PG_SCHEMA": schema})
+        cfg = icebox_config.load()
+        assert cfg.pg_schema == schema
 
 
 def test_config_is_frozen():

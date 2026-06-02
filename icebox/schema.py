@@ -21,11 +21,24 @@ from pydantic import BaseModel, ConfigDict
 # ---------------------------------------------------------------------------
 # DDL — applied via psycopg in the migration runner
 # ---------------------------------------------------------------------------
-
-CREATE_SCHEMA = "CREATE SCHEMA IF NOT EXISTS icebox"
+#
+# All references below are UNQUALIFIED (no `icebox.` prefix). Each
+# icebox deployment owns its own PG schema (configured via
+# ICEBOX_PG_SCHEMA, default "icebox") and runs all its connections
+# with `options=-csearch_path=<schema>` so unqualified references
+# resolve to that schema. This is what makes "one icebox per
+# (topic, table) sharing a backing PG instance" cleanly isolated —
+# events runs against icebox_events.commit_cycles, person runs
+# against icebox_person.commit_cycles, and neither can accidentally
+# read the other's rows because the unqualified `commit_cycles` only
+# matches the schema in their own connection's search_path.
+#
+# The CREATE SCHEMA itself runs in ensure_schema_exists (with the
+# schema name interpolated as a validated identifier) BEFORE these
+# DDLs are applied. Hence no CREATE SCHEMA entry in ALL_DDL.
 
 CREATE_COMMIT_CYCLES = """
-CREATE TABLE IF NOT EXISTS icebox.commit_cycles (
+CREATE TABLE IF NOT EXISTS commit_cycles (
     cycle_id             uuid PRIMARY KEY,
     started_at           timestamptz NOT NULL DEFAULT now(),
     iceberg_snapshot_id  bigint,
@@ -36,12 +49,12 @@ CREATE TABLE IF NOT EXISTS icebox.commit_cycles (
 
 CREATE_COMMIT_CYCLES_INCOMPLETE_IDX = """
 CREATE INDEX IF NOT EXISTS commit_cycles_incomplete_idx
-    ON icebox.commit_cycles (started_at)
+    ON commit_cycles (started_at)
     WHERE completed_at IS NULL
 """
 
 CREATE_FILES = """
-CREATE TABLE IF NOT EXISTS icebox.files (
+CREATE TABLE IF NOT EXISTS files (
     id                   bigserial PRIMARY KEY,
     file_path            text NOT NULL UNIQUE,
     writer_ordinal       int NOT NULL,
@@ -52,7 +65,7 @@ CREATE TABLE IF NOT EXISTS icebox.files (
     schema_version       text NOT NULL,
     schema_fingerprint   text NOT NULL,
     parquet_stats        jsonb NOT NULL,
-    cycle_id             uuid REFERENCES icebox.commit_cycles(cycle_id),
+    cycle_id             uuid REFERENCES commit_cycles(cycle_id),
     staged_at            timestamptz NOT NULL DEFAULT now(),
     committed_at         timestamptz,
     iceberg_snapshot_id  bigint
@@ -61,18 +74,18 @@ CREATE TABLE IF NOT EXISTS icebox.files (
 
 CREATE_FILES_UNCLAIMED_IDX = """
 CREATE INDEX IF NOT EXISTS files_unclaimed_idx
-    ON icebox.files (staged_at)
+    ON files (staged_at)
     WHERE committed_at IS NULL AND cycle_id IS NULL
 """
 
 CREATE_FILES_IN_FLIGHT_IDX = """
 CREATE INDEX IF NOT EXISTS files_in_flight_idx
-    ON icebox.files (cycle_id)
+    ON files (cycle_id)
     WHERE committed_at IS NULL AND cycle_id IS NOT NULL
 """
 
 CREATE_STATUS = """
-CREATE TABLE IF NOT EXISTS icebox.status (
+CREATE TABLE IF NOT EXISTS status (
     id                            int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     last_success_at               timestamptz,
     consecutive_failures          int NOT NULL DEFAULT 0,
@@ -81,12 +94,13 @@ CREATE TABLE IF NOT EXISTS icebox.status (
 )
 """
 
-SEED_STATUS_ROW = "INSERT INTO icebox.status (id) VALUES (1) ON CONFLICT DO NOTHING"
+SEED_STATUS_ROW = "INSERT INTO status (id) VALUES (1) ON CONFLICT DO NOTHING"
 
-# Order matters: schema first, parent tables before children, indexes after
-# their tables. The runner executes these in this exact order.
+# Order matters: parent tables before children, indexes after their
+# tables. The runner executes these in this exact order. CREATE SCHEMA
+# is NOT in this tuple — it runs in postgres_sync.ensure_schema_exists
+# before the migration runner connects.
 ALL_DDL: tuple[str, ...] = (
-    CREATE_SCHEMA,
     CREATE_COMMIT_CYCLES,
     CREATE_COMMIT_CYCLES_INCOMPLETE_IDX,
     CREATE_FILES,

@@ -45,12 +45,12 @@ def main() -> None:
     )
     log.info("icebox starting on %s:%d", cfg.api_host, cfg.api_port)
 
-    # ---- DB bootstrap + psycopg pool + migrations --------------------
-    # Tactical hack: create the database if it doesn't exist so a
-    # fresh deployment doesn't boot-loop on "database does not exist".
-    # Proper provisioning belongs in Terraform — see
-    # ensure_database_exists docstring.
+    # ---- DB + schema bootstrap + psycopg pool + migrations -----------
+    # Tactical hacks: create the database and schema if they don't
+    # exist so a fresh deployment doesn't boot-loop. Proper provisioning
+    # belongs in Terraform — these are stopgaps.
     ps.ensure_database_exists(cfg)
+    ps.ensure_schema_exists(cfg)
     sync_pool = ps.build_psycopg_pool(cfg)
     sync_pool.open(wait=True)
     with sync_pool.connection() as conn:
@@ -77,14 +77,13 @@ def main() -> None:
                 "warehouse": cfg.iceberg_warehouse,
             },
         )
-        # v1 assumes a single (topic, table). Decompose with parse-style
-        # convention — we treat the topic name as <namespace>.<table>
-        # if it contains a dot, else (default_ns, topic).
-        if "." in cfg.kafka_topic:
-            ns, tbl = cfg.kafka_topic.split(".", 1)
-        else:
-            ns, tbl = "kafka", cfg.kafka_topic
-        return catalog.load_table((ns, tbl))
+        # Each icebox deployment serves exactly one (namespace, table),
+        # configured explicitly via ICEBOX_ICEBERG_NAMESPACE and
+        # ICEBOX_ICEBERG_TABLE. Previously this was parsed from
+        # cfg.kafka_topic with a "<ns>.<table>" or fallback "kafka.<topic>"
+        # convention — fragile and hidden. Explicit env vars make the
+        # mapping visible in chart values.
+        return catalog.load_table((cfg.iceberg_namespace, cfg.iceberg_table))
 
     deps = cm.CommitterDeps(
         load_table=_load_table,

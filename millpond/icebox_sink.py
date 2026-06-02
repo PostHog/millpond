@@ -580,6 +580,12 @@ class IceboxSink:
 
         req = RegisterFileRequest(
             protocol_version=PROTOCOL_VERSION,
+            # Validation-only: tell the icebox what (ns, table) this
+            # writer thinks it's targeting. Icebox 400s on mismatch,
+            # catching writers POSTing to the wrong icebox URL before
+            # the file silently lands in the wrong Iceberg table.
+            expected_iceberg_namespace=self.namespace,
+            expected_iceberg_table=self.table,
             file_path=s3_uri,
             writer_ordinal=self.writer_ordinal,
             kafka_offsets=dict(kafka_offsets),

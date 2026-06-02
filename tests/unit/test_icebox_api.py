@@ -36,10 +36,10 @@ def _cfg(
 ) -> Config:
     return Config(
         pg_host="x", pg_port=5432, pg_database="x", pg_username="x", pg_password="x",
-        pg_sslmode="disable",
+        pg_sslmode="disable", pg_schema="icebox",
         asyncpg_pool_min=1, asyncpg_pool_max=2,
         psycopg_pool_min=1, psycopg_pool_max=1,
-        iceberg_catalog_uri="x", iceberg_warehouse="x",
+        iceberg_catalog_uri="x", iceberg_warehouse="x", iceberg_namespace="kafka", iceberg_table="events",
         kafka_bootstrap_servers="x", kafka_topic="events",
         kafka_group_id="grp", kafka_extra_config_json="{}",
         committer_cadence_seconds=cadence,
@@ -237,6 +237,63 @@ def test_post_v1_files_returns_422_on_invalid_body(monkeypatch):
     client, _, _ = _client(monkeypatch=monkeypatch)
     resp = client.post("/v1/files", json=body)
     assert resp.status_code == 422
+
+
+def test_post_v1_files_returns_400_on_namespace_mismatch(monkeypatch):
+    """PE-suggested writer-side validation: if writer's
+    expected_iceberg_namespace doesn't match cfg.iceberg_namespace,
+    return 400. Catches a misconfigured writer POSTing to the wrong
+    icebox URL — without this, the file lands in the wrong Iceberg
+    table and UNIQUE(file_path) doesn't catch it."""
+    body = _valid_register_body()
+    body["expected_iceberg_namespace"] = "wrong_namespace"
+    body["expected_iceberg_table"] = "events"  # this side matches
+    client, _, insert_mock = _client(monkeypatch=monkeypatch)
+    resp = client.post("/v1/files", json=body)
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["error"] == "iceberg_namespace_mismatch"
+    assert detail["writer_expected"] == "wrong_namespace"
+    assert detail["icebox_serves"] == "kafka"  # from _cfg()
+    insert_mock.assert_not_called()
+
+
+def test_post_v1_files_returns_400_on_table_mismatch(monkeypatch):
+    """Same for the table mismatch."""
+    body = _valid_register_body()
+    body["expected_iceberg_namespace"] = "kafka"  # matches
+    body["expected_iceberg_table"] = "wrong_table"
+    client, _, insert_mock = _client(monkeypatch=monkeypatch)
+    resp = client.post("/v1/files", json=body)
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["error"] == "iceberg_table_mismatch"
+    insert_mock.assert_not_called()
+
+
+def test_post_v1_files_accepts_matching_namespace_and_table(monkeypatch):
+    """Happy path: writer declares the right namespace + table; icebox
+    accepts and inserts."""
+    body = _valid_register_body()
+    body["expected_iceberg_namespace"] = "kafka"  # matches cfg
+    body["expected_iceberg_table"] = "events"
+    client, _, insert_mock = _client(monkeypatch=monkeypatch)
+    resp = client.post("/v1/files", json=body)
+    assert resp.status_code == 201
+    insert_mock.assert_called_once()
+
+
+def test_post_v1_files_accepts_omitted_expected_fields(monkeypatch):
+    """Backward-compat: writers that DON'T include the validation
+    fields still get accepted (the icebox isn't strict-required since
+    we're greenfield rolling this out)."""
+    body = _valid_register_body()
+    # Don't include expected_iceberg_namespace or expected_iceberg_table
+    assert "expected_iceberg_namespace" not in body
+    client, _, insert_mock = _client(monkeypatch=monkeypatch)
+    resp = client.post("/v1/files", json=body)
+    assert resp.status_code == 201
+    insert_mock.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ SQL invariants:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Sequence
 from uuid import UUID
@@ -117,15 +118,36 @@ def ensure_database_exists(cfg: Config) -> None:
                     cfg.pg_database,
                 )
                 return
+            except psycopg.errors.InsufficientPrivilege as e:
+                # The icebox PG user lacks CREATEDB. Bootstrap can't
+                # paper over privilege — surface a clear, actionable
+                # error so operators don't have to dig through libpq
+                # stack traces. PE-review #5.
+                raise RuntimeError(
+                    f"ensure_database_exists: user {cfg.pg_username!r} "
+                    f"lacks CREATEDB privilege (cannot create database "
+                    f"{cfg.pg_database!r}). Operator: run "
+                    f"`ALTER ROLE {cfg.pg_username} CREATEDB;` as a "
+                    f"superuser, or provision the database manually via "
+                    f"Terraform. Original error: {e}"
+                ) from e
     log.info("ensure_database_exists: created database %r", cfg.pg_database)
 
 
-def build_psycopg_pool(cfg: Config) -> ConnectionPool:
-    """Construct the sync psycopg connection pool the committer uses.
+def ensure_schema_exists(cfg: Config) -> None:
+    """Create the icebox-owned schema if it doesn't exist.
 
-    Sized per cfg.psycopg_pool_{min,max}; defaults are 1 and 2 (the
-    committer is single-threaded — one connection at a time — and the
-    second slot is a buffer for sync admin operations).
+    Each icebox deployment owns its own PG schema (events runs against
+    `icebox_events`, person against `icebox_person`, etc.). The schema
+    name is interpolated below as a validated identifier — the config
+    loader enforces `[a-zA-Z_][a-zA-Z0-9_]{0,62}` at boot, so this is
+    safe even though we can't parameterize the schema name via
+    psycopg's bind syntax (PG protocol doesn't allow it for DDL).
+
+    Runs AFTER ensure_database_exists; the schema lives inside that
+    database. Connects with the icebox user's credentials, which must
+    have CREATE-on-database privilege. Insufficient-privilege errors
+    re-raise — that's an ops signal, not something we can paper over.
     """
     conninfo = psycopg.conninfo.make_conninfo(
         host=cfg.pg_host,
@@ -134,6 +156,76 @@ def build_psycopg_pool(cfg: Config) -> ConnectionPool:
         user=cfg.pg_username,
         password=cfg.pg_password,
         sslmode=cfg.pg_sslmode,
+        connect_timeout=10,
+    )
+    # Autocommit because we follow the same pattern as
+    # ensure_database_exists (one-off short-lived bootstrap conn).
+    # CREATE SCHEMA itself runs fine in or out of a transaction.
+    with psycopg.connect(conninfo, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # PE-review #8: short-circuit if the schema already exists.
+            # Every pod restart otherwise pays a CREATE SCHEMA round-trip
+            # (cheap server-side, but unnecessary catalog touch).
+            cur.execute(
+                "SELECT 1 FROM information_schema.schemata "
+                "WHERE schema_name = %s",
+                (cfg.pg_schema,),
+            )
+            if cur.fetchone() is not None:
+                log.debug(
+                    "ensure_schema_exists: schema %r already exists in "
+                    "database %r (no-op)",
+                    cfg.pg_schema, cfg.pg_database,
+                )
+                return
+
+            stmt = sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                sql.Identifier(cfg.pg_schema)
+            )
+            try:
+                cur.execute(stmt)
+            except psycopg.errors.InsufficientPrivilege as e:
+                # The icebox user lacks CREATE-on-database. Surface a
+                # clear, actionable error. PE-review #5.
+                raise RuntimeError(
+                    f"ensure_schema_exists: user {cfg.pg_username!r} "
+                    f"lacks CREATE privilege on database "
+                    f"{cfg.pg_database!r} (cannot create schema "
+                    f"{cfg.pg_schema!r}). Operator: run "
+                    f"`GRANT CREATE ON DATABASE {cfg.pg_database} TO "
+                    f"{cfg.pg_username};` as a superuser. "
+                    f"Original error: {e}"
+                ) from e
+    log.info(
+        "ensure_schema_exists: created schema %r in database %r",
+        cfg.pg_schema,
+        cfg.pg_database,
+    )
+
+
+def build_psycopg_pool(cfg: Config) -> ConnectionPool:
+    """Construct the sync psycopg connection pool the committer uses.
+
+    Sized per cfg.psycopg_pool_{min,max}; defaults are 1 and 2 (the
+    committer is single-threaded — one connection at a time — and the
+    second slot is a buffer for sync admin operations).
+
+    Every connection in this pool is automatically pinned to the
+    configured schema via `options=-csearch_path=<schema>` in the
+    conninfo. That lets all SQL stay UNQUALIFIED — `commit_cycles`
+    resolves to `<schema>.commit_cycles` per the session's search_path.
+    Schema names are validated as identifiers at config load
+    (see icebox/config.py:_SAFE_PG_IDENTIFIER) so the f-string here
+    is injection-safe.
+    """
+    conninfo = psycopg.conninfo.make_conninfo(
+        host=cfg.pg_host,
+        port=cfg.pg_port,
+        dbname=cfg.pg_database,
+        user=cfg.pg_username,
+        password=cfg.pg_password,
+        sslmode=cfg.pg_sslmode,
+        options=f"-csearch_path={cfg.pg_schema}",
     )
     pool = ConnectionPool(
         conninfo,
@@ -173,13 +265,13 @@ def apply_migrations(conn: psycopg.Connection) -> None:
 
 CLAIM_FILES_SQL = """
 WITH candidates AS (
-    SELECT id FROM icebox.files
+    SELECT id FROM files
     WHERE cycle_id IS NULL AND committed_at IS NULL
     ORDER BY staged_at
     LIMIT %(max_files)s
     FOR UPDATE SKIP LOCKED
 )
-UPDATE icebox.files f
+UPDATE files f
 SET cycle_id = %(cycle_id)s
 FROM candidates c
 WHERE f.id = c.id
@@ -208,7 +300,7 @@ def claim_files(
 
 
 INSERT_CYCLE_SQL = """
-INSERT INTO icebox.commit_cycles (cycle_id) VALUES (%(cycle_id)s)
+INSERT INTO commit_cycles (cycle_id) VALUES (%(cycle_id)s)
 """
 
 
@@ -223,7 +315,7 @@ def insert_cycle(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
 
 
 MARK_ICEBERG_COMMITTED_SQL = """
-UPDATE icebox.commit_cycles
+UPDATE commit_cycles
 SET iceberg_snapshot_id = %(snapshot_id)s
 WHERE cycle_id = %(cycle_id)s
 """
@@ -247,7 +339,7 @@ def mark_iceberg_committed(
 
 
 MARK_KAFKA_COMMITTED_SQL = """
-UPDATE icebox.commit_cycles
+UPDATE commit_cycles
 SET kafka_committed_at = now()
 WHERE cycle_id = %(cycle_id)s
 """
@@ -261,13 +353,13 @@ def mark_kafka_committed(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
 
 
 COMPLETE_CYCLE_SQL = """
-UPDATE icebox.commit_cycles
+UPDATE commit_cycles
 SET completed_at = now()
 WHERE cycle_id = %(cycle_id)s
 """
 
 MARK_FILES_COMMITTED_SQL = """
-UPDATE icebox.files
+UPDATE files
 SET committed_at = now(), iceberg_snapshot_id = %(snapshot_id)s
 WHERE cycle_id = %(cycle_id)s
 """
@@ -291,7 +383,7 @@ def complete_cycle(
 
 INCOMPLETE_CYCLES_SQL = """
 SELECT cycle_id, started_at, iceberg_snapshot_id, kafka_committed_at, completed_at
-FROM icebox.commit_cycles
+FROM commit_cycles
 WHERE completed_at IS NULL
 ORDER BY started_at
 LIMIT %(limit)s
@@ -331,7 +423,7 @@ def incomplete_cycles(
 
 
 UPDATE_HEARTBEAT_SQL = """
-UPDATE icebox.status SET last_committer_heartbeat = now() WHERE id = 1
+UPDATE status SET last_committer_heartbeat = now() WHERE id = 1
 """
 
 
@@ -345,13 +437,13 @@ def update_heartbeat(conn: psycopg.Connection) -> None:
 
 
 RECORD_FAILURE_SQL = """
-UPDATE icebox.status
+UPDATE status
 SET consecutive_failures = consecutive_failures + 1
 WHERE id = 1
 """
 
 RECORD_SUCCESS_SQL = """
-UPDATE icebox.status
+UPDATE status
 SET consecutive_failures = 0,
     last_success_at = now(),
     last_cycle_at = now()
@@ -377,7 +469,7 @@ FILES_FOR_CYCLE_SQL = """
 SELECT id, file_path, writer_ordinal, kafka_offsets, partition_values,
        record_count, file_size, schema_version, schema_fingerprint,
        parquet_stats, cycle_id, staged_at, committed_at, iceberg_snapshot_id
-FROM icebox.files
+FROM files
 WHERE cycle_id = %(cycle_id)s
 ORDER BY id
 """
@@ -397,13 +489,13 @@ def files_for_cycle(
 
 
 RELEASE_CYCLE_CLAIM_SQL = """
-UPDATE icebox.files
+UPDATE files
 SET cycle_id = NULL
 WHERE cycle_id = %(cycle_id)s AND committed_at IS NULL
 """
 
 DELETE_CYCLE_ROW_SQL = """
-DELETE FROM icebox.commit_cycles WHERE cycle_id = %(cycle_id)s
+DELETE FROM commit_cycles WHERE cycle_id = %(cycle_id)s
 """
 
 
@@ -420,22 +512,48 @@ def release_cycle_claim(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
         cur.execute(RELEASE_CYCLE_CLAIM_SQL, {"cycle_id": cycle_id})
 
 
-# Advisory-lock key for "only one committer per icebox-PG database".
-# PG advisory locks are 64-bit signed ints; we pick a fixed magic value
-# so any committer connecting to this DB tries the same lock. Single
-# committer == single producer of cycle rows == OCC-free Iceberg commits.
+# Advisory-lock key namespace for the icebox committer.
 #
-# Per the icebox plan, the deployment uses Recreate strategy + replicas=1.
-# This lock is the secondary defense: even if K8s briefly runs both old
-# and new pods during a chart upgrade, only one of them holds the lock
-# at any time. The other blocks on lock acquisition until the holder
-# disconnects.
+# PG advisory locks are 64-bit signed ints, shared across the whole
+# database. Multiple iceboxes share one PG instance (one schema per
+# deployment); the LOCK ID must be PER-SCHEMA so an events icebox and
+# a person icebox can each hold their own lock without conflict.
 #
-# Magic value: SHA-256 prefix of "posthog.icebox.committer.singleton.v1"
-# folded to 63 bits (PG advisory_lock takes signed int8). Bumping this
-# constant means an old-pod-holding-stale-lock would NOT block a new
-# pod — only do that during a deliberate migration.
-COMMITTER_ADVISORY_LOCK_ID = 0x4F6E1C3E_5B7A8D90  # arbitrary 64-bit
+# Derivation: SHA-256 of f"posthog.icebox.committer.{schema}", take
+# the first 8 bytes, interpret as signed int8 (PG advisory_lock
+# parameter type). Stable across runs, distinct per schema.
+#
+# Per the icebox plan, the deployment uses Recreate strategy +
+# replicas=1. This lock is the ONLY runtime defense against two
+# committers racing — if topology guarantees are violated (chart
+# accidentally flipped to RollingUpdate), the lock is what prevents
+# two committers from both running cycles. NOT a "secondary defense":
+# if it's bypassed, OCC contention is the failure mode the entire
+# icebox exists to eliminate.
+#
+# DO NOT version-tag this derivation and DO NOT change the prefix
+# string. Either change rotates every pod's lock id; during the
+# transition both old-pod-with-old-id and new-pod-with-new-id believe
+# they hold the singleton lock — exactly the failure mode the lock
+# prevents. If you ever need to coordinate a rotation, write a
+# documented migration playbook (drain old pods, then deploy new) —
+# don't bake rotation into a knob.
+
+
+def committer_advisory_lock_id(schema: str) -> int:
+    """Derive the 64-bit signed advisory-lock id for a given schema.
+
+    Pure function: same schema → same lock id, forever. Tests pin
+    EXACT values for every deployed schema — any change to this
+    derivation (algorithm, prefix string, byte order, truncation
+    length) fails CI loudly."""
+    digest = hashlib.sha256(
+        f"posthog.icebox.committer.{schema}".encode()
+    ).digest()
+    # Take 8 bytes, interpret as signed int8 (PG advisory_lock takes
+    # int8). big-endian for stability across architectures.
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
 
 TRY_ADVISORY_LOCK_SQL = "SELECT pg_try_advisory_lock(%(key)s)"
 UNLOCK_ADVISORY_LOCK_SQL = "SELECT pg_advisory_unlock(%(key)s)"
@@ -444,7 +562,7 @@ UNLOCK_ADVISORY_LOCK_SQL = "SELECT pg_advisory_unlock(%(key)s)"
 def try_acquire_committer_lock(
     conn: psycopg.Connection,
     *,
-    lock_id: int = COMMITTER_ADVISORY_LOCK_ID,
+    lock_id: int,
 ) -> bool:
     """Try to acquire the singleton committer advisory lock.
 
@@ -457,17 +575,30 @@ def try_acquire_committer_lock(
     is closed (e.g., pool eviction, process exit). That's the
     primary recovery mechanism — a dead committer's lock evaporates
     with its TCP connection.
+
+    Raises `RuntimeError` if the query returns no row or a NULL value
+    (transport corruption, catalog issue). The previous behavior was
+    to coerce NULL to False, which would misclassify a transport
+    error as "lock held by another committer" — six pods spinning on
+    a phantom lock while PG is actually degraded. PE-review #6.
     """
     with conn.cursor() as cur:
         cur.execute(TRY_ADVISORY_LOCK_SQL, {"key": lock_id})
         row = cur.fetchone()
-    return bool(row and row[0])
+    if row is None or row[0] is None:
+        raise RuntimeError(
+            f"pg_try_advisory_lock({lock_id}) returned no row or NULL — "
+            f"PG protocol or catalog error, NOT 'lock held'. Caller "
+            f"should treat this as a transport failure, retry, and "
+            f"page ops if it persists."
+        )
+    return bool(row[0])
 
 
 def release_committer_lock(
     conn: psycopg.Connection,
     *,
-    lock_id: int = COMMITTER_ADVISORY_LOCK_ID,
+    lock_id: int,
 ) -> None:
     """Explicit release. Optional — closing the connection releases
     automatically — but exposing this lets the committer call it on

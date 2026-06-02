@@ -22,25 +22,60 @@ from icebox import schema as ddl
 # ---------------------------------------------------------------------------
 
 
-def test_all_ddl_includes_schema_and_tables():
-    """Sanity: the ALL_DDL tuple contains schema creation, the three
-    tables, the indexes, and the status seed row, in dependency order."""
+def test_all_ddl_includes_tables_and_indexes():
+    """Sanity: the ALL_DDL tuple contains the three tables, the indexes,
+    and the status seed row, in dependency order. Schema creation
+    itself runs in postgres_sync.ensure_schema_exists BEFORE
+    apply_migrations, NOT as part of ALL_DDL — see the schema.py
+    module docstring."""
     blob = "\n".join(ddl.ALL_DDL).lower()
-    assert "create schema if not exists icebox" in blob
-    assert "create table if not exists icebox.commit_cycles" in blob
-    assert "create table if not exists icebox.files" in blob
-    assert "create table if not exists icebox.status" in blob
+    assert "create table if not exists commit_cycles" in blob
+    assert "create table if not exists files" in blob
+    assert "create table if not exists status" in blob
     # Indexes
     assert "commit_cycles_incomplete_idx" in blob
     assert "files_unclaimed_idx" in blob
     assert "files_in_flight_idx" in blob
     # Seed
-    assert "insert into icebox.status" in blob
+    assert "insert into status" in blob
 
 
-def test_schema_creation_is_first():
-    """Tables depend on the schema existing first."""
-    assert ddl.ALL_DDL[0] == ddl.CREATE_SCHEMA
+def test_all_ddl_uses_unqualified_table_names():
+    """Per-schema isolation depends on every table reference being
+    unqualified — `commit_cycles` resolves to <schema>.commit_cycles
+    via the session's search_path. A regression that re-introduces an
+    `icebox.` prefix would break the per-deployment isolation."""
+    blob = "\n".join(ddl.ALL_DDL).lower()
+    assert "icebox.commit_cycles" not in blob
+    assert "icebox.files" not in blob
+    assert "icebox.status" not in blob
+
+
+def test_no_ddl_references_table_name_column():
+    """Permanent per-schema-design invariant: each icebox owns ONE
+    Iceberg table and runs in its own PG schema. No DDL has a
+    `table_name` column because per-table routing happens at the
+    deployment layer, not at the row layer. A future PR that adds
+    `table_name` (e.g., trying to consolidate iceboxes back into one
+    process) reintroduces the multi-table-routing complexity we
+    deliberately avoided."""
+    blob = "\n".join(ddl.ALL_DDL).lower()
+    assert "table_name" not in blob, (
+        "no DDL should reference a table_name column; per-schema design "
+        "expresses per-table routing as deployment topology, not "
+        "row-level state. If you're adding this, see the multi-table "
+        "discussion notes."
+    )
+
+
+def test_no_ddl_references_iceberg_namespace_or_table_columns():
+    """Same invariant from the wire-format angle: RegisterFileRequest
+    has no iceberg_namespace/iceberg_table fields (each icebox knows
+    which table it serves from its own config). The DDL must mirror
+    this."""
+    blob = "\n".join(ddl.ALL_DDL).lower()
+    assert "iceberg_namespace" not in blob
+    assert "iceberg_table" not in blob
 
 
 def test_commit_cycles_table_before_files_table():
@@ -107,10 +142,10 @@ def test_files_has_unique_file_path():
 
 
 def test_files_has_fk_to_commit_cycles():
-    """Without the FK, an icebox.files row could reference a cycle_id
+    """Without the FK, an files row could reference a cycle_id
     that no commit_cycles row exists for."""
     sql = ddl.CREATE_FILES.lower()
-    assert "references icebox.commit_cycles" in sql
+    assert "references commit_cycles" in sql
 
 
 def test_status_has_singleton_check():

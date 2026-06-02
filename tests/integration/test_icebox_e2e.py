@@ -257,7 +257,7 @@ def test_full_cycle_sanity_check(
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT kafka_offsets, partition_values, parquet_stats, "
-                "schema_fingerprint, committed_at, cycle_id FROM icebox.files "
+                "schema_fingerprint, committed_at, cycle_id FROM files "
                 "WHERE id = %s",
                 (pg_row_id,),
             )
@@ -310,13 +310,13 @@ def test_full_cycle_sanity_check(
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT cycle_id, iceberg_snapshot_id, kafka_committed_at, "
-                "completed_at FROM icebox.commit_cycles WHERE cycle_id = %s",
+                "completed_at FROM commit_cycles WHERE cycle_id = %s",
                 (str(result.cycle_id),),
             )
             cycle_row = cur.fetchone()
             cur.execute(
                 "SELECT cycle_id, committed_at, iceberg_snapshot_id "
-                "FROM icebox.files WHERE id = %s",
+                "FROM files WHERE id = %s",
                 (pg_row_id,),
             )
             file_row = cur.fetchone()
@@ -369,10 +369,10 @@ def test_ensure_database_exists_creates_missing_database(pg_conn_kwargs):
         pg_database=target_db,
         pg_username=pg_conn_kwargs["user"],
         pg_password=pg_conn_kwargs["password"],
-        pg_sslmode="disable",
+        pg_sslmode="disable", pg_schema="icebox",
         asyncpg_pool_min=1, asyncpg_pool_max=2,
         psycopg_pool_min=1, psycopg_pool_max=2,
-        iceberg_catalog_uri="x", iceberg_warehouse="x",
+        iceberg_catalog_uri="x", iceberg_warehouse="x", iceberg_namespace="kafka", iceberg_table="events",
         kafka_bootstrap_servers="x", kafka_topic="events",
         kafka_group_id="grp", kafka_extra_config_json="{}",
         committer_cadence_seconds=60,
@@ -407,3 +407,260 @@ def test_ensure_database_exists_creates_missing_database(pg_conn_kwargs):
     # Cleanup: drop the test database so re-runs work.
     with psycopg.connect(sys_conninfo, autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(f'DROP DATABASE "{target_db}"')
+
+
+# ---------------------------------------------------------------------------
+# Per-schema isolation — multiple iceboxes on one PG don't conflict
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_ensure_schema_exists_creates_schema(pg_conn_kwargs):
+    """ensure_schema_exists creates the configured PG schema if missing
+    and is idempotent on re-invocation."""
+    import psycopg
+
+    from icebox.config import Config
+    from icebox import postgres_sync as ps_mod
+
+    schema = f"icebox_test_{__import__('uuid').uuid4().hex[:8]}"
+    cfg = Config(
+        pg_host=pg_conn_kwargs["host"], pg_port=pg_conn_kwargs["port"],
+        pg_database=pg_conn_kwargs["database"],
+        pg_username=pg_conn_kwargs["user"], pg_password=pg_conn_kwargs["password"],
+        pg_sslmode="disable", pg_schema=schema,
+        asyncpg_pool_min=1, asyncpg_pool_max=2,
+        psycopg_pool_min=1, psycopg_pool_max=2,
+        iceberg_catalog_uri="x", iceberg_warehouse="x", iceberg_namespace="kafka", iceberg_table="events",
+        kafka_bootstrap_servers="x", kafka_topic="events",
+        kafka_group_id="grp", kafka_extra_config_json="{}",
+        committer_cadence_seconds=60,
+        committer_max_pending_files=1000,
+        committer_degraded_failure_threshold=2,
+        committer_heartbeat_stale_multiple=3.0,
+        api_host="0.0.0.0", api_port=8000, log_level="INFO",
+    )
+
+    # Precondition: schema does NOT exist
+    conninfo = psycopg.conninfo.make_conninfo(
+        host=cfg.pg_host, port=cfg.pg_port, dbname=cfg.pg_database,
+        user=cfg.pg_username, password=cfg.pg_password,
+    )
+    with psycopg.connect(conninfo) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (schema,),
+        )
+        assert cur.fetchone() is None
+
+    ps_mod.ensure_schema_exists(cfg)
+
+    with psycopg.connect(conninfo) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (schema,),
+        )
+        assert cur.fetchone() == (1,)
+
+    # Idempotent: second call is a no-op
+    ps_mod.ensure_schema_exists(cfg)
+
+    # Cleanup
+    with psycopg.connect(conninfo, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+@pytest.mark.integration
+def test_two_iceboxes_with_different_schemas_isolated(pg_conn_kwargs):
+    """Two iceboxes with different cfg.pg_schema values run their
+    migrations in their own schemas and don't see each other's rows.
+    This is the load-bearing property for per-table icebox-per-millpond
+    deployments sharing a PG instance."""
+    import uuid
+
+    import psycopg
+
+    from icebox.config import Config
+    from icebox import postgres_sync as ps_mod
+
+    schema_a = f"icebox_a_{uuid.uuid4().hex[:8]}"
+    schema_b = f"icebox_b_{uuid.uuid4().hex[:8]}"
+
+    def _cfg(schema):
+        return Config(
+            pg_host=pg_conn_kwargs["host"], pg_port=pg_conn_kwargs["port"],
+            pg_database=pg_conn_kwargs["database"],
+            pg_username=pg_conn_kwargs["user"], pg_password=pg_conn_kwargs["password"],
+            pg_sslmode="disable", pg_schema=schema,
+            asyncpg_pool_min=1, asyncpg_pool_max=2,
+            psycopg_pool_min=1, psycopg_pool_max=2,
+            iceberg_catalog_uri="x", iceberg_warehouse="x", iceberg_namespace="kafka", iceberg_table="events",
+            kafka_bootstrap_servers="x", kafka_topic="events",
+            kafka_group_id="grp", kafka_extra_config_json="{}",
+            committer_cadence_seconds=60,
+            committer_max_pending_files=1000,
+            committer_degraded_failure_threshold=2,
+            committer_heartbeat_stale_multiple=3.0,
+            api_host="0.0.0.0", api_port=8000, log_level="INFO",
+        )
+
+    cfg_a, cfg_b = _cfg(schema_a), _cfg(schema_b)
+
+    # Bootstrap both schemas + migrate
+    for cfg in (cfg_a, cfg_b):
+        ps_mod.ensure_schema_exists(cfg)
+
+    pool_a = ps_mod.build_psycopg_pool(cfg_a)
+    pool_b = ps_mod.build_psycopg_pool(cfg_b)
+    pool_a.open(wait=True)
+    pool_b.open(wait=True)
+    try:
+        with pool_a.connection() as conn:
+            ps_mod.apply_migrations(conn)
+        with pool_b.connection() as conn:
+            ps_mod.apply_migrations(conn)
+
+        # Each pool's connection should resolve unqualified `status` to
+        # its own schema's row.
+        from uuid import uuid4 as _uuid
+
+        cycle_a = _uuid()
+        with pool_a.connection() as conn:
+            ps_mod.insert_cycle(conn, cycle_id=cycle_a)
+            conn.commit()
+
+        # B's pool MUST NOT see A's cycle row.
+        with pool_b.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM commit_cycles")
+            assert cur.fetchone() == (0,), (
+                "search_path isolation broken: schema B sees rows from schema A"
+            )
+
+        # A sees its own row.
+        with pool_a.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM commit_cycles")
+            assert cur.fetchone() == (1,)
+
+        # Each derived a different advisory lock id
+        assert (
+            ps_mod.committer_advisory_lock_id(schema_a)
+            != ps_mod.committer_advisory_lock_id(schema_b)
+        )
+    finally:
+        pool_a.close()
+        pool_b.close()
+        # Cleanup
+        conninfo = psycopg.conninfo.make_conninfo(
+            host=cfg_a.pg_host, port=cfg_a.pg_port, dbname=cfg_a.pg_database,
+            user=cfg_a.pg_username, password=cfg_a.pg_password,
+        )
+        with psycopg.connect(conninfo, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP SCHEMA "{schema_a}" CASCADE')
+            cur.execute(f'DROP SCHEMA "{schema_b}" CASCADE')
+
+
+@pytest.mark.integration
+def test_asyncpg_pool_isolates_by_schema(pg_conn_kwargs):
+    """The API hot-path (every POST, every status read) uses asyncpg.
+    Per-schema isolation depends on `server_settings={"search_path":
+    cfg.pg_schema}` being honored on every connection — the previous
+    integration test only covered the psycopg pool.
+
+    Build TWO asyncpg pools against the same PG but different schemas;
+    INSERT a file into schema A's `files` table via INSERT_FILE_SQL;
+    query schema B's `files` table via the status query → must be
+    empty. Anything else means the asyncpg path isn't actually pinning
+    search_path per connection."""
+    import asyncio
+    import uuid
+
+    import psycopg
+
+    from icebox import postgres_async as pa_mod
+    from icebox import postgres_sync as ps_mod
+    from icebox.config import Config
+
+    schema_a = f"icebox_async_a_{uuid.uuid4().hex[:8]}"
+    schema_b = f"icebox_async_b_{uuid.uuid4().hex[:8]}"
+
+    def _cfg(schema):
+        return Config(
+            pg_host=pg_conn_kwargs["host"], pg_port=pg_conn_kwargs["port"],
+            pg_database=pg_conn_kwargs["database"],
+            pg_username=pg_conn_kwargs["user"], pg_password=pg_conn_kwargs["password"],
+            pg_sslmode="disable", pg_schema=schema,
+            asyncpg_pool_min=1, asyncpg_pool_max=2,
+            psycopg_pool_min=1, psycopg_pool_max=2,
+            iceberg_catalog_uri="x", iceberg_warehouse="x", iceberg_namespace="kafka", iceberg_table="events",
+            kafka_bootstrap_servers="x", kafka_topic="events",
+            kafka_group_id="grp", kafka_extra_config_json="{}",
+            committer_cadence_seconds=60,
+            committer_max_pending_files=1000,
+            committer_degraded_failure_threshold=2,
+            committer_heartbeat_stale_multiple=3.0,
+            api_host="0.0.0.0", api_port=8000, log_level="INFO",
+        )
+
+    cfg_a, cfg_b = _cfg(schema_a), _cfg(schema_b)
+
+    # Bootstrap both schemas + migrate (via the sync helpers — they're
+    # the only thing that knows how to set up the icebox tables).
+    for cfg in (cfg_a, cfg_b):
+        ps_mod.ensure_schema_exists(cfg)
+        sync_pool = ps_mod.build_psycopg_pool(cfg)
+        sync_pool.open(wait=True)
+        try:
+            with sync_pool.connection() as conn:
+                ps_mod.apply_migrations(conn)
+        finally:
+            sync_pool.close()
+
+    async def _exercise_pools():
+        async_pool_a = await pa_mod.build_asyncpg_pool(cfg_a)
+        async_pool_b = await pa_mod.build_asyncpg_pool(cfg_b)
+        try:
+            # Insert into A via the production INSERT_FILE_SQL
+            async with async_pool_a.acquire() as conn:
+                await conn.execute(
+                    pa_mod.INSERT_FILE_SQL,
+                    "s3://b/test.parquet",  # file_path
+                    0,  # writer_ordinal
+                    "{}",  # kafka_offsets
+                    "{}",  # partition_values
+                    100,  # record_count
+                    1024,  # file_size
+                    "v1",  # schema_version
+                    "deadbeef" * 8,  # schema_fingerprint
+                    "{}",  # parquet_stats
+                )
+
+            # Query B via the production STATUS_QUERY_SQL — B must see
+            # ZERO pending files. If the search_path pin doesn't fire on
+            # every asyncpg acquire, B would see A's row.
+            async with async_pool_b.acquire() as conn:
+                row_b = await conn.fetchrow(pa_mod.STATUS_QUERY_SQL)
+            async with async_pool_a.acquire() as conn:
+                row_a = await conn.fetchrow(pa_mod.STATUS_QUERY_SQL)
+            return row_a, row_b
+        finally:
+            await async_pool_a.close()
+            await async_pool_b.close()
+
+    try:
+        row_a, row_b = asyncio.run(_exercise_pools())
+        assert row_a is not None
+        assert row_a["pending_files"] == 1
+        assert row_b is not None
+        assert row_b["pending_files"] == 0, (
+            f"asyncpg pool isolation broken: schema B sees "
+            f"{row_b['pending_files']} pending files from schema A"
+        )
+    finally:
+        # Cleanup
+        conninfo = psycopg.conninfo.make_conninfo(
+            host=cfg_a.pg_host, port=cfg_a.pg_port, dbname=cfg_a.pg_database,
+            user=cfg_a.pg_username, password=cfg_a.pg_password,
+        )
+        with psycopg.connect(conninfo, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP SCHEMA "{schema_a}" CASCADE')
+            cur.execute(f'DROP SCHEMA "{schema_b}" CASCADE')

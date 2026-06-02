@@ -65,7 +65,7 @@ def test_status_query_returns_hot_path_fields():
     """The hot-path status query runs on every POST. It must return the
     fields the backpressure decisions depend on, but NOT
     last_committed_iceberg_snapshot (which requires an unindexed scan
-    of icebox.commit_cycles that grows with cycle history)."""
+    of commit_cycles that grows with cycle history)."""
     sql = pa.STATUS_QUERY_SQL.lower()
     for col in (
         "pending_files",
@@ -98,7 +98,7 @@ def test_last_committed_snapshot_sql_scoped_to_commit_cycles():
     query, not the hot path."""
     sql = pa.LAST_COMMITTED_SNAPSHOT_SQL.lower()
     assert "max(iceberg_snapshot_id)" in sql
-    assert "from icebox.commit_cycles" in sql
+    assert "from commit_cycles" in sql
 
 
 def test_status_query_pending_filter_matches_partial_index():

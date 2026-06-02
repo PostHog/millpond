@@ -435,9 +435,15 @@ def committer_loop(
     # separately. Session-scoped advisory locks die with the connection,
     # so a dead committer's lock evaporates with TCP timeout.
     #
+    # Lock id is derived from cfg.pg_schema so multiple iceboxes sharing
+    # a PG instance (one per (topic, table)) each hold their own lock —
+    # events doesn't block person, etc. Same schema → same lock id, so
+    # two replicas of the SAME icebox still serialize correctly.
+    #
     # We loop with a small sleep so a Helm rollout (old pod terminating
     # holds the lock until its connection closes; new pod waits) is a
     # graceful handoff, not a startup crash.
+    lock_id = ps.committer_advisory_lock_id(cfg.pg_schema)
     lock_conn: psycopg.Connection | None = None
     while not stop_event.is_set():
         # Transient PG issues during pool checkout (TCP reset, server
@@ -459,7 +465,7 @@ def committer_loop(
         # way; otherwise a raise here would permanently leak a pool slot
         # (which at psycopg_pool_max=2 is half the budget).
         try:
-            acquired = ps.try_acquire_committer_lock(candidate_conn)
+            acquired = ps.try_acquire_committer_lock(candidate_conn, lock_id=lock_id)
         except Exception as exc:
             try:
                 pg_pool.putconn(candidate_conn)
@@ -553,7 +559,7 @@ def committer_loop(
     # but doesn't keep the loop from returning.
     if lock_conn is not None:
         try:
-            ps.release_committer_lock(lock_conn)
+            ps.release_committer_lock(lock_conn, lock_id=lock_id)
             log.info("committer_loop: released advisory lock")
         except Exception:
             log.exception("committer_loop: error releasing advisory lock")

@@ -89,6 +89,29 @@ class RegisterFileRequest(BaseModel):
         description="Wire-protocol version. Icebox rejects mismatched "
         "versions with 400 to catch deploy-skew scenarios.",
     )
+    # Validation-only fields. The icebox does NOT route on these — each
+    # deployment serves exactly one (namespace, table) pair, configured
+    # at the deployment layer (per-schema topology). But misconfigured
+    # writers POSTing to the wrong icebox URL would otherwise quietly
+    # write into the wrong Iceberg table — UNIQUE(file_path) doesn't
+    # catch this because the path is still unique. When set, the icebox
+    # asserts they match cfg.iceberg_namespace / cfg.iceberg_table and
+    # returns 400 on mismatch. Optional for compatibility with very old
+    # writers; recommended for every new POST.
+    expected_iceberg_namespace: str | None = Field(
+        default=None,
+        description="Validation-only: the namespace the writer believes "
+        "this icebox serves. Icebox returns 400 on mismatch. Catches "
+        "writer misconfiguration that would otherwise silently land "
+        "files in the wrong Iceberg table.",
+    )
+    expected_iceberg_table: str | None = Field(
+        default=None,
+        description="Validation-only: the table name the writer believes "
+        "this icebox serves. Icebox returns 400 on mismatch. Catches "
+        "writer misconfiguration that would otherwise silently land "
+        "files in the wrong Iceberg table.",
+    )
     file_path: str = Field(
         description="Full s3:// URI of the parquet file. The "
         "deterministic-path scheme makes this unique per (writer, "

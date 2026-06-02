@@ -82,22 +82,35 @@ def pg_conn_kwargs(pg_container) -> dict[str, Any]:
 
 @pytest.fixture
 def migrated_pg(pg_conn_kwargs) -> Iterator[ConnectionPool]:
-    """Open a psycopg pool, drop any existing icebox schema, re-migrate,
-    yield the pool. Closes on teardown.
+    """Open a psycopg pool, drop any existing icebox schema, re-create
+    it, run migrations, yield the pool. Closes on teardown.
 
     The drop-and-recreate gives us cleaner per-test state than TRUNCATE
     (no need to enumerate tables) and is cheap on alpine PG.
+
+    CREATE SCHEMA is now handled by ensure_schema_exists (not via
+    ALL_DDL), so this fixture explicitly drops the schema, calls
+    ensure_schema_exists to recreate it, then opens the pool (whose
+    connections set search_path = icebox via conninfo options).
     """
     cfg = _cfg_from_pg(pg_conn_kwargs)
-    pool = ps.build_psycopg_pool(cfg)
-    pool.open(wait=True)
 
-    # Per-test isolation: blow away anything from a previous test.
-    with pool.connection() as conn:
+    # Pre-drop runs through a fresh connection that does NOT pin
+    # search_path (we're about to drop the schema search_path points
+    # at). Use psycopg.connect directly to avoid the pool's options.
+    import psycopg
+    bare_conninfo = psycopg.conninfo.make_conninfo(
+        host=cfg.pg_host, port=cfg.pg_port, dbname=cfg.pg_database,
+        user=cfg.pg_username, password=cfg.pg_password,
+    )
+    with psycopg.connect(bare_conninfo, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP SCHEMA IF EXISTS icebox CASCADE")
-        conn.commit()
 
+    ps.ensure_schema_exists(cfg)
+
+    pool = ps.build_psycopg_pool(cfg)
+    pool.open(wait=True)
     with pool.connection() as conn:
         ps.apply_migrations(conn)
 
@@ -158,13 +171,15 @@ def _cfg_from_pg(
         pg_database=pg_conn_kwargs["database"],
         pg_username=pg_conn_kwargs["user"],
         pg_password=pg_conn_kwargs["password"],
-        pg_sslmode="disable",
+        pg_sslmode="disable", pg_schema="icebox",
         asyncpg_pool_min=1,
         asyncpg_pool_max=4,
         psycopg_pool_min=1,
         psycopg_pool_max=2,
         iceberg_catalog_uri="unused-integration",
         iceberg_warehouse="unused-integration",
+        iceberg_namespace="kafka",
+        iceberg_table="events",
         kafka_bootstrap_servers="unused:9092",
         kafka_topic="kafka.events",
         kafka_group_id="icebox-test",
