@@ -183,6 +183,28 @@ def test_cadence_negative_rejected(monkeypatch):
         icebox_config.load()
 
 
+def test_psycopg_pool_max_below_2_rejected(monkeypatch):
+    """PE review #5: psycopg_pool_max=1 deadlocks because the committer
+    holds 1 connection (advisory lock) for the lifetime of the thread,
+    leaving zero slots for cycle work."""
+    _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "1"})
+    with pytest.raises(RuntimeError, match="ICEBOX_PSYCOPG_POOL_MAX must be >= 2"):
+        icebox_config.load()
+
+
+def test_psycopg_pool_max_zero_rejected(monkeypatch):
+    _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "0"})
+    with pytest.raises(RuntimeError, match="ICEBOX_PSYCOPG_POOL_MAX must be >= 2"):
+        icebox_config.load()
+
+
+def test_psycopg_pool_max_exactly_2_accepted(monkeypatch):
+    """The floor must be inclusive — 2 is the documented minimum."""
+    _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "2"})
+    cfg = icebox_config.load()
+    assert cfg.psycopg_pool_max == 2
+
+
 def test_config_is_frozen():
     """Config is @dataclass(frozen=True) — accidental mutation must fail."""
     import dataclasses

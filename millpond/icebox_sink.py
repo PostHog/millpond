@@ -86,11 +86,20 @@ def build_s3_writer(
     Args mirror the s3_* fields in millpond.config.Config.
 
     Idempotency:
-      The icebox protocol relies on same kafka_offsets → same S3 path →
-      same bytes. S3 PUT is atomic per object; re-PUT of the same key
-      with the same content overwrites (no-op semantically). Writer
-      crash + replay re-PUTs the same path with identical bytes; the
-      icebox dedups via UNIQUE(file_path).
+      The icebox protocol relies on same kafka_offsets → same S3 path.
+      Bytes are also stable across replay because IceboxSink.write
+      takes `inserted_at` as a parameter (the caller derives it
+      deterministically from message content — see _flush in
+      millpond/main.py). Writer crash + replay produces an identical
+      parquet at the same path; the icebox dedups via UNIQUE(file_path)
+      on the POST side.
+
+      Caveat: PyArrow's S3 `open_output_stream` uses multipart upload.
+      A crash between `out.write(payload)` and `__exit__` leaves an
+      abandoned multipart upload that S3 bills for indefinitely (no
+      visible object). Mitigate via an S3 lifecycle rule that aborts
+      multipart uploads older than N days — operational, in the
+      chart's bucket terraform.
     """
     import pyarrow.fs as pafs
 
@@ -354,27 +363,37 @@ def _compare(iceberg_type, a, b) -> int:
     return -1 if a < b else 1
 
 
-# Reserved column names mirror millpond/iceberg.py's RESERVED_COLUMNS —
-# kept inline to avoid a millpond/iceberg.py import (which would drag
-# the catalog + S3 dependencies into the writer hot path).
+# Reserved column names — kept in sync with millpond/iceberg.py via a
+# runtime equivalence assertion in tests/unit/test_icebox_sink.py.
+# Kept inline rather than imported to avoid pulling
+# pyiceberg/aiohttp/cryptography into a DuckLake-only deployment.
 _PARTITION_COLS: tuple[str, ...] = ("year", "month", "day", "hour")
 _RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at", *_PARTITION_COLS})
 
 
-def _add_metadata_columns(batch: pa.Table) -> pa.Table:
+def _add_metadata_columns(batch: pa.Table, inserted_at: datetime.datetime) -> pa.Table:
     """Append ``_inserted_at`` + the four partition columns to the batch.
 
-    Mirror of millpond/iceberg.py:_add_metadata_columns. The same
-    convention is load-bearing for partition-pruning correctness — all
-    rows in a single flush share the same `_inserted_at` value so a
-    batch always lands in exactly one (year, month, day, hour) tuple.
+    Equivalent to millpond/iceberg.py:_add_metadata_columns in SHAPE
+    (column names, types, partition derivation), but the timestamp
+    comes from the CALLER, NOT from wall-clock ``now()``. Determinism
+    is load-bearing for the icebox sink: the S3 path embeds the
+    partition tuple, and idempotent replay requires same-input-→-same-
+    path. A wall-clock stamp here breaks that on any hour-boundary
+    crash + replay.
+
+    Caller convention (main.py:_flush for the icebox dispatch): pass
+    the MAX Kafka message timestamp the batch contains. Replay of the
+    same Kafka offsets produces the same MAX, so the partition tuple
+    is invariant under replay.
 
     int32 cast matches the partition spec's IntegerType (PyArrow's
     pc.year/month/day/hour return int64).
     """
-    now = datetime.datetime.now(datetime.UTC)
+    if inserted_at.tzinfo is None:
+        raise ValueError(f"inserted_at must be tz-aware (UTC); got naive datetime {inserted_at!r}")
     ts_type = pa.timestamp("us", tz="UTC")
-    ts_array = pa.array([now] * len(batch), ts_type)
+    ts_array = pa.array([inserted_at] * len(batch), ts_type)
     batch = batch.append_column("_inserted_at", ts_array)
     ts = batch.column("_inserted_at")
     batch = batch.append_column("year", pc.cast(pc.year(ts), pa.int32()))
@@ -386,9 +405,28 @@ def _add_metadata_columns(batch: pa.Table) -> pa.Table:
 
 def _partition_values_from_batch(batch: pa.Table) -> dict[str, int]:
     """Read the partition tuple from a batch produced by
-    _add_metadata_columns. All rows share the same (y,m,d,h) so taking
-    row 0 is sufficient."""
-    return {name: batch.column(name)[0].as_py() for name in _PARTITION_COLS}
+    _add_metadata_columns. Asserts all rows share the same tuple — the
+    convention is enforced by the upstream stamp, but a defensive
+    check here catches a future refactor that splits the helpers.
+    """
+    values: dict[str, int] = {}
+    for name in _PARTITION_COLS:
+        col = batch.column(name)
+        head = col[0].as_py()
+        # `pc.all(pc.equal(col, head))` would be more idiomatic but
+        # builds a full boolean column for a check that's O(1) common-
+        # case (one tuple). Comparing min/max is faster and asserts the
+        # invariant equally well.
+        col_min = pc.min(col).as_py()
+        col_max = pc.max(col).as_py()
+        if col_min != head or col_max != head:
+            raise ValueError(
+                f"_partition_values_from_batch: column {name!r} has multiple "
+                f"values [{col_min}, {col_max}]; partition stamping must "
+                f"produce one value per batch"
+            )
+        values[name] = head
+    return values
 
 
 @dataclass
@@ -438,16 +476,17 @@ class IceboxSink:
         batch: pa.Table,
         *,
         kafka_offsets: Mapping[str, int] | None = None,
+        inserted_at: datetime.datetime | None = None,
         s3_writer: Any = None,
     ) -> tuple[dict, int]:
         """Write the batch's parquet bytes to S3 at the deterministic
         path, register with icebox, return (response_body, status_code).
 
         The sink internally:
-          1. Adds _inserted_at + (year, month, day, hour) columns.
+          1. Adds _inserted_at + (year, month, day, hour) columns
+             (stamped from the caller's `inserted_at`, NOT wall-clock).
           2. Derives partition_values from the appended columns (all
-             rows share one tuple since _add_metadata_columns stamps
-             a single now() for the whole batch).
+             rows share one tuple).
           3. Computes the deterministic S3 path.
           4. Writes parquet to a BytesIO buffer, extracts stats.
           5. Ships bytes to S3 via the writer callable.
@@ -459,6 +498,13 @@ class IceboxSink:
             kafka_offsets: {partition_id (str): max_offset_in_batch}.
                 Required when called from production; main.py:_flush
                 computes it from the consumer's per-partition offsets.
+            inserted_at: UTC datetime to use for `_inserted_at` AND
+                the partition tuple. Caller MUST derive this
+                deterministically from message content (millpond:_flush
+                uses the MAX Kafka message timestamp seen in the
+                batch). Required because wall-clock now() would break
+                replay determinism: the S3 path embeds the partition
+                tuple, and same-offsets-→-same-path is the dedup contract.
             s3_writer: per-call override for the instance attribute.
                 Used by tests; production wires it once at construction.
 
@@ -466,8 +512,8 @@ class IceboxSink:
             (body, status) where status is 201 (new) or 409 (replay).
 
         Raises:
-            ValueError: zero-row batch, or kafka_offsets / s3_writer
-                missing.
+            ValueError: zero-row batch, or kafka_offsets / inserted_at /
+                s3_writer missing.
             IceboxResponseError, IceboxBackpressureExhausted: see
                 IceboxClient.register_file.
         """
@@ -477,6 +523,12 @@ class IceboxSink:
             raise ValueError(
                 "IceboxSink.write requires kafka_offsets; the icebox "
                 "commits Kafka offsets atomically with the Iceberg snapshot"
+            )
+        if inserted_at is None:
+            raise ValueError(
+                "IceboxSink.write requires inserted_at (UTC datetime) "
+                "derived deterministically from the batch's messages — "
+                "wall-clock now() would break replay determinism"
             )
         writer = s3_writer if s3_writer is not None else self.s3_writer
         if writer is None:
@@ -494,7 +546,7 @@ class IceboxSink:
                     f"by the sink, not the caller"
                 )
 
-        batch_with_meta = _add_metadata_columns(batch)
+        batch_with_meta = _add_metadata_columns(batch, inserted_at)
         partition_values = _partition_values_from_batch(batch_with_meta)
 
         self._ensure_schema(batch_with_meta.schema)

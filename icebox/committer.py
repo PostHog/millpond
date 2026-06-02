@@ -440,12 +440,47 @@ def committer_loop(
     # graceful handoff, not a startup crash.
     lock_conn: psycopg.Connection | None = None
     while not stop_event.is_set():
-        lock_conn = pg_pool.getconn()
-        if ps.try_acquire_committer_lock(lock_conn):
+        # Transient PG issues during pool checkout (TCP reset, server
+        # restart) should NOT kill the committer thread — log + retry.
+        try:
+            candidate_conn = pg_pool.getconn()
+        except Exception as exc:
+            log.warning(
+                "committer_loop: pg_pool.getconn() failed during lock "
+                "acquisition (%s); retrying in %.1fs",
+                exc,
+                ADVISORY_LOCK_RETRY_SECONDS,
+            )
+            stop_event.wait(ADVISORY_LOCK_RETRY_SECONDS)
+            continue
+
+        # try_acquire_committer_lock can raise on PG transport errors.
+        # try/finally ensures the conn is returned to the pool either
+        # way; otherwise a raise here would permanently leak a pool slot
+        # (which at psycopg_pool_max=2 is half the budget).
+        try:
+            acquired = ps.try_acquire_committer_lock(candidate_conn)
+        except Exception as exc:
+            try:
+                pg_pool.putconn(candidate_conn)
+            except Exception:
+                log.exception(
+                    "committer_loop: failed to return conn after lock-acquire error"
+                )
+            log.warning(
+                "committer_loop: try_acquire_committer_lock raised (%s); "
+                "retrying in %.1fs",
+                exc,
+                ADVISORY_LOCK_RETRY_SECONDS,
+            )
+            stop_event.wait(ADVISORY_LOCK_RETRY_SECONDS)
+            continue
+
+        if acquired:
+            lock_conn = candidate_conn
             log.info("committer_loop: acquired singleton advisory lock")
             break
-        pg_pool.putconn(lock_conn)
-        lock_conn = None
+        pg_pool.putconn(candidate_conn)
         log.info(
             "committer_loop: advisory lock held by another committer; "
             "retrying in %.1fs",

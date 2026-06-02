@@ -1,3 +1,4 @@
+import datetime
 import logging
 import signal
 import sys
@@ -218,47 +219,90 @@ def _kafka_offsets_for_icebox(
     """Flatten the consumer's (topic, partition) → offset map into the
     {partition_id_str: max_offset} shape the icebox wire format wants.
 
-    The icebox runs per (topic, table), so all offsets must be for the
-    same topic. Drop any mismatched entries with a warning — that
-    indicates an upstream consumer-wiring bug.
+    The icebox runs per (topic, table), so all offsets MUST be for the
+    same topic. A mismatch is a wiring bug (writer subscribed to the
+    wrong topic, or to multiple topics) — raise loudly rather than
+    silently drop, because the dropped offsets would become permanently
+    stuck consumer-group offsets on the icebox side (recovery only
+    sees what got registered via POSTs).
     """
     out: dict[str, int] = {}
     for (t, partition), offset in offsets.items():
         if t != topic:
-            log.warning(
-                "_flush: dropping offset for topic=%s (icebox is per-topic; expected %s)",
-                t,
-                topic,
+            raise RuntimeError(
+                f"_kafka_offsets_for_icebox: unexpected topic {t!r} in offsets; "
+                f"icebox is configured for {topic!r}. Check millpond consumer "
+                f"subscription — silent drops here would lose offsets."
             )
-            continue
         out[str(partition)] = offset
     return out
 
 
-def _flush(sink, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed, trigger="time"):
+def _flush(
+    sink,
+    cfg,
+    kafka,
+    consolidated,
+    pending_bytes,
+    pending_records,
+    offsets,
+    elapsed,
+    trigger="time",
+    *,
+    max_msg_timestamp_ms: int = -1,
+):
     """Write to the sink, commit offsets, update metrics.
 
     For DuckLake / Iceberg sinks, this writes the batch then commits
     Kafka offsets directly. For icebox, the sink POSTs files to the
     icebox service which commits Kafka offsets atomically with its
     Iceberg snapshot — so this function MUST NOT call kafka.commit().
+
+    `max_msg_timestamp_ms` is the MAX Kafka message timestamp in the
+    batch (milliseconds since epoch). Required for the icebox path —
+    the sink stamps `_inserted_at` + partition columns from this so
+    that idempotent replay produces the same S3 path. -1 sentinel
+    triggers a fall-back to current time IF the batch has zero Kafka
+    timestamps (shouldn't happen for real data).
     """
     consolidated = _apply_sort(consolidated, cfg)
+    # Single dispatch decision — keeps the write-shape choice and the
+    # kafka.commit decision structurally coupled. Splitting them invites
+    # a regression where one branch is updated but the other isn't.
+    is_icebox = cfg.destination == "icebox"
+
     t0 = time.monotonic()
-    if cfg.destination == "icebox":
-        # Icebox sink path: pass kafka_offsets through; the sink writes
-        # parquet to S3 + POSTs to icebox. No local kafka.commit() — the
-        # icebox owns offset commits atomically with its Iceberg snapshot.
+    if is_icebox:
+        # Icebox sink path: pass kafka_offsets + inserted_at through;
+        # the sink writes parquet to S3 + POSTs to icebox. No local
+        # kafka.commit() — the icebox owns offset commits atomically
+        # with its Iceberg snapshot.
+        if max_msg_timestamp_ms < 0:
+            # No Kafka timestamps in this batch — shouldn't happen for
+            # production data (Kafka always stamps), but guard against
+            # the test path. Fall back to current time; replay would
+            # produce a different value, breaking determinism. Log
+            # loudly so operators see the divergence.
+            log.warning(
+                "_flush: max_msg_timestamp_ms unset; falling back to now() "
+                "— idempotent replay determinism is COMPROMISED for this batch"
+            )
+            inserted_at = datetime.datetime.now(datetime.UTC)
+        else:
+            inserted_at = datetime.datetime.fromtimestamp(max_msg_timestamp_ms / 1000.0, tz=datetime.UTC)
         _write_with_retry(
             sink,
             consolidated,
-            write_kwargs={"kafka_offsets": _kafka_offsets_for_icebox(offsets, cfg.topic)},
+            write_kwargs={
+                "kafka_offsets": _kafka_offsets_for_icebox(offsets, cfg.topic),
+                "inserted_at": inserted_at,
+            },
         )
     else:
         _write_with_retry(sink, consolidated)
     write_duration = time.monotonic() - t0
 
-    if cfg.destination == "icebox":
+    if is_icebox:
         # Icebox commits Kafka offsets atomically with its Iceberg
         # snapshot; skip the local commit. We DO compute tp_offsets for
         # metric emission below so dashboards keep working.
@@ -348,6 +392,12 @@ def main():
     pending_bytes = 0
     pending_records = 0
     offsets: dict[tuple[str, int], int] = {}  # (topic, partition) -> max offset
+    # MAX Kafka message timestamp seen in the current batch, in
+    # milliseconds. Used by the icebox sink to stamp _inserted_at +
+    # partition columns deterministically — same offsets → same MAX
+    # → same partition → same S3 path → idempotent replay. -1 sentinel
+    # means "no messages yet". Reset alongside offsets on each flush.
+    max_msg_timestamp_ms: int = -1
     last_flush = time.monotonic()
     last_lag_sample = 0.0  # force immediate first sample
     last_heartbeat = time.monotonic()
@@ -408,6 +458,15 @@ def main():
                         values.append(msg.value())
                         key = (msg.topic(), msg.partition())
                         offsets[key] = max(offsets.get(key, -1), msg.offset())
+                        # Track MAX message timestamp for deterministic
+                        # partition stamping in the icebox path.
+                        # msg.timestamp() returns (type, value_ms);
+                        # we want the value regardless of type since
+                        # any monotonic-ish timestamp is fine for
+                        # partition-bucket purposes.
+                        _ts_type, ts_value_ms = msg.timestamp()
+                        if ts_value_ms > max_msg_timestamp_ms:
+                            max_msg_timestamp_ms = ts_value_ms
 
                 if values:
                     skipped = 0
@@ -445,6 +504,7 @@ def main():
                     offsets,
                     elapsed,
                     trigger,
+                    max_msg_timestamp_ms=max_msg_timestamp_ms,
                 )
 
                 # Sample lag metrics periodically, not on every flush
@@ -460,6 +520,7 @@ def main():
                 pending_bytes = 0
                 pending_records = 0
                 offsets.clear()
+                max_msg_timestamp_ms = -1
                 metrics.pending_bytes.set(0)
                 last_flush = time.monotonic()
 
@@ -474,7 +535,17 @@ def main():
                 consolidated = pa.concat_tables(pending, promote_options="default")
                 elapsed = time.monotonic() - last_flush
                 log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
-                _flush(sink, cfg, kafka, consolidated, pending_bytes, pending_records, offsets, elapsed)
+                _flush(
+                    sink,
+                    cfg,
+                    kafka,
+                    consolidated,
+                    pending_bytes,
+                    pending_records,
+                    offsets,
+                    elapsed,
+                    max_msg_timestamp_ms=max_msg_timestamp_ms,
+                )
             except Exception:
                 log.exception("Final flush failed — data safe in Kafka, will replay on restart")
 

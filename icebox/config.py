@@ -118,6 +118,19 @@ def load() -> Config:
             f"ICEBOX_COMMITTER_CADENCE_SECONDS must be >= 1, got {cadence}"
         )
 
+    psycopg_pool_max = _int("ICEBOX_PSYCOPG_POOL_MAX", 2)
+    if psycopg_pool_max < 2:
+        # The committer thread holds ONE pool connection for the
+        # lifetime of the process (the advisory lock conn — see
+        # icebox/committer.py:committer_loop). Cycle work + heartbeat
+        # need at least one additional slot. A pool sized to 1 would
+        # deadlock at the first cycle's pg_pool.connection() call.
+        raise RuntimeError(
+            f"ICEBOX_PSYCOPG_POOL_MAX must be >= 2 (committer holds 1 conn "
+            f"for the advisory lock + needs ≥1 more for cycle work), got "
+            f"{psycopg_pool_max}"
+        )
+
     return Config(
         pg_host=_require("ICEBOX_PG_HOST"),
         pg_port=_int("ICEBOX_PG_PORT", 5432),
@@ -128,7 +141,7 @@ def load() -> Config:
         asyncpg_pool_min=_int("ICEBOX_ASYNCPG_POOL_MIN", 2),
         asyncpg_pool_max=_int("ICEBOX_ASYNCPG_POOL_MAX", 8),
         psycopg_pool_min=_int("ICEBOX_PSYCOPG_POOL_MIN", 1),
-        psycopg_pool_max=_int("ICEBOX_PSYCOPG_POOL_MAX", 2),
+        psycopg_pool_max=psycopg_pool_max,
         iceberg_catalog_uri=_require("ICEBOX_ICEBERG_CATALOG_URI"),
         iceberg_warehouse=_optional("ICEBOX_ICEBERG_WAREHOUSE", "ingest"),
         kafka_bootstrap_servers=_require("ICEBOX_KAFKA_BOOTSTRAP_SERVERS"),

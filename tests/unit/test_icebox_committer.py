@@ -58,48 +58,124 @@ def _schema() -> Schema:
 
 
 class FakePool:
-    """A psycopg-shaped pool that yields a single shared mock connection.
+    """A psycopg-shaped pool that models DISTINCT connections for
+    `getconn()` (the advisory-lock conn) vs `connection()` (cycle work).
 
-    Records every call on the connection's cursor so tests can assert
-    which SQL ran and in what order.
+    Why distinct: the production semantic is "the lock is held on a
+    specific connection's session for the lifetime of the committer
+    thread." If a regression hands the lock conn out to a cycle's
+    `connection()` block (or vice versa), the lock could be released
+    mid-cycle when the with-block exits. A single-connection fake
+    can't catch this.
 
-    Supports both:
-      - context-managed `with pool.connection() as conn:` (cycle work)
-      - explicit `getconn()` / `putconn()` (committer_loop's dedicated
-        advisory-lock connection)
+    Tracks:
+      - `getconn_calls`: count of getconn invocations.
+      - `putconn_calls`: list of conns returned (for ordering assertions).
+      - `lock_conn` is the conn returned by getconn(); always the same
+        object so the test can verify it's NEVER returned via the
+        `connection()` path.
+      - `cycle_conn` is the conn yielded by `with pool.connection() as
+        conn:` — DIFFERENT from lock_conn.
 
-    For the advisory-lock path: by default, the cursor's fetchone returns
-    (True,) so try_acquire_committer_lock succeeds on first attempt.
-    Tests that want to exercise the "lock held by another committer"
-    path can override.
+    Records all SQL via:
+      - `lock_cursor.execute`: SQL run via the lock_conn (e.g.,
+        `pg_try_advisory_lock`, `pg_advisory_unlock`)
+      - `cycle_cursor.execute`: SQL run via cycle/heartbeat conns
+        (e.g., `update_heartbeat`, `claim_files`, `mark_*`)
+      - `cursor.execute` (legacy): an aggregated view that combines
+        both — kept for backward-compat with existing assertion code
+        that just checks "did this SQL appear anywhere."
     """
 
     def __init__(self):
-        self.conn = MagicMock()
-        # Connection.transaction() context manager
         @contextmanager
-        def tx_ctx():
+        def _tx_ctx():
             yield
-        self.conn.transaction.side_effect = tx_ctx
-        # cursor() context manager
-        self.cursor = MagicMock()
-        @contextmanager
-        def cur_ctx():
-            yield self.cursor
-        self.conn.cursor.side_effect = cur_ctx
-        # Default lock-acquire: True (first attempt succeeds)
-        self.cursor.fetchone.return_value = (True,)
+
+        # Build the two distinct mock connections
+        self.lock_conn = MagicMock()
+        self.cycle_conn = MagicMock()
+        self.lock_cursor = MagicMock()
+        self.cycle_cursor = MagicMock()
+
+        # Default fetchone for the lock cursor: True (acquire succeeds)
+        self.lock_cursor.fetchone.return_value = (True,)
+        # Default fetchall for the cycle cursor: empty (no rows)
+        self.cycle_cursor.fetchall.return_value = []
+        self.cycle_cursor.fetchone.return_value = None
+
+        # Wire each connection's cursor() to return its dedicated cursor
+        def _make_cursor_side_effect(cursor):
+            @contextmanager
+            def _cursor_ctx():
+                yield cursor
+            return _cursor_ctx
+
+        self.lock_conn.cursor.side_effect = _make_cursor_side_effect(self.lock_cursor)
+        self.cycle_conn.cursor.side_effect = _make_cursor_side_effect(self.cycle_cursor)
+        self.lock_conn.transaction.side_effect = _tx_ctx
+        self.cycle_conn.transaction.side_effect = _tx_ctx
+
+        # Aggregated views — most existing tests assert against this
+        # without caring which connection ran the SQL. Provide via a
+        # property so they always see the combined log.
+        # We use a single shared mock with side_effect that just
+        # forwards to whichever side ran.
+        self.conn = self.cycle_conn  # back-compat: most tests use .conn for cycle work
+        self.cursor = self._AggregatingCursor(self.lock_cursor, self.cycle_cursor)
+
+        self.getconn_calls = 0
+        self.putconn_calls: list = []
+
+    class _AggregatingCursor:
+        """A view over both real cursors that reports execute calls
+        across BOTH in chronological order. Lets tests assert "this
+        SQL appeared SOMEWHERE in the flow" without having to know
+        which connection ran it."""
+        def __init__(self, lock_cursor, cycle_cursor):
+            self._lock = lock_cursor
+            self._cycle = cycle_cursor
+
+        @property
+        def execute(self):
+            # Synthetic execute that exposes call_args_list as the
+            # union of both, ordered by call sequence.
+            agg = MagicMock()
+            # Combine and sort by the mock's call sequence number,
+            # which is what mock_calls records. Since we can't easily
+            # synthesize a global ordering across two separate mocks,
+            # we just concatenate (lock SQLs first, cycle SQLs second).
+            # In practice, the production flow runs the lock SQL FIRST
+            # (at startup, on the lock_conn) and cycle SQL LATER (per
+            # cycle, on pool-managed conns), so concatenation reflects
+            # the actual order.
+            agg.call_args_list = list(self._lock.execute.call_args_list) + list(
+                self._cycle.execute.call_args_list
+            )
+            return agg
+
+        @property
+        def fetchall(self):
+            return self._cycle.fetchall
+
+        @property
+        def fetchone(self):
+            return self._cycle.fetchone
 
     @contextmanager
     def connection(self):
-        yield self.conn
+        """Cycle-work conn — DISTINCT from lock_conn."""
+        yield self.cycle_conn
 
     def getconn(self):
-        return self.conn
+        """The advisory-lock dedicated conn."""
+        self.getconn_calls += 1
+        return self.lock_conn
 
     def putconn(self, conn):
-        # No-op for the fake — the connection is shared
-        pass
+        """Track which conn is being returned. A regression that
+        passes the wrong conn surfaces in the recorded sequence."""
+        self.putconn_calls.append(conn)
 
 
 def _file_row(
@@ -559,25 +635,26 @@ def test_committer_loop_stamps_heartbeat_before_recovery(monkeypatch):
     dead-committer accept-writes window extends past cadence ×
     stale_multiple. PE-review #15.
 
-    Note: the lock-acquire-then-stop pattern below uses the advisory
-    lock's True return to also trip the stop event, so the loop runs
-    just enough to stamp the heartbeat then exits."""
+    Recovery is allowed to run for real (FakePool returns empty
+    incomplete_cycles, so recovery is a natural no-op). The
+    try_acquire_committer_lock monkeypatch is the coordination shim
+    that trips stop_event right after a successful acquire; the
+    underlying lock-acquire behavior is exercised via FakePool."""
     import threading
     from icebox.postgres_sync import UPDATE_HEARTBEAT_SQL
 
     deps, pool = _deps(claimed_ids=[])
 
-    # Recovery is a no-op
-    monkeypatch.setattr(cm, "recover_in_flight_cycles", MagicMock(return_value=[]))
-
     stop = threading.Event()
 
-    # Trip stop_event from inside the advisory-lock acquisition so the
-    # loop runs through: lock → heartbeat stamp → recovery (mocked) →
-    # `while not stop` check (already set) → exit.
-    original_try_lock = cm.ps.try_acquire_committer_lock
+    # Coordinate test timing: trip stop_event from inside the lock
+    # acquisition so the loop runs through lock → heartbeat → recovery
+    # (naturally empty) → check stop (set) → exit. This monkeypatch is
+    # a sync primitive, NOT a substitution of the lock behavior — the
+    # cursor.execute still runs through FakePool.
+    original_try = cm.ps.try_acquire_committer_lock
     def lock_then_stop(conn, **kwargs):
-        result = True  # acquire succeeds
+        result = original_try(conn, **kwargs)
         stop.set()
         return result
     monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_then_stop)
@@ -586,7 +663,7 @@ def test_committer_loop_stamps_heartbeat_before_recovery(monkeypatch):
     cfg = Config(**{**cfg.__dict__, "committer_cadence_seconds": 1})
     cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
 
-    # Heartbeat MUST appear in the SQL log even though no cycle ran
+    # Heartbeat MUST appear in the SQL log
     executed = [c[0][0] for c in pool.cursor.execute.call_args_list]
     assert UPDATE_HEARTBEAT_SQL in executed
 
@@ -612,24 +689,21 @@ def test_committer_loop_exits_if_stop_set_during_lock_acquisition():
 
 def test_committer_loop_releases_advisory_lock_on_exit(monkeypatch):
     """Graceful shutdown calls pg_advisory_unlock so a fast pod restart
-    doesn't have to wait for TCP timeout on the dying connection."""
+    doesn't have to wait for TCP timeout on the dying connection.
+    Recovery runs through real code (FakePool yields empty incomplete
+    cycles); the lock monkeypatch is purely a stop coordinator."""
     import threading
     from icebox.postgres_sync import UNLOCK_ADVISORY_LOCK_SQL
 
     deps, pool = _deps(claimed_ids=[])
-    monkeypatch.setattr(cm, "recover_in_flight_cycles", MagicMock(return_value=[]))
 
     stop = threading.Event()
-    # Acquire succeeds; stop fires on first iteration via cycle-loop
-    # entry — simplest is to make claim return empty so the loop is
-    # a no-op then set stop.
-    pool.cursor.fetchall.return_value = []
-    pool.cursor.fetchall.side_effect = None
 
     original = cm.ps.try_acquire_committer_lock
     def lock_then_arm_stop(conn, **kwargs):
+        result = original(conn, **kwargs)
         stop.set()
-        return True
+        return result
     monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_then_arm_stop)
 
     cfg = _cfg()
@@ -688,17 +762,30 @@ def test_run_cycle_merges_disjoint_partition_offsets():
 # ---------------------------------------------------------------------------
 
 
-def test_min_inter_cycle_sleep_constant_floors_loop_wait():
-    """Even if a cycle takes longer than cadence, the loop sleeps at
-    least MIN_INTER_CYCLE_SLEEP_SECONDS so a tight failure loop doesn't
-    hammer Lakekeeper. PE-review #23.
+def test_min_inter_cycle_sleep_caps_failure_rate():
+    """PE-review #23 + QE-review T3: the floor exists to bound the
+    attempt rate during sustained Lakekeeper failure. Tied to the
+    design intent: ≤ 15 attempts/min at the baseline 60s cadence.
 
-    Bumped from 1.0s to 5.0s for prod-us: at the 60s baseline cadence,
-    that's 12 attempts/min in failure mode — plenty for Lakekeeper to
-    recover or for ops to notice, and the cost of cycle thrashing at
-    prod scale is non-trivial."""
-    assert cm.MIN_INTER_CYCLE_SLEEP_SECONDS > 0
-    assert cm.MIN_INTER_CYCLE_SLEEP_SECONDS == 5.0
+    Replacing a bare `== 5.0` pin with this property-based check
+    communicates WHY: if a future engineer tightens to 1s (60/min),
+    the test fails with a message explaining the prod incident cost;
+    if they relax to 30s (2/min), it still passes."""
+    assert cm.MIN_INTER_CYCLE_SLEEP_SECONDS > 0, (
+        "MIN_INTER_CYCLE_SLEEP_SECONDS must be positive — a zero floor "
+        "allows the loop to thrash Lakekeeper at thread-scheduling speed"
+    )
+    baseline_cadence_s = 60.0
+    max_attempts_per_min = 60.0 / cm.MIN_INTER_CYCLE_SLEEP_SECONDS
+    assert max_attempts_per_min <= 15, (
+        f"MIN_INTER_CYCLE_SLEEP_SECONDS={cm.MIN_INTER_CYCLE_SLEEP_SECONDS} "
+        f"allows {max_attempts_per_min}/min failure-cycle attempts at the "
+        f"{baseline_cadence_s}s baseline cadence. The cost of thrashing "
+        f"Lakekeeper during a sustained 5xx incident scales with conn "
+        f"churn × manifest writes that may partially commit before "
+        f"failing. Bumping this floor down requires re-evaluating prod "
+        f"incident rate; see PE-review #23 in the PR history."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +908,195 @@ def test_recover_branch_a_deletes_cycle_row():
     idx_rel = executed.index(RELEASE_CYCLE_CLAIM_SQL)
     idx_del = executed.index(DELETE_CYCLE_ROW_SQL)
     assert idx_rel < idx_del
+
+
+def test_committer_loop_lock_conn_distinct_from_cycle_conns(monkeypatch):
+    """PE/QE review #8: the advisory lock is session-scoped on a
+    SPECIFIC connection that's held for the lifetime of the thread.
+    If that conn is ever returned to the pool during cycle work, the
+    session ends and the lock evaporates — defeating the singleton
+    guarantee. Production code holds `lock_conn` outside the pool's
+    context managers; this test pins that property.
+
+    Uses the new FakePool that returns distinct mocks for getconn()
+    vs connection() — a regression that handed the lock_conn to a
+    cycle's `pool.connection()` would surface in the recorded SQL
+    ending up on the wrong cursor."""
+    import threading
+    from icebox.postgres_sync import TRY_ADVISORY_LOCK_SQL, UPDATE_HEARTBEAT_SQL
+
+    deps, pool = _deps(claimed_ids=[])
+
+    stop = threading.Event()
+    original_try = cm.ps.try_acquire_committer_lock
+    def lock_then_stop(conn, **kwargs):
+        result = original_try(conn, **kwargs)
+        stop.set()
+        return result
+    monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_then_stop)
+
+    cfg = _cfg()
+    cfg = Config(**{**cfg.__dict__, "committer_cadence_seconds": 1})
+    cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
+
+    # The advisory-lock SQL must have run on the lock_cursor (via lock_conn),
+    # NOT the cycle_cursor (via cycle_conn).
+    lock_executed = [c[0][0] for c in pool.lock_cursor.execute.call_args_list]
+    cycle_executed = [c[0][0] for c in pool.cycle_cursor.execute.call_args_list]
+    assert TRY_ADVISORY_LOCK_SQL in lock_executed, (
+        "pg_try_advisory_lock must run on the dedicated lock connection"
+    )
+    assert TRY_ADVISORY_LOCK_SQL not in cycle_executed, (
+        "pg_try_advisory_lock leaked onto a cycle-work connection — "
+        "session-scoped lock would be released when the with-block exits"
+    )
+
+    # Heartbeat goes through pool.connection() (cycle_conn), NOT the lock_conn
+    assert UPDATE_HEARTBEAT_SQL in cycle_executed, (
+        "update_heartbeat should run on a cycle-work connection (via pool.connection())"
+    )
+
+    # And the lock_conn was returned to the pool on shutdown.
+    assert pool.lock_conn in pool.putconn_calls
+
+
+def test_committer_loop_putconn_returns_lock_conn_on_acquisition_failure(monkeypatch):
+    """PE review #7: if try_acquire_committer_lock raises, the
+    candidate conn must NOT leak (try/finally around the acquire).
+    Pool budget at psycopg_pool_max=2 means one leaked conn halves
+    the budget — followed by another would brick the pool."""
+    import threading
+
+    deps, pool = _deps(claimed_ids=[])
+    raise_count = {"n": 0}
+
+    def lock_raiser(conn, **kwargs):
+        raise_count["n"] += 1
+        raise RuntimeError("transient PG error")
+
+    monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_raiser)
+
+    stop = threading.Event()
+    # Stop the loop after a short delay so it exits cleanly without
+    # the lock ever being acquired.
+    def stop_after_short_delay():
+        import time
+        time.sleep(0.05)
+        stop.set()
+    threading.Thread(target=stop_after_short_delay, daemon=True).start()
+
+    cfg = _cfg()
+    cfg = Config(**{**cfg.__dict__, "committer_cadence_seconds": 1})
+    cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
+
+    # Lock acquisition raised; the conn MUST have been returned to the
+    # pool (no leak). Putconn count = getconn count (every checkout
+    # got a corresponding return).
+    assert raise_count["n"] >= 1, "expected at least one acquire attempt"
+    assert pool.lock_conn in pool.putconn_calls, (
+        "lock_conn leaked when try_acquire_committer_lock raised"
+    )
+
+
+def test_committer_loop_recovers_from_getconn_exception(monkeypatch):
+    """PE review #6: if pg_pool.getconn() raises during the
+    acquisition loop, the committer must log + retry, NOT crash the
+    thread silently."""
+    import threading
+
+    deps, pool = _deps(claimed_ids=[])
+
+    # First getconn raises, second succeeds. Substitute the FakePool
+    # method directly — this isn't a monkeypatch of production code;
+    # it's a test-double behavior override.
+    original_getconn = pool.getconn
+    call_count = {"n": 0}
+
+    def flaky_getconn():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("transient PG connect error")
+        return original_getconn()
+
+    pool.getconn = flaky_getconn
+
+    stop = threading.Event()
+    original_try = cm.ps.try_acquire_committer_lock
+    def lock_then_stop(conn, **kwargs):
+        result = original_try(conn, **kwargs)
+        stop.set()
+        return result
+    monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_then_stop)
+
+    cfg = _cfg()
+    cfg = Config(**{**cfg.__dict__, "committer_cadence_seconds": 1})
+    # Must not raise
+    cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
+    assert call_count["n"] >= 2, "expected getconn to be retried after the raise"
+
+
+def test_committer_advisory_lock_uses_correct_lock_id():
+    """QE review T10: the lock-id constant is pinned in a separate
+    test, but no test verifies the ACTUAL value passed at the call
+    site. Catch a regression where someone hardcodes a different id."""
+    import threading
+    from icebox.postgres_sync import COMMITTER_ADVISORY_LOCK_ID
+
+    deps, pool = _deps(claimed_ids=[])
+    stop = threading.Event()
+    stop.set()  # exit before reaching cycle work
+    cm.committer_loop(cfg=_cfg(), pg_pool=pool, deps=deps, stop_event=stop)
+    # No call yet because stop is pre-set — instead, call the helper
+    # directly with the production conn and check what got passed.
+    pool.lock_cursor.reset_mock()
+    cm.ps.try_acquire_committer_lock(pool.lock_conn)
+    call = pool.lock_cursor.execute.call_args
+    assert call.args[1] == {"key": COMMITTER_ADVISORY_LOCK_ID}
+
+
+def test_committer_loop_heartbeat_runs_before_recovery(monkeypatch):
+    """QE review T2: the heartbeat MUST be stamped before recovery
+    runs (otherwise a long recovery sees a None heartbeat → API treats
+    as not-stale → writes accumulate against a maybe-dead committer).
+
+    Asserts ORDERING via the SQL trace recorded on the cycle_cursor.
+    Real heartbeat + real recovery both run (recovery is a natural
+    no-op because FakePool returns empty incomplete_cycles), and the
+    cycle_cursor records both queries — so UPDATE_HEARTBEAT_SQL must
+    appear before INCOMPLETE_CYCLES_SQL in execute.call_args_list.
+
+    This approach pins the production code's behavior end-to-end,
+    not just the order of two mocked method calls."""
+    import threading
+    from icebox.postgres_sync import INCOMPLETE_CYCLES_SQL, UPDATE_HEARTBEAT_SQL
+
+    deps, pool = _deps(claimed_ids=[])
+
+    stop = threading.Event()
+    original_try = cm.ps.try_acquire_committer_lock
+    def lock_then_stop(conn, **kwargs):
+        result = original_try(conn, **kwargs)
+        stop.set()
+        return result
+    monkeypatch.setattr(cm.ps, "try_acquire_committer_lock", lock_then_stop)
+
+    cfg = _cfg()
+    cfg = Config(**{**cfg.__dict__, "committer_cadence_seconds": 1})
+    cm.committer_loop(cfg=cfg, pg_pool=pool, deps=deps, stop_event=stop)
+
+    # Both queries land on the cycle_cursor (heartbeat via
+    # pool.connection(), incomplete_cycles via pool.connection() inside
+    # recover_in_flight_cycles). The lock SQLs are on the lock_cursor
+    # so they don't interfere with this assertion.
+    executed = [c[0][0] for c in pool.cycle_cursor.execute.call_args_list]
+    assert UPDATE_HEARTBEAT_SQL in executed
+    assert INCOMPLETE_CYCLES_SQL in executed
+    idx_hb = executed.index(UPDATE_HEARTBEAT_SQL)
+    idx_rec = executed.index(INCOMPLETE_CYCLES_SQL)
+    assert idx_hb < idx_rec, (
+        f"update_heartbeat must run BEFORE incomplete_cycles (recovery); "
+        f"SQL order on cycle_cursor was {executed}"
+    )
 
 
 def test_recover_kafka_failure_pumps_heartbeat():

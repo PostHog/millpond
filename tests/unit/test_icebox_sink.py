@@ -340,65 +340,151 @@ def _make_sink(**overrides):
     return IceboxSink(**defaults), register_mock
 
 
-def test_sink_write_produces_deterministic_path():
-    """Same kafka_offsets + same _add_metadata_columns now()-stamp → same S3 URI.
-    To stabilize the now() bit, we freeze datetime via monkeypatch in the
-    next test; here we just confirm same inputs in one tick yield equal paths."""
+# Standard inserted_at for tests — a stable, tz-aware UTC datetime.
+# Real production callers (millpond/main.py:_flush) derive this from
+# the MAX Kafka message timestamp in the batch.
+_FIXED_INSERTED_AT = datetime(2026, 6, 1, 14, 30, 45, 0, tzinfo=UTC)
+
+
+def test_sink_write_produces_deterministic_path_across_hour_boundary():
+    """The load-bearing test: same kafka_offsets PLUS same inserted_at
+    yields the same S3 path, regardless of wall-clock. The previous
+    version of this test passed by wall-clock coincidence (both writes
+    in the same wall-second). The fix: pin inserted_at explicitly so
+    the test exercises the actual determinism contract."""
     s3_calls = []
     sink, _ = _make_sink()
     batch = _arrow_batch_simple()
     sink.write(
         batch,
         kafka_offsets={"0": 100, "1": 200},
+        inserted_at=_FIXED_INSERTED_AT,
         s3_writer=lambda uri, data: s3_calls.append(uri),
     )
     sink.write(
         batch,
         kafka_offsets={"0": 100, "1": 200},
+        inserted_at=_FIXED_INSERTED_AT,
         s3_writer=lambda uri, data: s3_calls.append(uri),
     )
-    # Both calls in the same test process within the same wall-second
-    # produce identical partition tuples; the kafka_offsets fingerprint
-    # is identical. Paths match.
     assert s3_calls[0] == s3_calls[1]
 
 
+def test_sink_write_path_differs_when_inserted_at_crosses_hour():
+    """Confirms the partition is BAKED INTO the path. Different
+    inserted_at → different path (this is the desired property — same
+    offsets at different times genuinely mean different partitions)."""
+    s3_calls = []
+    sink, _ = _make_sink()
+    batch = _arrow_batch_simple()
+    sink.write(
+        batch,
+        kafka_offsets={"0": 100},
+        inserted_at=datetime(2026, 6, 1, 13, 59, 30, tzinfo=UTC),
+        s3_writer=lambda uri, data: s3_calls.append(uri),
+    )
+    sink.write(
+        batch,
+        kafka_offsets={"0": 100},
+        inserted_at=datetime(2026, 6, 1, 14, 0, 15, tzinfo=UTC),
+        s3_writer=lambda uri, data: s3_calls.append(uri),
+    )
+    assert s3_calls[0] != s3_calls[1], (
+        "different inserted_at must produce different paths "
+        "(year/month/day/hour partition embedded in S3 URI)"
+    )
+
+
+def test_sink_write_replay_after_hour_boundary_yields_same_path():
+    """The critical regression test for the PE/QE blocker: writer
+    crashes at 13:59, replays at 14:00 with the same Kafka offsets;
+    because main.py:_flush derives inserted_at from the MAX MESSAGE
+    timestamp in the batch (NOT wall-clock), replay produces the same
+    inserted_at and therefore the same S3 path → S3 dedup → icebox 409
+    on POST → no duplicate registration."""
+    s3_calls = []
+    sink, _ = _make_sink()
+    batch = _arrow_batch_simple()
+    # Simulate what main.py:_flush computes: a per-batch deterministic
+    # inserted_at derived from the data's max Kafka timestamp.
+    batch_max_ts = datetime(2026, 6, 1, 13, 58, 0, tzinfo=UTC)
+
+    # First attempt: wall-clock 13:59:30 (irrelevant — sink only uses inserted_at)
+    sink.write(
+        batch, kafka_offsets={"0": 100, "1": 200},
+        inserted_at=batch_max_ts,
+        s3_writer=lambda uri, data: s3_calls.append(uri),
+    )
+    # Replay: wall-clock 14:00:15 (after hour boundary), but caller
+    # recomputes the same batch_max_ts because the messages are the same
+    sink.write(
+        batch, kafka_offsets={"0": 100, "1": 200},
+        inserted_at=batch_max_ts,
+        s3_writer=lambda uri, data: s3_calls.append(uri),
+    )
+    assert s3_calls[0] == s3_calls[1], (
+        "Replay-with-same-messages MUST produce same S3 path "
+        "(this is the deterministic-replay contract). If this test fails, "
+        "the icebox sink is no longer idempotent under writer-crash-replay."
+    )
+
+
 def test_sink_write_path_includes_partition_columns():
-    """The S3 path embeds year/month/day/hour derived from the sink's
-    internal _add_metadata_columns stamp."""
+    """The S3 path embeds year/month/day/hour derived from inserted_at."""
     s3_calls = []
     sink, _ = _make_sink()
     sink.write(
         _arrow_batch_simple(),
         kafka_offsets={"0": 100},
+        inserted_at=_FIXED_INSERTED_AT,
         s3_writer=lambda uri, data: s3_calls.append(uri),
     )
     uri = s3_calls[0]
-    # Path contains four partition segments (year=, month=, day=, hour=)
-    assert "year=" in uri
-    assert "month=" in uri
-    assert "day=" in uri
-    assert "hour=" in uri
+    assert "year=2026" in uri
+    assert "month=06" in uri
+    assert "day=01" in uri
+    assert "hour=14" in uri
+
+
+def test_sink_write_rejects_naive_inserted_at():
+    """A naive (tz-less) datetime would silently produce ambiguous
+    partition values; refuse at the call site."""
+    sink, _ = _make_sink()
+    with pytest.raises(ValueError, match="tz-aware"):
+        sink.write(
+            _arrow_batch_simple(),
+            kafka_offsets={"0": 1},
+            inserted_at=datetime(2026, 6, 1, 14, 0),  # naive
+            s3_writer=lambda uri, data: None,
+        )
+
+
+def test_sink_write_requires_inserted_at():
+    """No inserted_at = refuse. The icebox's idempotency depends on
+    caller-provided determinism here."""
+    sink, _ = _make_sink()
+    with pytest.raises(ValueError, match="inserted_at"):
+        sink.write(
+            _arrow_batch_simple(),
+            kafka_offsets={"0": 1},
+            s3_writer=lambda uri, data: None,
+        )
 
 
 def test_sink_write_posts_correct_request_body():
     """The icebox sees: full RegisterFileRequest with stats, fingerprint,
-    partition values (sink-derived), kafka_offsets (caller-supplied)."""
+    partition values (sink-derived from inserted_at), kafka_offsets."""
     sink, register_mock = _make_sink(writer_ordinal=20)
     sink.write(
         _arrow_batch_simple(),
         kafka_offsets={"0": 1000},
+        inserted_at=_FIXED_INSERTED_AT,
         s3_writer=lambda uri, data: None,
     )
     req = register_mock.call_args[0][0]
     assert req.writer_ordinal == 20
     assert req.kafka_offsets == {"0": 1000}
-    # partition_values are now derived from the sink-stamped _inserted_at;
-    # all four keys must be present
-    assert set(req.partition_values.keys()) == {"year", "month", "day", "hour"}
-    assert all(isinstance(v, int) for v in req.partition_values.values())
-    # record_count reflects rows in the original batch (metadata columns
-    # are added on the way to parquet but don't change row count)
+    assert req.partition_values == {"year": 2026, "month": 6, "day": 1, "hour": 14}
     assert req.record_count == 3
     assert req.file_size > 0
     assert len(req.schema_fingerprint) == 64
@@ -407,13 +493,13 @@ def test_sink_write_posts_correct_request_body():
 
 
 def test_sink_write_uploads_to_s3_at_request_path():
-    """The S3 PUT must hit the same path that's in the POST body —
-    if these diverge, the icebox registers a path with no file."""
+    """The S3 PUT must hit the same path that's in the POST body."""
     s3_calls = []
     sink, register_mock = _make_sink()
     sink.write(
         _arrow_batch_simple(),
         kafka_offsets={"0": 1000},
+        inserted_at=_FIXED_INSERTED_AT,
         s3_writer=lambda uri, data: s3_calls.append((uri, data)),
     )
     s3_uri = s3_calls[0][0]
@@ -422,66 +508,73 @@ def test_sink_write_uploads_to_s3_at_request_path():
 
 
 def test_sink_write_rejects_empty_batch():
-    """main.py gates on non-empty; defensive guard catches regressions."""
     sink, _ = _make_sink(bucket="b", warehouse_prefix="w", namespace="n", table="t")
     empty = pa.table({"x": pa.array([], type=pa.int64())})
     with pytest.raises(ValueError, match="zero-row"):
         sink.write(
             empty, kafka_offsets={"0": 0},
+            inserted_at=_FIXED_INSERTED_AT,
             s3_writer=lambda uri, data: None,
         )
 
 
 def test_sink_write_requires_kafka_offsets():
-    """Without kafka_offsets, the icebox couldn't commit Kafka — fail
-    loud at call site rather than constructing a half-formed POST."""
     sink, _ = _make_sink()
     with pytest.raises(ValueError, match="kafka_offsets"):
-        sink.write(_arrow_batch_simple(), s3_writer=lambda uri, data: None)
+        sink.write(
+            _arrow_batch_simple(),
+            inserted_at=_FIXED_INSERTED_AT,
+            s3_writer=lambda uri, data: None,
+        )
 
 
 def test_sink_write_requires_s3_writer():
-    """If neither per-call nor instance s3_writer is set, refuse."""
     sink, _ = _make_sink()
     with pytest.raises(ValueError, match="s3_writer"):
-        sink.write(_arrow_batch_simple(), kafka_offsets={"0": 1})
+        sink.write(
+            _arrow_batch_simple(),
+            kafka_offsets={"0": 1},
+            inserted_at=_FIXED_INSERTED_AT,
+        )
 
 
 def test_sink_write_uses_instance_s3_writer_when_no_per_call():
-    """Production wiring sets s3_writer once at construction. Verify
-    that path works (no per-call override needed)."""
     s3_calls = []
     sink, _ = _make_sink(s3_writer=lambda uri, data: s3_calls.append(uri))
-    sink.write(_arrow_batch_simple(), kafka_offsets={"0": 1})
+    sink.write(
+        _arrow_batch_simple(),
+        kafka_offsets={"0": 1},
+        inserted_at=_FIXED_INSERTED_AT,
+    )
     assert len(s3_calls) == 1
 
 
-def test_sink_write_rejects_batch_with_reserved_columns():
-    """The sink adds metadata columns internally. A caller passing a
-    pre-stamped batch would double-add — refuse."""
+@pytest.mark.parametrize("reserved_col", ["_inserted_at", "year", "month", "day", "hour"])
+def test_sink_write_rejects_batch_with_reserved_columns(reserved_col):
+    """The sink adds ALL metadata columns. A caller passing ANY of them
+    pre-stamped would double-add."""
     sink, _ = _make_sink()
     pre_stamped = _arrow_batch_simple().append_column(
-        "_inserted_at", pa.array([1, 2, 3], pa.int64())
+        reserved_col, pa.array([1, 2, 3], pa.int64())
     )
-    with pytest.raises(ValueError, match="_inserted_at"):
+    with pytest.raises(ValueError, match=reserved_col):
         sink.write(
-            pre_stamped, kafka_offsets={"0": 1},
+            pre_stamped,
+            kafka_offsets={"0": 1},
+            inserted_at=_FIXED_INSERTED_AT,
             s3_writer=lambda uri, data: None,
         )
 
 
 def test_sink_write_adds_partition_columns():
-    """The parquet that lands in S3 must contain the four partition
-    columns — otherwise the icebox-side DataFile.partition tuple
-    wouldn't match the actual data."""
     s3_payloads: list[bytes] = []
     sink, _ = _make_sink()
     sink.write(
         _arrow_batch_simple(),
         kafka_offsets={"0": 1},
+        inserted_at=_FIXED_INSERTED_AT,
         s3_writer=lambda uri, data: s3_payloads.append(data),
     )
-    # Inspect the parquet that was actually shipped
     pf = pq.ParquetFile(pa.BufferReader(s3_payloads[0]))
     schema_names = pf.schema_arrow.names
     for col in ("_inserted_at", "year", "month", "day", "hour"):
@@ -489,10 +582,11 @@ def test_sink_write_adds_partition_columns():
 
 
 def test_sink_reset_caches_clears_schema():
-    """After reset, next write re-derives the schema."""
     sink, _ = _make_sink()
     sink.write(
-        _arrow_batch_simple(), kafka_offsets={"0": 0},
+        _arrow_batch_simple(),
+        kafka_offsets={"0": 0},
+        inserted_at=_FIXED_INSERTED_AT,
         s3_writer=lambda uri, data: None,
     )
     assert sink._iceberg_schema is not None
@@ -513,12 +607,84 @@ def test_sink_close_propagates_to_client():
 
 
 def test_sink_schema_fingerprint_stable_across_batches():
-    """Two writes of the same source schema produce the same fingerprint
-    in the POST body — the metadata columns are deterministic, so the
-    augmented schema is identical across calls."""
     sink, register_mock = _make_sink()
     batch = _arrow_batch_simple()
-    sink.write(batch, kafka_offsets={"0": 1}, s3_writer=lambda uri, data: None)
-    sink.write(batch, kafka_offsets={"0": 2}, s3_writer=lambda uri, data: None)
+    sink.write(
+        batch, kafka_offsets={"0": 1},
+        inserted_at=_FIXED_INSERTED_AT,
+        s3_writer=lambda uri, data: None,
+    )
+    sink.write(
+        batch, kafka_offsets={"0": 2},
+        inserted_at=_FIXED_INSERTED_AT,
+        s3_writer=lambda uri, data: None,
+    )
     fps = [c[0][0].schema_fingerprint for c in register_mock.call_args_list]
     assert fps[0] == fps[1]
+
+
+# ---------------------------------------------------------------------------
+# Drift-detection tests vs millpond/iceberg.py (PE + QE flagged)
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_columns_match_iceberg_sink():
+    """The icebox sink keeps an inline copy of millpond/iceberg.py's
+    RESERVED_COLUMNS to avoid pulling pyiceberg into a DuckLake-only
+    deployment. This test pins equivalence so a future addition to
+    one set without the other surfaces immediately."""
+    from millpond.icebox_sink import _RESERVED_COLUMNS
+    from millpond.iceberg import RESERVED_COLUMNS as ICEBERG_RESERVED
+    assert _RESERVED_COLUMNS == ICEBERG_RESERVED
+
+
+def test_add_metadata_columns_schema_matches_iceberg_sink():
+    """The icebox sink's _add_metadata_columns must produce the same
+    schema shape as millpond/iceberg.py's. Drift here would silently
+    break the schema fingerprint contract between writer and icebox-
+    side table — every POST would 400 with schema_mismatch.
+
+    Pins SHAPE (column names, types) not VALUES (timestamps differ
+    naturally between calls, by design)."""
+    import millpond.iceberg as iceberg_mod
+    import millpond.icebox_sink as icebox_sink_mod
+
+    batch = _arrow_batch_simple()
+    fixed_ts = _FIXED_INSERTED_AT
+
+    # icebox-sink helper takes inserted_at; iceberg.py's uses now() —
+    # so VALUES differ but SHAPE must match.
+    icebox_out = icebox_sink_mod._add_metadata_columns(batch, fixed_ts)
+    iceberg_out = iceberg_mod._add_metadata_columns(batch)
+
+    # Same column ORDER and TYPES — the schema fingerprint depends on this.
+    assert icebox_out.schema.names == iceberg_out.schema.names, (
+        f"column order drift: icebox={icebox_out.schema.names} "
+        f"iceberg={iceberg_out.schema.names}"
+    )
+    for name in icebox_out.schema.names:
+        ix_type = icebox_out.schema.field(name).type
+        ib_type = iceberg_out.schema.field(name).type
+        assert ix_type == ib_type, (
+            f"type drift on column {name!r}: icebox={ix_type} iceberg={ib_type}"
+        )
+
+
+def test_partition_values_from_batch_rejects_heterogeneous_partition():
+    """Defensive: if a future refactor split _add_metadata_columns from
+    the row-0 read and someone built a batch with mixed (y, m, d, h)
+    tuples, we want to fail loudly rather than ship a row-0-only
+    partition tuple that mismatches the parquet's actual data."""
+    from millpond.icebox_sink import _partition_values_from_batch
+
+    # Build a batch where the 'hour' column has two different values
+    bad = pa.table({
+        "x": pa.array([1, 2], pa.int64()),
+        "_inserted_at": pa.array([_FIXED_INSERTED_AT, _FIXED_INSERTED_AT], pa.timestamp("us", tz="UTC")),
+        "year": pa.array([2026, 2026], pa.int32()),
+        "month": pa.array([6, 6], pa.int32()),
+        "day": pa.array([1, 1], pa.int32()),
+        "hour": pa.array([14, 15], pa.int32()),  # split across hours
+    })
+    with pytest.raises(ValueError, match="multiple values"):
+        _partition_values_from_batch(bad)
