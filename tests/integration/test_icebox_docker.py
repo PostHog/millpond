@@ -36,6 +36,7 @@ names are a follow-up.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import io
 import socket
 import time
@@ -156,6 +157,41 @@ def _wait_for_container_exit(container: DockerContainer, timeout: float = 30.0) 
     raise RuntimeError(f"container did not exit within {timeout}s")
 
 
+@functools.lru_cache(maxsize=1)
+def _resolve_test_platform() -> str:
+    """Decide which ``--platform`` to use for the icebox image.
+
+    Resolution order:
+      1. ``MILLPOND_TEST_PLATFORM`` env var if set (empty string ⇒
+         no --platform flag at all).
+      2. Apple-Silicon hosts (Darwin + arm64): default to
+         ``linux/arm64`` for native-speed iteration. The Rosetta
+         emulation cost of building/running linux/amd64 on M-series
+         (~30% slowdown) makes the default friction-y, and Apple-
+         Silicon devs running these tests are virtually always doing
+         iterative work, not CI parity validation.
+      3. Everywhere else: ``linux/amd64`` (matches what the chart
+         publishes to ECR; what runs in mw-prod-us).
+
+    Devs who want strict prod-arch parity on Apple Silicon can
+    ``MILLPOND_TEST_PLATFORM=linux/amd64``.
+    """
+    import os
+    import platform as host_platform
+
+    env_override = os.environ.get("MILLPOND_TEST_PLATFORM")
+    if env_override is not None:
+        return env_override
+    if host_platform.system() == "Darwin" and host_platform.machine() == "arm64":
+        print(
+            "[icebox-docker-tests] Apple Silicon detected; defaulting build "
+            "to linux/arm64 for native iteration. Export "
+            "MILLPOND_TEST_PLATFORM=linux/amd64 to test against the prod arch."
+        )
+        return "linux/arm64"
+    return "linux/amd64"
+
+
 # ---------------------------------------------------------------------------
 # Session-scoped: image build + shared docker network
 # ---------------------------------------------------------------------------
@@ -175,20 +211,13 @@ def icebox_image() -> Iterator[str]:
     changed. The image carries both `millpond` and `icebox` console
     scripts; we run it with command="icebox".
     """
-    import os
     import subprocess
 
     tag = "millpond:icebox-integration-test"
-    # Pin the build platform to match what the chart ships
-    # (linux/amd64). Without this, an Apple-Silicon dev gets a
-    # linux/arm64 image — exactly the test/prod divergence this
-    # file exists to catch.
-    #
-    # Devs who want native-arch local iteration can opt out via
-    # ``MILLPOND_TEST_PLATFORM=linux/arm64`` (or any other platform
-    # string), or set it to an empty string to skip the --platform
-    # flag entirely. CI keeps the default amd64 pin.
-    platform = os.environ.get("MILLPOND_TEST_PLATFORM", "linux/amd64")
+    # Resolution lives in _resolve_test_platform: explicit env-var
+    # override wins; Apple Silicon defaults to native arm64; else
+    # linux/amd64 (matches what ships).
+    platform = _resolve_test_platform()
     build_cmd = ["docker", "build"]
     if platform:
         build_cmd += ["--platform", platform]
@@ -470,12 +499,10 @@ def _spawn_icebox(
     if extra_env:
         env.update(extra_env)
 
-    # Honor the same MILLPOND_TEST_PLATFORM override the image build
-    # uses, so the run-time platform always matches the build-time
-    # platform. Default linux/amd64 matches the chart's prod image.
-    import os
-
-    run_platform = os.environ.get("MILLPOND_TEST_PLATFORM", "linux/amd64")
+    # Run-time platform must match build-time platform; reuse the
+    # same resolution rules (env-var override, Apple-Silicon default
+    # to arm64, everywhere else amd64).
+    run_platform = _resolve_test_platform()
     container_kwargs: dict[str, Any] = {"entrypoint": ["icebox"]}
     if run_platform:
         container_kwargs["platform"] = run_platform
