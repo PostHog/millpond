@@ -33,12 +33,91 @@ from collections.abc import Sequence
 from uuid import UUID
 
 import psycopg
+from psycopg import sql
 from psycopg_pool import ConnectionPool
 
 from icebox.config import Config
 from icebox.schema import ALL_DDL, CommitCycleRow
 
 log = logging.getLogger(__name__)
+
+
+
+
+def ensure_database_exists(cfg: Config) -> None:
+    """Tactical boot-time bootstrap: if the configured PG database
+    doesn't exist, create it.
+
+    Without this, a fresh icebox deployment boot-loops on
+    "database does not exist" because the migration runner runs
+    AGAINST the configured database — it can't create the database
+    it's connecting to.
+
+    The proper place for this is Terraform (provision the database
+    when provisioning the icebox). This is a stopgap so the dev
+    rollout doesn't require coordinating two PRs.
+
+    Flow:
+      1. Connect to the `postgres` system database (always exists
+         in PG) and SELECT from pg_database to check existence.
+      2. If the target DB exists, return.
+      3. If not, CREATE DATABASE via the same `postgres` connection.
+      4. Race tolerance: if CREATE DATABASE returns 42P04 (duplicate),
+         treat as success (another icebox replica won the race).
+      5. Insufficient-privilege / connect failures re-raise — those
+         are signals for ops, not states we can paper over here.
+
+    The two-step approach (check + create) is used instead of
+    "try connect, fall back on error" because psycopg's
+    OperationalError from `connect()` doesn't carry sqlstate for
+    connection-time failures; string-matching the message is
+    fragile across versions and locales.
+    """
+    conninfo_postgres = psycopg.conninfo.make_conninfo(
+        host=cfg.pg_host,
+        port=cfg.pg_port,
+        dbname="postgres",
+        user=cfg.pg_username,
+        password=cfg.pg_password,
+        sslmode=cfg.pg_sslmode,
+        connect_timeout=10,
+    )
+    # CREATE DATABASE cannot run inside a transaction block; we open
+    # the system connection with autocommit so the optional CREATE
+    # below works. The check query is also fine under autocommit.
+    with psycopg.connect(conninfo_postgres, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s",
+                (cfg.pg_database,),
+            )
+            if cur.fetchone() is not None:
+                log.info(
+                    "ensure_database_exists: database %r already exists, "
+                    "no bootstrap needed",
+                    cfg.pg_database,
+                )
+                return
+
+            log.warning(
+                "ensure_database_exists: database %r does not exist; "
+                "attempting CREATE DATABASE. This is a TACTICAL BOOT-"
+                "TIME BOOTSTRAP — proper provisioning belongs in Terraform.",
+                cfg.pg_database,
+            )
+            stmt = sql.SQL("CREATE DATABASE {}").format(sql.Identifier(cfg.pg_database))
+            try:
+                cur.execute(stmt)
+            except psycopg.errors.DuplicateDatabase:
+                # Race: another icebox replica created it between the
+                # SELECT and the CREATE. Treat as success.
+                log.info(
+                    "ensure_database_exists: database %r was created "
+                    "concurrently — proceeding",
+                    cfg.pg_database,
+                )
+                return
+    log.info("ensure_database_exists: created database %r", cfg.pg_database)
 
 
 def build_psycopg_pool(cfg: Config) -> ConnectionPool:

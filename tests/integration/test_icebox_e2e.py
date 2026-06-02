@@ -333,3 +333,77 @@ def test_full_cycle_sanity_check(
 
     # Sanity: the committer's mocked Kafka admin received an offset commit.
     deps.kafka_commit_offsets.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# DB-bootstrap-if-missing — integration test against real Postgres
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_ensure_database_exists_creates_missing_database(pg_conn_kwargs):
+    """End-to-end test of the tactical boot-time DB bootstrap against
+    a real Postgres. The fixture's PG comes with ONE pre-created database
+    (`test` by default). We point a fresh Config at a NON-EXISTENT
+    database name, call ensure_database_exists, and verify:
+      1. The database is created.
+      2. Re-running is idempotent (path-A early-return).
+
+    Without this hack, a fresh icebox deployment would boot-loop on
+    "database does not exist" until the database was provisioned
+    out-of-band via Terraform.
+    """
+    import uuid
+
+    import psycopg
+
+    from icebox.config import Config
+    from icebox import postgres_sync as ps_mod
+
+    # Unique DB name so re-running the test suite doesn't collide with
+    # leftovers from a prior run on the same session container.
+    target_db = f"icebox_bootstrap_{uuid.uuid4().hex[:8]}"
+    cfg = Config(
+        pg_host=pg_conn_kwargs["host"],
+        pg_port=pg_conn_kwargs["port"],
+        pg_database=target_db,
+        pg_username=pg_conn_kwargs["user"],
+        pg_password=pg_conn_kwargs["password"],
+        pg_sslmode="disable",
+        asyncpg_pool_min=1, asyncpg_pool_max=2,
+        psycopg_pool_min=1, psycopg_pool_max=2,
+        iceberg_catalog_uri="x", iceberg_warehouse="x",
+        kafka_bootstrap_servers="x", kafka_topic="events",
+        kafka_group_id="grp", kafka_extra_config_json="{}",
+        committer_cadence_seconds=60,
+        committer_max_pending_files=1000,
+        committer_degraded_failure_threshold=2,
+        committer_heartbeat_stale_multiple=3.0,
+        api_host="0.0.0.0", api_port=8000, log_level="INFO",
+    )
+
+    # Precondition: the target DB does NOT exist
+    sys_conninfo = psycopg.conninfo.make_conninfo(
+        host=cfg.pg_host, port=cfg.pg_port, dbname="postgres",
+        user=cfg.pg_username, password=cfg.pg_password,
+    )
+    with psycopg.connect(sys_conninfo) as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_db,))
+        assert cur.fetchone() is None, f"target DB {target_db!r} unexpectedly exists"
+
+    # Call 1: bootstrap creates the DB
+    ps_mod.ensure_database_exists(cfg)
+
+    with psycopg.connect(sys_conninfo) as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_db,))
+        assert cur.fetchone() == (1,), (
+            f"ensure_database_exists did not create {target_db!r}"
+        )
+
+    # Call 2: idempotent — second call is a no-op (path A early-return).
+    # Must not raise.
+    ps_mod.ensure_database_exists(cfg)
+
+    # Cleanup: drop the test database so re-runs work.
+    with psycopg.connect(sys_conninfo, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP DATABASE "{target_db}"')

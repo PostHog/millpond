@@ -247,6 +247,125 @@ def test_release_cycle_claim_passes_cycle_id():
     )
 
 
+class TestEnsureDatabaseExists:
+    """Tactical DB-create-if-missing bootstrap. Mocked at the
+    psycopg.connect boundary; the integration test exercises the real
+    PG path."""
+
+    def _cfg(self):
+        from icebox.config import Config
+        return Config(
+            pg_host="x", pg_port=5432, pg_database="icebox",
+            pg_username="u", pg_password="p", pg_sslmode="disable",
+            asyncpg_pool_min=1, asyncpg_pool_max=2,
+            psycopg_pool_min=1, psycopg_pool_max=2,
+            iceberg_catalog_uri="x", iceberg_warehouse="x",
+            kafka_bootstrap_servers="x", kafka_topic="events",
+            kafka_group_id="grp", kafka_extra_config_json="{}",
+            committer_cadence_seconds=60,
+            committer_max_pending_files=1000,
+            committer_degraded_failure_threshold=2,
+            committer_heartbeat_stale_multiple=3.0,
+            api_host="0.0.0.0", api_port=8000, log_level="INFO",
+        )
+
+    def _fake_connect_to_postgres(self, monkeypatch, *, exists: bool, create_raises=None):
+        """Set up psycopg.connect to return a mock connection whose
+        cursor returns `exists`-controlled results for the pg_database
+        check, and optionally raises on the CREATE DATABASE statement."""
+        from unittest.mock import MagicMock
+        import psycopg
+
+        cursor = MagicMock()
+        cursor.__enter__ = lambda self: cursor
+        cursor.__exit__ = lambda self, *a: None
+        # The check query: cursor.fetchone() returns (1,) if exists else None.
+        cursor.fetchone.return_value = (1,) if exists else None
+        if create_raises is not None:
+            cursor.execute.side_effect = (
+                lambda stmt, *a, **kw: None if "pg_database" in str(stmt) else _raise(create_raises)
+            )
+
+        target_db = []
+
+        def fake_connect(conninfo, **kwargs):
+            for fragment in conninfo.split():
+                if fragment.startswith("dbname="):
+                    target_db.append(fragment.split("=", 1)[1])
+            conn = MagicMock()
+            conn.cursor.return_value = cursor
+            conn.__enter__ = lambda self: conn
+            conn.__exit__ = lambda self, *a: None
+            return conn
+
+        monkeypatch.setattr(psycopg, "connect", fake_connect)
+        return cursor, target_db
+
+    def test_returns_silently_when_database_already_exists(self, monkeypatch):
+        """Steady-state path: the database exists; the function does the
+        check query and returns without running CREATE DATABASE."""
+        cfg = self._cfg()
+        cursor, target_db = self._fake_connect_to_postgres(monkeypatch, exists=True)
+        ps.ensure_database_exists(cfg)
+        # Connected ONLY to the postgres system DB (one round-trip,
+        # autocommit). No connect to the target DB itself.
+        assert target_db == ["postgres"]
+        # Check query ran; CREATE DATABASE did NOT.
+        executed_sqls = [str(c.args[0]) for c in cursor.execute.call_args_list]
+        assert any("pg_database" in s for s in executed_sqls)
+        assert not any("CREATE DATABASE" in s for s in executed_sqls)
+
+    def test_creates_database_when_missing(self, monkeypatch):
+        """Bootstrap path: pg_database check returns no row; function
+        issues CREATE DATABASE against the same `postgres` connection."""
+        cfg = self._cfg()
+        cursor, target_db = self._fake_connect_to_postgres(monkeypatch, exists=False)
+        ps.ensure_database_exists(cfg)
+        assert target_db == ["postgres"]
+        executed_sqls = [str(c.args[0]) for c in cursor.execute.call_args_list]
+        assert any("pg_database" in s for s in executed_sqls)
+        assert any("CREATE DATABASE" in s for s in executed_sqls), (
+            f"expected CREATE DATABASE in executed SQL, got: {executed_sqls}"
+        )
+        # The identifier is included in the Composed SQL
+        assert any("icebox" in s for s in executed_sqls)
+
+    def test_raises_when_postgres_system_db_unreachable(self, monkeypatch):
+        """A connection refused (network failure, wrong host) shouldn't
+        be papered over — it's an ops signal, not a bootstrap state."""
+        import psycopg
+
+        cfg = self._cfg()
+
+        def fake_connect(conninfo, **kwargs):
+            raise psycopg.OperationalError("connection refused")
+
+        monkeypatch.setattr(psycopg, "connect", fake_connect)
+        with pytest.raises(psycopg.OperationalError, match="connection refused"):
+            ps.ensure_database_exists(cfg)
+
+    def test_tolerates_concurrent_creation_race(self, monkeypatch):
+        """Two icebox replicas boot simultaneously. Both pg_database
+        checks return no row. Both try CREATE DATABASE. One wins; the
+        other gets DuplicateDatabase. Treat as success — the DB now
+        exists either way."""
+        import psycopg.errors
+
+        cfg = self._cfg()
+        cursor, _ = self._fake_connect_to_postgres(
+            monkeypatch,
+            exists=False,
+            create_raises=psycopg.errors.DuplicateDatabase("already exists"),
+        )
+        # MUST NOT raise — race is benign.
+        ps.ensure_database_exists(cfg)
+
+
+def _raise(exc):
+    """Helper for side_effect that raises a specific exception."""
+    raise exc
+
+
 def test_delete_cycle_row_passes_cycle_id():
     conn, cur = _mock_conn_with_cursor()
     cycle = uuid4()

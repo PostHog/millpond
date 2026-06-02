@@ -45,7 +45,12 @@ def main() -> None:
     )
     log.info("icebox starting on %s:%d", cfg.api_host, cfg.api_port)
 
-    # ---- psycopg pool + migrations -----------------------------------
+    # ---- DB bootstrap + psycopg pool + migrations --------------------
+    # Tactical hack: create the database if it doesn't exist so a
+    # fresh deployment doesn't boot-loop on "database does not exist".
+    # Proper provisioning belongs in Terraform — see
+    # ensure_database_exists docstring.
+    ps.ensure_database_exists(cfg)
     sync_pool = ps.build_psycopg_pool(cfg)
     sync_pool.open(wait=True)
     with sync_pool.connection() as conn:
