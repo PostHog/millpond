@@ -34,6 +34,28 @@ from icebox.api import create_app
 from icebox.config import Config
 
 # ---------------------------------------------------------------------------
+# Hook: expose test pass/fail outcome to fixture teardowns
+# ---------------------------------------------------------------------------
+#
+# By default, pytest fixtures can't tell whether the test that just
+# ran passed or failed — they only see exceptions raised through the
+# yield, which excludes assertion failures (those land on the test
+# report, not the fixture's call stack).
+#
+# This hook attaches the test report to the request.node object as
+# ``rep_setup`` / ``rep_call`` / ``rep_teardown``. Fixtures that want
+# to dump diagnostics on failure check ``request.node.rep_call.failed``.
+# Standard pytest pattern; cribbed from docs.
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):  # type: ignore[no-untyped-def]
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, f"rep_{rep.when}", rep)
+
+
+# ---------------------------------------------------------------------------
 # Session-scoped Postgres container
 # ---------------------------------------------------------------------------
 

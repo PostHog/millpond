@@ -16,10 +16,8 @@ Shutdown:
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import signal
-import sys
 import threading
 from contextlib import asynccontextmanager
 
@@ -34,6 +32,12 @@ from icebox import postgres_sync as ps
 from icebox.api import create_app
 
 log = logging.getLogger(__name__)
+
+# Sentinel log line emitted at the end of main() iff the drain
+# completed and pools closed cleanly. Bound as a module constant so
+# integration tests can import it — otherwise a rename here would
+# silently rot the test that pins clean-shutdown behavior.
+SHUTDOWN_COMPLETE_MARKER = "icebox: shutdown complete"
 
 
 def main() -> None:
@@ -152,7 +156,7 @@ def main() -> None:
     else:
         log.info("icebox: committer thread drained cleanly")
     sync_pool.close()
-    log.info("icebox: shutdown complete")
+    log.info(SHUTDOWN_COMPLETE_MARKER)
 
 
 if __name__ == "__main__":
