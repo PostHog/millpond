@@ -1,0 +1,49 @@
+# Keep the docker build context lean. The Dockerfile only copies:
+#   pyproject.toml, uv.lock, LICENSE
+#   millpond/, icebox/, shared/, tools/
+# Everything else just bloats the build context (full repo is 391M;
+# .venv alone is 335M).
+
+# Python virtual envs and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# VCS + IDE
+.git/
+.gitignore
+.githooks/
+.github/
+.claude/
+.idea/
+.vscode/
+
+# Test-only sources — the production image doesn't run them
+tests/
+test/
+
+# Misc local dirs
+experiments/
+lakekeeper/
+docs/
+imgs/
+grafana/
+k8s/
+
+# Local docker-compose stacks
+docker-compose*.yaml
+docker-compose*.yml
+
+# Local working notes at the repo root (icebox/README.md and similar
+# in-tree docs are deliberately NOT excluded — they ship as part of
+# the icebox/ directory the Dockerfile copies).
+/*.log
+/AGENT.md
+/summary.md
+
+# OS clutter
+.DS_Store
+.flox/

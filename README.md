@@ -57,6 +57,8 @@ Millpond writes to one of two lake formats, selected at startup by `MILLPOND_DES
 
 The selection is a thin Protocol-based abstraction (`millpond/sink.py`) — `main.py` only sees `Sink.write(batch)`, `reset_caches()`, `close()`. Both implementations are in their own module (`ducklake.py`, `iceberg.py`).
 
+For the Iceberg path at production scale, the writers do not commit to the catalog directly. They emit parquet to S3 and `POST /v1/files` to **[icebox](icebox/README.md)**, a writer/committer split that serializes commits from many concurrent writer pods through a single committer thread per `(namespace, table)`. This eliminates the OCC contention described in the [Next steps](#iceberg-multi-writer-commit-contention--solved-by-icebox) section below and is what makes 32 concurrent writers per Iceberg table viable. See `icebox/README.md` for the full design.
+
 ## Record Handling
 
 Two optional stages sit between Kafka conversion and the sink. Both are disabled when their env vars are unset.
@@ -514,13 +516,11 @@ Related issues:
 
 ## Next steps
 
-### Iceberg multi-writer commit contention
+### Iceberg multi-writer commit contention — solved by icebox
 
-The Iceberg sink can't currently sustain two pods committing to the same table at typical flush cadence. PyIceberg's REST commit attaches a branch-snapshot requirement (`expected id != actual id`); when a second writer commits between when we loaded the table and when we send the commit, the catalog rejects with `CommitFailedException: branch main has changed`. `_write_with_retry` in `main.py` invalidates caches and retries up to 3 times with exponential backoff (1s, 2s, 4s), but under sustained dual-writer load with `FLUSH_INTERVAL_MS=5000`, the retries collide with the *next* round of commits and exhaust the budget — the pod exits.
+The Iceberg sink originally couldn't sustain two pods committing to the same table at typical flush cadence. PyIceberg's REST commit attaches a branch-snapshot requirement (`expected id != actual id`); when a second writer commits between when we loaded the table and when we send the commit, the catalog rejects with `CommitFailedException: branch main has changed`. `_write_with_retry` in `main.py` invalidates caches and retries up to 3 times with exponential backoff (1s, 2s, 4s), but under sustained dual-writer load with `FLUSH_INTERVAL_MS=5000` the retries collide with the *next* round of commits and exhaust the budget — the pod exits.
 
-This is why `docker-compose.iceberg.yaml` runs a single millpond pod while `docker-compose.yaml` (DuckLake) runs two. The DuckLake path serialises writes through Postgres-backed catalog locks; Iceberg's optimistic concurrency control needs more retry headroom and jittered backoff to avoid retry-storms, or the writers need partition-aware table layouts so they aren't contending on the same snapshot.
-
-Surfaced by the e2e suite when first wired up — see `tests/e2e/test_e2e_iceberg.py` and the comment in `docker-compose.iceberg.yaml`.
+**The fix shipped:** [`icebox/`](icebox/README.md) — a writer/committer split that fronts the Iceberg catalog. Writers `POST /v1/files` with parquet-file metadata; a single committer thread per icebox deployment batches the rows into one Iceberg snapshot per cadence interval. One committer per `(namespace, table)` per environment, advisory-lock enforced, so even 32 concurrent writers contribute to one ordered stream of commits without OCC contention. See [`icebox/README.md`](icebox/README.md) for the full design and operational notes.
 
 ## Note
 This project should absolutely be called TableFowl, but that would be an [SEO](https://www.confluent.io/product/tableflow/) and linguistic palaver.

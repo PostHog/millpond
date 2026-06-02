@@ -32,6 +32,15 @@ def _cfg(destination: str) -> MagicMock:
     cfg.s3_secret_access_key = "secret"
     cfg.s3_region = "us-east-1"
     cfg.s3_endpoint = None
+    # Icebox-side fields — populated only when destination == "icebox",
+    # but the MagicMock returns sane values for the other sinks too.
+    cfg.icebox_url = "http://icebox:8000"
+    cfg.icebox_bucket = "bucket"
+    cfg.icebox_warehouse_prefix = "warehouses/ingest"
+    cfg.icebox_max_attempts = 6
+    cfg.icebox_max_backoff_s = 30.0
+    cfg.icebox_timeout_s = 10.0
+    cfg.ordinal = 0
     return cfg
 
 
@@ -61,6 +70,20 @@ class TestMakeSinkDispatch:
         with pytest.raises(ValueError, match="Unknown destination"):
             sink_mod.make_sink(_cfg("snowflake"))
 
+    def test_returns_icebox_sink_for_icebox(self):
+        """destination == 'icebox' constructs an IceboxSink wrapping an
+        IceboxClient. No pyiceberg catalog load happens on the writer
+        side — that's the whole point of the icebox split."""
+        from millpond.icebox_sink import IceboxSink
+
+        sink = sink_mod.make_sink(_cfg("icebox"))
+        assert isinstance(sink, IceboxSink)
+        assert sink.writer_ordinal == 0
+        assert sink.bucket == "bucket"
+        assert sink.warehouse_prefix == "warehouses/ingest"
+        assert sink.namespace == "millpond"
+        assert sink.table == "events"
+
 
 class TestSinkProtocolConformance:
     """Each Sink class must expose `write`, `reset_caches`, `close` as callables.
@@ -69,7 +92,14 @@ class TestSinkProtocolConformance:
     is the runtime backstop against an accidental rename.
     """
 
-    @pytest.mark.parametrize("class_path", ["millpond.ducklake.DuckLakeSink", "millpond.iceberg.IcebergSink"])
+    @pytest.mark.parametrize(
+        "class_path",
+        [
+            "millpond.ducklake.DuckLakeSink",
+            "millpond.iceberg.IcebergSink",
+            "millpond.icebox_sink.IceboxSink",
+        ],
+    )
     def test_required_methods_exist(self, class_path):
         module_name, class_name = class_path.rsplit(".", 1)
         module = __import__(module_name, fromlist=[class_name])
@@ -102,4 +132,8 @@ class TestLazyImport:
         )
         assert re.search(r"^[ \t]+from millpond\.ducklake import", src, re.M), (
             "make_sink must import ducklake lazily (inside the function), not at module top"
+        )
+        assert re.search(r"^[ \t]+from millpond\.icebox_sink import", src, re.M), (
+            "make_sink must import icebox_sink lazily — httpx + fastapi-adjacent "
+            "deps shouldn't load for DuckLake/Iceberg-only deployments"
         )

@@ -38,6 +38,17 @@ dependencies = [
     # tests/unit/test_pyiceberg_pin.py imports both and will fail loudly on
     # any upgrade; treat that as the signal to revisit this module.
     "pyiceberg[pyarrow]==0.11.1",
+    "asyncpg>=0.30",
+    "psycopg[binary,pool]>=3.2",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "httpx>=0.27",
+    # OpenTelemetry SDK + HTTP OTLP log exporter. The icebox uses this
+    # to ship structured logs to PostHog Logs when
+    # POSTHOG_PROJECT_TOKEN is set. PostHog terminates standard OTLP/HTTP
+    # at /i/v1/logs — no PostHog-specific Python package exists.
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +56,7 @@ msk-iam = ["aws-msk-iam-sasl-signer-python>=1.0.0"]
 
 [project.scripts]
 millpond = "millpond.main:main"
+icebox = "icebox.main:main"
 
 [dependency-groups]
 dev = [

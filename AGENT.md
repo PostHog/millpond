@@ -110,8 +110,26 @@ while not shutdown:
 
 - **No consumer groups.** Each pod computes its partitions from its StatefulSet ordinal and total partition count, uses `consumer.assign()`.
 - **No threads, no queues.** Kafka is the queue. Backpressure is implicit: while flushing to the lake, the consumer simply doesn't call `consume()`. Kafka holds the data.
-- **Offset commit** is explicit: only after a successful lake write.
+- **Offset commit** is explicit: only after a successful lake write — DuckLake path commits locally; Iceberg path delegates to the icebox (below).
 - **If a pod dies**, its partitions stop being consumed until K8s restarts it. No rebalance.
+
+
+## icebox — writer/committer split for Iceberg
+
+The Iceberg path doesn't commit to the catalog from the writer pod. It POSTs file metadata to **icebox**, a separate service that fronts the Iceberg REST catalog and serializes commits from many concurrent writer pods through a single committer thread per `(namespace, table)`. See [`icebox/README.md`](icebox/README.md) for the full design and operational notes. Summary:
+
+```
+32× millpond writers ──POST /v1/files──▶ icebox ──cycle──▶ Lakekeeper
+                                          │
+                                          └──cycle──▶ Kafka offset commit
+```
+
+- One icebox deployment per `(Iceberg namespace, table)` per environment. Each owns its own Postgres schema (`ICEBOX_PG_SCHEMA`); the committer's singleton invariant is enforced by a per-schema PG advisory lock derived from the schema name.
+- Writer-side change is contained in [`millpond/icebox_sink.py`](millpond/icebox_sink.py) (an alternative Sink implementation) — the rest of the writer pipeline is unchanged.
+- The committer batches every claimed file row into one cycle and produces one Iceberg snapshot per cadence (`ICEBOX_COMMITTER_CADENCE_SECONDS`, default 60s). Many writers, one committer per table → zero OCC contention. This is what makes the prod target of 32 concurrent writer pods per Iceberg table viable.
+- The icebox also owns Kafka offset commit on the writers' behalf — writers use `consumer.assign()` and never join the consumer group; the icebox commits offsets atomically with each cycle's Iceberg snapshot. This guarantees exactly-once-from-Kafka through the writer-committer split.
+- Endpoints: `POST /v1/files` (writer perimeter), `GET /v1/status`, `GET /readyz`, `GET /healthz`, `GET /metrics` (Prometheus). Logs are JSON-by-default and stamped with `cycle_id` via a `ContextVar`. PostHog Logs export is wired through standard OTLP/HTTP when `POSTHOG_PROJECT_TOKEN` is set.
+- The same Docker image carries both binaries; the chart's `deployment.yaml` selects with `command: ["icebox"]` vs `command: ["millpond"]`.
 
 
 ## Key Design Decisions

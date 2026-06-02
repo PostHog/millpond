@@ -128,6 +128,12 @@ def _make_iceberg_cfg(catalog_uri: str, minio_endpoint: str, table_name: str) ->
         filter_drop_field=None,
         filter_values=None,
         sort_by=None,
+        icebox_url=None,
+        icebox_bucket=None,
+        icebox_warehouse_prefix=None,
+        icebox_max_attempts=6,
+        icebox_max_backoff_s=30.0,
+        icebox_timeout_s=10.0,
         kafka_config_overrides=(),
     )
 
