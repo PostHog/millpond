@@ -78,6 +78,15 @@ def _register_routes(app: FastAPI) -> None:
     async def readyz(request: Request) -> Response:
         return await _handle_readyz(request)
 
+    @app.get("/healthz")
+    async def healthz() -> Response:
+        # Liveness check: the API process is responsive. Cheaper than
+        # /readyz which does a PG round-trip. K8s liveness probes hit
+        # this; readiness probes hit /readyz. Shape mirrors millpond's
+        # /healthz so the same Dockerfile HEALTHCHECK works for both
+        # binaries.
+        return JSONResponse(status_code=200, content={"alive": True})
+
 
 async def _handle_register_file(
     req: RegisterFileRequest,
@@ -184,10 +193,20 @@ async def _handle_readyz(request: Request) -> Response:
     try:
         status = await pa.read_status(pool)
     except Exception as e:
-        log.exception("readyz: PG unreachable")
+        # Log the exception detail server-side ONLY. Bind the exception
+        # so its repr appears in the log MESSAGE (not just the trailing
+        # traceback) — operators scanning ERROR-level logs see the
+        # cause at a glance. `log.exception` also attaches the full
+        # traceback via sys.exc_info() under the same record.
+        #
+        # The response body intentionally omits exception text / stack
+        # info — /readyz is reachable from outside the pod (K8s,
+        # dashboards) and an unredacted exception string could leak
+        # PG connection details, internal hostnames, etc.
+        log.exception("readyz: PG unreachable: %r", e)
         return JSONResponse(
             status_code=503,
-            content={"ready": False, "reason": "postgres_unreachable", "error": str(e)},
+            content={"ready": False, "reason": "postgres_unreachable"},
         )
 
     if pa.is_heartbeat_stale(

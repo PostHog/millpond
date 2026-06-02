@@ -305,6 +305,73 @@ def test_readyz_returns_503_when_pg_unreachable(monkeypatch):
     assert resp.json()["reason"] == "postgres_unreachable"
 
 
+def test_readyz_does_not_leak_exception_text_in_body(monkeypatch, caplog):
+    """Security finding: /readyz is reachable from outside the pod
+    (K8s, dashboards, sometimes load balancers); an unredacted
+    exception string could expose internal hostnames, connection
+    strings, or stack-trace fragments. The response body must NOT
+    contain the raw exception text. Operators get the full detail
+    via log.exception server-side.
+
+    Pins TWO invariants in one test:
+      1. Response body excludes the exception text (security).
+      2. The exception detail IS logged server-side (operability —
+         a 503 from /readyz with no log signal would be unactionable).
+    """
+    import logging
+
+    import icebox.api as api_mod
+    cfg = _cfg()
+    pool = MagicMock()
+    app = create_app(cfg=cfg, pool=pool, clock=lambda: datetime.now(UTC))
+    # Distinctive sentinel that should NEVER appear in the response,
+    # but MUST appear in the log.
+    monkeypatch.setattr(
+        api_mod.pa,
+        "read_status",
+        AsyncMock(side_effect=RuntimeError(
+            "INTERNAL-LEAK-SENTINEL-pg.internal:5432 password=secret123"
+        )),
+    )
+    client = TestClient(app)
+    with caplog.at_level(logging.ERROR, logger="icebox.api"):
+        resp = client.get("/readyz")
+    assert resp.status_code == 503
+
+    # (1) Response body redaction
+    body_text = resp.text
+    assert "INTERNAL-LEAK-SENTINEL" not in body_text, (
+        f"/readyz leaked exception text in response body: {body_text}"
+    )
+    assert "secret123" not in body_text
+    assert resp.json()["reason"] == "postgres_unreachable"
+
+    # (2) Server-side log capture — the operator MUST be able to
+    # diagnose. The exception repr must appear in the ERROR log
+    # record's message (not just buried in the trailing traceback).
+    error_logs = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert error_logs, "expected an ERROR-level log when /readyz fails"
+    log_text = " ".join(r.getMessage() for r in error_logs)
+    assert "INTERNAL-LEAK-SENTINEL" in log_text, (
+        f"exception detail missing from log message; got: {log_text!r}"
+    )
+
+
+def test_healthz_returns_200_without_pg_check(monkeypatch):
+    """Liveness probe — must not touch PG. K8s liveness fires every
+    few seconds; doing a PG round-trip per probe would multiply load
+    and tie liveness to backend health (the opposite of liveness's
+    purpose)."""
+    client, read_status_mock, _ = _client(monkeypatch=monkeypatch)
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"alive": True}
+    # Critical invariant: /healthz must NOT hit PG. A regression that
+    # routes /healthz through read_status would re-couple liveness to
+    # database health.
+    read_status_mock.assert_not_called()
+
+
 def test_readyz_does_not_fail_on_first_boot_with_no_heartbeat(monkeypatch):
     """Fresh install: status row exists but no heartbeat written yet.
     readyz must NOT fail on this — otherwise the pod is unhealthy at
