@@ -62,6 +62,8 @@ RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs');
 # Health check for non-K8s environments (K8s uses liveness/readiness probes in statefulset.yaml).
 # Both `millpond` and `icebox` binaries serve /healthz on port 8000 so the same HEALTHCHECK
 # works regardless of which entrypoint the container runs.
+EXPOSE 8000
+
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
 
 # Default entrypoint is the writer (`millpond`). For the icebox service, the
