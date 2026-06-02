@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 from fastapi.testclient import TestClient
 
 from icebox.api import create_app
@@ -20,7 +19,6 @@ from shared.models import (
     RegisteredFile,
     StatusResponse,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -78,13 +76,19 @@ def _client(
     insert_return: tuple[RegisteredFile, bool] | None = None,
     clock: datetime | None = None,
     monkeypatch=None,
+    schema_fingerprint_cache=None,
 ):
     """Build a TestClient with mocked PG access. Returns (client, mocks)."""
     import icebox.api as api_mod
     cfg = cfg or _cfg()
     pool = MagicMock()
     clock = clock or datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
-    app = create_app(cfg=cfg, pool=pool, clock=lambda: clock)
+    app = create_app(
+        cfg=cfg,
+        pool=pool,
+        clock=lambda: clock,
+        schema_fingerprint_cache=schema_fingerprint_cache,
+    )
 
     # Patch the module-level functions the handlers call
     if status is None:
@@ -512,3 +516,101 @@ def test_readyz_uses_injected_clock(monkeypatch):
     client, _, _ = _client(monkeypatch=monkeypatch, status=status, clock=future)
     resp = client.get("/readyz")
     assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Schema fingerprint check at the API perimeter
+# ---------------------------------------------------------------------------
+
+
+class _FpCacheStub:
+    """Minimal SchemaFingerprintCache-shaped stub for the API tests.
+
+    The real cache wraps an async lock + a sync ``load_table`` callable.
+    Here we just need an awaitable ``validate`` whose return / raise
+    semantics the API handler reads.
+    """
+
+    def __init__(self, *, returns: bool | None = None, raises: Exception | None = None):
+        self.returns = returns
+        self.raises = raises
+        self.calls: list[str] = []
+
+    async def validate(self, claimed_fingerprint: str) -> bool:
+        self.calls.append(claimed_fingerprint)
+        if self.raises is not None:
+            raise self.raises
+        assert self.returns is not None
+        return self.returns
+
+
+def test_post_v1_files_returns_400_when_fingerprint_cache_says_mismatch(monkeypatch):
+    cache = _FpCacheStub(returns=False)
+    client, _read_status_mock, _ = _client(
+        monkeypatch=monkeypatch, schema_fingerprint_cache=cache
+    )
+    resp = client.post("/v1/files", json=_valid_register_body())
+    assert resp.status_code == 400, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "schema_fingerprint_mismatch"
+    assert detail["writer_fingerprint"] == "deadbeef" * 8
+    assert "hint" in detail
+    # The cache was actually consulted (no silent skip).
+    assert cache.calls == ["deadbeef" * 8]
+
+
+def test_post_v1_files_returns_201_when_fingerprint_cache_says_match(monkeypatch):
+    cache = _FpCacheStub(returns=True)
+    client, _read_status_mock, _ = _client(
+        monkeypatch=monkeypatch, schema_fingerprint_cache=cache
+    )
+    resp = client.post("/v1/files", json=_valid_register_body())
+    assert resp.status_code == 201, resp.text
+    assert cache.calls == ["deadbeef" * 8]
+
+
+def test_post_v1_files_fails_open_when_fingerprint_cache_raises(monkeypatch):
+    """Catalog outages MUST NOT block POSTs (preserves the /readyz
+    contract). The committer's own fingerprint check stays as
+    defense-in-depth."""
+    cache = _FpCacheStub(raises=RuntimeError("catalog unreachable"))
+    client, _read_status_mock, _ = _client(
+        monkeypatch=monkeypatch, schema_fingerprint_cache=cache
+    )
+    resp = client.post("/v1/files", json=_valid_register_body())
+    assert resp.status_code == 201, resp.text
+
+
+def test_post_v1_files_skips_fingerprint_check_when_cache_unset(monkeypatch):
+    """Test harness that doesn't wire a cache (schema_fingerprint_cache=None)
+    must NOT block POSTs — backwards compatible with every existing
+    create_app() callsite that hasn't been updated to pass a cache."""
+    client, _, _ = _client(monkeypatch=monkeypatch, schema_fingerprint_cache=None)
+    resp = client.post("/v1/files", json=_valid_register_body())
+    assert resp.status_code == 201, resp.text
+
+
+def test_post_v1_files_fingerprint_check_runs_after_backpressure(monkeypatch):
+    """The fingerprint check is ordered AFTER backpressure: under
+    queue-full / heartbeat-stale / degraded the 503 or 429 must take
+    precedence over a 400 fingerprint rejection (system-can't-handle
+    > bad-body), and we avoid paying the async catalog round-trip
+    cost on POSTs we'd reject anyway. The handler asserts this via
+    the per-status-code priority tests; here we pin that the cache
+    is NOT consulted on a 429 path."""
+    status = StatusResponse(
+        pending_files=1500,  # over the cfg default max
+        last_committer_heartbeat=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+        consecutive_failures=0,
+    )
+    cache = _FpCacheStub(returns=False)
+    client, _, _ = _client(
+        monkeypatch=monkeypatch,
+        cfg=_cfg(max_pending=1000),
+        status=status,
+        schema_fingerprint_cache=cache,
+    )
+    resp = client.post("/v1/files", json=_valid_register_body())
+    assert resp.status_code == 429, resp.text
+    # Backpressure short-circuited before the perimeter check fired.
+    assert cache.calls == []

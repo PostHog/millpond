@@ -12,7 +12,6 @@ Covers:
 from __future__ import annotations
 
 import base64
-import io
 import time
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
@@ -21,6 +20,8 @@ import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
+from pyiceberg.schema import assign_fresh_schema_ids
 
 from millpond.icebox_sink import (
     IceboxBackpressureExhausted,
@@ -30,10 +31,6 @@ from millpond.icebox_sink import (
     _wire_encode,
     parquet_stats_from_metadata,
 )
-from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
-from pyiceberg.schema import assign_fresh_schema_ids
-from shared.models import PROTOCOL_VERSION
-
 
 # ---------------------------------------------------------------------------
 # IceboxClient — retry semantics
@@ -280,6 +277,7 @@ def test_parquet_stats_field_id_keys_are_strings():
 
 def test_wire_encode_date_to_iso():
     from datetime import date
+
     from pyiceberg.types import DateType
 
     assert _wire_encode(DateType(), date(2026, 6, 1)) == "2026-06-01"
@@ -633,8 +631,8 @@ def test_reserved_columns_match_iceberg_sink():
     RESERVED_COLUMNS to avoid pulling pyiceberg into a DuckLake-only
     deployment. This test pins equivalence so a future addition to
     one set without the other surfaces immediately."""
-    from millpond.icebox_sink import _RESERVED_COLUMNS
     from millpond.iceberg import RESERVED_COLUMNS as ICEBERG_RESERVED
+    from millpond.icebox_sink import _RESERVED_COLUMNS
     assert _RESERVED_COLUMNS == ICEBERG_RESERVED
 
 

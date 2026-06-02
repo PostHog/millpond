@@ -16,15 +16,13 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
-import pytest
+from pyiceberg.schema import Schema
+from pyiceberg.types import IntegerType, NestedField, StringType
 
 from icebox import committer as cm
 from icebox.config import Config
 from icebox.schema import CommitCycleRow
 from shared.fingerprint import schema_fingerprint
-from pyiceberg.schema import Schema
-from pyiceberg.types import IntegerType, NestedField, StringType
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -294,7 +292,7 @@ def test_run_cycle_iceberg_failure_releases_claims():
     deps.kafka_commit_offsets.assert_not_called()
     # release_cycle_claim was executed (one of the cursor.execute calls)
     executed_sqls = [c[0][0] for c in pool.cursor.execute.call_args_list]
-    from icebox.postgres_sync import RELEASE_CYCLE_CLAIM_SQL, RECORD_FAILURE_SQL
+    from icebox.postgres_sync import RECORD_FAILURE_SQL, RELEASE_CYCLE_CLAIM_SQL
     assert RELEASE_CYCLE_CLAIM_SQL in executed_sqls
     assert RECORD_FAILURE_SQL in executed_sqls
 
@@ -310,7 +308,9 @@ def test_run_cycle_kafka_failure_leaves_cycle_stuck():
     assert "kafka-commit failed" in (result.error or "")
     executed_sqls = [c[0][0] for c in pool.cursor.execute.call_args_list]
     from icebox.postgres_sync import (
-        RELEASE_CYCLE_CLAIM_SQL, RECORD_FAILURE_SQL, MARK_ICEBERG_COMMITTED_SQL,
+        MARK_ICEBERG_COMMITTED_SQL,
+        RECORD_FAILURE_SQL,
+        RELEASE_CYCLE_CLAIM_SQL,
     )
     assert RELEASE_CYCLE_CLAIM_SQL not in executed_sqls
     assert RECORD_FAILURE_SQL in executed_sqls
@@ -390,7 +390,9 @@ def test_recover_branch_a_snapshot_found_backfills_and_continues():
     deps.kafka_commit_offsets.assert_called_once()
     executed_sqls = [c[0][0] for c in pool.cursor.execute.call_args_list]
     from icebox.postgres_sync import (
-        MARK_ICEBERG_COMMITTED_SQL, MARK_KAFKA_COMMITTED_SQL, COMPLETE_CYCLE_SQL,
+        COMPLETE_CYCLE_SQL,
+        MARK_ICEBERG_COMMITTED_SQL,
+        MARK_KAFKA_COMMITTED_SQL,
     )
     assert MARK_ICEBERG_COMMITTED_SQL in executed_sqls
     assert MARK_KAFKA_COMMITTED_SQL in executed_sqls
@@ -641,6 +643,7 @@ def test_committer_loop_stamps_heartbeat_before_recovery(monkeypatch):
     that trips stop_event right after a successful acquire; the
     underlying lock-acquire behavior is exercised via FakePool."""
     import threading
+
     from icebox.postgres_sync import UPDATE_HEARTBEAT_SQL
 
     deps, pool = _deps(claimed_ids=[])
@@ -693,6 +696,7 @@ def test_committer_loop_releases_advisory_lock_on_exit(monkeypatch):
     Recovery runs through real code (FakePool yields empty incomplete
     cycles); the lock monkeypatch is purely a stop coordinator."""
     import threading
+
     from icebox.postgres_sync import UNLOCK_ADVISORY_LOCK_SQL
 
     deps, pool = _deps(claimed_ids=[])
@@ -923,6 +927,7 @@ def test_committer_loop_lock_conn_distinct_from_cycle_conns(monkeypatch):
     cycle's `pool.connection()` would surface in the recorded SQL
     ending up on the wrong cursor."""
     import threading
+
     from icebox.postgres_sync import TRY_ADVISORY_LOCK_SQL, UPDATE_HEARTBEAT_SQL
 
     deps, pool = _deps(claimed_ids=[])
@@ -1075,6 +1080,7 @@ def test_committer_loop_heartbeat_runs_before_recovery(monkeypatch):
     This approach pins the production code's behavior end-to-end,
     not just the order of two mocked method calls."""
     import threading
+
     from icebox.postgres_sync import INCOMPLETE_CYCLES_SQL, UPDATE_HEARTBEAT_SQL
 
     deps, pool = _deps(claimed_ids=[])
@@ -1131,6 +1137,7 @@ def test_recover_in_flight_cycles_logs_error_on_limit_hit(caplog):
     more stuck cycles than the recovery scan can see. Page ops via
     log.error so the absence isn't silent."""
     import logging
+
     from icebox import postgres_sync as psy
 
     # Build a fake pool returning exactly LIMIT rows for incomplete_cycles

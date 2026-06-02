@@ -30,6 +30,7 @@ from icebox import kafka as ikafka
 from icebox import postgres_async as pa
 from icebox import postgres_sync as ps
 from icebox.api import create_app
+from icebox.schema_cache import SchemaFingerprintCache
 from icebox.structured_logging import setup_logging
 
 log = logging.getLogger(__name__)
@@ -125,8 +126,20 @@ def main() -> None:
         finally:
             await pool.close()
 
+    # Schema-fingerprint cache for API-perimeter validation. Shares
+    # the same ``_load_table`` callable the committer thread uses
+    # (each invocation builds a fresh ``Catalog`` and issues a REST
+    # GET), so any catalog-side schema change is visible to both
+    # paths after the cache TTL elapses.
+    fp_cache = SchemaFingerprintCache(
+        load_table=_load_table,
+        ttl_seconds=cfg.schema_fingerprint_cache_ttl_seconds,
+    )
+
     # build_app with a placeholder pool — lifespan swaps it in
-    app = create_app(cfg=cfg, pool=None)  # type: ignore[arg-type]
+    app = create_app(  # type: ignore[arg-type]
+        cfg=cfg, pool=None, schema_fingerprint_cache=fp_cache
+    )
     app.router.lifespan_context = lifespan
 
     # ---- Graceful shutdown wiring ------------------------------------

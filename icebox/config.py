@@ -142,6 +142,15 @@ class Config:
     # ICEBOX_SERVICE_VERSION (e.g., to expose the image digest).
     service_version: str = "unknown"
 
+    # Schema-fingerprint cache TTL — how long the API perimeter
+    # trusts its in-memory copy of the Iceberg table's current
+    # fingerprint before refreshing from the catalog. Mismatches
+    # force an immediate refresh regardless of TTL, so this is the
+    # max staleness window during which a stale writer would slip a
+    # POST through that the committer would later reject — keep it
+    # short.
+    schema_fingerprint_cache_ttl_seconds: float = 60.0
+
 
 def _require(name: str) -> str:
     value = os.environ.get(name)
@@ -305,6 +314,9 @@ def load() -> Config:
             "https://us.i.posthog.com/i/v1/logs",
         ),
         service_version=_optional("ICEBOX_SERVICE_VERSION", _default_service_version()),
+        schema_fingerprint_cache_ttl_seconds=_float(
+            "ICEBOX_SCHEMA_FINGERPRINT_CACHE_TTL_SECONDS", 60.0
+        ),
     )
 
 

@@ -5,7 +5,6 @@ import pytest
 
 from icebox import config as icebox_config
 
-
 REQUIRED_ENV = {
     "ICEBOX_PG_HOST": "lakekeeper-pg.megaberg",
     "ICEBOX_PG_PASSWORD": "secret",

@@ -1,11 +1,94 @@
-# icebox — operational notes
+# icebox
 
-The icebox is a writer/committer split for high-concurrency Iceberg writes.
-See `ICEBOX-PLAN.md` at the repo root for the design.
+A writer/committer split for high-concurrency Iceberg writes. Each
+icebox instance fronts exactly one Iceberg `(namespace, table)` pair
+and serializes commits from many concurrent millpond writer pods
+through a single committer thread, eliminating PyIceberg's REST-catalog
+optimistic-concurrency contention.
 
-This file captures **deferred operational concerns** and **known
-limitations** for operators reading the code. Everything here is
-intentional non-coverage in the current PR — not undiscovered.
+## Why
+
+The millpond writer's Iceberg sink path commits via PyIceberg's REST
+client. Each writer-to-Lakekeeper commit attaches a branch-snapshot
+requirement (`expected id != actual id`); two writers committing at
+the same flush cadence race against the catalog and the loser retries
+with exponential backoff. Under sustained dual-writer load with
+`FLUSH_INTERVAL_MS=5000` (let alone the 32 writers the production
+deployment targets), retries pile up on the *next* round of commits
+and exhaust the budget. The pod exits. See the main README's
+"Iceberg multi-writer commit contention" entry for the original
+discovery and the comment in `docker-compose.iceberg.yaml`.
+
+icebox solves this with a producer/consumer split:
+
+```
+32× millpond writers ──POST /v1/files──▶ icebox ──cycle──▶ Lakekeeper
+                                          │
+                                          └──cycle──▶ Kafka offset commit
+```
+
+- **Writers write parquet to S3** as before, but instead of calling
+  PyIceberg's commit, they `POST /v1/files` with file metadata to the
+  icebox. The POST returns 201 once the row lands in the icebox's
+  Postgres.
+- **One icebox per (Iceberg namespace, table) per environment.** Each
+  deployment owns its own PG schema and serves exactly one table. The
+  committer thread inside the icebox is a singleton enforced via a
+  per-schema PG advisory lock derived from the schema name.
+- **The committer batches** every claimed file row into one cycle and
+  produces one Iceberg snapshot per cycle (default cadence 60s). Many
+  writers, one committer per table → zero OCC contention.
+- **Offsets are committed by the icebox**, not by the writers. The
+  writers use `consumer.assign()` and never join the consumer group;
+  the icebox holds the offset-commit responsibility for the group
+  on the writers' behalf. This is what guarantees the
+  exactly-one-snapshot-per-cycle / exactly-once-from-Kafka invariant
+  through the writer-committer split.
+
+## Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/files` | Writer registers a parquet file. 201 on accept, 409 on idempotent replay, 400 on body/schema mismatch, 429 on queue full, 503 on degraded or stale heartbeat. |
+| `GET /v1/status` | Operator-facing observability snapshot (pending files, last cycle, last committed snapshot id, consecutive failures). |
+| `GET /readyz` | Readiness: PG reachable AND committer heartbeat fresh. Downstream (Lakekeeper, Kafka) outages do NOT fail readyz — the icebox keeps accepting POSTs and stages files for future cycles. |
+| `GET /healthz` | Liveness only — the API process is responsive. No PG round-trip. |
+| `GET /metrics` | Prometheus exposition: pending files, oldest pending age, consecutive failures, committer heartbeat age, cycle counts and duration histogram, post counts by HTTP status. |
+
+## Structured logging + PostHog Logs
+
+Logs are JSON-by-default (`ICEBOX_LOG_FORMAT=json`). Every log line
+emitted inside a committer cycle is automatically stamped with
+`cycle_id` via a `ContextVar` — no per-call-site plumbing — so a
+cycle's complete trace is grep-friendly.
+
+When `POSTHOG_PROJECT_TOKEN` is set, the icebox additionally exports
+log records to PostHog Logs via standard OTLP/HTTP
+(`https://us.i.posthog.com/i/v1/logs` by default; override via
+`POSTHOG_LOGS_ENDPOINT`). Resource attributes are
+`service.name=icebox`, `service.namespace=<pg_schema>`,
+`service.version=<package version>`. The `BatchLogRecordProcessor` is
+flushed on the SIGTERM drain path so in-flight batches make it out
+before the process exits.
+
+## Tests
+
+| Path | Scope |
+|---|---|
+| `tests/unit/test_icebox_*.py` | Unit tests for each module: API perimeter checks (backpressure ordering, fingerprint mismatch, namespace/table mismatch, redaction), committer state machine, recovery branches, schema-fingerprint cache, JSON formatter + ContextVar propagation, metric accounting. |
+| `tests/integration/test_icebox_e2e.py` | In-process e2e against testcontainers Postgres + a PyIceberg `SqlCatalog` against SQLite. Fast feedback for refactor regressions. |
+| `tests/integration/test_icebox_docker.py` | End-to-end against the actual `icebox` Docker image built from the repo Dockerfile, talking to testcontainers Postgres + MinIO + tabulario/iceberg-rest + Redpanda. Covers image boot path, real cycle producing real Iceberg snapshot, SIGKILL recovery, SIGTERM drain (idle + mid-cycle), 32-concurrent POST burst, same-schema advisory-lock contention, and downstream-outage graceful degradation. |
+
+The Docker integration suite pins the build platform to `linux/amd64`
+by default to match what the chart publishes; Apple-Silicon devs are
+auto-detected and fall back to `linux/arm64` for native iteration
+(see `_resolve_test_platform` in the test module).
+
+## Operational notes
+
+The rest of this file captures **deferred operational concerns** and
+**known limitations** for operators reading the code. Everything here
+is intentional non-coverage in the current PR — not undiscovered.
 
 ## Deferred operational concerns
 

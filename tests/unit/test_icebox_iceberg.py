@@ -18,8 +18,8 @@ from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.transforms import IdentityTransform
-from pyiceberg.types import IntegerType, LongType, NestedField, StringType, TimestamptzType
 from pyiceberg.typedef import Record
+from pyiceberg.types import IntegerType, NestedField, StringType, TimestamptzType
 
 from icebox.iceberg import (
     CYCLE_ID_SUMMARY_KEY,
@@ -28,7 +28,6 @@ from icebox.iceberg import (
     find_snapshot_for_cycle,
     partition_tuple_from_spec,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

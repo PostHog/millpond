@@ -357,8 +357,8 @@ def test_ensure_database_exists_creates_missing_database(pg_conn_kwargs):
 
     import psycopg
 
-    from icebox.config import Config
     from icebox import postgres_sync as ps_mod
+    from icebox.config import Config
 
     # Unique DB name so re-running the test suite doesn't collide with
     # leftovers from a prior run on the same session container.
@@ -420,8 +420,8 @@ def test_ensure_schema_exists_creates_schema(pg_conn_kwargs):
     and is idempotent on re-invocation."""
     import psycopg
 
-    from icebox.config import Config
     from icebox import postgres_sync as ps_mod
+    from icebox.config import Config
 
     schema = f"icebox_test_{__import__('uuid').uuid4().hex[:8]}"
     cfg = Config(
@@ -480,8 +480,8 @@ def test_two_iceboxes_with_different_schemas_isolated(pg_conn_kwargs):
 
     import psycopg
 
-    from icebox.config import Config
     from icebox import postgres_sync as ps_mod
+    from icebox.config import Config
 
     schema_a = f"icebox_a_{uuid.uuid4().hex[:8]}"
     schema_b = f"icebox_b_{uuid.uuid4().hex[:8]}"

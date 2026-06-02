@@ -17,7 +17,6 @@ import pytest
 
 from icebox import postgres_sync as ps
 
-
 # ---------------------------------------------------------------------------
 # SQL structural assertions — catches "renamed column, forgot to update SQL"
 # ---------------------------------------------------------------------------
@@ -304,6 +303,7 @@ class TestEnsureDatabaseExists:
         cursor returns `exists`-controlled results for the pg_database
         check, and optionally raises on the CREATE DATABASE statement."""
         from unittest.mock import MagicMock
+
         import psycopg
 
         cursor = MagicMock()

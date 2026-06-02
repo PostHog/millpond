@@ -262,7 +262,6 @@ def test_pin_canary_to_bytes_float_roundtrip():
     that ship float32 columns hit this path. float32 precision loss
     means we use pytest.approx."""
     import pytest
-
     from pyiceberg.conversions import from_bytes, to_bytes
     from pyiceberg.types import FloatType
 

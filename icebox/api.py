@@ -31,6 +31,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from icebox import metrics
 from icebox import postgres_async as pa
 from icebox.config import Config
+from icebox.schema_cache import SchemaFingerprintCache
 from shared.models import (
     PROTOCOL_VERSION,
     BackpressureResponse,
@@ -46,6 +47,7 @@ def create_app(
     cfg: Config,
     pool: asyncpg.Pool,
     clock: Callable[[], datetime] | None = None,
+    schema_fingerprint_cache: SchemaFingerprintCache | None = None,
 ) -> FastAPI:
     """Build the FastAPI app with config + pool + clock wired in.
 
@@ -54,11 +56,18 @@ def create_app(
         pool: asyncpg pool (already opened).
         clock: optional callable returning current UTC time. Tests pin
             this for deterministic heartbeat-staleness checks.
+        schema_fingerprint_cache: optional cache for the Iceberg table's
+            current schema fingerprint. When set, POST /v1/files
+            rejects mismatches with 400 at the API perimeter instead
+            of stalling them in the committer. When None (test
+            harnesses that don't wire a catalog), the perimeter check
+            is skipped — the committer's check still applies.
     """
     app = FastAPI(title="icebox", version="1")
     app.state.cfg = cfg
     app.state.pool = pool
     app.state.clock = clock or (lambda: datetime.now(UTC))
+    app.state.schema_fingerprint_cache = schema_fingerprint_cache
     _register_routes(app)
     _register_metrics_middleware(app)
     return app
@@ -249,6 +258,48 @@ async def _handle_register_file(
             ).model_dump(),
             headers={"Retry-After": str(cfg.committer_cadence_seconds)},
         )
+
+    # Schema-fingerprint check at the API perimeter. The committer's
+    # own fingerprint check is preserved as defense-in-depth, but
+    # catching mismatches synchronously here lets writers see the
+    # rejection immediately (rather than stalling in the next cycle's
+    # skipped_reason="schema_mismatch") and avoids burning a cycle's
+    # failure-counter slot on a bad writer.
+    #
+    # Ordered AFTER the backpressure checks so we don't pay the async
+    # catalog round-trip cost on POSTs we'd reject for liveness or
+    # capacity reasons anyway — and so backpressure 503/429 take
+    # precedence over 400 (system-can't-handle takes priority over
+    # bad-body).
+    #
+    # FAIL-OPEN if the catalog is unreachable — the existing /readyz
+    # contract says downstream outages don't block POSTs, and the
+    # committer's check still catches real mismatches even when the
+    # perimeter is degraded.
+    fp_cache: SchemaFingerprintCache | None = (
+        request.app.state.schema_fingerprint_cache
+    )
+    if fp_cache is not None:
+        try:
+            fp_ok = await fp_cache.validate(req.schema_fingerprint)
+        except Exception:
+            log.exception(
+                "register_file: fingerprint cache refresh failed; "
+                "falling through to committer-side check"
+            )
+        else:
+            if not fp_ok:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "schema_fingerprint_mismatch",
+                        "writer_fingerprint": req.schema_fingerprint,
+                        "hint": (
+                            "writer's view of the Iceberg table schema is "
+                            "stale — refresh from the catalog and retry"
+                        ),
+                    },
+                )
 
     registered, was_new = await pa.insert_file(pool, req)
     status_code = 201 if was_new else 409

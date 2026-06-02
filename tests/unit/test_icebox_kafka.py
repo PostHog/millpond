@@ -18,7 +18,6 @@ from icebox.kafka import (
     merge_max_offsets,
 )
 
-
 # ---------------------------------------------------------------------------
 # merge_max_offsets — pure function, the most-exercised path
 # ---------------------------------------------------------------------------

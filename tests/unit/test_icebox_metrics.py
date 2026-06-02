@@ -92,10 +92,9 @@ def test_run_cycle_records_metrics_and_resets_cycle_id_var():
     stale id)."""
     # Defer imports so the metric module test file stays independent
     # of committer module side effects on import order.
-    from tests.unit.test_icebox_committer import _cfg, _deps  # type: ignore
-
     from icebox import committer as cm
     from icebox.structured_logging import cycle_id_var
+    from tests.unit.test_icebox_committer import _cfg, _deps  # type: ignore
 
     # Snapshot success counter before invoking run_cycle.
     before = _sample_value("icebox_cycles_total", {"result": "success"}) or 0.0
@@ -120,9 +119,8 @@ def test_run_cycle_records_metrics_and_resets_cycle_id_var():
 
 def test_run_cycle_no_files_records_skipped_no_files_label():
     """Vacuous cycles must increment cycles_total{result="skipped_no_files"}."""
-    from tests.unit.test_icebox_committer import _cfg, _deps  # type: ignore
-
     from icebox import committer as cm
+    from tests.unit.test_icebox_committer import _cfg, _deps  # type: ignore
 
     before = _sample_value("icebox_cycles_total", {"result": "skipped_no_files"}) or 0.0
 

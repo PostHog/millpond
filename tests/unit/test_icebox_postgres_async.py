@@ -12,7 +12,6 @@ from datetime import UTC, datetime, timedelta
 
 from icebox import postgres_async as pa
 
-
 # ---------------------------------------------------------------------------
 # SQL structural assertions
 # ---------------------------------------------------------------------------

@@ -604,6 +604,7 @@ def icebox_container(
     docker_net: Network,
     pg_on_net: Any,
     iceberg_rest_on_net: DockerContainer,
+    minio_on_net: DockerContainer,
     redpanda_on_net: DockerContainer,
     request: pytest.FixtureRequest,
 ) -> Iterator[IceboxHandle]:
@@ -612,7 +613,14 @@ def icebox_container(
     Cadence is set to 2s so a single cycle can fire within test runtime.
     DB and schema are NOT pre-created — the boot path is exercised by
     every test that uses this fixture.
+
+    The REST catalog table (NAMESPACE, TABLE) is DROPPED at fixture
+    setup so each test starts from a clean catalog state. Tests that
+    need the table call ``_create_iceberg_table`` to recreate; tests
+    that don't get the API-perimeter fingerprint check fail-open
+    (load_table raises NoSuchTable → cache falls through, POST proceeds).
     """
+    _drop_catalog_table_if_exists(iceberg_rest_on_net, minio_on_net)
     schema_name = f"icebox_t_{uuid.uuid4().hex[:12]}"
     handle = _spawn_icebox(
         icebox_image=icebox_image,
@@ -626,12 +634,48 @@ def icebox_container(
         _teardown_icebox(handle, failed=_test_failed(request))
 
 
+def _drop_catalog_table_if_exists(
+    iceberg_rest: DockerContainer,
+    minio: DockerContainer,
+    *,
+    namespace: str = NAMESPACE,
+    table: str = TABLE,
+) -> None:
+    """Drop the (namespace, table) from the session REST catalog if it
+    exists. Used by per-test fixtures to start each test from a known
+    empty catalog so the API-perimeter fingerprint check fails open
+    by default and tests that don't care about the table aren't
+    rejected on fingerprint mismatch from a leftover schema."""
+    rest_host = iceberg_rest.get_container_host_ip()
+    rest_port = int(iceberg_rest.get_exposed_port(8181))
+    minio_host = minio.get_container_host_ip()
+    minio_port = int(minio.get_exposed_port(9000))
+    catalog = RestCatalog(
+        "icebox-docker-test-cleanup",
+        **{
+            "uri": f"http://{rest_host}:{rest_port}",
+            "warehouse": "s3://warehouse/",
+            "s3.endpoint": f"http://{minio_host}:{minio_port}",
+            "s3.access-key-id": "minioadmin",
+            "s3.secret-access-key": "minioadmin",
+            "s3.region": "us-east-1",
+            "s3.path-style-access": "true",
+        },
+    )
+    try:
+        catalog.drop_table((namespace, table))
+    except Exception:
+        # NoSuchTable is the normal case; ignore.
+        pass
+
+
 @pytest.fixture
 def icebox_factory(
     icebox_image: str,
     docker_net: Network,
     pg_on_net: Any,
     iceberg_rest_on_net: DockerContainer,
+    minio_on_net: DockerContainer,
     redpanda_on_net: DockerContainer,
     request: pytest.FixtureRequest,
 ) -> Iterator[Callable[..., IceboxHandle]]:
@@ -639,6 +683,11 @@ def icebox_factory(
 
     Tracks every spawned handle so the fixture tears them all down at
     the end of the test, with logs-on-failure dumped per container.
+
+    On each spawn the factory drops the (namespace, table) from the
+    session REST catalog so the API-perimeter fingerprint cache fails
+    open by default — tests that need the table call
+    ``_create_iceberg_table`` to recreate.
     """
     handles: list[IceboxHandle] = []
 
@@ -650,7 +699,12 @@ def icebox_factory(
         extra_env: dict[str, str] | None = None,
         network_alias: str | None = None,
         wait_for_ready: bool = True,
+        drop_catalog_table_first: bool = True,
     ) -> IceboxHandle:
+        if drop_catalog_table_first:
+            _drop_catalog_table_if_exists(
+                iceberg_rest_on_net, minio_on_net, namespace=namespace, table=table
+            )
         sn = schema_name or f"icebox_t_{uuid.uuid4().hex[:12]}"
         alias = network_alias or f"icebox-{sn.replace('_', '-')}"
         handle = _spawn_icebox(
@@ -1095,38 +1149,64 @@ def test_register_file_rejects_malformed_body(icebox_container: IceboxHandle) ->
 
 
 @pytest.mark.integration
-def test_schema_fingerprint_mismatch_skips_cycle(
+def test_committer_skips_cycle_on_stale_fingerprint_row_in_pg(
     icebox_container: IceboxHandle,
     host_rest_catalog: RestCatalog,
     pg_on_net: Any,
 ) -> None:
-    """A file POSTed with a fingerprint that doesn't match the table's
-    current schema is accepted at the API (current behavior — fingerprint
-    check is at the committer today) but the next cycle hits the
-    mismatch path: skipped_reason='schema_mismatch', file claim released,
+    """The committer's defense-in-depth fingerprint check still applies
+    even though the API perimeter now rejects mismatches upfront. A
+    file row inserted directly into PG with a stale fingerprint
+    (simulates: writer POSTed before an ALTER TABLE happened, then
+    cycle runs after) must hit the committer's mismatch path:
+    skipped_reason='schema_mismatch', file claim released,
     failure_counter incremented.
 
-    This documents the committer's defense against silent schema drift
-    end-to-end and would catch a refactor that accidentally swallowed
-    the mismatch instead of releasing claims.
+    We bypass the API by inserting directly into the icebox schema's
+    ``files`` table from a host-side PG connection — the API perimeter
+    would catch the bad fingerprint at the door now, but this row
+    arrives pre-staged.
     """
-    base_url = icebox_container.base_url
-    table = _create_iceberg_table(host_rest_catalog)
+    _create_iceberg_table(host_rest_catalog)
 
-    req = _build_register_request(
-        table,
-        file_path="s3://warehouse/will-never-be-read.parquet",
-        record_count=1,
-        file_size=100,
-        partition_values={"year": 2026, "month": 6, "day": 2, "hour": 12},
-        # Definitely not the table's current fingerprint.
-        schema_fingerprint_override="deadbeef" * 8,
-    )
-    r = httpx.post(
-        f"{base_url}/v1/files", json=req.model_dump(mode="json"), timeout=10
-    )
-    assert r.status_code == 201, r.text
-    file_row_id = r.json()["row_id"]
+    # Insert a file row directly via host PG, mimicking what the API
+    # would have written before the perimeter check was added.
+    bad_fp = "deadbeef" * 8
+    file_path = f"s3://warehouse/stale-fp-{uuid.uuid4().hex[:8]}.parquet"
+    partition_values = {"year": 2026, "month": 6, "day": 2, "hour": 12}
+    parquet_stats: dict[str, Any] = {
+        "column_sizes": {},
+        "value_counts": {},
+        "null_value_counts": {},
+        "lower_bounds": {},
+        "upper_bounds": {},
+    }
+    with _pg_conn(pg_on_net, schema=icebox_container.schema_name) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO files (
+                    file_path, writer_ordinal, kafka_offsets, partition_values,
+                    record_count, file_size, schema_version, schema_fingerprint,
+                    parquet_stats
+                ) VALUES (
+                    %s, %s, %s::jsonb, %s::jsonb,
+                    %s, %s, %s, %s, %s::jsonb
+                ) RETURNING id
+                """,
+                (
+                    file_path,
+                    0,
+                    json.dumps({"0": 1}),
+                    json.dumps(partition_values),
+                    1,
+                    100,
+                    "v1",
+                    bad_fp,
+                    json.dumps(parquet_stats),
+                ),
+            )
+            file_row_id = cur.fetchone()[0]
 
     # Wait for the committer to attempt a cycle and detect the mismatch.
     # Observable signals after release_cycle_claim + record_failure:
@@ -1725,7 +1805,10 @@ def test_recovery_after_sigkill_completes_file(
 
     # Spawn icebox A. Use a stable schema so B can reuse it.
     schema = f"icebox_rec_{uuid.uuid4().hex[:8]}"
-    handle_a = icebox_factory(schema_name=schema)
+    # drop_catalog_table_first=False on both spawns: the test
+    # pre-created the table BEFORE spawning A, and B's recovery path
+    # needs the same table to still exist.
+    handle_a = icebox_factory(schema_name=schema, drop_catalog_table_first=False)
 
     req = _build_register_request(
         table,
@@ -1767,38 +1850,41 @@ def test_recovery_after_sigkill_completes_file(
     # startup recovery (icebox/committer.py) detects the orphan cycle
     # (if any) and either deletes it or finalizes it; the file then
     # gets re-batched or finalized.
-    handle_b = icebox_factory(schema_name=schema)
+    handle_b = icebox_factory(schema_name=schema, drop_catalog_table_first=False)
 
-    # Wait for the file to be marked committed AND for the snapshot to
-    # show up in the catalog.
+    # Wait for the file row to be marked fully committed. The
+    # iceberg snapshot lands in the catalog before files.committed_at
+    # is set (complete_cycle runs AFTER mark_iceberg_committed +
+    # kafka_commit), so polling on the catalog and then querying PG
+    # races against the cycle. Poll the file row's committed_at
+    # directly — that's the post-complete_cycle marker.
     deadline = time.monotonic() + 60.0
-    saw_snapshot = False
+    committed_row: tuple[Any, ...] | None = None
     while time.monotonic() < deadline:
-        reloaded = host_rest_catalog.load_table((NAMESPACE, TABLE))
-        snaps = list(reloaded.snapshots())
-        if snaps:
-            saw_snapshot = True
+        with _pg_conn(pg_on_net, schema=schema) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT committed_at, iceberg_snapshot_id FROM files WHERE id = %s",
+                    (file_row_id,),
+                )
+                row = cur.fetchone()
+        if row is not None and row[0] is not None and row[1] is not None:
+            committed_row = row
             break
         time.sleep(0.5)
-    if not saw_snapshot:
+    if committed_row is None:
         out, err = handle_b.container.get_logs()
         raise AssertionError(
-            "no snapshot in catalog after recovery. icebox B logs:\n"
+            f"file row {file_row_id} never reached committed state. Last PG row: "
+            f"{row!r}\n--- icebox B logs ---\n"
             f"{out.decode(errors='replace')}\n"
             f"{err.decode(errors='replace')}"
         )
 
-    # The committed file must have a non-NULL committed_at.
-    with _pg_conn(pg_on_net, schema=schema) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT committed_at, iceberg_snapshot_id FROM files WHERE id = %s",
-                (file_row_id,),
-            )
-            row = cur.fetchone()
-    assert row is not None
-    assert row[0] is not None, f"file committed_at still NULL after recovery: {row!r}"
-    assert row[1] is not None, f"file iceberg_snapshot_id still NULL: {row!r}"
+    # And there must be a corresponding snapshot in the catalog.
+    reloaded = host_rest_catalog.load_table((NAMESPACE, TABLE))
+    snaps = list(reloaded.snapshots())
+    assert snaps, "no snapshot in catalog after file row was marked committed"
 
 
 # ---------------------------------------------------------------------------
@@ -2218,3 +2304,57 @@ def test_log_output_is_json_with_cycle_id_during_cycle(
         "stamping is not wired up. Sample JSON lines:\n"
         + "\n".join(json.dumps(o) for o in parsed[:5])
     )
+
+
+# ---------------------------------------------------------------------------
+# Hardening: schema fingerprint check at the API perimeter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_schema_fingerprint_mismatch_rejected_at_api_perimeter(
+    icebox_container: IceboxHandle,
+    host_rest_catalog: RestCatalog,
+) -> None:
+    """A POST whose ``schema_fingerprint`` doesn't match the Iceberg
+    table's current schema must be rejected synchronously with 400
+    at the API. The committer's own fingerprint check still applies
+    as defense in depth, but a writer with a stale schema should see
+    the rejection immediately rather than having its file row stall
+    in PG waiting for a cycle that will then skip.
+    """
+    base_url = icebox_container.base_url
+    # Pre-create the Iceberg table so the cache has a current schema
+    # to validate against.
+    _create_iceberg_table(host_rest_catalog)
+
+    bad_body = {
+        "file_path": f"s3://warehouse/fp-mismatch-{uuid.uuid4().hex[:8]}.parquet",
+        "writer_ordinal": 0,
+        "kafka_offsets": {"0": 1},
+        "partition_values": {"year": 2026, "month": 6, "day": 3, "hour": 2},
+        "record_count": 1,
+        "file_size": 100,
+        "schema_version": "v1",
+        # Deliberately not the table's fingerprint.
+        "schema_fingerprint": "ff" * 32,
+        "parquet_stats": {
+            "column_sizes": {},
+            "value_counts": {},
+            "null_value_counts": {},
+            "lower_bounds": {},
+            "upper_bounds": {},
+        },
+        "expected_iceberg_namespace": NAMESPACE,
+        "expected_iceberg_table": TABLE,
+    }
+    r = httpx.post(f"{base_url}/v1/files", json=bad_body, timeout=10)
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "schema_fingerprint_mismatch", r.text
+    # The 400 must NOT echo the request body verbatim — same redaction
+    # rationale as the namespace/table mismatch tests.
+    assert bad_body["file_path"] not in r.text
+    # The fingerprint itself appears in the structured detail (writer
+    # debugging needs it) but the rest of the body shouldn't.
+    assert '"kafka_offsets"' not in r.text
