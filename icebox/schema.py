@@ -17,7 +17,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-
 # ---------------------------------------------------------------------------
 # DDL — applied via psycopg in the migration runner
 # ---------------------------------------------------------------------------

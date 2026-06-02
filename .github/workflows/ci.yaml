@@ -61,6 +61,45 @@ jobs:
 
     - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
 
+    # Pre-pull every container image the integration suite needs, with
+    # a 3x retry. GitHub-hosted runners hit Docker Hub registry timeouts
+    # routinely (verified failure mode: dial tcp 54.235.153.191:443:
+    # i/o timeout) which leaves the test session erroring out on the
+    # first pull instead of running the suite. Pre-pulling here means
+    # the warmup pays the registry cost once with retries, and the test
+    # session itself hits a populated local cache.
+    #
+    # Image tags must stay in sync with what tests/integration/ and
+    # the icebox Dockerfile actually request. If a new test brings in
+    # a new image, add it here too.
+    - name: Pre-pull integration test images (3x retry)
+      run: |
+        set -eu
+        images=(
+          python:3.12-slim
+          ghcr.io/astral-sh/uv:0.7
+          postgres:16-alpine
+          minio/minio:RELEASE.2025-04-22T22-12-26Z
+          minio/mc:RELEASE.2025-04-16T18-13-26Z
+          tabulario/iceberg-rest@sha256:3b7d31bdfec626b68e97531c9778a1b9119659e456fe28545a49f6aa6a9ce472
+          docker.redpanda.com/redpandadata/redpanda:v24.3.4
+          testcontainers/ryuk:0.8.1
+        )
+        for image in "${images[@]}"; do
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              break
+            fi
+            if [[ $attempt -eq 3 ]]; then
+              echo "FATAL: failed to pull $image after 3 attempts" >&2
+              exit 1
+            fi
+            sleep_s=$((attempt * 5))
+            echo "pull $image failed; retry $attempt of 3 after ${sleep_s}s..." >&2
+            sleep "$sleep_s"
+          done
+        done
+
     - name: Integration tests
       run: uv run pytest tests/integration -v
 

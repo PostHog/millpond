@@ -38,6 +38,7 @@ from __future__ import annotations
 import datetime as dt
 import functools
 import io
+import json
 import socket
 import time
 import urllib.request
@@ -2051,4 +2052,169 @@ def test_thirty_two_concurrent_posts_all_accepted(
         f"expected 32 data files committed across snapshots; "
         f"got total_committed={total_committed}, "
         f"snapshots={[dict(s.summary) for s in snapshots if s.summary]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hardening: /metrics endpoint + JSON log shape + cycle_id stamping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_metrics_endpoint_serves_prometheus_format(
+    icebox_container: IceboxHandle,
+) -> None:
+    """``/metrics`` returns text/plain in Prometheus exposition format
+    with the icebox-specific metric names defined in
+    icebox/metrics.py. The live gauges are populated from the
+    just-completed PG read.
+    """
+    base_url = icebox_container.base_url
+    r = httpx.get(f"{base_url}/metrics", timeout=5)
+    assert r.status_code == 200, r.text
+    assert "text/plain" in r.headers["content-type"]
+    body = r.text
+    # HELP lines for each metric name we declare.
+    for name in (
+        "icebox_pending_files",
+        "icebox_oldest_pending_age_seconds",
+        "icebox_consecutive_failures",
+        "icebox_committer_heartbeat_age_seconds",
+        "icebox_cycles_total",
+        "icebox_cycle_duration_seconds",
+        "icebox_files_committed_total",
+        "icebox_post_total",
+    ):
+        assert f"# HELP {name} " in body, f"missing HELP for {name} in /metrics body"
+
+
+@pytest.mark.integration
+def test_metrics_post_total_increments_after_post(
+    icebox_container: IceboxHandle,
+) -> None:
+    """A POST /v1/files must show up in icebox_post_total{status="201"}
+    on the next /metrics scrape — the perimeter middleware in
+    icebox/api.py is what ensures status codes are counted regardless
+    of which return path the handler took.
+    """
+    base_url = icebox_container.base_url
+
+    def _scrape_count(status: str) -> float:
+        r = httpx.get(f"{base_url}/metrics", timeout=5)
+        r.raise_for_status()
+        for line in r.text.splitlines():
+            # Match e.g. icebox_post_total{status="201"} 5.0
+            if line.startswith("icebox_post_total{") and f'status="{status}"' in line:
+                return float(line.split()[-1])
+        return 0.0
+
+    before = _scrape_count("201")
+
+    body = {
+        "file_path": f"s3://warehouse/metrics-{uuid.uuid4().hex[:8]}.parquet",
+        "writer_ordinal": 0,
+        "kafka_offsets": {"0": 1},
+        "partition_values": {"year": 2026, "month": 6, "day": 3, "hour": 0},
+        "record_count": 1,
+        "file_size": 100,
+        "schema_version": "v1",
+        "schema_fingerprint": "a" * 64,
+        "parquet_stats": {
+            "column_sizes": {},
+            "value_counts": {},
+            "null_value_counts": {},
+            "lower_bounds": {},
+            "upper_bounds": {},
+        },
+        "expected_iceberg_namespace": NAMESPACE,
+        "expected_iceberg_table": TABLE,
+    }
+    r = httpx.post(f"{base_url}/v1/files", json=body, timeout=10)
+    assert r.status_code == 201, r.text
+
+    after = _scrape_count("201")
+    assert after == before + 1.0, (
+        f"icebox_post_total{{status=201}} did not increment: before={before} after={after}"
+    )
+
+
+@pytest.mark.integration
+def test_log_output_is_json_with_cycle_id_during_cycle(
+    icebox_container: IceboxHandle,
+    host_rest_catalog: RestCatalog,
+    minio_on_net: DockerContainer,
+) -> None:
+    """Container stdout must be one-JSON-object-per-line, and at least
+    one line emitted during a successful cycle must carry the
+    ``cycle_id`` field set by the committer's ContextVar.
+    """
+    table = _create_iceberg_table(host_rest_catalog)
+    partition_values = {"year": 2026, "month": 6, "day": 3, "hour": 1}
+    s3_uri, file_size, row_count = _upload_parquet_to_minio(
+        minio_on_net=minio_on_net,
+        table_location=table.location(),
+        partition_values=partition_values,
+    )
+    req = _build_register_request(
+        table,
+        file_path=s3_uri,
+        record_count=row_count,
+        file_size=file_size,
+        partition_values=partition_values,
+    )
+    r = httpx.post(
+        f"{icebox_container.base_url}/v1/files",
+        json=req.model_dump(mode="json"),
+        timeout=10,
+    )
+    assert r.status_code == 201, r.text
+
+    # Wait until a snapshot lands (proves a cycle fired end-to-end).
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        reloaded = host_rest_catalog.load_table((NAMESPACE, TABLE))
+        if list(reloaded.snapshots()):
+            break
+        time.sleep(0.5)
+    else:
+        raise AssertionError("no cycle fired within 30s")
+
+    # Grab the container's full stdout + stderr.
+    out, err = icebox_container.container.get_logs()
+    stream = out.decode(errors="replace") + err.decode(errors="replace")
+
+    # Each non-empty line of the icebox's own output should be a
+    # parseable JSON object. uvicorn's access log uses Python's
+    # logging but goes through the same root handler, so it's JSON
+    # too. testcontainers may interleave a "Container started" line
+    # from its own ryuk supervisor on some setups — tolerate non-JSON
+    # lines but require that AT LEAST ONE line has cycle_id and AT
+    # LEAST ONE line decodes as JSON with our required keys.
+    parsed: list[dict[str, Any]] = []
+    for line in stream.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            parsed.append(obj)
+
+    assert parsed, (
+        f"no JSON-formatted log lines found in container output. "
+        f"first 1000 chars:\n{stream[:1000]}"
+    )
+    # Every parsed line should have the standard fields.
+    for obj in parsed[:5]:
+        assert {"ts", "level", "logger", "msg"} <= obj.keys(), obj
+
+    # At least one line emitted from inside run_cycle (committer step
+    # markers) must carry cycle_id.
+    with_cycle_id = [o for o in parsed if "cycle_id" in o]
+    assert with_cycle_id, (
+        "no log line carried cycle_id; the committer's ContextVar "
+        "stamping is not wired up. Sample JSON lines:\n"
+        + "\n".join(json.dumps(o) for o in parsed[:5])
     )

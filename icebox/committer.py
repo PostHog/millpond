@@ -49,11 +49,34 @@ from psycopg_pool import ConnectionPool
 
 from icebox import iceberg as ib
 from icebox import kafka as kf
+from icebox import metrics
 from icebox import postgres_sync as ps
 from icebox.config import Config
 from icebox.schema import CommitCycleRow
+from icebox.structured_logging import cycle_id_var
 
 log = logging.getLogger(__name__)
+
+
+def _cycle_result_label(result: CycleResult) -> str:
+    """Map a CycleResult onto a Prometheus ``result`` label value.
+
+    Kept in sync with the labelset documented in icebox/metrics.py.
+    """
+    if result.skipped_reason is not None:
+        return f"skipped_{result.skipped_reason}"
+    if result.success:
+        return "success"
+    # No skipped_reason and not success ⇒ unhandled failure path.
+    # The committer's exception handlers set ``result.error`` with a
+    # prefix that identifies the step; bucket by prefix so the
+    # histogram has actionable cardinality.
+    err = result.error or ""
+    if err.startswith("iceberg-commit failed"):
+        return "failed_iceberg_commit"
+    if err.startswith("kafka-commit failed"):
+        return "failed_kafka_commit"
+    return "failed_other"
 
 
 # Floor on the sleep between cycles in committer_loop, even if the
@@ -108,9 +131,43 @@ def run_cycle(
 ) -> CycleResult:
     """Execute one committer cycle. Returns CycleResult so the caller
     can observe outcome without scraping logs.
+
+    Wrapping concerns: every log line emitted inside this function is
+    automatically stamped with ``cycle_id`` via ``cycle_id_var``
+    (consumed by ``JsonFormatter``). The wall-clock duration and the
+    cycle outcome are recorded into Prometheus metrics on every return
+    path via the ``finally`` block.
     """
     cycle_id = uuid4()
     result = CycleResult(cycle_id=cycle_id)
+    cv_token = cycle_id_var.set(str(cycle_id))
+    start_monotonic = time.monotonic()
+    try:
+        return _run_cycle_body(cfg=cfg, pg_pool=pg_pool, deps=deps, result=result)
+    finally:
+        duration = time.monotonic() - start_monotonic
+        label = _cycle_result_label(result)
+        metrics.CYCLES_TOTAL.labels(result=label).inc()
+        metrics.CYCLE_DURATION_SECONDS.labels(result=label).observe(duration)
+        if result.success and result.iceberg_snapshot_id is not None:
+            metrics.FILES_COMMITTED_TOTAL.inc(result.file_count)
+        cycle_id_var.reset(cv_token)
+
+
+def _run_cycle_body(
+    *,
+    cfg: Config,
+    pg_pool: ConnectionPool,
+    deps: CommitterDeps,
+    result: CycleResult,
+) -> CycleResult:
+    """Inner cycle body. ``cycle_id`` is already on ``result`` and bound
+    to the ``cycle_id_var`` ContextVar by the public ``run_cycle``
+    entry point; this function is split out so the wrapper's
+    ``try/finally`` can record metrics on every return path.
+    """
+    cycle_id = result.cycle_id
+    assert cycle_id is not None  # set by run_cycle
 
     # ---- Step 1-3: claim files in a PG transaction -----------------------
     with pg_pool.connection() as conn:

@@ -128,6 +128,19 @@ class Config:
 
     # Logging
     log_level: str
+    # ``json`` | ``text``. JSON is what mw-prod-us ships; ``text`` is
+    # the friendlier local-dev shape. Defaults at the dataclass level
+    # so test builders that don't set these still work.
+    log_format: str = "json"
+    # PostHog Logs (OTLP/HTTP) — ON when ``posthog_project_token`` is
+    # set, OFF otherwise. ``posthog_logs_endpoint`` defaults to the US
+    # PostHog Cloud ingress; override for EU or self-hosted PostHog.
+    posthog_project_token: str | None = None
+    posthog_logs_endpoint: str = "https://us.i.posthog.com/i/v1/logs"
+    # service.version reported in OTLP resource attributes. Defaults
+    # to the millpond package version. Operators can override via
+    # ICEBOX_SERVICE_VERSION (e.g., to expose the image digest).
+    service_version: str = "unknown"
 
 
 def _require(name: str) -> str:
@@ -279,4 +292,32 @@ def load() -> Config:
         api_host=_optional("ICEBOX_API_HOST", "0.0.0.0"),
         api_port=_int("ICEBOX_API_PORT", 8000),
         log_level=_optional("ICEBOX_LOG_LEVEL", "INFO"),
+        log_format=_optional("ICEBOX_LOG_FORMAT", "json"),
+        # No ``ICEBOX_`` prefix on POSTHOG_PROJECT_TOKEN: it's a
+        # PostHog-wide secret typically sourced from a shared K8s
+        # Secret (the same one other PostHog SDKs consume), so the
+        # canonical PostHog name is what operators expect to see.
+        posthog_project_token=(
+            os.environ.get("POSTHOG_PROJECT_TOKEN") or None
+        ),
+        posthog_logs_endpoint=_optional(
+            "POSTHOG_LOGS_ENDPOINT",
+            "https://us.i.posthog.com/i/v1/logs",
+        ),
+        service_version=_optional("ICEBOX_SERVICE_VERSION", _default_service_version()),
     )
+
+
+def _default_service_version() -> str:
+    """Best-effort service version string for OTLP resource attrs.
+
+    Falls back to the millpond setuptools-scm version baked into the
+    package; that maps cleanly to a git rev in non-prod builds and
+    to a clean tag in prod images.
+    """
+    try:
+        from millpond._version import version
+
+        return str(version)
+    except Exception:
+        return "unknown"

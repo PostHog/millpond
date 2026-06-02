@@ -26,13 +26,14 @@ from datetime import UTC, datetime
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from icebox import metrics
 from icebox import postgres_async as pa
 from icebox.config import Config
 from shared.models import (
     PROTOCOL_VERSION,
     BackpressureResponse,
-    RegisteredFile,
     RegisterFileRequest,
     StatusResponse,
 )
@@ -59,7 +60,24 @@ def create_app(
     app.state.pool = pool
     app.state.clock = clock or (lambda: datetime.now(UTC))
     _register_routes(app)
+    _register_metrics_middleware(app)
     return app
+
+
+def _register_metrics_middleware(app: FastAPI) -> None:
+    """Count POST /v1/files responses by status code.
+
+    Kept as a middleware (instead of scattering ``.inc()`` calls
+    across the handler's many return paths) so a refactor that adds
+    a new response code is automatically counted.
+    """
+
+    @app.middleware("http")
+    async def _count_post_v1_files(request: Request, call_next):  # type: ignore[no-untyped-def]
+        response = await call_next(request)
+        if request.method == "POST" and request.url.path == "/v1/files":
+            metrics.POST_TOTAL.labels(status=str(response.status_code)).inc()
+        return response
 
 
 def _register_routes(app: FastAPI) -> None:
@@ -77,6 +95,33 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/readyz")
     async def readyz(request: Request) -> Response:
         return await _handle_readyz(request)
+
+    @app.get("/metrics")
+    async def metrics_endpoint(request: Request) -> Response:
+        # Refresh PG-derived live gauges before emitting. Doing this
+        # synchronously in the scrape handler keeps the values fresh
+        # (at most one scrape stale) without needing a background
+        # thread, and matches what Prometheus dashboards expect.
+        pool: asyncpg.Pool = request.app.state.pool
+        clock = request.app.state.clock
+        try:
+            status = await pa.read_status(pool)
+        except Exception:
+            log.exception("/metrics: read_status failed; live gauges stale this scrape")
+        else:
+            metrics.PENDING_FILES.set(status.pending_files)
+            metrics.OLDEST_PENDING_AGE_SECONDS.set(
+                status.oldest_pending_age_seconds
+                if status.oldest_pending_age_seconds is not None
+                else -1.0
+            )
+            metrics.CONSECUTIVE_FAILURES.set(status.consecutive_failures)
+            if status.last_committer_heartbeat is not None:
+                age_s = (clock() - status.last_committer_heartbeat).total_seconds()
+                metrics.COMMITTER_HEARTBEAT_AGE_SECONDS.set(age_s)
+            else:
+                metrics.COMMITTER_HEARTBEAT_AGE_SECONDS.set(-1.0)
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/healthz")
     async def healthz() -> Response:

@@ -31,8 +31,8 @@ from typing import Any
 from uuid import UUID
 
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
-from pyiceberg.schema import Schema
 from pyiceberg.partitioning import PartitionSpec
+from pyiceberg.schema import Schema
 from pyiceberg.table import Table
 from pyiceberg.typedef import Record
 

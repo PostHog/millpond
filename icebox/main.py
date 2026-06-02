@@ -30,6 +30,7 @@ from icebox import kafka as ikafka
 from icebox import postgres_async as pa
 from icebox import postgres_sync as ps
 from icebox.api import create_app
+from icebox.structured_logging import setup_logging
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +44,18 @@ SHUTDOWN_COMPLETE_MARKER = "icebox: shutdown complete"
 def main() -> None:
     """Console-script entrypoint."""
     cfg = icebox_config.load()
-    logging.basicConfig(
+    # Structured logging (JSON by default; text for local-dev when
+    # ICEBOX_LOG_FORMAT=text) + optional OTLP export to PostHog Logs.
+    # Returns the OTel LoggerProvider when PostHog is enabled so we
+    # can flush it on shutdown.
+    logger_provider = setup_logging(
         level=cfg.log_level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        fmt=cfg.log_format,
+        posthog_token=cfg.posthog_project_token,
+        posthog_endpoint=cfg.posthog_logs_endpoint,
+        service_name="icebox",
+        service_namespace=cfg.pg_schema,
+        service_version=cfg.service_version,
     )
     log.info("icebox starting on %s:%d", cfg.api_host, cfg.api_port)
 
@@ -156,6 +166,15 @@ def main() -> None:
     else:
         log.info("icebox: committer thread drained cleanly")
     sync_pool.close()
+    # Flush any in-flight OTLP log batches before exiting so logs
+    # generated during the drain itself reach PostHog. shutdown()
+    # blocks until the BatchLogRecordProcessor's queue is drained
+    # (or its export-timeout elapses).
+    if logger_provider is not None:
+        try:
+            logger_provider.shutdown()
+        except Exception:
+            log.exception("icebox: OTel LoggerProvider shutdown failed")
     log.info(SHUTDOWN_COMPLETE_MARKER)
 
 
