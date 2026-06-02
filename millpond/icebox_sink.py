@@ -1,10 +1,11 @@
 """Sink that ships parquet to S3 and registers it with the icebox service.
 
 Replaces the direct PyIceberg-commit path for high-concurrency writers.
-Per ICEBOX-PLAN.md: writers compute a deterministic S3 path, write the
-parquet, extract column stats from the ParquetWriter metadata, and POST
-a RegisterFileRequest to icebox. The icebox owns Iceberg commit + Kafka
-offset commit in a batched cycle.
+Writers compute a deterministic S3 path, write the parquet, extract
+column stats from the ParquetWriter metadata, and POST a
+RegisterFileRequest to icebox. The icebox owns Iceberg commit + Kafka
+offset commit in a batched cycle. See ``icebox/README.md`` for the
+service design.
 
 Key responsibility distinctions vs IcebergSink:
   - No `table.append()` — the icebox does that for us.
@@ -269,7 +270,7 @@ def parquet_stats_from_metadata(
 
     Returns:
         ParquetStats with field-id-keyed dicts. Values follow the
-        wire-format rules in ICEBOX-PLAN.md "Wire format rules".
+        wire-format rules captured in ``shared/bounds.py``.
     """
     if parquet_meta.num_row_groups == 0:
         return ParquetStats(

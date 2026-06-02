@@ -80,7 +80,8 @@ class Config:
     # so all SQL stays unqualified.
     pg_schema: str
 
-    # Connection pool sizing — see ICEBOX-PLAN.md "Async-vs-sync"
+    # Connection pool sizing — the asyncpg pool serves API requests;
+    # the psycopg pool is for the synchronous committer + bootstrap.
     asyncpg_pool_min: int
     asyncpg_pool_max: int
     psycopg_pool_min: int
@@ -119,7 +120,7 @@ class Config:
 
     # Heartbeat staleness — POSTs are rejected with 503 if the
     # committer hasn't written a heartbeat within this multiple of
-    # the cadence. See ICEBOX-PLAN.md "Committer thread liveness".
+    # the cadence.
     committer_heartbeat_stale_multiple: float
 
     # REST API
@@ -193,7 +194,7 @@ def load() -> Config:
       ICEBOX_KAFKA_BOOTSTRAP_SERVERS,
       ICEBOX_KAFKA_TOPIC, ICEBOX_KAFKA_GROUP_ID
 
-    Optional with defaults match the ICEBOX-PLAN.md spec.
+    Optional fields use the dataclass defaults declared above.
     """
     cadence = _int("ICEBOX_COMMITTER_CADENCE_SECONDS", 60)
     if cadence < 1:

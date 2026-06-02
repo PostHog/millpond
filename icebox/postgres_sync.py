@@ -2,8 +2,7 @@
 
 The committer runs in a dedicated thread (NOT an asyncio task) because
 PyIceberg's commit path is synchronous; calling it from within FastAPI's
-asyncio loop would block incoming POST handlers. See ICEBOX-PLAN.md
-"Async-vs-sync inside the icebox process".
+asyncio loop would block incoming POST handlers.
 
 This module exposes:
   - `build_psycopg_pool` — connection pool sized small (defaults to

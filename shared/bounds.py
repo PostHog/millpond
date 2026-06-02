@@ -1,7 +1,7 @@
 """Typed-JSON ↔ Iceberg bound bytes conversion.
 
-The icebox wire format (see ICEBOX-PLAN.md "Wire format rules") ships
-lower/upper bound values as TYPED JSON keyed by Iceberg field ID:
+The icebox wire format ships lower/upper bound values as TYPED JSON
+keyed by Iceberg field ID:
 
   - int/long/float/double → JSON number
   - boolean → JSON bool
@@ -41,8 +41,8 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
-    IntegerType,
     IcebergType,
+    IntegerType,
     LongType,
     StringType,
     TimestampType,

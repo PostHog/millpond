@@ -310,11 +310,12 @@ async def _handle_register_file(
 
 
 async def _handle_readyz(request: Request) -> Response:
-    """Readyz semantics (per ICEBOX-PLAN.md "GET /readyz decoupled from
-    downstream"): pass iff Postgres is reachable AND the committer
-    heartbeat is not stale. Downstream (Lakekeeper, Kafka) outages do
-    NOT fail readyz — the icebox can keep accepting POSTs and stage
-    files for future commit cycles.
+    """Readyz semantics: pass iff Postgres is reachable AND the
+    committer heartbeat is not stale. Downstream (Lakekeeper, Kafka)
+    outages do NOT fail readyz — the icebox can keep accepting POSTs
+    and stage files for future commit cycles. Decoupling from
+    downstream is intentional; see ``icebox/README.md`` for the
+    rationale.
     """
     cfg: Config = request.app.state.cfg
     pool: asyncpg.Pool = request.app.state.pool

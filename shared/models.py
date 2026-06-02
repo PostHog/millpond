@@ -9,10 +9,10 @@ strictly the same model (the DB has additional bookkeeping columns like
 staged_at, committed_at, cycle_id, iceberg_snapshot_id), but the
 producer-visible fields are identical.
 
-Wire format rules for parquet_stats are spelled out in ICEBOX-PLAN.md
-"Wire format rules" and enforced inside ParquetStats — values are typed
-JSON keyed by Iceberg field ID strings, NOT base64/opaque bytes. The
-committer alone converts to Iceberg single-value-serialization bytes.
+Wire format rules for parquet_stats are enforced inside ParquetStats —
+values are typed JSON keyed by Iceberg field ID strings, NOT base64/
+opaque bytes. The committer alone converts to Iceberg single-value-
+serialization bytes (see ``shared/bounds.py``).
 """
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
-
 
 # Bumped on schema-incompatible POST body changes. Mismatch yields a
 # loud 400 from the icebox, not silent field loss. v1 == 1.

@@ -11,8 +11,8 @@ the cycle and commits via AdminClient.alter_consumer_group_offsets().
 Critical detail: writers DO NOT consumer.subscribe() — they use
 consumer.assign(), so the group is always "Empty" from Kafka's POV.
 That makes AdminClient.alter_consumer_group_offsets safe to call (the
-API only refuses on a Stable group). See WarpStream compat notes in
-ICEBOX-PLAN.md "Validated assumptions".
+API only refuses on a Stable group). This was validated against
+WarpStream's Kafka-compatible API.
 
 Kafka offset semantics: committed offset = NEXT offset to read. Writers
 report max_offset_seen; we add 1 here to get the next-to-read.

@@ -2,8 +2,7 @@
 
 Runs in a dedicated thread (NOT an asyncio task) because PyIceberg's
 commit path is synchronous; running it on the event loop would block
-incoming POSTs. See ICEBOX-PLAN.md "Async-vs-sync inside the icebox
-process".
+incoming POSTs.
 
 Per-cycle state machine:
 
@@ -399,7 +398,6 @@ def _recover_one(
             # Heartbeat update on branch A: a long recovery walking many
             # released-no-iceberg cycles otherwise wouldn't update the
             # heartbeat at all, leaving the API 503'ing legitimate POSTs.
-            # See ICEBOX-PLAN.md "Committer thread liveness".
             #
             # Also: the cycle row is now a zombie (no Iceberg snapshot
             # ever landed for it). DELETE it so it doesn't accumulate
