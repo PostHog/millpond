@@ -15,9 +15,8 @@ the same flush cadence race against the catalog and the loser retries
 with exponential backoff. Under sustained dual-writer load with
 `FLUSH_INTERVAL_MS=5000` (let alone the 32 writers the production
 deployment targets), retries pile up on the *next* round of commits
-and exhaust the budget. The pod exits. See the main README's
-"Iceberg multi-writer commit contention" entry for the original
-discovery and the comment in `docker-compose.iceberg.yaml`.
+and exhaust the budget. The pod exits. The original discovery is
+also commented in `docker-compose.iceberg.yaml`.
 
 icebox solves this with a producer/consumer split:
 
