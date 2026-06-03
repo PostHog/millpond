@@ -3,7 +3,7 @@
 A standalone Python app that consumes from a Kafka topic and writes to a lake table. Single thread, single loop, no Kafka Connect. One deployment writes to exactly one destination — either [DuckLake](https://github.com/duckdb/ducklake), [Apache Iceberg](https://iceberg.apache.org/) via direct PyIceberg commit, or Iceberg via the bundled [**icebox**](icebox/README.md) writer/committer split (production-scale Iceberg). Selected via `MILLPOND_DESTINATION` (`ducklake` | `iceberg` | `icebox`).
 
 **Contents:**
-[Naming](#naming) | [Why](#why) | [Architecture](#architecture) | [Destinations](#destinations) | [icebox](icebox/README.md) | [Record Handling](#record-handling) | [Adaptive Backpressure](#adaptive-backpressure) | [Performance](#performance) | [Resource Footprint](#resource-footprint) | [Setup](#setup) | [Development](#development) | [Configuration](#configuration) | [Releases](#releases) | [Deployment](#deployment) | [Partitioning](#partitioning) | [Object Sizing](#object-sizing) | [Error Handling](#error-handling-and-retries) | [Multiple Pipelines](#multiple-pipelines) | [AWS Credential Isolation](#aws-credential-isolation) | [Operational Notes](#operational-notes) | [Next steps](#next-steps)
+[Naming](#naming) | [Why](#why) | [Architecture](#architecture) | [Destinations](#destinations) | [icebox](icebox/README.md) | [Record Handling](#record-handling) | [Adaptive Backpressure](#adaptive-backpressure) | [Performance](#performance) | [Resource Footprint](#resource-footprint) | [Setup](#setup) | [Development](#development) | [Configuration](#configuration) | [Releases](#releases) | [Deployment](#deployment) | [Partitioning](#partitioning) | [Object Sizing](#object-sizing) | [Error Handling](#error-handling-and-retries) | [Multiple Pipelines](#multiple-pipelines) | [AWS Credential Isolation](#aws-credential-isolation) | [Operational Notes](#operational-notes) | [tools](tools/README.md)
 
 ## Naming
 
@@ -57,7 +57,7 @@ Millpond writes to one of two lake formats, selected at startup by `MILLPOND_DES
 
 The selection is a thin Protocol-based abstraction (`millpond/sink.py`) — `main.py` only sees `Sink.write(batch)`, `reset_caches()`, `close()`. Both implementations are in their own module (`ducklake.py`, `iceberg.py`).
 
-For the Iceberg path at production scale, the writers do not commit to the catalog directly. They emit parquet to S3 and `POST /v1/files` to **[icebox](icebox/README.md)**, a writer/committer split that serializes commits from many concurrent writer pods through a single committer thread per `(namespace, table)`. This eliminates the OCC contention described in the [Next steps](#iceberg-multi-writer-commit-contention--solved-by-icebox) section below and is what makes 32 concurrent writers per Iceberg table viable. See `icebox/README.md` for the full design.
+For Iceberg at production scale, writers do not commit to the catalog directly. They emit parquet to S3 and `POST /v1/files` to **[icebox](icebox/README.md)** — a writer/committer split that serializes commits from many concurrent writer pods through a single committer thread per `(namespace, table)`, eliminating PyIceberg's REST-catalog optimistic-concurrency contention. See [`icebox/README.md`](icebox/README.md) for the full design, endpoint contract, and operational notes.
 
 ## Record Handling
 
@@ -153,116 +153,14 @@ The `just up-ssl` recipe generates self-signed certs and runs Kafka with SSL lis
 
 Requires Docker (uses `keytool` from the Kafka container image for cert generation).
 
-### DuckLake Maintenance
+### DuckLake Maintenance and state metrics
 
-`tools/ducklake_maintenance.py` is a self-contained Python script for DuckLake maintenance operations (snapshot expiry, file cleanup, orphan deletion, checkpoint, tiered compaction, deletion-queue dedup, catalog-side orphan recovery). It is baked into the Docker image at `/app/tools/ducklake_maintenance.py` and designed to run as a K8s CronJob reusing the same image and credentials as the main application.
+The `tools/` directory ships two DuckLake-only operational binaries inside the same image as the writer:
 
-```bash
-python /app/tools/ducklake_maintenance.py maintain --days 7           # expire snapshots + cleanup files
-python /app/tools/ducklake_maintenance.py maintain --days 7 --dry-run # preview only
-python /app/tools/ducklake_maintenance.py expire --days 3             # expire snapshots only
-python /app/tools/ducklake_maintenance.py cleanup --days 1            # cleanup scheduled files only
-python /app/tools/ducklake_maintenance.py cleanup-all                 # cleanup all scheduled files regardless of age
-python /app/tools/ducklake_maintenance.py dedup-deletions             # drop duplicate rows in the pending-deletion queue
-python /app/tools/ducklake_maintenance.py find-orphans                # list catalog rows whose S3 key no longer exists
-python /app/tools/ducklake_maintenance.py heal-orphans                # delete those catalog rows (gated B1/B3 safety checks)
-python /app/tools/ducklake_maintenance.py cleanup-all-safe            # dedup + heal-orphans + cleanup-all in a loop until clean
-python /app/tools/ducklake_maintenance.py fsck                        # cleanup-all-safe + ducklake_delete_orphaned_files
-python /app/tools/ducklake_maintenance.py checkpoint                  # integrated merge + expire + cleanup
-python /app/tools/ducklake_maintenance.py orphans                     # delete S3-side orphaned files (catalog has no row)
-python /app/tools/ducklake_maintenance.py compact --tier 1            # tiered compaction (see "When to add a merge job")
-```
+- **`tools/ducklake_maintenance.py`** — CLI for snapshot expiry, file cleanup, orphan recovery, tiered compaction, fsck. Runs as a K8s CronJob.
+- **`tools/ducklake_metrics.py`** — Long-running Prometheus-exposition daemon for catalog-side lake-state metrics. Runs as a single-replica Deployment.
 
-The script logs `cleanup throughput: files_processed=N elapsed_s=T rate_obj_s=R queue_depth_after=A` after every `cleanup` / `cleanup-all` (skipped on `--dry-run`), so you can confirm steady-state throughput without enabling debug logging. `files_processed` is the actual count of files the call returned, not a queue-depth delta, so the number is accurate even when other writers enqueue deletions during the run. Pass `--debug` to opt back into DuckDB's HTTP and Postgres-extension query logging — both are off by default because they add per-call overhead that compounds across tens of thousands of S3 deletes.
-
-If `PUSHGATEWAY_URL` is set, the script pushes `maintenance_start_time` (on start) and `maintenance_duration_seconds` (on completion) to a Prometheus Pushgateway, enabling Grafana annotation queries for maintenance windows.
-
-#### Catalog-side orphan recovery
-
-If a `cleanup-all` run is interrupted (DuckLake bug: an S3 NoSuchKey on DELETE rolls back the whole transaction, but the S3 deletes already-completed are permanent), the catalog ends up with rows in `ducklake_files_scheduled_for_deletion` that point at S3 keys that no longer exist. Every subsequent `cleanup-all` will crash on those orphans until they're cleaned up. The catalog-recovery subcommands handle this without manual SQL surgery:
-
-| Subcommand | Action |
-|---|---|
-| `find-orphans` | List orphan rows on stdout (read-only). |
-| `heal-orphans` | Delete the orphan rows. Two safety gates: B1 proves `ducklake_data_file` is non-empty AND no orphan path is still live; B3 aborts if any positional-delete vector references an orphan id. `--dry-run` runs the gates but skips the DELETE. |
-| `cleanup-all-safe` | Loop dedup-deletions + heal-orphans + cleanup-all under one advisory lock until cleanup-all exits clean. Caps at `--max-iterations` (default 10). |
-| `fsck` | `cleanup-all-safe` followed by `ducklake_delete_orphaned_files` (S3-side orphan sweep). The end-to-end "lake catalog is healthy" recipe. |
-
-Mutual exclusion comes from `pg_try_advisory_lock(hashtext('millpond-ducklake-maintenance')::bigint)` taken on the `pg` ATTACH; concurrent maintenance invocations bail with a clear error rather than racing each other's DELETEs.
-
-`tools/ducklake_maintenance.sql` is loaded at every session start (both by `ducklake_maintenance.py` and by the `just shell` recipe) and defines small DuckDB macros for ad-hoc inspection — `SELECT count_pending_dups()` for queue dup count, `SELECT * FROM find_catalog_orphans('s3://bucket/lake/data')` for the orphan list. The header documents the conventions (no `LEFT ANTI JOIN`, no duckdb-side `ctid`, advisory-lock key) that any new recipe must follow.
-
-`tools/justfile` wraps the script and is also baked into the image at `/justfile` for interactive use:
-
-```bash
-just --list                  # see available recipes
-just maintain-dry-run 3      # preview: expire >3 day snapshots + cleanup
-just maintain 3              # execute it
-just dedup-deletions-dry-run # preview duplicate rows in the pending-deletion queue
-just dedup-deletions         # drop them
-just find-orphans            # list catalog-side orphan rows
-just heal-orphans-dry-run    # preview heal-orphans (gates only, no DELETE)
-just heal-orphans            # delete catalog-side orphan rows
-just cleanup-all-safe        # dedup + heal + cleanup-all in a loop
-just fsck-dry-run            # preview fsck end-to-end
-just fsck                    # bring catalog to known-good state
-just shell                   # interactive DuckDB shell with lake + pg ATTACHed and macros loaded
-just orphans-dry-run         # preview S3-side orphaned files
-```
-
-All commands use the pod's existing env vars (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`).
-
-### DuckLake state metrics
-
-`tools/ducklake_metrics.py` is a small long-running daemon that runs catalog-side queries against the DuckLake on a schedule and exposes results as Prometheus gauges over HTTP. Same Docker image as `ducklake_maintenance.py`; intended to run as a single-replica Deployment so a Prometheus scraper can watch lake shape, compaction backlog, snapshot age, partition skew, and the pending-deletion queue without S3 round trips.
-
-```bash
-just ducklake-metrics                       # built-ins only, listens on :9100
-just ducklake-metrics-with-config queries.yaml   # extend built-ins from user YAML
-just ducklake-metrics-list                  # print resolved query list and exit (no connection needed)
-```
-
-Endpoints: `/metrics` (Prometheus exposition), `/-/healthy` (k8s liveness), `/-/ready` (k8s readiness). The daemon reconnects to the catalog with exponential backoff (1s → 60s cap) on connect failure, and forces a reconnect after 10 consecutive query failures across all queries; transient SQL errors in a single query log + increment `ducklake_metrics_query_errors_total` without killing the process.
-
-Built-in queries:
-
-| Metric prefix | Labels | Values | Source |
-|---|---|---|---|
-| `ducklake_pending_deletes` | — | `total`, `unique_paths`, `dup_rows` | `ducklake_files_scheduled_for_deletion` |
-| `ducklake_files_per_band` | `band` (`lt1mib` / `1to5mib` / `5to10mib` / `10to32mib` / `32to64mib` / `64to128mib` / `gt128mib`) | `count`, `bytes` | `ducklake_data_file` |
-| `ducklake_compaction_candidates` | `tier` (`tier1` / `tier2` / `tier3` / `large` / `total`) | `count` | `ducklake_data_file` |
-| `ducklake_snapshots` | — | `count`, `oldest_seconds_ago`, `newest_seconds_ago` | `ducklake_snapshot` |
-| `ducklake_files_per_partition_top20` | `partition` | `count` | `ducklake_data_file` ⨝ `ducklake_file_partition_value` |
-| `ducklake_catalog` | `suffix` | `format_version` | `ducklake_metadata` (key=`version`); numeric `major.minor` lands in the value, any trailing tag (e.g. `-dev1`, `-rc7`) lands in the `suffix` label so dev/pre-release builds stay distinguishable. Empty `suffix=""` for clean releases |
-
-Plus self-metrics: `ducklake_metrics_up`, `ducklake_metrics_query_duration_seconds{query}`, `ducklake_metrics_query_last_success_timestamp{query}`, `ducklake_metrics_query_errors_total{query}`.
-
-User YAML schema (extends or overrides built-ins by name):
-
-```yaml
-queries:
-  - name: events_files_per_table
-    help: Live data file count by table (custom example)
-    interval_mins: 5            # positive integer; minimum 1
-    labels: [table_name]
-    values: [count]
-    sql: |
-      SELECT t.table_name, COUNT(*) AS count
-      FROM __ducklake_metadata_lake.ducklake_data_file df
-      JOIN __ducklake_metadata_lake.ducklake_table t USING (table_id)
-      WHERE df.end_snapshot IS NULL
-      GROUP BY t.table_name
-```
-
-Built-ins are intentionally lake-wide (no `table_name` label); per-table breakdowns belong in user YAML when needed.
-
-Configuration env vars (in addition to the standard `DUCKLAKE_*` / `DUCKDB_*` set used by `ducklake_maintenance.py`):
-
-| Variable | Default | Description |
-|---|---|---|
-| `DUCKLAKE_METRICS_PORT` | `9100` | HTTP listen port |
-| `DUCKLAKE_METRICS_CONFIG` | unset | Path to user-supplied queries YAML |
-| `DUCKLAKE_METRICS_DISABLE` | unset | Comma-separated query names to skip from built-ins |
+Subcommand and YAML schema reference, full env-var contract, and the `just` recipe inventory live in [`tools/README.md`](tools/README.md). Both binaries reuse the writer's `DUCKLAKE_RDS_*` / `DUCKDB_S3_*` / `DUCKLAKE_DATA_PATH` env vars.
 
 ## Configuration
 
@@ -436,26 +334,7 @@ At peak (9.5K/partition), the size trigger fires at ~35s producing ~320MB object
 
 ### When to add a merge job
 
-If your volume is low enough that time-triggered flushes produce <10MB objects, run periodic compaction. The `compact` subcommand implements a tiered strategy: small files merge frequently into medium files, medium files merge less often into large files. Each tier saves and restores the catalog's `target_file_size` so running one tier doesn't permanently change file sizing for inserts or other compactions.
-
-```bash
-just compact-to-tier-1-dry-run        # preview: files <1 MiB → ~5 MiB
-just compact-to-tier-1                # execute (catalog-wide)
-just compact-to-tier-2 events         # tier 1->2, scoped to one table
-just compact-probe events 4           # diagnostic: merge up to 4 adjacent files in 'events'
-```
-
-Tier ranges (verified semantics: `min_file_size` inclusive, `max_file_size` exclusive):
-
-| Recipe | Input range | Target |
-|---|---|---|
-| `compact-to-tier-1` | `[0, 1 MiB)` | ~5 MiB |
-| `compact-to-tier-2` | `[1 MiB, 10 MiB)` | ~32 MiB |
-| `compact-to-tier-3` | `[10 MiB, 64 MiB)` | ~128 MiB |
-
-The `compact` subcommand bounds DuckDB resource use during the merge — `--threads` (default 2) and `--memory-limit` (default 4GB) — because `ducklake_merge_adjacent_files` isn't fully streaming today and over-uses memory relative to input size. The defaults are conservative; raise them on lakes that fit comfortably in pod memory.
-
-This is an out-of-band maintenance operation, not part of the hot path.
+If your volume is low enough that time-triggered flushes produce <10MB objects, run periodic compaction. The `ducklake_maintenance.py compact` subcommand implements a tiered strategy: small files merge frequently into medium files, medium files merge less often into large files. Tier ranges, `target_file_size` save/restore semantics, and the `--threads` / `--memory-limit` knobs are documented in [`tools/README.md`](tools/README.md). This is an out-of-band maintenance operation, not part of the hot path.
 
 See the [sizing calculator](https://posthog.github.io/millpond/sizing-calculator.html) for interactive estimates.
 
@@ -527,14 +406,6 @@ Related issues:
 - [confluent-kafka-python #1485](https://github.com/confluentinc/confluent-kafka-python/issues/1485) — oauth token not refreshing on existing connections
 - [aws-msk-iam-auth #143](https://github.com/aws/aws-msk-iam-auth/issues/143) — re-authentication fails with OAUTHBEARER
 - [aws-msk-iam-auth #176](https://github.com/aws/aws-msk-iam-auth/issues/176) — second re-authentication fails with default credentials
-
-## Next steps
-
-### Iceberg multi-writer commit contention — solved by icebox
-
-The Iceberg sink originally couldn't sustain two pods committing to the same table at typical flush cadence. PyIceberg's REST commit attaches a branch-snapshot requirement (`expected id != actual id`); when a second writer commits between when we loaded the table and when we send the commit, the catalog rejects with `CommitFailedException: branch main has changed`. `_write_with_retry` in `main.py` invalidates caches and retries up to 3 times with exponential backoff (sleeps 1s after attempt 1, 2s after attempt 2; attempt 3 raises rather than sleeping further), but under sustained dual-writer load with `FLUSH_INTERVAL_MS=5000` the retries collide with the *next* round of commits and exhaust the budget — the pod exits.
-
-**The fix shipped:** [`icebox/`](icebox/README.md) — a writer/committer split that fronts the Iceberg catalog. Writers `POST /v1/files` with parquet-file metadata; a single committer thread per icebox deployment batches the rows into one Iceberg snapshot per cadence interval. One committer per `(namespace, table)` per environment, advisory-lock enforced, so even 32 concurrent writers contribute to one ordered stream of commits without OCC contention. See [`icebox/README.md`](icebox/README.md) for the full design and operational notes.
 
 ## Note
 This project should absolutely be called TableFowl, but that would be an [SEO](https://www.confluent.io/product/tableflow/) and linguistic palaver.
