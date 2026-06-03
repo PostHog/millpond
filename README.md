@@ -1,9 +1,9 @@
 # Millpond — Kafka to DuckLake or Iceberg
 
-A standalone Python app that consumes from a Kafka topic and writes to a lake table. Single thread, single loop, no Kafka Connect. One deployment writes to exactly one destination — either [DuckLake](https://github.com/duckdb/ducklake) or [Apache Iceberg](https://iceberg.apache.org/), selected via `MILLPOND_DESTINATION`.
+A standalone Python app that consumes from a Kafka topic and writes to a lake table. Single thread, single loop, no Kafka Connect. One deployment writes to exactly one destination — either [DuckLake](https://github.com/duckdb/ducklake), [Apache Iceberg](https://iceberg.apache.org/) via direct PyIceberg commit, or Iceberg via the bundled [**icebox**](icebox/README.md) writer/committer split (production-scale Iceberg). Selected via `MILLPOND_DESTINATION` (`ducklake` | `iceberg` | `icebox`).
 
 **Contents:**
-[Naming](#naming) | [Why](#why) | [Architecture](#architecture) | [Destinations](#destinations) | [Record Handling](#record-handling) | [Adaptive Backpressure](#adaptive-backpressure) | [Performance](#performance) | [Resource Footprint](#resource-footprint) | [Setup](#setup) | [Development](#development) | [Configuration](#configuration) | [Releases](#releases) | [Deployment](#deployment) | [Partitioning](#partitioning) | [Object Sizing](#object-sizing) | [Error Handling](#error-handling-and-retries) | [Multiple Pipelines](#multiple-pipelines) | [AWS Credential Isolation](#aws-credential-isolation) | [Operational Notes](#operational-notes) | [Next steps](#next-steps)
+[Naming](#naming) | [Why](#why) | [Architecture](#architecture) | [Destinations](#destinations) | [icebox](icebox/README.md) | [Record Handling](#record-handling) | [Adaptive Backpressure](#adaptive-backpressure) | [Performance](#performance) | [Resource Footprint](#resource-footprint) | [Setup](#setup) | [Development](#development) | [Configuration](#configuration) | [Releases](#releases) | [Deployment](#deployment) | [Partitioning](#partitioning) | [Object Sizing](#object-sizing) | [Error Handling](#error-handling-and-retries) | [Multiple Pipelines](#multiple-pipelines) | [AWS Credential Isolation](#aws-credential-isolation) | [Operational Notes](#operational-notes) | [Next steps](#next-steps)
 
 ## Naming
 
@@ -207,7 +207,6 @@ just cleanup-all-safe        # dedup + heal + cleanup-all in a loop
 just fsck-dry-run            # preview fsck end-to-end
 just fsck                    # bring catalog to known-good state
 just shell                   # interactive DuckDB shell with lake + pg ATTACHed and macros loaded
-just drop events             # drop a table (data files remain until cleanup)
 just orphans-dry-run         # preview S3-side orphaned files
 ```
 
@@ -276,10 +275,10 @@ All configuration via environment variables.
 | `KAFKA_BOOTSTRAP_SERVERS` | yes | | Kafka broker addresses |
 | `KAFKA_TOPIC` | yes | | Topic to consume |
 | `REPLICA_COUNT` | yes | | Number of StatefulSet replicas (must match `spec.replicas`) |
-| `MILLPOND_DESTINATION` | no | `ducklake` | Destination format: `ducklake` or `iceberg`. Case-insensitive; empty/whitespace falls back to `ducklake`. |
+| `MILLPOND_DESTINATION` | no | `ducklake` | Destination: `ducklake`, `iceberg` (direct PyIceberg commit), or `icebox` (Iceberg via the bundled writer/committer split — see [icebox/README.md](icebox/README.md)). Case-insensitive; empty/whitespace falls back to `ducklake`. |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
-| `GROUP_ID` | no | `millpond-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. For Iceberg the default is `millpond-{topic}-{iceberg_table}` (the namespace prefix only shows up in metrics/client.id, not group.id). |
+| `GROUP_ID` | no | `millpond-{topic}-{table_label_part}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. `{table_label_part}` is derived from the destination table identifier in `millpond/config.py` (the namespace prefix only shows up in metrics/client.id, not group.id). |
 | `CONSUME_BATCH_SIZE` | no | `1000` | Max messages per `consume()` call — amortizes Python↔C boundary cost |
 | `FETCH_MIN_BYTES` | no | `1048576` | Broker accumulates at least this many bytes before responding (1MB) |
 | `FETCH_MAX_WAIT_MS` | no | `500` | Max broker wait when `fetch.min.bytes` not yet satisfied |
@@ -323,6 +322,21 @@ All configuration via environment variables.
 
 `MILLPOND_S3_*` is a separate env var family from `DUCKDB_S3_*` deliberately — they target different client libraries, and a deployment switch from DuckLake to Iceberg should be a clean swap of env vars rather than re-using the DuckDB-specific names.
 
+### icebox (required when `MILLPOND_DESTINATION=icebox`)
+
+The icebox path reuses the entire `Iceberg` env-var block above (writers still need to know the catalog URI, warehouse, namespace, table, and S3 credentials so the catalog/file metadata they POST to the icebox is correctly addressed) and adds the writer-to-icebox transport variables:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `ICEBOX_URL` | yes | | In-cluster base URL of the icebox service (e.g. `http://icebox-events.megaberg.svc:8000`) |
+| `ICEBOX_BUCKET` | yes | | S3 bucket the writer drops parquet into (the icebox reads the path from the POST body; it does not re-derive it) |
+| `ICEBOX_WAREHOUSE_PREFIX` | yes | | Prefix under `ICEBOX_BUCKET` for staged parquet files (e.g. `kafka/events/data`) |
+| `ICEBOX_MAX_ATTEMPTS` | no | `6` | Max attempts for `POST /v1/files` against the icebox (the writer's flush-side retry loop, separate from the lake-write retry) |
+| `ICEBOX_MAX_BACKOFF_S` | no | `30` | Max backoff between icebox POST retries (exponential, capped at this value) |
+| `ICEBOX_TIMEOUT_S` | no | `10` | Per-request timeout against the icebox API |
+
+The icebox itself has its own env-var contract (`ICEBOX_*` consumed by `icebox/main.py` — Postgres connection, committer cadence, etc.). Those are documented in [`icebox/README.md`](icebox/README.md) and live in the icebox deployment, not the writer.
+
 ### Optional record handling
 
 See [Record Handling](#record-handling) for context. All four variables below are optional; unset means the corresponding stage is disabled.
@@ -351,7 +365,7 @@ kubectl apply -f k8s/pdb.yaml
 kubectl apply -f k8s/statefulset.yaml
 ```
 
-Partition count is discovered at startup via `consumer.list_topics()`. Each pod computes its partition assignment from its ordinal:
+Partition count is discovered at startup via `admin.list_topics(topic=cfg.topic, timeout=30)` (an `AdminClient`, not the consumer instance). Each pod computes its partition assignment from its ordinal:
 
 ```python
 my_partitions = [p for p in range(partition_count) if p % replica_count == ordinal]
@@ -456,7 +470,7 @@ The flush path has two failure points, each with its own retry policy:
 
 Both use `errors_total{type="write_retry"}` and `errors_total{type="offset_commit"}` counters so transient vs persistent failures are distinguishable in dashboards.
 
-The write-retry loop catches `Exception` broadly to cover both backends' failure modes — `duckdb.Error` for DuckLake; `pyiceberg.exceptions.CommitFailedException`, `CommitStateUnknownException`, `ServerError`, `ServiceUnavailableError` for Iceberg REST catalog 5xx; `OSError` for S3; `KafkaException` for broker disconnects. Each retry invokes `sink.reset_caches()` to drop cached table/schema state so the next attempt re-checks the catalog (covers the case where another pod evolved the schema or recreated the table between attempts).
+The write-retry loop catches `Exception` broadly to cover every backend's failure modes — `duckdb.Error` for DuckLake; `pyiceberg.exceptions.CommitFailedException`, `CommitStateUnknownException`, `ServerError`, `ServiceUnavailableError` for direct-Iceberg REST catalog 5xx; `httpx.HTTPError` + the `IceboxResponseError` / `IceboxBackpressureExhausted` raised by `millpond/icebox_sink.py` for the icebox-path POST failures; `OSError` for S3; `KafkaException` for broker disconnects. Each retry invokes `sink.reset_caches()` to drop cached table/schema state so the next attempt re-checks the catalog (covers the case where another pod evolved the schema or recreated the table between attempts).
 
 **Why crash after exhausting retries?** A persistent write failure means S3 or the catalog is down — continuing would just accumulate pending data in memory until OOM. A persistent commit failure means the Kafka coordinator is unreachable — the write already succeeded, but without committed offsets the next restart will replay the batch (at-least-once duplicates). In both cases, crashing lets K8s apply its restart backoff, and Kafka holds the data safely until the dependency recovers.
 
@@ -518,7 +532,7 @@ Related issues:
 
 ### Iceberg multi-writer commit contention — solved by icebox
 
-The Iceberg sink originally couldn't sustain two pods committing to the same table at typical flush cadence. PyIceberg's REST commit attaches a branch-snapshot requirement (`expected id != actual id`); when a second writer commits between when we loaded the table and when we send the commit, the catalog rejects with `CommitFailedException: branch main has changed`. `_write_with_retry` in `main.py` invalidates caches and retries up to 3 times with exponential backoff (1s, 2s, 4s), but under sustained dual-writer load with `FLUSH_INTERVAL_MS=5000` the retries collide with the *next* round of commits and exhaust the budget — the pod exits.
+The Iceberg sink originally couldn't sustain two pods committing to the same table at typical flush cadence. PyIceberg's REST commit attaches a branch-snapshot requirement (`expected id != actual id`); when a second writer commits between when we loaded the table and when we send the commit, the catalog rejects with `CommitFailedException: branch main has changed`. `_write_with_retry` in `main.py` invalidates caches and retries up to 3 times with exponential backoff (sleeps 1s after attempt 1, 2s after attempt 2; attempt 3 raises rather than sleeping further), but under sustained dual-writer load with `FLUSH_INTERVAL_MS=5000` the retries collide with the *next* round of commits and exhaust the budget — the pod exits.
 
 **The fix shipped:** [`icebox/`](icebox/README.md) — a writer/committer split that fronts the Iceberg catalog. Writers `POST /v1/files` with parquet-file metadata; a single committer thread per icebox deployment batches the rows into one Iceberg snapshot per cadence interval. One committer per `(namespace, table)` per environment, advisory-lock enforced, so even 32 concurrent writers contribute to one ordered stream of commits without OCC contention. See [`icebox/README.md`](icebox/README.md) for the full design and operational notes.
 

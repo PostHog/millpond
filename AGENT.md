@@ -5,13 +5,15 @@
 Always run before pushing:
 
 ```bash
-just lint              # ruff check
-just fmt-check         # ruff format --check
+just lint              # ruff check (currently scoped to millpond/ only — see note)
+just fmt-check         # ruff format --check (currently scoped to millpond/ only — see note)
 just test              # unit tests
-just test-integration  # MinIO + iceberg-rest via testcontainers (~10s)
+just test-integration  # icebox Docker stack + MinIO + iceberg-rest via testcontainers (~2 min)
 just test-e2e          # full DuckLake stack (~1m)
 just test-e2e-iceberg  # full Iceberg stack (~1m)
 ```
+
+Note: `just lint` and `just fmt-check` only run against `millpond/` today; the recipes predate the `icebox/`, `shared/`, and `tests/` additions. Pre-commit hooks run ruff project-wide, so lint failures still surface — but the just recipes themselves are scope-narrow until they're updated.
 
 All must pass. Do not push with any lint, test, integration, or e2e failures — CI runs all of these on every push and PR (`.github/workflows/ci.yaml`), and the integration/e2e jobs are gating. Catch failures locally rather than on the runner.
 
@@ -168,7 +170,7 @@ If Python ever shows up in profiles, the entire app ports to C with the same str
 
 Two critical tuning knobs for confluent-kafka-python:
 
-1. **Use `consume(num_messages=N)` batch API, not `poll()`**. Amortizes the Python↔C boundary crossing cost per call. The `consume()` [docstring](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#confluent_kafka.Consumer.consume) explicitly notes it is more performant than calling `poll()` in a loop. Community benchmarks report significant throughput gains (see confluent-kafka-python issues [#291](https://github.com/confluentinc/confluent-kafka-python/issues/291), [#612](https://github.com/confluentinc/confluent-kafka-python/issues/612)).
+1. **Use `consume(num_messages=N)` batch API, not `poll()`**. The librdkafka C extension's per-call overhead is fixed, so one `consume(num_messages=N)` is cheaper than N `poll()` calls — the FFI-amortization argument is conceptual (it is not stated as such in the [docstring](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#confluent_kafka.Consumer.consume), which only describes the API contract). The recommendation matches community consensus (see [confluent-kafka-python #580](https://github.com/confluentinc/confluent-kafka-python/issues/580) for the API-shape discussion). [#597](https://github.com/confluentinc/confluent-kafka-python/issues/597) reports a 4× throughput gap, but as ProcessPoolExecutor vs ThreadPoolExecutor under the GIL with both legs using `consume()` — not as `consume()` vs `poll()` — so don't cite it for the latter.
 
 2. **Set `fetch.min.bytes` to 1MB+** (default is 1 byte). This is the single biggest throughput lever — reduces fetch request count dramatically by letting the broker accumulate data before responding. Trade latency for throughput. Pair with `fetch.max.wait.ms=500`. See [Kafka consumer config docs](https://kafka.apache.org/documentation/#consumerconfigs_fetch.min.bytes) and [Confluent throughput optimization guide](https://docs.confluent.io/cloud/current/client-apps/optimizing/throughput.html).
 
@@ -180,7 +182,7 @@ Pod ordinal from StatefulSet hostname (e.g. `millpond-events-3` → ordinal `3`)
 my_partitions = [p for p in range(partition_count) if p % replica_count == ordinal]
 ```
 
-**Partition count**: discovered at startup via `consumer.list_topics(topic)`. No env var — eliminates desync risk if partitions are added server-side.
+**Partition count**: discovered at startup via `admin.list_topics(topic=cfg.topic, timeout=30)` (an `AdminClient`, not the consumer instance). No env var — eliminates desync risk if partitions are added server-side.
 
 **Replica count**: set via `REPLICA_COUNT` env var (matches `spec.replicas` in the StatefulSet). This is operator-controlled and can't be discovered reliably from inside the pod.
 
@@ -190,7 +192,7 @@ Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
 
 **`auto.offset.reset=earliest`**: required. With `assign()`, if a partition has no committed offset (new partition, or `GROUP_ID` changed), the default `latest` silently drops all existing data. `earliest` replays from the beginning — safe for at-least-once.
 
-**`group.id`**: defaults to `millpond-{topic}-{table}`. Used only for offset storage in `__consumer_offsets` (no consumer group semantics). Changing `group.id` loses all committed offsets and triggers a full replay from `earliest`.
+**`group.id`**: defaults to `millpond-{topic}-{table_label_part}` (where `table_label_part` is derived from the destination table identifier in `config.py:353`). Used only for offset storage in `__consumer_offsets` (no consumer group semantics). Changing `group.id` loses all committed offsets and triggers a full replay from `earliest`.
 
 **Monitoring caveat**: because we use `assign()` instead of `subscribe()`, standard consumer group monitoring tools (`kafka-consumer-groups.sh`, Burrow, etc.) show empty output or stale data. Use Millpond's own `millpond_consumer_lag` metric for lag monitoring, and `millpond_last_committed_offset` for offset tracking.
 
@@ -423,9 +425,9 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 
 | Risk | Mitigation |
 |------|------------|
-| Partition count desync | Partition count discovered via `consumer.list_topics()` at startup — no env var. `REPLICA_COUNT` env var must match `spec.replicas`; desync causes uneven assignment but not data loss (some partitions double-assigned, some unassigned). |
+| Partition count desync | Partition count discovered via `admin.list_topics()` at startup — no env var. `REPLICA_COUNT` env var must match `spec.replicas`; desync causes uneven assignment but not data loss (some partitions double-assigned, some unassigned). |
 | Concurrent DDL from multiple pods (two pods both evolve schema simultaneously) | DuckLake: `ADD COLUMN IF NOT EXISTS` is idempotent — multiple pods racing is harmless. `ALTER COLUMN SET DATA TYPE` widening to the same target is also idempotent. Iceberg: `update_schema()` uses optimistic concurrency; the loser raises `CommitFailedException`, the write-retry path invalidates the cache and re-reads (possibly observing the winner's evolution), then tries again. Cannot designate a single schema-owner pod because schema discovery is distributed (new fields can appear in any partition). In practice, schema changes are rare — the primary use case (events) uses a stable schema that relies on maps/dictionaries for extensibility rather than adding columns. |
-| Liveness probe only checks prometheus HTTP, not app health | Add `/healthz` endpoint that checks last-poll and last-flush recency. Pod is unhealthy if either exceeds a threshold. |
+| Liveness probe only checks prometheus HTTP, not app health | **Mitigated.** `/healthz` and `/readyz` endpoints at `millpond/server.py` check `last_poll` recency against `max_poll_age_s=300`; pod reports 503 if no poll in the last 5 minutes. |
 
 ### High
 
@@ -520,15 +522,22 @@ Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTP
 | Package | Why |
 |---------|-----|
 | `confluent-kafka>=2.6` | librdkafka Python wrapper |
-| `duckdb==1.5.1` | DuckDB Python client (pinned; the ducklake extension is sensitive to minor-version moves) |
+| `duckdb==1.5.2` | DuckDB Python client (pinned; the ducklake extension is sensitive to minor-version moves) |
 | `pyiceberg[pyarrow]==0.11.1` | PyIceberg REST catalog client — pinned exactly because `millpond/iceberg.py` uses two private symbols (`_pyarrow_to_schema_without_ids`, `assign_fresh_schema_ids`). The canary test in `tests/unit/test_pyiceberg_pin.py` fails loudly on any upgrade. |
 | `pyarrow>=18.0` | Arrow tables, zero-copy DuckDB/Iceberg integration |
 | `orjson>=3.10` | Fast JSON parsing (Rust) |
 | `prometheus-client>=0.21` | Metrics exposition |
 | `pytz>=2024.1` | Required by duckdb's TIMESTAMPTZ Python conversion (1.5.x doesn't accept stdlib zoneinfo) |
 | `pyyaml>=6.0.3` | `tools/ducklake_metrics.py` query definitions |
+| `asyncpg>=0.30` | Async Postgres driver for the icebox API hot path (POST /v1/files insert + status read) |
+| `psycopg[binary,pool]>=3.2` | Sync Postgres driver for the icebox committer thread + DB/schema bootstrap |
+| `fastapi>=0.115` | icebox HTTP API (POST /v1/files, GET /v1/status, /readyz, /healthz, /metrics) |
+| `uvicorn>=0.32` | ASGI server hosting the icebox FastAPI app |
+| `httpx>=0.27` | HTTP client used by the writer-side IcebergSink to POST to icebox; also used in tests |
+| `opentelemetry-sdk>=1.30` | Structured-log OTLP export plumbing for the icebox |
+| `opentelemetry-exporter-otlp-proto-http>=1.30` | OTLP/HTTP exporter — ships icebox logs to PostHog Logs when `POSTHOG_PROJECT_TOKEN` is set |
 
-Both `duckdb` and `pyiceberg` are always installed — there is no "ducklake-only" or "iceberg-only" build variant. The lazy import in `make_sink()` means a deployment that only uses one destination doesn't pay the other's import cost at startup, but the dependency footprint on disk is identical.
+`duckdb`, `pyiceberg`, and the icebox-stack deps (`asyncpg`, `psycopg`, `fastapi`, `uvicorn`, `opentelemetry-*`) are always installed — there is no "ducklake-only" / "iceberg-only" / "writer-only" / "icebox-only" build variant. The lazy import in `make_sink()` means a deployment that only uses one destination doesn't pay the other's import cost at startup; the icebox modules are similarly imported lazily by the `icebox` console script entry point. The dependency footprint on disk is identical regardless of which binary the pod runs.
 
 ## Project Structure
 
@@ -540,23 +549,49 @@ millpond/
 ├── .github/workflows/
 │   ├── ci.yaml               # Format, lint, unit tests on PR/push
 │   └── release.yaml          # Auto-version, tarball, Docker image, GitHub release
-├── Dockerfile
-├── docker-compose.yaml       # Full dev stack (Kafka, Postgres, MinIO, Grafana)
+├── Dockerfile                # Builds one image carrying both `millpond` and `icebox` console scripts
+├── docker-compose.yaml       # DuckLake dev stack (Kafka, Postgres, MinIO, Grafana)
+├── docker-compose.iceberg.yaml  # Iceberg dev stack (Kafka, MinIO, iceberg-rest)
+├── docker-compose.ssl.yaml   # Overlay adding SSL Kafka to docker-compose.yaml
 ├── k8s/
 │   ├── statefulset.yaml
 │   ├── service.yaml          # Headless service for StatefulSet
 │   └── pdb.yaml              # PodDisruptionBudget
-├── millpond/
+├── millpond/                 # The writer
 │   ├── __init__.py
 │   ├── main.py               # Entry point, main loop, signal handling — backend-agnostic via Sink
 │   ├── config.py             # Env var → dataclass; per-destination validation
 │   ├── sink.py               # Sink Protocol + make_sink(cfg) factory (lazy backend imports)
 │   ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + numeric normalization)
 │   ├── ducklake.py           # DuckLake backend: connect, write, DuckLakeSink class
-│   ├── iceberg.py            # Iceberg backend: connect, write, SchemaManager, IcebergSink class
+│   ├── iceberg.py            # Iceberg backend (direct-commit path): connect, write, SchemaManager
+│   ├── icebox_sink.py        # Iceberg backend (icebox-coordinated path): POST /v1/files to icebox
 │   ├── schema.py             # DuckLake SchemaManager (Iceberg's is embedded in iceberg.py)
+│   ├── consumer.py           # Kafka consumer + AdminClient for partition discovery
+│   ├── backpressure.py       # Adaptive batch sizing
 │   ├── metrics.py            # Prometheus metric definitions
-│   └── server.py             # HTTP server for /metrics and /healthz
+│   └── server.py             # HTTP server for /metrics, /healthz, /readyz
+├── icebox/                   # The icebox: writer/committer-split service fronting Lakekeeper
+│   ├── __init__.py
+│   ├── main.py               # `icebox` console-script entry point; lifespan + signal wiring
+│   ├── api.py                # FastAPI app: POST /v1/files, GET /v1/status, /readyz, /healthz, /metrics
+│   ├── committer.py          # Singleton committer thread + 9-step cycle + 3-branch recovery
+│   ├── config.py             # Env-driven Config dataclass (ICEBOX_*)
+│   ├── iceberg.py            # commit_data_files + DataFile builder + snapshot_id helpers
+│   ├── kafka.py              # AdminClient + alter_consumer_group_offsets (offset commit on writers' behalf)
+│   ├── postgres_async.py     # asyncpg pool for the API hot path
+│   ├── postgres_sync.py      # psycopg pool + cycle state-machine SQL + advisory lock
+│   ├── schema.py             # PG DDL + Pydantic row models
+│   ├── schema_cache.py       # TTL cache for the table's current schema fingerprint
+│   ├── metrics.py            # Prometheus gauges/counters/histogram for the icebox
+│   ├── structured_logging.py # JSON formatter + cycle_id ContextVar + optional OTLP/HTTP export
+│   └── README.md             # icebox-specific design + operational notes
+├── shared/                   # Wire format + helpers used by both millpond/icebox_sink and icebox/
+│   ├── __init__.py
+│   ├── models.py             # Pydantic wire models (RegisterFileRequest, ParquetStats, etc.)
+│   ├── bounds.py             # Typed-JSON ↔ Iceberg single-value-serialization bytes
+│   ├── fingerprint.py        # Iceberg-schema → SHA-256 fingerprint for the cache + writer perimeter
+│   └── paths.py              # Deterministic S3 path helpers
 ├── tools/
 │   ├── ducklake_maintenance.py     # Self-contained DuckLake maintenance script (K8s CronJob, DuckLake-only)
 │   ├── ducklake_maintenance.sql    # Macros loaded at session start
@@ -564,10 +599,11 @@ millpond/
 │   ├── justfile                    # Interactive wrapper for ducklake_maintenance.py + DuckDB CLI shell
 │   └── sizing-calculator.html      # Interactive flush/object sizing calculator
 ├── tests/
-│   ├── unit/                 # Fast, no external deps; uses PyIceberg SqlCatalog for iceberg-side
-│   ├── integration/          # Local DuckDB write path + MinIO+iceberg-rest via testcontainers
-│   └── e2e/                  # Full docker-compose stack via testcontainers
+│   ├── unit/                 # Fast, no external deps; uses PyIceberg SqlCatalog for iceberg-side; covers icebox modules too
+│   ├── integration/          # Local DuckDB + MinIO + iceberg-rest + Redpanda + icebox Docker stack via testcontainers
+│   ├── e2e/                  # Full docker-compose stack via testcontainers (DuckLake + Iceberg matrices)
+│   └── stress/               # Manual-only stress harness (deselected by default; not run in CI)
 └── test/                     # Dev fixtures (producer.py, ducklake-init.sql)
 ```
 
-`tools/` is intentionally DuckLake-only — Iceberg deployments use their catalog's native compaction/expiry tooling. No equivalent of `ducklake_maintenance.py` exists for Iceberg in this repo.
+`tools/` scripts are DuckLake-specific (maintenance and state-metrics). Iceberg-side tooling lives under `icebox/`: the committer service handles batched commits and is the answer to OCC contention; there is no equivalent of `ducklake_maintenance.py` for Iceberg in this repo (compaction/expiry are still expected to come from the catalog's native tooling).
