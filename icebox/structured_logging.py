@@ -116,28 +116,42 @@ def setup_logging(
 ) -> Any | None:
     """Configure the root logger and (optionally) PostHog OTLP export.
 
-    Resource-attr shape on the OTLP side:
-      - ``service.name`` (constant ``icebox``): groups all instances of
-        the icebox binary across (env, table) in PostHog Logs.
-      - ``service.namespace`` (default ``millpond``): the release
-        family this icebox belongs to. OTel semconv intends this for
-        logical service grouping, NOT data-side namespacing — earlier
-        versions misused it for the PG schema.
+    Resource-attr taxonomy on the OTLP side, split by ownership:
+
+    **App-owned** (passed here):
+      - ``service.name`` (constant ``icebox``): one binary, one service.
+        Per-instance differentiation is on ``service.instance.id``.
+      - ``service.namespace`` (default ``millpond``): release family.
+        OTel semconv intends this for logical service grouping — NOT
+        data-side namespacing. (Earlier versions misused it for the
+        PG schema; see migration note in icebox/README.md.)
       - ``service.instance.id`` (per-consumer key, e.g.
         ``events-icebox``): differentiates instances of the same
-        service. PostHog Logs uses this as the per-pod axis.
+        service. This IS the per-pod / per-(namespace,table) axis.
       - ``service.version``: package version.
-      - ``source_type=icebox``: matches the existing PostHog
-        Vector-on-EC2 convention (which sets ``source_type=journald``)
-        so common filters carry over.
-      - ``icebox.iceberg.{warehouse,namespace,table}`` and
-        ``icebox.kafka.{topic,group_id}``: vendor-namespaced custom
-        attrs so per-(table, topic) filters work in the UI.
+      - ``messaging.system``, ``messaging.destination.name``,
+        ``messaging.kafka.consumer.group``: OTel semconv standard for
+        Kafka attrs. Picked over vendor-prefixed
+        ``icebox.kafka.*`` so future OTel-aware tooling (collector
+        processors, dashboard packs, alert templates) Just Works.
+      - ``icebox.iceberg.{warehouse,namespace,table}``: vendor-prefixed
+        because OTel semconv has no Iceberg coverage today.
 
-    Standard OTel semconv attrs (``deployment.environment``, ``k8s.*``,
-    ``host.hostname``) are NOT passed here — the chart sets them via
-    ``OTEL_RESOURCE_ATTRIBUTES`` and OTel's ``Resource.create()``
-    auto-merges. Keeps the env/cluster concern out of the icebox app.
+    **Chart-owned** (NOT passed here; supplied via
+    ``OTEL_RESOURCE_ATTRIBUTES`` env, auto-merged by ``Resource.create``):
+      - ``deployment.environment``
+      - ``k8s.cluster.name``, ``k8s.namespace.name``, ``k8s.pod.name``,
+        ``k8s.deployment.name``
+      - ``host.hostname``
+
+    Split by ownership, not by precedence — there's no key the app and
+    the chart both set, so we never depend on the implicit
+    last-arg-wins rule of ``Resource.merge``.
+
+    ``cycle_id`` is intentionally a per-record attribute
+    (``icebox.cycle_id``), NOT a Resource attribute, because it's
+    scoped to a single cycle inside the process — not a property of
+    the process itself.
 
     Returns the OTel ``LoggerProvider`` when PostHog logging is
     enabled, so the caller can register ``provider.shutdown()`` on
@@ -202,22 +216,32 @@ def setup_logging(
         "service.name": service_name,
         "service.namespace": service_namespace,
         "service.version": service_version,
-        "source_type": "icebox",
     }
+    # Kafka attrs use OTel messaging semconv (see
+    # https://opentelemetry.io/docs/specs/semconv/messaging/) so
+    # generic OTel tooling can interpret them. Iceberg attrs stay
+    # vendor-prefixed (no semconv coverage today).
     for key, value in (
         ("service.instance.id", service_instance_id),
+        ("messaging.destination.name", kafka_topic),
+        ("messaging.kafka.consumer.group", kafka_group_id),
         ("icebox.iceberg.warehouse", iceberg_warehouse),
         ("icebox.iceberg.namespace", iceberg_namespace),
         ("icebox.iceberg.table", iceberg_table),
-        ("icebox.kafka.topic", kafka_topic),
-        ("icebox.kafka.group_id", kafka_group_id),
     ):
         if value is not None:
             resource_attrs[key] = value
+    # ``messaging.system`` is the constant axis for the system itself;
+    # only emit it if we actually have Kafka attrs to qualify.
+    if kafka_topic is not None or kafka_group_id is not None:
+        resource_attrs["messaging.system"] = "kafka"
 
     # Resource.create() merges in OTEL_RESOURCE_ATTRIBUTES env so the
     # chart can supply deployment.environment, k8s.*, host.hostname
-    # without an app code change. User-passed attrs win on conflict.
+    # without an app code change. We split by key ownership (app vs.
+    # chart) so the implicit user-attrs-win precedence of merge() is
+    # never load-bearing — but a test still pins it as a safety net
+    # against future SDK refactors.
     resource = Resource.create(resource_attrs)
     provider = LoggerProvider(resource=resource)
     set_logger_provider(provider)
@@ -229,11 +253,17 @@ def setup_logging(
             )
         )
     )
-    # Same formatter so the OTel body has consistent JSON shape with
-    # what lands in stdout. OTel will wrap the record in its own
-    # envelope on the wire, but the body field will be parseable.
-    otel_handler = LoggingHandler(level=level, logger_provider=provider)
-    otel_handler.setFormatter(formatter)
+    # log_code_attributes=False is the explicit (and default) request to
+    # NOT stamp code.{file,function,line} on every record. The previous
+    # opentelemetry-sdk handler stamped them unconditionally; the new
+    # instrumentation-package handler defaults to off, but pinning the
+    # kwarg makes the choice deliberate code rather than implicit
+    # default — future readers see we want them off.
+    otel_handler = LoggingHandler(
+        level=level,
+        logger_provider=provider,
+        log_code_attributes=False,
+    )
     # Filter is OTel-side only so the stdout JSON shape stays stable
     # (existing ``cycle_id`` body field via the formatter's
     # ContextVar read) while OTel records gain ``icebox.cycle_id`` as

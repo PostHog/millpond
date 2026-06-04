@@ -136,10 +136,27 @@ def test_setup_logging_text_mode_installs_plain_formatter():
 
 def test_setup_logging_silences_uvicorn_access_logger():
     """uvicorn.access ships one line per probe + per writer POST and
-    swamps the useful committer logs. setup_logging() must pin it at
-    WARNING so probes/scrapes/POSTs don't reach stdout or OTLP."""
+    swamps the useful committer logs. Effective behavior: an INFO
+    record on that logger after setup_logging() must NOT reach the
+    captured stream. Asserting on the logger.level value alone would
+    miss the case where uvicorn (or anything else) flips the level
+    back at server start."""
+    import io
+
     setup_logging(level="DEBUG", fmt="json")
-    assert logging.getLogger("uvicorn.access").level == logging.WARNING
+    # Add a capture sink to the same root handler chain
+    captured = io.StringIO()
+    root = logging.getLogger()
+    capture_handler = logging.StreamHandler(captured)
+    capture_handler.setLevel(logging.DEBUG)
+    root.addHandler(capture_handler)
+    try:
+        logging.getLogger("uvicorn.access").info(
+            'GET /healthz HTTP/1.1" 200'
+        )
+        assert "/healthz" not in captured.getvalue()
+    finally:
+        root.removeHandler(capture_handler)
 
 
 def test_setup_logging_clears_prior_handlers_on_repeat_call():
@@ -189,10 +206,11 @@ def test_setup_logging_with_posthog_token_returns_provider_and_adds_handler():
     setup_logging(level="INFO", fmt="json")
 
 
-def test_setup_logging_resource_attrs_include_icebox_custom_and_source_type():
-    """The OTLP resource should carry the icebox.* facets + source_type
-    so PostHog Logs can filter by (table, topic) and the existing
-    PostHog Vector-on-EC2 source_type filter carries over."""
+def test_setup_logging_resource_attrs_use_semconv_for_kafka_and_vendor_for_iceberg():
+    """OTLP resource attrs split: Kafka uses OTel messaging semconv
+    (interop with future tooling), Iceberg stays vendor-prefixed
+    (no semconv coverage). No `source_type` — service.name carries
+    the axis."""
     from unittest.mock import MagicMock
 
     with patch(
@@ -214,16 +232,49 @@ def test_setup_logging_resource_attrs_include_icebox_custom_and_source_type():
         attrs = dict(provider.resource.attributes)
         assert attrs["service.name"] == "icebox"
         assert attrs["service.namespace"] == "millpond"
-        assert attrs["source_type"] == "icebox"
         assert attrs["service.instance.id"] == "events-icebox"
+        # Kafka: messaging.* semconv
+        assert attrs["messaging.system"] == "kafka"
+        assert attrs["messaging.destination.name"] == "clickhouse_events_json"
+        assert (
+            attrs["messaging.kafka.consumer.group"]
+            == "millpond-icebox-clickhouse_events_json-events"
+        )
+        # Iceberg: vendor-prefixed (no semconv exists today)
         assert attrs["icebox.iceberg.warehouse"] == "ingest"
         assert attrs["icebox.iceberg.namespace"] == "kafka"
         assert attrs["icebox.iceberg.table"] == "events"
-        assert attrs["icebox.kafka.topic"] == "clickhouse_events_json"
-        assert (
-            attrs["icebox.kafka.group_id"]
-            == "millpond-icebox-clickhouse_events_json-events"
+        # Negative assertions: pre-rename names and dropped attrs
+        assert "icebox.kafka.topic" not in attrs
+        assert "icebox.kafka.group_id" not in attrs
+        assert "source_type" not in attrs
+    finally:
+        provider.shutdown()
+        setup_logging(level="INFO", fmt="json")
+
+
+def test_setup_logging_omits_messaging_system_when_no_kafka_attrs():
+    """messaging.system=kafka is only emitted when there are actual
+    Kafka attrs to qualify — don't lie about the system if we have
+    nothing to say about it."""
+    from unittest.mock import MagicMock
+
+    with patch(
+        "opentelemetry.exporter.otlp.proto.http._log_exporter.OTLPLogExporter",
+        return_value=MagicMock(),
+    ):
+        provider = setup_logging(
+            level="INFO",
+            fmt="json",
+            posthog_token="phc_test",
+            iceberg_warehouse="ingest",
+            iceberg_namespace="kafka",
+            iceberg_table="events",
         )
+    try:
+        attrs = dict(provider.resource.attributes)
+        assert "messaging.system" not in attrs
+        assert "messaging.destination.name" not in attrs
     finally:
         provider.shutdown()
         setup_logging(level="INFO", fmt="json")
@@ -249,7 +300,40 @@ def test_setup_logging_omits_none_optional_resource_attrs():
         assert "service.name" in attrs
         assert "service.instance.id" not in attrs
         assert "icebox.iceberg.warehouse" not in attrs
-        assert "icebox.kafka.topic" not in attrs
+        assert "messaging.destination.name" not in attrs
+    finally:
+        provider.shutdown()
+        setup_logging(level="INFO", fmt="json")
+
+
+def test_setup_logging_app_passed_attrs_win_over_otel_resource_attributes_env(monkeypatch):
+    """Lock the user-attrs-win contract for ``Resource.create``. Even
+    though we split by key ownership (app vs. chart) so the precedence
+    rule is never load-bearing in production, an accidental future
+    chart change that sets a key the app also sets would silently
+    swap winners if this contract reverses — pin it with a test."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.setenv(
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "service.namespace=env-wins,deployment.environment=prod",
+    )
+    with patch(
+        "opentelemetry.exporter.otlp.proto.http._log_exporter.OTLPLogExporter",
+        return_value=MagicMock(),
+    ):
+        provider = setup_logging(
+            level="INFO",
+            fmt="json",
+            posthog_token="phc_test",
+            service_namespace="app-wins",
+        )
+    try:
+        attrs = dict(provider.resource.attributes)
+        # Same-key conflict: app value wins (this is the contract).
+        assert attrs["service.namespace"] == "app-wins"
+        # Distinct key supplied only by env still flows through.
+        assert attrs["deployment.environment"] == "prod"
     finally:
         provider.shutdown()
         setup_logging(level="INFO", fmt="json")
@@ -282,6 +366,46 @@ def test_cycle_id_attr_filter_noop_when_contextvar_unset():
     record = _make_record(msg="no cycle context")
     flt.filter(record)
     assert "icebox.cycle_id" not in record.__dict__
+
+
+def test_cycle_id_survives_logging_makerecord_plumbing():
+    """Records produced via the public logging API path
+    (`logger.info(..., extra={...})` → `Logger.makeRecord` →
+    `LogRecord.__init__`) must carry the dotted attribute the filter
+    sets — not just hand-built `LogRecord` instances. Some
+    implementations of `LogRecord` go through `__dict__.update(extra)`
+    which can mishandle dotted keys; this test exercises the real
+    plumbing once so a regression there can't slip through."""
+    from icebox.structured_logging import _CycleIdAttrFilter
+
+    token = cycle_id_var.set("c-from-real-logger")
+    try:
+        flt = _CycleIdAttrFilter()
+        logger = logging.getLogger("test_cycle_id_real_logger")
+        logger.addFilter(flt)
+        # Add a capturing handler whose emit() inspects the record
+        # AFTER the filter runs — same lifecycle the OTel handler sees.
+        captured: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        cap = _Capture()
+        logger.addHandler(cap)
+        logger.setLevel(logging.INFO)
+        try:
+            logger.info("hello from a real logger", extra={"file_count": 7})
+            assert len(captured) == 1
+            rec = captured[0]
+            assert rec.__dict__["icebox.cycle_id"] == "c-from-real-logger"
+            # The non-dotted `extra` field came through normally too.
+            assert rec.__dict__["file_count"] == 7
+        finally:
+            logger.removeHandler(cap)
+            logger.removeFilter(flt)
+    finally:
+        cycle_id_var.reset(token)
 
 
 @pytest.fixture(autouse=True)

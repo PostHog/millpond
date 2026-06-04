@@ -64,11 +64,47 @@ cycle's complete trace is grep-friendly.
 When `POSTHOG_PROJECT_TOKEN` is set, the icebox additionally exports
 log records to PostHog Logs via standard OTLP/HTTP
 (`https://us.i.posthog.com/i/v1/logs` by default; override via
-`POSTHOG_LOGS_ENDPOINT`). Resource attributes are
-`service.name=icebox`, `service.namespace=<pg_schema>`,
-`service.version=<package version>`. The `BatchLogRecordProcessor` is
-flushed on the SIGTERM drain path so in-flight batches make it out
-before the process exits.
+`POSTHOG_LOGS_ENDPOINT`). The `BatchLogRecordProcessor` is flushed on
+the SIGTERM drain path so in-flight batches make it out before the
+process exits.
+
+### Resource attribute taxonomy
+
+Split by ownership so the app and the chart never set the same key.
+
+**App-owned** (passed by `icebox/main.py` → `setup_logging`):
+
+| Attr | Value | Why |
+|---|---|---|
+| `service.name` | `icebox` (constant) | One binary, one service. Per-instance differentiation is on `service.instance.id`. |
+| `service.namespace` | `millpond` (default; override via `ICEBOX_SERVICE_NAMESPACE`) | OTel-semconv "logical service grouping". **Note:** earlier versions misused this for the PG schema. Filters that targeted the old per-deployment value (`service.namespace=icebox_events_icebox` etc.) must migrate to `service.instance.id=<consumer-key>`. |
+| `service.instance.id` | The consumer key, e.g. `events-icebox` (from `ICEBOX_SERVICE_INSTANCE_ID`) | This IS the per-(namespace, table) axis. |
+| `service.version` | The millpond package version | |
+| `messaging.system` | `kafka` (only when Kafka attrs are set) | OTel messaging semconv. |
+| `messaging.destination.name` | The Kafka topic | OTel messaging semconv (chosen over vendor-prefixed `icebox.kafka.topic` for interop with OTel-aware tooling). |
+| `messaging.kafka.consumer.group` | The icebox-side consumer group id | OTel messaging semconv. |
+| `icebox.iceberg.warehouse` / `namespace` / `table` | Lakekeeper warehouse, namespace, table | Vendor-prefixed because OTel semconv has no Iceberg coverage today. |
+
+**Chart-owned** (set via the chart's `OTEL_RESOURCE_ATTRIBUTES` env on
+the icebox Deployment — auto-merged into the resource by
+`Resource.create()`):
+
+- `deployment.environment` (e.g. `managed-warehouse-prod-us`)
+- `k8s.cluster.name`, `k8s.namespace.name`, `k8s.pod.name`, `k8s.deployment.name`
+- `host.hostname`
+
+These are not passed by the app — keeping env/cluster concerns out of
+icebox code.
+
+### Per-record attributes
+
+| Attr | Source | Why |
+|---|---|---|
+| `icebox.cycle_id` | The `cycle_id_var` ContextVar set by `committer.run_cycle` | Per-record, NOT Resource. Resource attrs describe the *process*; `cycle_id` describes a *single cycle* inside it. Moving it to Resource would silently break per-cycle filtering. |
+
+The stdout JSON formatter additionally emits a plain `cycle_id` field
+in the body for stdout-only readers. PostHog Logs queries should use
+`attributes.icebox.cycle_id`.
 
 ## Tests
 

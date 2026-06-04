@@ -96,7 +96,11 @@ POST_TOTAL = Counter(
 SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL = Counter(
     "icebox_schema_fingerprint_cache_misses_total",
     "Times the writer-claimed schema fingerprint didn't match the cached "
-    "value, forcing a catalog refresh. Expected ~zero at steady state; a "
-    "non-zero rate after an ALTER TABLE is normal until cache + writers "
-    "converge.",
+    "value, forcing a catalog refresh. Partitioned by reason:\n"
+    "  - cache_stale_after_alter: the catalog refresh matched the writer "
+    "    (the cache was just behind reality — normal post-ALTER race).\n"
+    "  - fingerprint_mismatch: the refresh STILL doesn't match — the "
+    "    writer is presenting a fingerprint the catalog doesn't know. "
+    "    Alertable; the cache_stale_after_alter rate is not.",
+    labelnames=("reason",),
 )

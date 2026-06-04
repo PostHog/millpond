@@ -52,7 +52,13 @@ dependencies = [
     # 1.42 deprecated opentelemetry.sdk._logs.LoggingHandler in favor of the
     # one shipped from opentelemetry-instrumentation-logging. Same API,
     # same wire behavior, just no DeprecationWarning at construction.
-    "opentelemetry-instrumentation-logging>=0.50b0",
+    # Ceiling is to bound surprise — the instrumentation contrib packages
+    # have moved module paths across minor revs before (the handler lives
+    # at opentelemetry.instrumentation.logging.handler today; that's NOT
+    # the package's documented public surface — public is
+    # LoggingInstrumentor — so a future rev could move it without a
+    # deprecation cycle. Bump deliberately.
+    "opentelemetry-instrumentation-logging>=0.50b0,<0.64",
 ]
 
 [project.optional-dependencies]
