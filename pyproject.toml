@@ -49,6 +49,10 @@ dependencies = [
     # at /i/v1/logs — no PostHog-specific Python package exists.
     "opentelemetry-sdk>=1.30",
     "opentelemetry-exporter-otlp-proto-http>=1.30",
+    # 1.42 deprecated opentelemetry.sdk._logs.LoggingHandler in favor of the
+    # one shipped from opentelemetry-instrumentation-logging. Same API,
+    # same wire behavior, just no DeprecationWarning at construction.
+    "opentelemetry-instrumentation-logging>=0.50b0",
 ]
 
 [project.optional-dependencies]

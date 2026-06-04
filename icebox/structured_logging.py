@@ -182,7 +182,17 @@ def setup_logging(
     # rebuild), but the modules pull in a fair amount of code.
     from opentelemetry._logs import set_logger_provider
     from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+
+    # The handler from opentelemetry.sdk._logs is deprecated since
+    # opentelemetry-sdk 1.42 in favor of the one from
+    # opentelemetry-instrumentation-logging. Same constructor signature
+    # (level, logger_provider), same wire behavior — the
+    # instrumentation-package version additionally defaults to NOT
+    # emitting code.{file,function,line} attributes per record, which
+    # is exactly what we want for PostHog Logs (those attrs were pure
+    # noise in the export).
+    from opentelemetry.instrumentation.logging.handler import LoggingHandler
+    from opentelemetry.sdk._logs import LoggerProvider
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.resources import Resource
 
