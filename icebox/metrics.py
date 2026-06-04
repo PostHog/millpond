@@ -87,3 +87,16 @@ POST_TOTAL = Counter(
     "POST /v1/files responses, partitioned by HTTP status code.",
     labelnames=("status",),
 )
+
+
+# ---------------------------------------------------------------------------
+# Schema-fingerprint cache
+# ---------------------------------------------------------------------------
+
+SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL = Counter(
+    "icebox_schema_fingerprint_cache_misses_total",
+    "Times the writer-claimed schema fingerprint didn't match the cached "
+    "value, forcing a catalog refresh. Expected ~zero at steady state; a "
+    "non-zero rate after an ALTER TABLE is normal until cache + writers "
+    "converge.",
+)

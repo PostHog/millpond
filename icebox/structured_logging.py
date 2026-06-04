@@ -151,6 +151,15 @@ def setup_logging(
         root.removeHandler(handler)
     root.setLevel(level)
 
+    # Silence uvicorn's per-request access log. kubelet probes
+    # (/readyz, /healthz) + Prometheus scrape (/metrics) + every
+    # writer POST (/v1/files) generate one line each here. None of it
+    # carries operational signal that isn't already in our metrics
+    # — but together they swamp the useful committer logs (~63% of
+    # all icebox log volume per a 1h prod sample). WARNING-level
+    # keeps the door open for uvicorn to surface a startup failure.
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
     formatter: logging.Formatter
     if fmt == "json":
         formatter = JsonFormatter()

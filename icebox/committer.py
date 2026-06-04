@@ -179,7 +179,11 @@ def _run_cycle_body(
             )
 
     if not claimed_ids:
-        log.info("run_cycle: no files to claim — vacuous cycle %s", cycle_id)
+        # DEBUG because vacuous cycles are normal at low ingest volume
+        # and dominate operational log volume otherwise. The
+        # icebox_cycles_total{result="skipped_no_files"} counter +
+        # committer_heartbeat metric carry the operational signal.
+        log.debug("run_cycle: no files to claim — vacuous cycle %s", cycle_id)
         result.skipped_reason = "no_files"
         # Still considered a "success" for status semantics: the loop
         # ran and we're not falling behind, just nothing to do.

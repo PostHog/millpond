@@ -134,6 +134,14 @@ def test_setup_logging_text_mode_installs_plain_formatter():
     assert not isinstance(root.handlers[0].formatter, JsonFormatter)
 
 
+def test_setup_logging_silences_uvicorn_access_logger():
+    """uvicorn.access ships one line per probe + per writer POST and
+    swamps the useful committer logs. setup_logging() must pin it at
+    WARNING so probes/scrapes/POSTs don't reach stdout or OTLP."""
+    setup_logging(level="DEBUG", fmt="json")
+    assert logging.getLogger("uvicorn.access").level == logging.WARNING
+
+
 def test_setup_logging_clears_prior_handlers_on_repeat_call():
     # Re-running should not stack handlers (matters for tests +
     # process forks / reloaders).

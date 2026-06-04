@@ -33,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from icebox import metrics
 from shared.fingerprint import schema_fingerprint
 
 log = logging.getLogger(__name__)
@@ -108,7 +109,13 @@ class SchemaFingerprintCache:
         current = await self.current()
         if claimed_fingerprint == current:
             return True
-        log.info(
+        # DEBUG because at steady state this fires on every legitimate
+        # schema-evolution race (writer ran ALTER TABLE between our
+        # cache refresh and its POST) AND on misconfigured writers.
+        # In 1h of prod logs this was 22% of all volume — a metric
+        # captures the rate without the per-event noise.
+        metrics.SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL.inc()
+        log.debug(
             "schema_fingerprint_cache: cached fingerprint did not match "
             "writer-claimed value; forcing refresh"
         )

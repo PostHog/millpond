@@ -107,6 +107,38 @@ def test_validate_returns_false_when_mismatch_persists_after_refresh(fp_stub):
     assert loader.call_count == 2
 
 
+def test_validate_mismatch_increments_cache_miss_counter(fp_stub):
+    """The per-mismatch metric replaces the previous per-event INFO log.
+    At steady state operators read the counter rate, not the body of
+    every miss."""
+    from icebox.metrics import SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL
+
+    loader = MagicMock(
+        side_effect=[
+            _table_with_schema("fp-A"),  # initial populate
+            _table_with_schema("fp-B"),  # forced refresh after mismatch
+        ]
+    )
+    cache = SchemaFingerprintCache(load_table=loader, ttl_seconds=60.0)
+    before = SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL._value.get()
+    asyncio.run(cache.validate("fp-B"))
+    after = SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL._value.get()
+    assert after == before + 1
+
+
+def test_validate_cached_match_does_not_increment_cache_miss_counter(fp_stub):
+    """Sanity check the inverse — a cache hit must NOT touch the miss
+    counter."""
+    from icebox.metrics import SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL
+
+    loader = MagicMock(return_value=_table_with_schema("fp-X"))
+    cache = SchemaFingerprintCache(load_table=loader, ttl_seconds=60.0)
+    before = SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL._value.get()
+    asyncio.run(cache.validate("fp-X"))
+    after = SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL._value.get()
+    assert after == before
+
+
 def test_current_propagates_loader_exception(fp_stub):
     loader = MagicMock(side_effect=RuntimeError("catalog unreachable"))
     cache = SchemaFingerprintCache(load_table=loader, ttl_seconds=60.0)
