@@ -93,6 +93,32 @@ POST_TOTAL = Counter(
 # Schema-fingerprint cache
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Iceberg table state — read from the snapshot.summary returned by every
+# successful iceberg-commit. Free signal (no extra Lakekeeper round-trip,
+# no background thread), updated once per cycle.
+# ---------------------------------------------------------------------------
+
+ICEBERG_TABLE_DATA_FILES = Gauge(
+    "icebox_iceberg_table_data_files",
+    "Total data files in the icebox's target Iceberg table after the last "
+    "successful cycle commit. Source: snapshot.summary['total-data-files'].",
+)
+
+ICEBERG_TABLE_RECORDS = Gauge(
+    "icebox_iceberg_table_records",
+    "Total records in the icebox's target Iceberg table after the last "
+    "successful cycle commit. Source: snapshot.summary['total-records'].",
+)
+
+ICEBERG_TABLE_FILES_SIZE_BYTES = Gauge(
+    "icebox_iceberg_table_files_size_bytes",
+    "Total bytes across all data files in the icebox's target Iceberg "
+    "table after the last successful cycle commit. Source: "
+    "snapshot.summary['total-files-size'].",
+)
+
+
 SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL = Counter(
     "icebox_schema_fingerprint_cache_misses_total",
     "Times the writer-claimed schema fingerprint didn't match the cached "

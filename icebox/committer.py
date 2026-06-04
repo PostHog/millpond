@@ -246,7 +246,7 @@ def _run_cycle_body(
             data_files.append(df)
             kafka_offset_dicts.append(kafka_offsets)
 
-        snapshot_id = deps.commit_data_files(
+        snapshot_id, snapshot_summary = deps.commit_data_files(
             table=table,
             data_files=data_files,
             cycle_id=cycle_id,
@@ -256,6 +256,27 @@ def _run_cycle_body(
             "run_cycle: cycle %s iceberg-committed snapshot_id=%s",
             cycle_id, snapshot_id,
         )
+        # Free signal: the summary the committer just produced carries
+        # cumulative table stats. Surfaces table growth + compaction
+        # signal without a separate thread or Lakekeeper poll.
+        # Defensive None-skip: if a future PyIceberg API shift leaves
+        # snapshot_summary empty, the gauges retain their last value
+        # (which is still the truth — table state hasn't changed).
+        if snapshot_summary is not None:
+            for key, gauge in (
+                ("total-data-files", metrics.ICEBERG_TABLE_DATA_FILES),
+                ("total-records", metrics.ICEBERG_TABLE_RECORDS),
+                ("total-files-size", metrics.ICEBERG_TABLE_FILES_SIZE_BYTES),
+            ):
+                raw = snapshot_summary.get(key)
+                if raw is None:
+                    continue
+                try:
+                    gauge.set(int(raw))
+                except (TypeError, ValueError):
+                    # Summary values are spec-defined as ints-as-strings;
+                    # a non-parseable value is a producer bug, not ours.
+                    continue
 
     except Exception as exc:
         log.exception(
