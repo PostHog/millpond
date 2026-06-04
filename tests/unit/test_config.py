@@ -58,6 +58,22 @@ class TestLoad:
         assert cfg.fetch_max_wait_ms == 500
         assert cfg.consume_batch_size == 1000
         assert cfg.stats_interval_ms == 5000
+        # PostHog Logs export: off by default.
+        assert cfg.posthog_project_token is None
+        assert cfg.posthog_logs_endpoint == "https://us.i.posthog.com/i/v1/logs"
+        assert cfg.service_namespace == "millpond"
+        assert cfg.service_instance_id is None
+
+    def test_posthog_otlp_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "phc_test")
+        monkeypatch.setenv("POSTHOG_LOGS_ENDPOINT", "https://eu.i.posthog.com/i/v1/logs")
+        monkeypatch.setenv("MILLPOND_SERVICE_NAMESPACE", "my-ns")
+        monkeypatch.setenv("MILLPOND_SERVICE_INSTANCE_ID", "events")
+        cfg = load()
+        assert cfg.posthog_project_token == "phc_test"
+        assert cfg.posthog_logs_endpoint == "https://eu.i.posthog.com/i/v1/logs"
+        assert cfg.service_namespace == "my-ns"
+        assert cfg.service_instance_id == "events"
 
     def test_ordinal_exceeds_replica_count(self, monkeypatch):
         monkeypatch.setenv("POD_NAME", "millpond-events-5")

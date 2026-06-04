@@ -372,7 +372,7 @@ def _update_lag_metrics(kafka, tp_offsets):
 
 
 def main():
-    logging_config.setup()
+    logging_config.setup_stdout()
     try:
         __version__ = version("millpond")
     except PackageNotFoundError:
@@ -384,8 +384,14 @@ def main():
     http = None
     sink = None
     kafka = None
+    logger_provider = None
 
     cfg = config.load()
+    # OTLP/HTTP export to PostHog Logs. Returns None when
+    # cfg.posthog_project_token is unset (default for local dev). The
+    # provider is flushed on the shutdown path so in-flight batches
+    # make it out before the process exits.
+    logger_provider = logging_config.attach_posthog_otlp(cfg)
     metrics.init(f"{cfg.topic}-{cfg.table_label}", broker_source=cfg.broker_source)
 
     pending: list[pa.Table] = []
@@ -567,6 +573,13 @@ def main():
                 http.shutdown()
             except Exception:
                 log.exception("HTTP server shutdown failed")
+        if logger_provider is not None:
+            # Flush the OTLP batch processor so in-flight log records
+            # make it to PostHog Logs before the process exits.
+            try:
+                logger_provider.shutdown()
+            except Exception:
+                log.exception("OTLP logger provider shutdown failed")
         log.info("millpond shutdown complete")
 
     return 0

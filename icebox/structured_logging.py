@@ -1,82 +1,48 @@
 """Structured-logging setup for the icebox.
 
-Provides:
+Composes the shared building blocks in ``shared.structured_logging``
+with icebox-specific bits:
+
   - ``cycle_id_var`` — a ``ContextVar`` the committer sets at the top
     of ``run_cycle`` so every log line emitted during that cycle is
     automatically stamped with the cycle's UUID.
-  - ``JsonFormatter`` — emits one JSON object per log record. Pulls
-    ``cycle_id`` from the ContextVar, includes the standard fields
-    (ts, level, logger, msg, exc), and inlines any ``extra=`` keyword
-    fields passed to the log call.
-  - ``setup_logging`` — installs the stdout handler with either the
-    JSON formatter or a plain text formatter, and (when
-    ``POSTHOG_PROJECT_TOKEN`` is set) attaches an OpenTelemetry
-    OTLP/HTTP log handler that ships records to PostHog Logs.
-
-The OTel path uses standard ``opentelemetry-sdk`` +
-``opentelemetry-exporter-otlp-proto-http``; PostHog terminates OTLP
-at ``/i/v1/logs`` so there is no PostHog-specific package needed
-(verified against ``posthog`` 7.16.x in the SDK research).
+  - ``IceboxJsonFormatter`` — JsonFormatter that pulls ``cycle_id``
+    from the ContextVar into the stdout JSON body.
+  - ``_CycleIdAttrFilter`` — OTel-side filter that stamps
+    ``icebox.cycle_id`` onto each log record as a typed attribute.
+  - ``setup_logging`` — assembles the icebox-flavored configuration
+    on top of the shared helpers.
 """
 from __future__ import annotations
 
-import json
 import logging
-import sys
 from contextvars import ContextVar
-from datetime import UTC, datetime
 from typing import Any
 
-# ContextVar carried through every committer cycle. The JsonFormatter
+from shared import structured_logging as sl
+
+# ContextVar carried through every committer cycle. The formatter
 # reads from it when rendering log records, so all logs emitted
 # during ``run_cycle`` are automatically stamped with the cycle's UUID.
 cycle_id_var: ContextVar[str | None] = ContextVar("icebox_cycle_id", default=None)
 
 
-# Standard ``LogRecord`` attrs we do NOT want to inline as JSON keys
-# (they're already in the top-level shape or are noise).
-_STANDARD_LOGRECORD_ATTRS = frozenset({
-    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
-    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
-    "created", "msecs", "relativeCreated", "thread", "threadName",
-    "processName", "process", "message", "taskName",
-})
+class IceboxJsonFormatter(sl.JsonFormatter):
+    """JSON formatter that inlines ``cycle_id`` into the stdout body.
 
-
-class JsonFormatter(logging.Formatter):
-    """JSON log formatter.
-
-    Output shape (one line per record):
-        {"ts": "...", "level": "INFO", "logger": "...", "msg": "...",
-         "cycle_id": "...", "<extra_key>": <extra_value>, ...,
-         "exc": "<traceback>"}
-
-    Extras passed to ``log.info("...", extra={"foo": 1})`` are inlined
-    at the top level. Values that aren't JSON-serializable are coerced
-    via ``repr``.
+    Kept separate from the OTLP-side stamping (which uses
+    ``_CycleIdAttrFilter`` with the namespaced key ``icebox.cycle_id``)
+    so the stdout JSON shape stays backward-compatible with the
+    pre-existing ``cycle_id`` body field.
     """
 
-    def format(self, record: logging.LogRecord) -> str:
-        out: dict[str, Any] = {
-            "ts": datetime.fromtimestamp(record.created, UTC).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-        }
-        cid = cycle_id_var.get()
-        if cid is not None:
-            out["cycle_id"] = cid
-        for key, value in record.__dict__.items():
-            if key in _STANDARD_LOGRECORD_ATTRS or key.startswith("_"):
-                continue
-            try:
-                json.dumps(value)
-                out[key] = value
-            except (TypeError, ValueError):
-                out[key] = repr(value)
-        if record.exc_info:
-            out["exc"] = self.formatException(record.exc_info)
-        return json.dumps(out, default=str)
+    def extra_context(self) -> dict[str, Any]:
+        return {"cycle_id": cycle_id_var.get()}
+
+
+# Backward-compat alias: tests and the rest of the codebase reference
+# ``JsonFormatter`` directly. The icebox flavor IS the default.
+JsonFormatter = IceboxJsonFormatter
 
 
 class _CycleIdAttrFilter(logging.Filter):
@@ -156,14 +122,9 @@ def setup_logging(
     Returns the OTel ``LoggerProvider`` when PostHog logging is
     enabled, so the caller can register ``provider.shutdown()`` on
     the SIGTERM drain path. Returns ``None`` when disabled.
-
-    Idempotent: re-running clears the root logger's handlers first
-    so tests and re-imports don't stack duplicate sinks.
     """
-    root = logging.getLogger()
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
-    root.setLevel(level)
+    formatter = IceboxJsonFormatter() if fmt == "json" else sl.text_formatter()
+    root = sl.install_root_handlers(level=level, formatter=formatter)
 
     # Silence uvicorn's per-request access log. kubelet probes
     # (/readyz, /healthz) + Prometheus scrape (/metrics) + every
@@ -172,43 +133,10 @@ def setup_logging(
     # — but together they swamp the useful committer logs (~63% of
     # all icebox log volume per a 1h prod sample). WARNING-level
     # keeps the door open for uvicorn to surface a startup failure.
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
-    formatter: logging.Formatter
-    if fmt == "json":
-        formatter = JsonFormatter()
-    else:
-        formatter = logging.Formatter(
-            "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-        )
-
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    root.addHandler(stream_handler)
+    sl.silence_logger("uvicorn.access", logging.WARNING)
 
     if not posthog_token:
         return None
-
-    # Lazy import: bringing OTel in only when we're actually exporting
-    # keeps the cold-start cost off the path for tests / dev that
-    # haven't set the token. The deps ARE installed (we ship them so
-    # the prod chart can opt in by setting env vars without an image
-    # rebuild), but the modules pull in a fair amount of code.
-    from opentelemetry._logs import set_logger_provider
-    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-
-    # The handler from opentelemetry.sdk._logs is deprecated since
-    # opentelemetry-sdk 1.42 in favor of the one from
-    # opentelemetry-instrumentation-logging. Same constructor signature
-    # (level, logger_provider), same wire behavior — the
-    # instrumentation-package version additionally defaults to NOT
-    # emitting code.{file,function,line} attributes per record, which
-    # is exactly what we want for PostHog Logs (those attrs were pure
-    # noise in the export).
-    from opentelemetry.instrumentation.logging.handler import LoggingHandler
-    from opentelemetry.sdk._logs import LoggerProvider
-    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-    from opentelemetry.sdk.resources import Resource
 
     # Build the resource-attr dict, dropping None values so unset
     # optionals don't render as empty strings on the wire.
@@ -236,38 +164,15 @@ def setup_logging(
     if kafka_topic is not None or kafka_group_id is not None:
         resource_attrs["messaging.system"] = "kafka"
 
-    # Resource.create() merges in OTEL_RESOURCE_ATTRIBUTES env so the
-    # chart can supply deployment.environment, k8s.*, host.hostname
-    # without an app code change. We split by key ownership (app vs.
-    # chart) so the implicit user-attrs-win precedence of merge() is
-    # never load-bearing — but a test still pins it as a safety net
-    # against future SDK refactors.
-    resource = Resource.create(resource_attrs)
-    provider = LoggerProvider(resource=resource)
-    set_logger_provider(provider)
-    provider.add_log_record_processor(
-        BatchLogRecordProcessor(
-            OTLPLogExporter(
-                endpoint=posthog_endpoint,
-                headers={"Authorization": f"Bearer {posthog_token}"},
-            )
-        )
+    provider = sl.build_otel_logger_provider(
+        posthog_token=posthog_token,
+        posthog_endpoint=posthog_endpoint,
+        resource_attrs=resource_attrs,
     )
-    # log_code_attributes=False is the explicit (and default) request to
-    # NOT stamp code.{file,function,line} on every record. The previous
-    # opentelemetry-sdk handler stamped them unconditionally; the new
-    # instrumentation-package handler defaults to off, but pinning the
-    # kwarg makes the choice deliberate code rather than implicit
-    # default — future readers see we want them off.
-    otel_handler = LoggingHandler(
+    sl.attach_otel_handler(
+        provider=provider,
+        root=root,
         level=level,
-        logger_provider=provider,
-        log_code_attributes=False,
+        extra_filters=[_CycleIdAttrFilter()],
     )
-    # Filter is OTel-side only so the stdout JSON shape stays stable
-    # (existing ``cycle_id`` body field via the formatter's
-    # ContextVar read) while OTel records gain ``icebox.cycle_id`` as
-    # a typed record attribute for PostHog Logs filtering.
-    otel_handler.addFilter(_CycleIdAttrFilter())
-    root.addHandler(otel_handler)
     return provider
