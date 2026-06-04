@@ -116,6 +116,23 @@ class Config:
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
+    # Optional PostHog Logs export via OTLP/HTTP. ON when
+    # ``posthog_project_token`` is set, OFF otherwise. Endpoint
+    # defaults to the US PostHog Cloud ingress; override for EU or
+    # self-hosted PostHog. service_namespace + service_instance_id
+    # match the icebox taxonomy (see shared/structured_logging.py +
+    # icebox/README.md). service_instance_id is typically the
+    # consumer-key the chart uses for the StatefulSet name, e.g.
+    # "events-icebox" or "events".
+    posthog_project_token: str | None = None
+    posthog_logs_endpoint: str = "https://us.i.posthog.com/i/v1/logs"
+    service_namespace: str = "millpond"
+    service_instance_id: str | None = None
+    # service.version reported in OTLP resource attrs. Defaults to the
+    # millpond package version. Operators can override via
+    # MILLPOND_SERVICE_VERSION (e.g. to expose the image digest).
+    service_version: str = "unknown"
+
     @property
     def flush_interval_s(self) -> float:
         return self.flush_interval_ms / 1000.0
@@ -127,6 +144,21 @@ class Config:
         if self.destination in ("iceberg", "icebox"):
             return f"{self.iceberg_namespace}.{self.iceberg_table}"
         return self.ducklake_table or "unknown"
+
+
+def _default_service_version() -> str:
+    """Best-effort service version string for OTLP resource attrs.
+
+    Falls back to the millpond setuptools-scm version baked into the
+    package; that maps cleanly to a git rev in non-prod builds and to a
+    clean tag in prod images.
+    """
+    try:
+        from millpond._version import version
+
+        return str(version)
+    except Exception:
+        return "unknown"
 
 
 def _parse_ordinal(pod_name: str) -> int:
@@ -389,6 +421,18 @@ def load() -> Config:
         filter_values=filter_values,
         sort_by=sort_by,
         kafka_config_overrides=kafka_overrides,
+        # No ``MILLPOND_`` prefix on POSTHOG_PROJECT_TOKEN: it's a
+        # PostHog-wide secret typically sourced from a shared K8s Secret
+        # (the same one other PostHog SDKs consume), so the canonical
+        # PostHog name is what operators expect to see.
+        posthog_project_token=(os.environ.get("POSTHOG_PROJECT_TOKEN") or None),
+        posthog_logs_endpoint=os.environ.get(
+            "POSTHOG_LOGS_ENDPOINT",
+            "https://us.i.posthog.com/i/v1/logs",
+        ),
+        service_namespace=os.environ.get("MILLPOND_SERVICE_NAMESPACE", "millpond"),
+        service_instance_id=os.environ.get("MILLPOND_SERVICE_INSTANCE_ID") or None,
+        service_version=os.environ.get("MILLPOND_SERVICE_VERSION", _default_service_version()),
     )
 
     log.info(

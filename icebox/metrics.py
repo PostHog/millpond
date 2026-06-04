@@ -87,3 +87,75 @@ POST_TOTAL = Counter(
     "POST /v1/files responses, partitioned by HTTP status code.",
     labelnames=("status",),
 )
+
+
+# ---------------------------------------------------------------------------
+# Schema-fingerprint cache
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Iceberg table state — read from the snapshot.summary returned by every
+# successful iceberg-commit. Free signal (no extra Lakekeeper round-trip,
+# no background thread), updated once per cycle.
+#
+# RESERVED: these gauges are intentionally UNLABELED. Each icebox process
+# serves exactly one (Iceberg namespace, table) pair (see icebox/README.md
+# "One icebox per (Iceberg namespace, table)") — single-table invariant.
+# The per-(table) axis comes from the icebox.iceberg.* OTLP resource attrs +
+# the Prometheus job dimension. If a future change ever runs multiple
+# tables per process, adding labels here is a breaking metric-series
+# change; plan the migration explicitly.
+# ---------------------------------------------------------------------------
+
+ICEBERG_TABLE_DATA_FILES = Gauge(
+    "icebox_iceberg_table_data_files",
+    "Total data files in the icebox's target Iceberg table after the last "
+    "successful cycle commit. Source: snapshot.summary['total-data-files'].",
+)
+
+ICEBERG_TABLE_RECORDS = Gauge(
+    "icebox_iceberg_table_records",
+    "Total records in the icebox's target Iceberg table after the last "
+    "successful cycle commit. Source: snapshot.summary['total-records'].",
+)
+
+ICEBERG_TABLE_FILES_SIZE_BYTES = Gauge(
+    "icebox_iceberg_table_files_size_bytes",
+    "Total bytes across all data files in the icebox's target Iceberg "
+    "table after the last successful cycle commit. Source: "
+    "snapshot.summary['total-files-size'].",
+)
+
+# Per-cycle deltas — operational signals distinct from cumulative state:
+# - added_data_files climbing = compaction debt growing
+# - added_records / added_files_size = effective per-cycle ingest rate
+ICEBERG_TABLE_ADDED_DATA_FILES = Gauge(
+    "icebox_iceberg_table_added_data_files",
+    "Data files added by the last successful cycle commit. Source: "
+    "snapshot.summary['added-data-files'].",
+)
+
+ICEBERG_TABLE_ADDED_RECORDS = Gauge(
+    "icebox_iceberg_table_added_records",
+    "Records added by the last successful cycle commit. Source: "
+    "snapshot.summary['added-records'].",
+)
+
+ICEBERG_TABLE_ADDED_FILES_SIZE_BYTES = Gauge(
+    "icebox_iceberg_table_added_files_size_bytes",
+    "Bytes added by the last successful cycle commit. Source: "
+    "snapshot.summary['added-files-size'].",
+)
+
+
+SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL = Counter(
+    "icebox_schema_fingerprint_cache_misses_total",
+    "Times the writer-claimed schema fingerprint didn't match the cached "
+    "value, forcing a catalog refresh. Partitioned by reason:\n"
+    "  - cache_stale_after_alter: the catalog refresh matched the writer "
+    "    (the cache was just behind reality — normal post-ALTER race).\n"
+    "  - fingerprint_mismatch: the refresh STILL doesn't match — the "
+    "    writer is presenting a fingerprint the catalog doesn't know. "
+    "    Alertable; the cache_stale_after_alter rate is not.",
+    labelnames=("reason",),
+)

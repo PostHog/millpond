@@ -33,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from icebox import metrics
 from shared.fingerprint import schema_fingerprint
 
 log = logging.getLogger(__name__)
@@ -108,9 +109,27 @@ class SchemaFingerprintCache:
         current = await self.current()
         if claimed_fingerprint == current:
             return True
-        log.info(
+        # DEBUG because at steady state this fires on every legitimate
+        # schema-evolution race (writer ran ALTER TABLE between our
+        # cache refresh and its POST) AND on misconfigured writers.
+        # In 1h of prod logs this was 22% of all volume — the labeled
+        # counter below carries the operational signal, partitioned by
+        # reason so alerts can fire on `fingerprint_mismatch` without
+        # false pages on every legitimate `cache_stale_after_alter`.
+        log.debug(
             "schema_fingerprint_cache: cached fingerprint did not match "
             "writer-claimed value; forcing refresh"
         )
         refreshed = await self.current(force_refresh=True)
-        return claimed_fingerprint == refreshed
+        if claimed_fingerprint == refreshed:
+            # Refresh matched: the cache was stale post-ALTER. Normal.
+            metrics.SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL.labels(
+                reason="cache_stale_after_alter"
+            ).inc()
+            return True
+        # Refresh still doesn't match: the writer's fingerprint is
+        # unknown to the catalog. Alertable.
+        metrics.SCHEMA_FINGERPRINT_CACHE_MISSES_TOTAL.labels(
+            reason="fingerprint_mismatch"
+        ).inc()
+        return False

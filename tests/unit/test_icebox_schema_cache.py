@@ -107,6 +107,66 @@ def test_validate_returns_false_when_mismatch_persists_after_refresh(fp_stub):
     assert loader.call_count == 2
 
 
+def _miss_count(reason: str) -> float:
+    """Read the labeled cache-miss counter via the public registry idiom.
+    Returns 0.0 when the label hasn't been seen yet (sample absent)."""
+    from prometheus_client import REGISTRY
+
+    value = REGISTRY.get_sample_value(
+        "icebox_schema_fingerprint_cache_misses_total",
+        labels={"reason": reason},
+    )
+    return value or 0.0
+
+
+def test_validate_mismatch_with_stale_cache_reports_cache_stale_after_alter(fp_stub):
+    """Cache held fp-A but the catalog (post-ALTER) actually serves
+    fp-B; writer claims fp-B. Reason: cache_stale_after_alter — the
+    cache was just behind reality. Normal; not alertable."""
+    loader = MagicMock(
+        side_effect=[
+            _table_with_schema("fp-A"),  # initial populate
+            _table_with_schema("fp-B"),  # forced refresh after mismatch
+        ]
+    )
+    cache = SchemaFingerprintCache(load_table=loader, ttl_seconds=60.0)
+    before_stale = _miss_count("cache_stale_after_alter")
+    before_mismatch = _miss_count("fingerprint_mismatch")
+    asyncio.run(cache.validate("fp-B"))
+    assert _miss_count("cache_stale_after_alter") == before_stale + 1
+    assert _miss_count("fingerprint_mismatch") == before_mismatch
+
+
+def test_validate_mismatch_with_unknown_fingerprint_reports_fingerprint_mismatch(fp_stub):
+    """Cache held fp-A; refresh still returns fp-A; writer claims fp-Z
+    — the catalog doesn't know fp-Z. Reason: fingerprint_mismatch.
+    Alertable."""
+    loader = MagicMock(
+        side_effect=[
+            _table_with_schema("fp-A"),
+            _table_with_schema("fp-A"),  # refresh still shows A
+        ]
+    )
+    cache = SchemaFingerprintCache(load_table=loader, ttl_seconds=60.0)
+    before_stale = _miss_count("cache_stale_after_alter")
+    before_mismatch = _miss_count("fingerprint_mismatch")
+    asyncio.run(cache.validate("fp-Z"))
+    assert _miss_count("cache_stale_after_alter") == before_stale
+    assert _miss_count("fingerprint_mismatch") == before_mismatch + 1
+
+
+def test_validate_cached_match_does_not_increment_cache_miss_counter(fp_stub):
+    """Sanity check the inverse — a cache hit must NOT touch either
+    miss-counter label."""
+    loader = MagicMock(return_value=_table_with_schema("fp-X"))
+    cache = SchemaFingerprintCache(load_table=loader, ttl_seconds=60.0)
+    before_stale = _miss_count("cache_stale_after_alter")
+    before_mismatch = _miss_count("fingerprint_mismatch")
+    asyncio.run(cache.validate("fp-X"))
+    assert _miss_count("cache_stale_after_alter") == before_stale
+    assert _miss_count("fingerprint_mismatch") == before_mismatch
+
+
 def test_current_propagates_loader_exception(fp_stub):
     loader = MagicMock(side_effect=RuntimeError("catalog unreachable"))
     cache = SchemaFingerprintCache(load_table=loader, ttl_seconds=60.0)

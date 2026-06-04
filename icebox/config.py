@@ -142,6 +142,17 @@ class Config:
     # to the millpond package version. Operators can override via
     # ICEBOX_SERVICE_VERSION (e.g., to expose the image digest).
     service_version: str = "unknown"
+    # service.namespace per OTel semconv — "logical grouping of related
+    # services in a deployment unit". For PostHog this is the release
+    # family ("millpond"). NOT the data-side namespace (we previously
+    # misused this field for the PG schema; the icebox.* custom attrs
+    # carry the per-(warehouse, namespace, table) facets now).
+    service_namespace: str = "millpond"
+    # service.instance.id per OTel semconv — distinguishes instances of
+    # the same service. Set by the chart to the consumer key (e.g.
+    # ``events-icebox``) so PostHog Logs can filter by instance the
+    # same way it does by service. Optional; unset = no attr.
+    service_instance_id: str | None = None
 
     # Schema-fingerprint cache TTL — how long the API perimeter
     # trusts its in-memory copy of the Iceberg table's current
@@ -315,6 +326,8 @@ def load() -> Config:
             "https://us.i.posthog.com/i/v1/logs",
         ),
         service_version=_optional("ICEBOX_SERVICE_VERSION", _default_service_version()),
+        service_namespace=_optional("ICEBOX_SERVICE_NAMESPACE", "millpond"),
+        service_instance_id=os.environ.get("ICEBOX_SERVICE_INSTANCE_ID") or None,
         schema_fingerprint_cache_ttl_seconds=_float(
             "ICEBOX_SCHEMA_FINGERPRINT_CACHE_TTL_SECONDS", 60.0
         ),

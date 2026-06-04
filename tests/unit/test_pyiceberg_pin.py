@@ -421,3 +421,92 @@ def test_pin_canary_snapshot_summary_preserves_custom_keys():
         "icebox/iceberg.py:find_snapshot_for_cycle relies on byte-identical "
         "round-trip"
     )
+
+
+# ---------------------------------------------------------------------------
+# In-transaction snapshot summary surface — load-bearing for the table-state
+# Gauges that icebox/committer.py reads from commit_data_files's returned
+# CommitResult.summary. If any of these symbols move or rename, the broad
+# try/except in icebox/iceberg.py:commit_data_files degrades to summary=None
+# SILENTLY — operators just stop seeing the gauges advance. Catch the drift
+# loudly at install time instead.
+# ---------------------------------------------------------------------------
+
+
+def test_pin_canary_table_metadata_snapshot_by_id_method_exists():
+    """commit_data_files looks up the just-committed snapshot via
+    ``tx.table_metadata.snapshot_by_id(snapshot_id)`` to extract the
+    summary in the same scope as the commit (no extra Lakekeeper
+    round-trip). If this method renames or disappears, the lookup
+    raises and summary degrades to None — operators silently lose
+    the table-state gauges.
+
+    ``TableMetadata`` is a discriminated union; the method lives on
+    each concrete version class. Pin on both V1 and V2 (the two
+    versions PostHog tables use today)."""
+    from pyiceberg.table.metadata import TableMetadataV1, TableMetadataV2
+
+    for cls in (TableMetadataV1, TableMetadataV2):
+        assert hasattr(cls, "snapshot_by_id"), (
+            f"{cls.__name__}.snapshot_by_id no longer exposed; "
+            "icebox/iceberg.py:commit_data_files post-commit summary extraction "
+            "degrades to None silently — table-state gauges stop advancing"
+        )
+
+
+def test_pin_canary_snapshot_summary_additional_properties_attr():
+    """commit_data_files flattens
+    ``snapshot.summary.additional_properties`` to extract the
+    spec-defined keys (``total-data-files``, ``added-records``, etc.).
+    If PyIceberg renames or moves that attribute, the gauge feed stops
+    silently behind the broad try/except. Pin via constructing a
+    Snapshot directly so a rename surfaces here at install time."""
+    from pyiceberg.table.snapshots import Snapshot
+
+    snap = Snapshot(
+        snapshot_id=1,
+        sequence_number=1,
+        timestamp_ms=0,
+        manifest_list="",
+        summary={
+            "operation": "append",
+            "total-data-files": "42",
+            "added-records": "100",
+        },  # type: ignore[arg-type]
+        schema_id=0,
+    )
+    assert hasattr(snap.summary, "additional_properties"), (
+        "Snapshot.summary.additional_properties no longer exposed; "
+        "icebox/iceberg.py:commit_data_files can't extract per-snapshot "
+        "stats — table-state gauges stop advancing"
+    )
+    props = snap.summary.additional_properties
+    assert props.get("total-data-files") == "42"
+    assert props.get("added-records") == "100"
+
+
+def test_pin_canary_snapshot_summary_operation_enum_value():
+    """commit_data_files captures the snapshot's operation type via
+    ``snapshot.summary.operation.value`` (Enum → string). If PyIceberg
+    changes the type (e.g., to plain str), the .value access raises
+    and partial-summary preservation logic loses the operation tag
+    silently."""
+    from pyiceberg.table.snapshots import Operation, Snapshot
+
+    snap = Snapshot(
+        snapshot_id=1,
+        sequence_number=1,
+        timestamp_ms=0,
+        manifest_list="",
+        summary={"operation": "append"},  # type: ignore[arg-type]
+        schema_id=0,
+    )
+    assert snap.summary is not None
+    op = snap.summary.operation
+    assert isinstance(op, Operation), (
+        "Snapshot.summary.operation is no longer an Operation enum; "
+        "icebox/iceberg.py:commit_data_files's `op.value` access path "
+        "now raises and silently drops the operation tag from the "
+        "extracted summary"
+    )
+    assert op.value == "append"

@@ -61,6 +61,21 @@ def test_load_with_only_required_env(monkeypatch):
     assert cfg.asyncpg_pool_max == 8
     assert cfg.psycopg_pool_min == 1
     assert cfg.psycopg_pool_max == 2
+    assert cfg.service_namespace == "millpond"
+    assert cfg.service_instance_id is None
+
+
+def test_service_namespace_and_instance_id_overrides(monkeypatch):
+    _set_env(
+        monkeypatch,
+        {
+            "ICEBOX_SERVICE_NAMESPACE": "icebox-shadow",
+            "ICEBOX_SERVICE_INSTANCE_ID": "events-icebox",
+        },
+    )
+    cfg = icebox_config.load()
+    assert cfg.service_namespace == "icebox-shadow"
+    assert cfg.service_instance_id == "events-icebox"
 
 
 def test_load_missing_pg_host_raises(monkeypatch):

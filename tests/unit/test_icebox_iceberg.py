@@ -244,13 +244,19 @@ def test_build_data_file_respects_format_version_v1():
 # ---------------------------------------------------------------------------
 
 
-def _wire_producer_mock(snapshot_id: int | None = 12345):
+def _wire_producer_mock(snapshot_id: int | None = 12345, summary: object | None = None):
     """Build (table, tx, producer) mocks with context managers wired.
 
     The producer carries snapshot_id directly — commit_data_files reads
     it from the producer, NOT from table.current_snapshot(). Pass None
-    to simulate a PyIceberg-version mismatch where the producer's
-    snapshot_id is missing."""
+    for snapshot_id to simulate a PyIceberg-version mismatch where the
+    producer's snapshot_id is missing.
+
+    ``summary``: pass a mock Snapshot (with .summary.additional_properties
+    + .summary.operation) to exercise the post-commit summary-extraction
+    path. Default None means tx.table_metadata.snapshot_by_id returns
+    None — extraction silently skipped, summary returned as None.
+    """
     table = MagicMock()
     tx = MagicMock()
     producer = MagicMock()
@@ -259,6 +265,7 @@ def _wire_producer_mock(snapshot_id: int | None = 12345):
     table.transaction.return_value.__exit__ = lambda self, *a: None
     tx._append_snapshot_producer.return_value.__enter__ = lambda self: producer
     tx._append_snapshot_producer.return_value.__exit__ = lambda self, *a: None
+    tx.table_metadata.snapshot_by_id.return_value = summary
     return table, tx, producer
 
 
@@ -276,7 +283,8 @@ def test_commit_data_files_uses_cycle_id_summary_key():
     tx._append_snapshot_producer.assert_called_once()
     call_kwargs = tx._append_snapshot_producer.call_args.kwargs
     assert call_kwargs["snapshot_properties"] == {CYCLE_ID_SUMMARY_KEY: str(cycle)}
-    assert result == 12345
+    assert result.snapshot_id == 12345
+    assert result.summary is None  # mock tx returns no snapshot lookup
 
 
 def test_commit_data_files_appends_each_file_to_producer():
@@ -299,7 +307,7 @@ def test_commit_data_files_reads_snapshot_id_from_producer_not_table():
     result = commit_data_files(
         table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4(),
     )
-    assert result == 999, (
+    assert result.snapshot_id == 999, (
         "commit_data_files must read snapshot_id from the producer, "
         "not from table.current_snapshot() which could be stale"
     )
@@ -328,6 +336,90 @@ def test_commit_data_files_respects_branch_arg():
         branch="staging",
     )
     assert tx._append_snapshot_producer.call_args.kwargs["branch"] == "staging"
+
+
+def test_commit_data_files_extracts_summary_when_present():
+    """The post-commit summary lookup must surface the spec keys we
+    chart (total-data-files etc.) into the returned dict so the
+    committer can update the gauges with no extra round-trip."""
+    # Build a fake Snapshot whose .summary.additional_properties carries
+    # the spec keys + a real operation enum.
+    from pyiceberg.table.snapshots import Operation
+
+    fake_snapshot = MagicMock()
+    fake_snapshot.summary.additional_properties = {
+        "total-data-files": "42",
+        "total-records": "1000000",
+        "total-files-size": "987654321",
+        "added-data-files": "3",
+    }
+    fake_snapshot.summary.operation = Operation.APPEND
+
+    table, _, _ = _wire_producer_mock(snapshot_id=777, summary=fake_snapshot)
+    result = commit_data_files(
+        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
+    )
+    assert result.snapshot_id == 777
+    assert result.summary is not None
+    assert result.summary["total-data-files"] == "42"
+    assert result.summary["total-records"] == "1000000"
+    assert result.summary["total-files-size"] == "987654321"
+    # Operation key is namespaced to avoid collision with any future
+    # producer-attached `operation` summary property.
+    assert result.summary["posthog.icebox.operation"] == "append"
+
+
+def test_commit_data_files_preserves_partial_summary_when_operation_fails():
+    """Operation extraction failure must NOT discard the
+    additional_properties we already pulled. Partial summary beats
+    None — the cumulative + delta gauges still get values, only the
+    operation label is missing."""
+    # Build a hand-rolled summary object: real attribute access for
+    # additional_properties, raise on .operation. MagicMock's auto-attr
+    # short-circuits PropertyMock here, so use a plain class.
+    class _PartialSummary:
+        additional_properties = {
+            "total-data-files": "100",
+            "added-records": "500",
+        }
+
+        @property
+        def operation(self):
+            raise AttributeError("simulated PyIceberg API drift")
+
+    fake_snapshot = MagicMock()
+    fake_snapshot.summary = _PartialSummary()
+    table, _, _ = _wire_producer_mock(snapshot_id=42, summary=fake_snapshot)
+    result = commit_data_files(
+        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
+    )
+    assert result.snapshot_id == 42
+    assert result.summary is not None
+    assert result.summary["total-data-files"] == "100"
+    assert result.summary["added-records"] == "500"
+    assert "posthog.icebox.operation" not in result.summary
+
+
+def test_commit_data_files_returns_none_summary_when_lookup_fails():
+    """A future PyIceberg API shift in the in-tx metadata view must
+    NOT kill the commit. The snapshot_id load-bearing return still
+    flows; summary is None and the committer's gauges hold their last
+    value for that cycle."""
+
+    # Wire a snapshot mock whose .summary raises on attribute access
+    class _BoomSummary:
+        @property
+        def additional_properties(self):
+            raise RuntimeError("simulated PyIceberg API drift")
+
+    fake_snapshot = MagicMock()
+    fake_snapshot.summary = _BoomSummary()
+    table, _, _ = _wire_producer_mock(snapshot_id=555, summary=fake_snapshot)
+    result = commit_data_files(
+        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
+    )
+    assert result.snapshot_id == 555
+    assert result.summary is None
 
 
 # ---------------------------------------------------------------------------

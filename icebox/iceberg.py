@@ -27,6 +27,7 @@ calls this out as a non-goal.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -39,6 +40,30 @@ from pyiceberg.typedef import Record
 from shared.bounds import encode_bounds
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CommitResult:
+    """The result of a successful iceberg-commit cycle.
+
+    Returned as a dataclass (not a tuple) so adding fields like
+    per-cycle delta counts or schema-evolution flags later doesn't
+    force every caller to update positional unpacking.
+
+    Attributes:
+        snapshot_id: The committed Iceberg snapshot ID. Load-bearing
+            for PG state — persisted so recovery doesn't need to
+            rescan the snapshot_log.
+        summary: The snapshot's spec-defined summary dict (keys like
+            ``total-data-files``, ``total-records``, ``added-records``,
+            etc.) extracted from the transaction's metadata in the
+            same scope as the commit — no extra Lakekeeper round-trip.
+            ``None`` only if a future PyIceberg API drift in the
+            in-tx metadata view defeats the lookup; defensive.
+    """
+
+    snapshot_id: int
+    summary: dict[str, str] | None
 
 
 # Snapshot summary key for cycle_id — the recovery scan looks for this
@@ -180,7 +205,7 @@ def commit_data_files(
     data_files: list[DataFile],
     cycle_id: UUID,
     branch: str = "main",
-) -> int:
+) -> CommitResult:
     """Commit a batch of DataFiles in a single Iceberg snapshot, tagging
     the snapshot with the cycle_id for recovery.
 
@@ -192,8 +217,15 @@ def commit_data_files(
         branch: snapshot branch. Defaults to "main".
 
     Returns:
-        The committed snapshot ID. Persists to PG so subsequent
-        recovery doesn't need to rescan the snapshot_log.
+        A ``CommitResult(snapshot_id, summary)``. ``snapshot_id`` is the
+        committed Iceberg snapshot ID — persisted to PG so subsequent
+        recovery doesn't need to rescan the snapshot_log. ``summary``
+        is the snapshot's Iceberg-spec summary dict (with keys like
+        ``total-data-files``, ``total-records``, ``added-records``,
+        etc.) extracted from the transaction's updated metadata in
+        the same scope as the commit — no extra Lakekeeper round-trip.
+        ``summary`` is ``None`` only if a future PyIceberg API drift
+        in the in-tx metadata view defeats the lookup; defensive.
 
     Raises:
         Whatever PyIceberg raises if the commit fails (transient FS
@@ -221,6 +253,7 @@ def commit_data_files(
     # for the snapshot the producer just built.
     snapshot_props = {CYCLE_ID_SUMMARY_KEY: str(cycle_id)}
     snapshot_id: int | None = None
+    summary: dict[str, str] | None = None
     with table.transaction() as tx:
         with tx._append_snapshot_producer(
             snapshot_properties=snapshot_props,
@@ -229,6 +262,34 @@ def commit_data_files(
             for df in data_files:
                 producer.append_data_file(df)
             snapshot_id = producer.snapshot_id
+        # After the producer context exits, the transaction's metadata
+        # includes the new snapshot. Look it up via the public
+        # ``tx.table_metadata.snapshot_by_id`` API — same scope, no
+        # extra Lakekeeper round-trip.
+        #
+        # Defensive partial-extraction: pull additional_properties
+        # first (the bulk of the value); only THEN try to attach the
+        # operation. A failure during operation lookup keeps the
+        # already-extracted dict so the committer's gauges still get
+        # the cumulative+delta numbers — partial summaries beat None
+        # for observability. A failure earlier (no snapshot found at
+        # all, or additional_properties raises) degrades to summary=None.
+        try:
+            new_snapshot = tx.table_metadata.snapshot_by_id(snapshot_id)
+        except Exception:
+            new_snapshot = None
+        if new_snapshot is not None and new_snapshot.summary is not None:
+            try:
+                summary = dict(new_snapshot.summary.additional_properties)
+            except Exception:
+                summary = None
+            if summary is not None:
+                try:
+                    summary["posthog.icebox.operation"] = (
+                        new_snapshot.summary.operation.value
+                    )
+                except Exception:
+                    pass  # keep the additional_properties we did get
 
     if snapshot_id is None:
         raise RuntimeError(
@@ -236,7 +297,7 @@ def commit_data_files(
             f"cycle_id={cycle_id}; this indicates a PyIceberg API change "
             f"affecting _append_snapshot_producer"
         )
-    return snapshot_id
+    return CommitResult(snapshot_id=snapshot_id, summary=summary)
 
 
 def find_snapshot_for_cycle(table: Table, cycle_id: UUID) -> int | None:
