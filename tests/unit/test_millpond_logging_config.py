@@ -4,12 +4,14 @@ taxonomy emitted per destination (ducklake / iceberg / icebox).
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from millpond import logging_config
+from millpond.config import Config
 
 
 @pytest.fixture(autouse=True)
@@ -22,29 +24,69 @@ def _reset_root_logger():
         root.removeHandler(h)
 
 
-def _make_cfg(**overrides):
-    """Minimal cfg-like object that satisfies attach_posthog_otlp's
-    attribute access. Saves importing config.Config and wiring every
-    field — we only need what the function reads."""
-    base = dict(
-        posthog_project_token=None,
-        posthog_logs_endpoint="https://us.i.posthog.com/i/v1/logs",
-        service_namespace="millpond",
-        service_instance_id=None,
-        service_version="0.0.0",
+def _minimal_config() -> Config:
+    """A real Config instance with the minimum required field set so a
+    future rename of any field surfaces here as a TypeError, not as a
+    silent green-test/red-prod skew. Tests use ``dataclasses.replace``
+    to override just the field(s) they care about.
+
+    Per attach_posthog_otlp, posthog_project_token=None disables the
+    OTLP path — the OFF state is the default; tests turning it ON
+    pass an explicit token via replace().
+    """
+    return Config(
+        bootstrap_servers="localhost:9092",
         topic="clickhouse_events_json",
         group_id="millpond-test",
+        replica_count=1,
+        ordinal=0,
         destination="ducklake",
         ducklake_table=None,
         ducklake_data_path=None,
+        ducklake_connection=None,
+        rds_host=None,
+        rds_port=None,
+        rds_database=None,
+        rds_username=None,
+        rds_password=None,
+        partition_by=None,
+        iceberg_catalog_uri=None,
         iceberg_warehouse=None,
         iceberg_namespace=None,
         iceberg_table=None,
+        iceberg_table_location=None,
+        iceberg_catalog_token=None,
+        s3_access_key_id=None,
+        s3_secret_access_key=None,
+        s3_region=None,
+        s3_endpoint=None,
         icebox_url=None,
         icebox_bucket=None,
+        icebox_warehouse_prefix=None,
+        icebox_max_attempts=6,
+        icebox_max_backoff_s=30.0,
+        icebox_timeout_s=10.0,
+        flush_size=104857600,
+        flush_interval_ms=60000,
+        fetch_min_bytes=1048576,
+        fetch_max_wait_ms=500,
+        consume_batch_size=1000,
+        stats_interval_ms=5000,
+        broker_source="warpstream",
+        filter_keep_field=None,
+        filter_drop_field=None,
+        filter_values=None,
+        sort_by=None,
+        kafka_config_overrides=(),
     )
-    base.update(overrides)
-    return type("Cfg", (), base)()
+
+
+def _make_cfg(**overrides) -> Config:
+    """Build a real Config via dataclasses.replace from the minimal
+    baseline. Any rename of a Config field surfaces as a TypeError on
+    this call site — structural canary that the previous
+    ``type("Cfg", (), ...)`` fake lacked."""
+    return dataclasses.replace(_minimal_config(), **overrides)
 
 
 # ---------------------------------------------------------------------------

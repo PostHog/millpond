@@ -13,13 +13,14 @@ from __future__ import annotations
 import inspect
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 from pyiceberg.schema import Schema
 from pyiceberg.types import IntegerType, NestedField, StringType
 
 from icebox import committer as cm
+from icebox import iceberg as ib
 from icebox.config import Config
 from icebox.schema import CommitCycleRow
 from shared.fingerprint import schema_fingerprint
@@ -235,7 +236,9 @@ def _deps(
     deps = cm.CommitterDeps(
         load_table=lambda: table,
         commit_data_files=MagicMock(
-            return_value=(iceberg_snapshot_id, None),
+            return_value=ib.CommitResult(
+                snapshot_id=iceberg_snapshot_id, summary=None
+            ),
             side_effect=iceberg_commit_raises,
         ),
         find_snapshot_for_cycle=MagicMock(return_value=snapshot_log_lookup_result),
@@ -263,37 +266,69 @@ def test_run_cycle_happy_path():
     deps.kafka_commit_offsets.assert_called_once()
 
 
+def _gauge_value(metric_name: str) -> float | None:
+    """Read a Gauge via the public REGISTRY idiom (matches the
+    pattern in test_icebox_schema_cache.py:_miss_count). Avoids
+    poking at the private ``._value.get()`` accessor that prior
+    review told us to stop using."""
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value(metric_name)
+
+
 def test_run_cycle_sets_iceberg_table_gauges_from_snapshot_summary():
     """When commit_data_files returns a summary with the spec keys,
     the committer must surface them on the icebox.* table-state
-    Gauges. Operators want a zero-thread, zero-Lakekeeper-poll signal
-    of table growth + compaction state."""
+    Gauges — both cumulative AND per-cycle deltas. Operators want a
+    zero-thread, zero-Lakekeeper-poll signal of table growth +
+    compaction state."""
+    from icebox import iceberg as ib
     from icebox.metrics import (
+        ICEBERG_TABLE_ADDED_DATA_FILES,
+        ICEBERG_TABLE_ADDED_FILES_SIZE_BYTES,
+        ICEBERG_TABLE_ADDED_RECORDS,
         ICEBERG_TABLE_DATA_FILES,
         ICEBERG_TABLE_FILES_SIZE_BYTES,
         ICEBERG_TABLE_RECORDS,
     )
 
+    # Clear before the test so we can assert exact post-cycle values.
+    for gauge in (
+        ICEBERG_TABLE_DATA_FILES,
+        ICEBERG_TABLE_RECORDS,
+        ICEBERG_TABLE_FILES_SIZE_BYTES,
+        ICEBERG_TABLE_ADDED_DATA_FILES,
+        ICEBERG_TABLE_ADDED_RECORDS,
+        ICEBERG_TABLE_ADDED_FILES_SIZE_BYTES,
+    ):
+        gauge.set(0)
+
     deps, pool = _deps(iceberg_snapshot_id=12345)
-    # commit_data_files now returns (snapshot_id, summary). Override the
-    # _deps default so the test injects realistic Iceberg-spec values.
     deps.commit_data_files = MagicMock(
-        return_value=(
-            12345,
-            {
+        return_value=ib.CommitResult(
+            snapshot_id=12345,
+            summary={
                 "total-data-files": "42",
                 "total-records": "1000000",
                 "total-files-size": "987654321",
-                "operation": "append",
+                "added-data-files": "3",
+                "added-records": "27000",
+                "added-files-size": "12345678",
+                "posthog.icebox.operation": "append",
             },
         )
     )
 
     result = cm.run_cycle(cfg=_cfg(), pg_pool=pool, deps=deps)
     assert result.success is True
-    assert ICEBERG_TABLE_DATA_FILES._value.get() == 42.0
-    assert ICEBERG_TABLE_RECORDS._value.get() == 1000000.0
-    assert ICEBERG_TABLE_FILES_SIZE_BYTES._value.get() == 987654321.0
+    # Cumulative
+    assert _gauge_value("icebox_iceberg_table_data_files") == 42.0
+    assert _gauge_value("icebox_iceberg_table_records") == 1000000.0
+    assert _gauge_value("icebox_iceberg_table_files_size_bytes") == 987654321.0
+    # Per-cycle deltas
+    assert _gauge_value("icebox_iceberg_table_added_data_files") == 3.0
+    assert _gauge_value("icebox_iceberg_table_added_records") == 27000.0
+    assert _gauge_value("icebox_iceberg_table_added_files_size_bytes") == 12345678.0
 
 
 def test_run_cycle_handles_none_summary_without_touching_gauges():
@@ -301,18 +336,51 @@ def test_run_cycle_handles_none_summary_without_touching_gauges():
     safety net), the committer must not raise and the gauges keep
     their previous value (which is still the truth — table state
     hasn't changed)."""
+    from icebox import iceberg as ib
     from icebox.metrics import ICEBERG_TABLE_DATA_FILES
 
     # Pre-set the gauge so we can detect any clobber to 0.
     ICEBERG_TABLE_DATA_FILES.set(999)
 
     deps, pool = _deps(iceberg_snapshot_id=12345)
-    deps.commit_data_files = MagicMock(return_value=(12345, None))
+    deps.commit_data_files = MagicMock(
+        return_value=ib.CommitResult(snapshot_id=12345, summary=None)
+    )
 
     result = cm.run_cycle(cfg=_cfg(), pg_pool=pool, deps=deps)
     assert result.success is True
     # Gauge unchanged — last successful value preserved.
-    assert ICEBERG_TABLE_DATA_FILES._value.get() == 999.0
+    assert _gauge_value("icebox_iceberg_table_data_files") == 999.0
+
+
+def test_run_cycle_gauge_update_failure_does_not_poison_commit():
+    """QE MAJOR: a raise during the gauge-update path must NOT trip
+    the iceberg-commit's except branch. If it did, release_cycle_claim
+    would fire AFTER the snapshot landed — files re-batched in a
+    future cycle, double-commit. Force a gauge to raise during set()
+    and assert the cycle still completes successfully."""
+    from icebox import iceberg as ib
+    from icebox.metrics import ICEBERG_TABLE_DATA_FILES
+
+    deps, pool = _deps(iceberg_snapshot_id=12345)
+    deps.commit_data_files = MagicMock(
+        return_value=ib.CommitResult(
+            snapshot_id=12345,
+            summary={"total-data-files": "42"},
+        )
+    )
+
+    # Patch the gauge's .set to raise. The committer's narrow
+    # try/except around _update_table_state_gauges must catch this
+    # without releasing the cycle claim.
+    with patch.object(
+        ICEBERG_TABLE_DATA_FILES, "set", side_effect=RuntimeError("simulated")
+    ):
+        result = cm.run_cycle(cfg=_cfg(), pg_pool=pool, deps=deps)
+    assert result.success is True
+    assert result.iceberg_snapshot_id == 12345
+    # release_cycle_claim must NOT have fired — cycle proceeded normally.
+    deps.kafka_commit_offsets.assert_called_once()
 
 
 def test_run_cycle_no_files_marks_vacuous_success():
@@ -903,7 +971,9 @@ def test_recover_in_flight_cycles_loads_table_fresh_per_cycle():
 
     deps = cm.CommitterDeps(
         load_table=counting_load,
-        commit_data_files=MagicMock(return_value=(999, None)),
+        commit_data_files=MagicMock(
+            return_value=ib.CommitResult(snapshot_id=999, summary=None)
+        ),
         find_snapshot_for_cycle=MagicMock(return_value=None),
         build_data_file=MagicMock(return_value=MagicMock()),
         kafka_admin=MagicMock(),
@@ -1207,7 +1277,9 @@ def test_recover_in_flight_cycles_logs_error_on_limit_hit(caplog):
     # to assert here.
     deps = cm.CommitterDeps(
         load_table=lambda: MagicMock(),
-        commit_data_files=MagicMock(return_value=(1, None)),
+        commit_data_files=MagicMock(
+            return_value=ib.CommitResult(snapshot_id=1, summary=None)
+        ),
         find_snapshot_for_cycle=MagicMock(return_value=1),
         build_data_file=MagicMock(return_value=MagicMock()),
         kafka_admin=MagicMock(),

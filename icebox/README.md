@@ -52,7 +52,7 @@ icebox solves this with a producer/consumer split:
 | `GET /v1/status` | Operator-facing observability snapshot (pending files, last cycle, last committed snapshot id, consecutive failures). |
 | `GET /readyz` | Readiness: PG reachable AND committer heartbeat fresh. Downstream (Lakekeeper, Kafka) outages do NOT fail readyz — the icebox keeps accepting POSTs and stages files for future cycles. |
 | `GET /healthz` | Liveness only — the API process is responsive. No PG round-trip. |
-| `GET /metrics` | Prometheus exposition: pending files, oldest pending age, consecutive failures, committer heartbeat age, cycle counts and duration histogram, post counts by HTTP status. |
+| `GET /metrics` | Prometheus exposition: pending files, oldest pending age, consecutive failures, committer heartbeat age, cycle counts and duration histogram, post counts by HTTP status, schema-fingerprint cache misses (by `reason`), and **Iceberg table state** — `icebox_iceberg_table_data_files`, `_records`, `_files_size_bytes` (cumulative after last cycle) plus `_added_data_files`, `_added_records`, `_added_files_size_bytes` (per-cycle deltas). Table-state gauges are read free from each cycle's snapshot summary — no thread, no extra Lakekeeper round-trip. |
 
 ## Structured logging + PostHog Logs
 

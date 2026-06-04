@@ -97,6 +97,14 @@ POST_TOTAL = Counter(
 # Iceberg table state — read from the snapshot.summary returned by every
 # successful iceberg-commit. Free signal (no extra Lakekeeper round-trip,
 # no background thread), updated once per cycle.
+#
+# RESERVED: these gauges are intentionally UNLABELED. Each icebox process
+# serves exactly one (Iceberg namespace, table) pair (see icebox/README.md
+# "One icebox per (Iceberg namespace, table)") — single-table invariant.
+# The per-(table) axis comes from the icebox.iceberg.* OTLP resource attrs +
+# the Prometheus job dimension. If a future change ever runs multiple
+# tables per process, adding labels here is a breaking metric-series
+# change; plan the migration explicitly.
 # ---------------------------------------------------------------------------
 
 ICEBERG_TABLE_DATA_FILES = Gauge(
@@ -116,6 +124,27 @@ ICEBERG_TABLE_FILES_SIZE_BYTES = Gauge(
     "Total bytes across all data files in the icebox's target Iceberg "
     "table after the last successful cycle commit. Source: "
     "snapshot.summary['total-files-size'].",
+)
+
+# Per-cycle deltas — operational signals distinct from cumulative state:
+# - added_data_files climbing = compaction debt growing
+# - added_records / added_files_size = effective per-cycle ingest rate
+ICEBERG_TABLE_ADDED_DATA_FILES = Gauge(
+    "icebox_iceberg_table_added_data_files",
+    "Data files added by the last successful cycle commit. Source: "
+    "snapshot.summary['added-data-files'].",
+)
+
+ICEBERG_TABLE_ADDED_RECORDS = Gauge(
+    "icebox_iceberg_table_added_records",
+    "Records added by the last successful cycle commit. Source: "
+    "snapshot.summary['added-records'].",
+)
+
+ICEBERG_TABLE_ADDED_FILES_SIZE_BYTES = Gauge(
+    "icebox_iceberg_table_added_files_size_bytes",
+    "Bytes added by the last successful cycle commit. Source: "
+    "snapshot.summary['added-files-size'].",
 )
 
 

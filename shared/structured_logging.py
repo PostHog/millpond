@@ -128,6 +128,9 @@ def build_otel_logger_provider(
     posthog_token: str,
     posthog_endpoint: str,
     resource_attrs: dict[str, str],
+    batch_schedule_delay_millis: int = 5000,
+    batch_max_export_size: int = 512,
+    batch_max_queue_size: int = 4096,
 ) -> Any:
     """Build a LoggerProvider with the OTLP/HTTP exporter to PostHog Logs.
 
@@ -135,6 +138,18 @@ def build_otel_logger_provider(
     merges in ``OTEL_RESOURCE_ATTRIBUTES`` from env (the standard SDK
     behavior, which the chart relies on for ``deployment.environment``
     / ``k8s.*`` / ``host.hostname``).
+
+    Batch knobs are pinned to explicit values rather than letting the
+    SDK pick. At 32 writer + 6+ icebox pods exporting at the SDK
+    defaults (``schedule_delay_millis=1000``, ``max_export_batch_size=512``,
+    ``max_queue_size=2048``), the aggregate is ~38 batched exports/sec
+    to a single PostHog Logs endpoint from one deployment family. Our
+    defaults are tuned for PostHog Logs ingest: 5s schedule delay (≈ a
+    fifth of SDK chatter), the standard 512-record batch, and a 2× queue
+    so a stalled exporter doesn't drop logs during transient PostHog
+    ingress backpressure. Operators can override per-service via the
+    Config fields ``posthog_logs_schedule_delay_ms`` /
+    ``posthog_logs_max_batch_size`` / ``posthog_logs_max_queue_size``.
 
     Caller owns the returned provider — register
     ``provider.shutdown()`` on the SIGTERM drain path so the
@@ -158,7 +173,10 @@ def build_otel_logger_provider(
             OTLPLogExporter(
                 endpoint=posthog_endpoint,
                 headers={"Authorization": f"Bearer {posthog_token}"},
-            )
+            ),
+            schedule_delay_millis=batch_schedule_delay_millis,
+            max_export_batch_size=batch_max_export_size,
+            max_queue_size=batch_max_queue_size,
         )
     )
     return provider

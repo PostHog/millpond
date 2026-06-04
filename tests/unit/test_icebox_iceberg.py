@@ -283,9 +283,8 @@ def test_commit_data_files_uses_cycle_id_summary_key():
     tx._append_snapshot_producer.assert_called_once()
     call_kwargs = tx._append_snapshot_producer.call_args.kwargs
     assert call_kwargs["snapshot_properties"] == {CYCLE_ID_SUMMARY_KEY: str(cycle)}
-    snapshot_id, summary = result
-    assert snapshot_id == 12345
-    assert summary is None  # mock tx returns no snapshot lookup
+    assert result.snapshot_id == 12345
+    assert result.summary is None  # mock tx returns no snapshot lookup
 
 
 def test_commit_data_files_appends_each_file_to_producer():
@@ -308,8 +307,7 @@ def test_commit_data_files_reads_snapshot_id_from_producer_not_table():
     result = commit_data_files(
         table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4(),
     )
-    snapshot_id, _ = result
-    assert snapshot_id == 999, (
+    assert result.snapshot_id == 999, (
         "commit_data_files must read snapshot_id from the producer, "
         "not from table.current_snapshot() which could be stale"
     )
@@ -358,15 +356,48 @@ def test_commit_data_files_extracts_summary_when_present():
     fake_snapshot.summary.operation = Operation.APPEND
 
     table, _, _ = _wire_producer_mock(snapshot_id=777, summary=fake_snapshot)
-    snapshot_id, summary = commit_data_files(
+    result = commit_data_files(
         table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
     )
-    assert snapshot_id == 777
-    assert summary is not None
-    assert summary["total-data-files"] == "42"
-    assert summary["total-records"] == "1000000"
-    assert summary["total-files-size"] == "987654321"
-    assert summary["operation"] == "append"  # Operation enum's value
+    assert result.snapshot_id == 777
+    assert result.summary is not None
+    assert result.summary["total-data-files"] == "42"
+    assert result.summary["total-records"] == "1000000"
+    assert result.summary["total-files-size"] == "987654321"
+    # Operation key is namespaced to avoid collision with any future
+    # producer-attached `operation` summary property.
+    assert result.summary["posthog.icebox.operation"] == "append"
+
+
+def test_commit_data_files_preserves_partial_summary_when_operation_fails():
+    """Operation extraction failure must NOT discard the
+    additional_properties we already pulled. Partial summary beats
+    None — the cumulative + delta gauges still get values, only the
+    operation label is missing."""
+    # Build a hand-rolled summary object: real attribute access for
+    # additional_properties, raise on .operation. MagicMock's auto-attr
+    # short-circuits PropertyMock here, so use a plain class.
+    class _PartialSummary:
+        additional_properties = {
+            "total-data-files": "100",
+            "added-records": "500",
+        }
+
+        @property
+        def operation(self):
+            raise AttributeError("simulated PyIceberg API drift")
+
+    fake_snapshot = MagicMock()
+    fake_snapshot.summary = _PartialSummary()
+    table, _, _ = _wire_producer_mock(snapshot_id=42, summary=fake_snapshot)
+    result = commit_data_files(
+        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
+    )
+    assert result.snapshot_id == 42
+    assert result.summary is not None
+    assert result.summary["total-data-files"] == "100"
+    assert result.summary["added-records"] == "500"
+    assert "posthog.icebox.operation" not in result.summary
 
 
 def test_commit_data_files_returns_none_summary_when_lookup_fails():
@@ -384,11 +415,11 @@ def test_commit_data_files_returns_none_summary_when_lookup_fails():
     fake_snapshot = MagicMock()
     fake_snapshot.summary = _BoomSummary()
     table, _, _ = _wire_producer_mock(snapshot_id=555, summary=fake_snapshot)
-    snapshot_id, summary = commit_data_files(
+    result = commit_data_files(
         table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
     )
-    assert snapshot_id == 555
-    assert summary is None
+    assert result.snapshot_id == 555
+    assert result.summary is None
 
 
 # ---------------------------------------------------------------------------

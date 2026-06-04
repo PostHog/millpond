@@ -148,10 +148,3 @@ def attach_posthog_otlp(cfg) -> Any | None:
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     )
     return provider
-
-
-# Backward-compat alias: the existing main.py calls `setup()` once.
-# Keep that working with the basic-stdout phase; callers that want
-# OTLP must additionally call attach_posthog_otlp(cfg).
-def setup() -> None:
-    setup_stdout()

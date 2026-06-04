@@ -57,6 +57,37 @@ from icebox.structured_logging import cycle_id_var
 log = logging.getLogger(__name__)
 
 
+def _update_table_state_gauges(summary: dict[str, str]) -> None:
+    """Push iceberg snapshot summary values onto the table-state Gauges.
+
+    Caller MUST invoke this outside the iceberg-commit try block (see
+    run_cycle). If a gauge.set() were to raise inside the saga's except
+    handler, release_cycle_claim would fire AFTER the snapshot had
+    already landed — re-batching the same files for double-commit.
+
+    Defensive non-raise per key: spec-defined integer-string values can
+    show up as None (key absent) or non-parseable (producer bug). Skip
+    rather than failing the cycle's observability pass.
+    """
+    for key, gauge in (
+        # Cumulative table state — total-after-commit
+        ("total-data-files", metrics.ICEBERG_TABLE_DATA_FILES),
+        ("total-records", metrics.ICEBERG_TABLE_RECORDS),
+        ("total-files-size", metrics.ICEBERG_TABLE_FILES_SIZE_BYTES),
+        # Per-cycle deltas — compaction-churn + ingest-rate signals
+        ("added-data-files", metrics.ICEBERG_TABLE_ADDED_DATA_FILES),
+        ("added-records", metrics.ICEBERG_TABLE_ADDED_RECORDS),
+        ("added-files-size", metrics.ICEBERG_TABLE_ADDED_FILES_SIZE_BYTES),
+    ):
+        raw = summary.get(key)
+        if raw is None:
+            continue
+        try:
+            gauge.set(int(raw))
+        except (TypeError, ValueError):
+            continue
+
+
 def _cycle_result_label(result: CycleResult) -> str:
     """Map a CycleResult onto a Prometheus ``result`` label value.
 
@@ -115,7 +146,7 @@ class CommitterDeps:
     """Side-effect callables the committer depends on. Tests pass mocks."""
 
     load_table: Callable[[], Any]  # returns pyiceberg Table
-    commit_data_files: Callable[..., int] = ib.commit_data_files  # returns snapshot_id
+    commit_data_files: Callable[..., ib.CommitResult] = ib.commit_data_files
     find_snapshot_for_cycle: Callable[..., int | None] = ib.find_snapshot_for_cycle
     build_data_file: Callable[..., Any] = ib.build_data_file
     kafka_admin: Any = None  # confluent_kafka AdminClient — built once at startup
@@ -246,37 +277,16 @@ def _run_cycle_body(
             data_files.append(df)
             kafka_offset_dicts.append(kafka_offsets)
 
-        snapshot_id, snapshot_summary = deps.commit_data_files(
+        commit_result = deps.commit_data_files(
             table=table,
             data_files=data_files,
             cycle_id=cycle_id,
         )
-        result.iceberg_snapshot_id = snapshot_id
+        result.iceberg_snapshot_id = commit_result.snapshot_id
         log.info(
             "run_cycle: cycle %s iceberg-committed snapshot_id=%s",
-            cycle_id, snapshot_id,
+            cycle_id, commit_result.snapshot_id,
         )
-        # Free signal: the summary the committer just produced carries
-        # cumulative table stats. Surfaces table growth + compaction
-        # signal without a separate thread or Lakekeeper poll.
-        # Defensive None-skip: if a future PyIceberg API shift leaves
-        # snapshot_summary empty, the gauges retain their last value
-        # (which is still the truth — table state hasn't changed).
-        if snapshot_summary is not None:
-            for key, gauge in (
-                ("total-data-files", metrics.ICEBERG_TABLE_DATA_FILES),
-                ("total-records", metrics.ICEBERG_TABLE_RECORDS),
-                ("total-files-size", metrics.ICEBERG_TABLE_FILES_SIZE_BYTES),
-            ):
-                raw = snapshot_summary.get(key)
-                if raw is None:
-                    continue
-                try:
-                    gauge.set(int(raw))
-                except (TypeError, ValueError):
-                    # Summary values are spec-defined as ints-as-strings;
-                    # a non-parseable value is a producer bug, not ours.
-                    continue
 
     except Exception as exc:
         log.exception(
@@ -291,11 +301,29 @@ def _run_cycle_body(
                 ps.update_heartbeat(conn)
         return result
 
+    # CRITICAL: gauge update is OUTSIDE the iceberg-commit try block.
+    # If a gauge.set() raised here while still inside that try, the
+    # except branch would release the cycle claim AFTER the snapshot
+    # had already landed in Lakekeeper — the files would be re-batched
+    # in a future cycle and double-committed against the same data.
+    # Decouple observability from the commit saga: any failure here
+    # gets logged but doesn't poison cycle state.
+    if commit_result.summary is not None:
+        try:
+            _update_table_state_gauges(commit_result.summary)
+        except Exception:
+            log.warning(
+                "run_cycle: cycle %s table-state gauge update failed "
+                "(commit already landed; gauges hold their last value)",
+                cycle_id,
+                exc_info=True,
+            )
+
     # ---- Step 6: persist iceberg_snapshot_id BEFORE attempting Kafka -----
     with pg_pool.connection() as conn:
         with conn.transaction():
             ps.mark_iceberg_committed(
-                conn, cycle_id=cycle_id, snapshot_id=snapshot_id
+                conn, cycle_id=cycle_id, snapshot_id=commit_result.snapshot_id
             )
 
     # ---- Step 7: kafka commit --------------------------------------------
@@ -319,7 +347,7 @@ def _run_cycle_body(
         log.exception(
             "run_cycle: kafka-commit failed for cycle %s (iceberg already "
             "committed snapshot_id=%s — recovery will finalize): %s",
-            cycle_id, snapshot_id, exc,
+            cycle_id, commit_result.snapshot_id, exc,
         )
         result.error = f"kafka-commit failed (cycle stuck): {exc}"
         with pg_pool.connection() as conn:
@@ -332,7 +360,7 @@ def _run_cycle_body(
     with pg_pool.connection() as conn:
         with conn.transaction():
             ps.mark_kafka_committed(conn, cycle_id=cycle_id)
-            ps.complete_cycle(conn, cycle_id=cycle_id, snapshot_id=snapshot_id)
+            ps.complete_cycle(conn, cycle_id=cycle_id, snapshot_id=commit_result.snapshot_id)
             ps.record_success(conn)
             ps.update_heartbeat(conn)
 

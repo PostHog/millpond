@@ -387,12 +387,16 @@ def main():
     logger_provider = None
 
     cfg = config.load()
+    # metrics.init() FIRST so a failure in OTLP setup (DNS lookup at
+    # OTLPLogExporter construction, malformed token, etc.) doesn't take
+    # out the /metrics endpoint — operators still get the writer's
+    # Prometheus axis to triage the failure.
+    metrics.init(f"{cfg.topic}-{cfg.table_label}", broker_source=cfg.broker_source)
     # OTLP/HTTP export to PostHog Logs. Returns None when
     # cfg.posthog_project_token is unset (default for local dev). The
     # provider is flushed on the shutdown path so in-flight batches
     # make it out before the process exits.
     logger_provider = logging_config.attach_posthog_otlp(cfg)
-    metrics.init(f"{cfg.topic}-{cfg.table_label}", broker_source=cfg.broker_source)
 
     pending: list[pa.Table] = []
     pending_bytes = 0
