@@ -79,6 +79,25 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(out, default=str)
 
 
+class _CycleIdAttrFilter(logging.Filter):
+    """Stamp ``icebox.cycle_id`` onto records inside a cycle context.
+
+    Attached to the OTel handler only. The stdout JsonFormatter keeps
+    its own ContextVar read (preserves the legacy ``cycle_id`` body
+    field), while OTel record attributes get the namespaced key so
+    PostHog Logs can filter on it like any other resource/record dim.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        cid = cycle_id_var.get()
+        if cid is not None:
+            # Dotted attribute names are legal as dict keys via setattr
+            # — OTel's LoggingHandler picks these up into record attrs
+            # without further translation.
+            record.__dict__["icebox.cycle_id"] = cid
+        return True
+
+
 def setup_logging(
     *,
     level: str = "INFO",
@@ -86,10 +105,39 @@ def setup_logging(
     posthog_token: str | None = None,
     posthog_endpoint: str = "https://us.i.posthog.com/i/v1/logs",
     service_name: str = "icebox",
-    service_namespace: str = "default",
+    service_namespace: str = "millpond",
     service_version: str = "unknown",
+    service_instance_id: str | None = None,
+    iceberg_warehouse: str | None = None,
+    iceberg_namespace: str | None = None,
+    iceberg_table: str | None = None,
+    kafka_topic: str | None = None,
+    kafka_group_id: str | None = None,
 ) -> Any | None:
     """Configure the root logger and (optionally) PostHog OTLP export.
+
+    Resource-attr shape on the OTLP side:
+      - ``service.name`` (constant ``icebox``): groups all instances of
+        the icebox binary across (env, table) in PostHog Logs.
+      - ``service.namespace`` (default ``millpond``): the release
+        family this icebox belongs to. OTel semconv intends this for
+        logical service grouping, NOT data-side namespacing — earlier
+        versions misused it for the PG schema.
+      - ``service.instance.id`` (per-consumer key, e.g.
+        ``events-icebox``): differentiates instances of the same
+        service. PostHog Logs uses this as the per-pod axis.
+      - ``service.version``: package version.
+      - ``source_type=icebox``: matches the existing PostHog
+        Vector-on-EC2 convention (which sets ``source_type=journald``)
+        so common filters carry over.
+      - ``icebox.iceberg.{warehouse,namespace,table}`` and
+        ``icebox.kafka.{topic,group_id}``: vendor-namespaced custom
+        attrs so per-(table, topic) filters work in the UI.
+
+    Standard OTel semconv attrs (``deployment.environment``, ``k8s.*``,
+    ``host.hostname``) are NOT passed here — the chart sets them via
+    ``OTEL_RESOURCE_ATTRIBUTES`` and OTel's ``Resource.create()``
+    auto-merges. Keeps the env/cluster concern out of the icebox app.
 
     Returns the OTel ``LoggerProvider`` when PostHog logging is
     enabled, so the caller can register ``provider.shutdown()`` on
@@ -129,11 +177,29 @@ def setup_logging(
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.resources import Resource
 
-    resource = Resource.create({
+    # Build the resource-attr dict, dropping None values so unset
+    # optionals don't render as empty strings on the wire.
+    resource_attrs: dict[str, str] = {
         "service.name": service_name,
         "service.namespace": service_namespace,
         "service.version": service_version,
-    })
+        "source_type": "icebox",
+    }
+    for key, value in (
+        ("service.instance.id", service_instance_id),
+        ("icebox.iceberg.warehouse", iceberg_warehouse),
+        ("icebox.iceberg.namespace", iceberg_namespace),
+        ("icebox.iceberg.table", iceberg_table),
+        ("icebox.kafka.topic", kafka_topic),
+        ("icebox.kafka.group_id", kafka_group_id),
+    ):
+        if value is not None:
+            resource_attrs[key] = value
+
+    # Resource.create() merges in OTEL_RESOURCE_ATTRIBUTES env so the
+    # chart can supply deployment.environment, k8s.*, host.hostname
+    # without an app code change. User-passed attrs win on conflict.
+    resource = Resource.create(resource_attrs)
     provider = LoggerProvider(resource=resource)
     set_logger_provider(provider)
     provider.add_log_record_processor(
@@ -149,5 +215,10 @@ def setup_logging(
     # envelope on the wire, but the body field will be parseable.
     otel_handler = LoggingHandler(level=level, logger_provider=provider)
     otel_handler.setFormatter(formatter)
+    # Filter is OTel-side only so the stdout JSON shape stays stable
+    # (existing ``cycle_id`` body field via the formatter's
+    # ContextVar read) while OTel records gain ``icebox.cycle_id`` as
+    # a typed record attribute for PostHog Logs filtering.
+    otel_handler.addFilter(_CycleIdAttrFilter())
     root.addHandler(otel_handler)
     return provider

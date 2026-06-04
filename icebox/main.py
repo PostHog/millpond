@@ -55,8 +55,14 @@ def main() -> None:
         posthog_token=cfg.posthog_project_token,
         posthog_endpoint=cfg.posthog_logs_endpoint,
         service_name="icebox",
-        service_namespace=cfg.pg_schema,
+        service_namespace=cfg.service_namespace,
         service_version=cfg.service_version,
+        service_instance_id=cfg.service_instance_id,
+        iceberg_warehouse=cfg.iceberg_warehouse,
+        iceberg_namespace=cfg.iceberg_namespace,
+        iceberg_table=cfg.iceberg_table,
+        kafka_topic=cfg.kafka_topic,
+        kafka_group_id=cfg.kafka_group_id,
     )
     log.info("icebox starting on %s:%d", cfg.api_host, cfg.api_port)
 

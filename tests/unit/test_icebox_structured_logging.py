@@ -181,6 +181,101 @@ def test_setup_logging_with_posthog_token_returns_provider_and_adds_handler():
     setup_logging(level="INFO", fmt="json")
 
 
+def test_setup_logging_resource_attrs_include_icebox_custom_and_source_type():
+    """The OTLP resource should carry the icebox.* facets + source_type
+    so PostHog Logs can filter by (table, topic) and the existing
+    PostHog Vector-on-EC2 source_type filter carries over."""
+    from unittest.mock import MagicMock
+
+    with patch(
+        "opentelemetry.exporter.otlp.proto.http._log_exporter.OTLPLogExporter",
+        return_value=MagicMock(),
+    ):
+        provider = setup_logging(
+            level="INFO",
+            fmt="json",
+            posthog_token="phc_test",
+            service_instance_id="events-icebox",
+            iceberg_warehouse="ingest",
+            iceberg_namespace="kafka",
+            iceberg_table="events",
+            kafka_topic="clickhouse_events_json",
+            kafka_group_id="millpond-icebox-clickhouse_events_json-events",
+        )
+    try:
+        attrs = dict(provider.resource.attributes)
+        assert attrs["service.name"] == "icebox"
+        assert attrs["service.namespace"] == "millpond"
+        assert attrs["source_type"] == "icebox"
+        assert attrs["service.instance.id"] == "events-icebox"
+        assert attrs["icebox.iceberg.warehouse"] == "ingest"
+        assert attrs["icebox.iceberg.namespace"] == "kafka"
+        assert attrs["icebox.iceberg.table"] == "events"
+        assert attrs["icebox.kafka.topic"] == "clickhouse_events_json"
+        assert (
+            attrs["icebox.kafka.group_id"]
+            == "millpond-icebox-clickhouse_events_json-events"
+        )
+    finally:
+        provider.shutdown()
+        setup_logging(level="INFO", fmt="json")
+
+
+def test_setup_logging_omits_none_optional_resource_attrs():
+    """Unset optional attrs must not render as empty strings or null
+    on the wire — they should be absent from the resource entirely."""
+    from unittest.mock import MagicMock
+
+    with patch(
+        "opentelemetry.exporter.otlp.proto.http._log_exporter.OTLPLogExporter",
+        return_value=MagicMock(),
+    ):
+        provider = setup_logging(
+            level="INFO",
+            fmt="json",
+            posthog_token="phc_test",
+        )
+    try:
+        attrs = dict(provider.resource.attributes)
+        # Required attrs present, optionals absent.
+        assert "service.name" in attrs
+        assert "service.instance.id" not in attrs
+        assert "icebox.iceberg.warehouse" not in attrs
+        assert "icebox.kafka.topic" not in attrs
+    finally:
+        provider.shutdown()
+        setup_logging(level="INFO", fmt="json")
+
+
+def test_cycle_id_attr_filter_stamps_record_when_contextvar_set():
+    """The OTel-side filter must surface ``icebox.cycle_id`` as a
+    record attribute so PostHog Logs can filter on it directly,
+    independent of the JSON body shape on stdout."""
+    from icebox.structured_logging import _CycleIdAttrFilter
+
+    flt = _CycleIdAttrFilter()
+    token = cycle_id_var.set("c-xyz")
+    try:
+        record = _make_record(msg="inside cycle")
+        flt.filter(record)
+        # Dot-keyed attrs aren't accessible via getattr-with-dots syntax;
+        # OTel reads them from __dict__ directly.
+        assert record.__dict__["icebox.cycle_id"] == "c-xyz"
+    finally:
+        cycle_id_var.reset(token)
+
+
+def test_cycle_id_attr_filter_noop_when_contextvar_unset():
+    from icebox.structured_logging import _CycleIdAttrFilter
+
+    if cycle_id_var.get() is not None:
+        cycle_id_var.set(None)
+    flt = _CycleIdAttrFilter()
+    record = _make_record(msg="no cycle context")
+    flt.filter(record)
+    assert "icebox.cycle_id" not in record.__dict__
+
+
 @pytest.fixture(autouse=True)
 def _reset_root_logger():
     """Reset root logger handlers between tests so log lines from one
