@@ -126,13 +126,13 @@ def setup_logging(
     formatter = IceboxJsonFormatter() if fmt == "json" else sl.text_formatter()
     root = sl.install_root_handlers(level=level, formatter=formatter)
 
-    # Silence uvicorn's per-request access log. kubelet probes
-    # (/readyz, /healthz) + Prometheus scrape (/metrics) + every
-    # writer POST (/v1/files) generate one line each here. None of it
-    # carries operational signal that isn't already in our metrics
-    # — but together they swamp the useful committer logs (~63% of
-    # all icebox log volume per a 1h prod sample). WARNING-level
-    # keeps the door open for uvicorn to surface a startup failure.
+    # Belt-and-suspenders against uvicorn.access leakage. The
+    # load-bearing silencing happens at ``uvicorn.run(access_log=False)``
+    # in icebox/main.py — verified in prod after the level-only approach
+    # turned out to be defeated by uvicorn's startup logger-config reset.
+    # This setLevel still catches any future ``uvicorn.access`` records
+    # constructed outside the standard access-log path (e.g. a
+    # middleware hook), so leaving it in place is cheap insurance.
     sl.silence_logger("uvicorn.access", logging.WARNING)
 
     if not posthog_token:

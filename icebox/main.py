@@ -162,6 +162,17 @@ def main() -> None:
         host=cfg.api_host,
         port=cfg.api_port,
         log_config=None,  # we configured logging above
+        # ``access_log=False`` is what actually stops uvicorn from
+        # emitting one INFO line per kubelet probe / Prometheus scrape /
+        # writer POST. The ``logging.getLogger("uvicorn.access")
+        # .setLevel(WARNING)`` call in setup_logging is belt-and-suspenders
+        # — it runs BEFORE uvicorn boots and uvicorn's ``Server.run()``
+        # can quietly reset logger levels during startup, defeating the
+        # silencing. Disabling at the source is bulletproof; the
+        # logger-level silencing stays in place so any code path that
+        # constructs a ``uvicorn.access`` record outside ``access_log``
+        # (e.g. a future middleware hook) also gets suppressed.
+        access_log=False,
     )
 
     log.info("icebox: uvicorn exited, waiting for committer thread")
