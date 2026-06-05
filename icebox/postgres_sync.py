@@ -37,7 +37,7 @@ from psycopg import sql
 from psycopg_pool import ConnectionPool
 
 from icebox.config import Config
-from icebox.schema import ALL_DDL, CommitCycleRow
+from icebox.schema import ALL_DDL, CommitCycleRow, IceboxPendingFileRow
 
 log = logging.getLogger(__name__)
 
@@ -616,3 +616,118 @@ def delete_cycle_row(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
     """
     with conn.cursor() as cur:
         cur.execute(DELETE_CYCLE_ROW_SQL, {"cycle_id": cycle_id})
+
+
+# ---------------------------------------------------------------------------
+# v6 polling-daemon helpers. Operate on the `icebox_files` table only;
+# the cycle-era helpers above will be removed once the new daemon is
+# in place. See docs/icebox-self-healing-recovery.md.
+# ---------------------------------------------------------------------------
+
+
+# Hot-path SELECT: pending rows older than the age filter, batch-limited,
+# row-locked via FOR UPDATE SKIP LOCKED so a second daemon (rollout
+# overlap, or future multi-replica) takes a disjoint slice.
+#
+# The interval is parameterized so tests can pin a small value without
+# wall-clock waiting. Production callers pass `cfg.age_filter_seconds`.
+CLAIM_PENDING_BATCH_SQL = """
+SELECT id, file_path, writer_ordinal, kafka_offsets, partition_values,
+       record_count, file_size, parquet_stats, inserted_at,
+       result, result_at, iceberg_snapshot_id
+FROM icebox_files
+WHERE result = 'pending'
+  AND inserted_at < now() - make_interval(secs => %(age_seconds)s)
+ORDER BY inserted_at
+LIMIT %(batch_size)s
+FOR UPDATE SKIP LOCKED
+"""
+
+
+def claim_pending_batch(
+    conn: psycopg.Connection,
+    *,
+    batch_size: int,
+    age_seconds: float,
+) -> list[IceboxPendingFileRow]:
+    """Lock up to `batch_size` pending rows older than `age_seconds`.
+
+    Returns the locked rows as IceboxPendingFileRow models. The caller
+    is in the same transaction; row locks survive until the tx commits
+    or rolls back.
+
+    Empty list means there's nothing eligible — the daemon's tick
+    treats this as a vacuous tick (heartbeat and return).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            CLAIM_PENDING_BATCH_SQL,
+            {"batch_size": batch_size, "age_seconds": age_seconds},
+        )
+        rows = cur.fetchall()
+    return [
+        IceboxPendingFileRow(
+            id=r[0],
+            file_path=r[1],
+            writer_ordinal=r[2],
+            kafka_offsets=r[3],
+            partition_values=r[4],
+            record_count=r[5],
+            file_size=r[6],
+            parquet_stats=r[7],
+            inserted_at=r[8],
+            result=r[9],
+            result_at=r[10],
+            iceberg_snapshot_id=r[11],
+        )
+        for r in rows
+    ]
+
+
+MARK_COMMITTED_SQL = """
+UPDATE icebox_files
+SET result='committed', result_at=now(), iceberg_snapshot_id=%(snapshot_id)s
+WHERE id = ANY(%(ids)s)
+"""
+
+
+def mark_committed(
+    conn: psycopg.Connection,
+    *,
+    ids: Sequence[int],
+    snapshot_id: int,
+) -> None:
+    """Mark a batch of rows as successfully committed to Iceberg.
+
+    Stamps `iceberg_snapshot_id` for traceability. Caller is inside a
+    transaction.
+    """
+    if not ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            MARK_COMMITTED_SQL,
+            {"snapshot_id": snapshot_id, "ids": list(ids)},
+        )
+
+
+MARK_FAILED_SQL = """
+UPDATE icebox_files
+SET result='failed', result_at=now()
+WHERE id = ANY(%(ids)s)
+"""
+
+
+def mark_failed(
+    conn: psycopg.Connection,
+    *,
+    ids: Sequence[int],
+) -> None:
+    """Mark a batch of rows as failed-non-transport. The daemon's caller
+    advances Kafka offsets past the batch separately; these rows stay
+    in PG as the audit trail (see v6 doc "Failed-row runbook").
+    """
+    if not ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(MARK_FAILED_SQL, {"ids": list(ids)})

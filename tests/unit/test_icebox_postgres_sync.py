@@ -170,6 +170,140 @@ def test_delete_cycle_row_targets_by_cycle_id():
 
 
 # ---------------------------------------------------------------------------
+# v6 polling-daemon helpers — SQL + call shapes
+# ---------------------------------------------------------------------------
+
+
+def test_claim_pending_batch_sql_uses_skip_locked():
+    """Same rationale as cycle-era CLAIM_FILES_SQL: two daemons must take
+    disjoint slices, not block each other."""
+    assert "for update skip locked" in ps.CLAIM_PENDING_BATCH_SQL.lower()
+
+
+def test_claim_pending_batch_sql_filters_on_pending_and_age():
+    """The hot SELECT is bounded by O(pending) via the partial index AND
+    by the age filter that prevents committing batches younger than the
+    interval (batching efficiency)."""
+    sql = ps.CLAIM_PENDING_BATCH_SQL.lower()
+    assert "result = 'pending'" in sql
+    assert "inserted_at < now() - make_interval(secs => %(age_seconds)s)" in sql
+
+
+def test_claim_pending_batch_sql_orders_by_inserted_at_with_limit():
+    """FIFO. Oldest pending row gets committed first; LIMIT bounds blast
+    radius per tick."""
+    sql = ps.CLAIM_PENDING_BATCH_SQL.lower()
+    assert re.search(r"order\s+by\s+inserted_at", sql)
+    assert "limit %(batch_size)s" in sql
+
+
+def test_mark_committed_sql_sets_result_and_snapshot_id():
+    """Both columns transition atomically. result_at stamps the moment
+    the daemon learned of success."""
+    sql = ps.MARK_COMMITTED_SQL.lower()
+    assert "set result='committed'" in sql
+    assert "result_at=now()" in sql
+    assert "iceberg_snapshot_id=%(snapshot_id)s" in sql
+    assert "where id = any(%(ids)s)" in sql
+
+
+def test_mark_failed_sql_does_not_touch_snapshot_id():
+    """A failed batch never produced an Iceberg snapshot; leaving
+    iceberg_snapshot_id NULL is part of the audit signal."""
+    sql = ps.MARK_FAILED_SQL.lower()
+    assert "set result='failed'" in sql
+    assert "result_at=now()" in sql
+    assert "iceberg_snapshot_id" not in sql
+    assert "where id = any(%(ids)s)" in sql
+
+
+def test_no_polling_daemon_sql_references_cycle_id():
+    """v6 deletes the cycle abstraction. None of the new helpers' SQL
+    should reference cycle_id — that's the lingering-cycle-code smell
+    we explicitly guard against during the rollout window where both
+    code paths coexist."""
+    new_sqls = (
+        ps.CLAIM_PENDING_BATCH_SQL,
+        ps.MARK_COMMITTED_SQL,
+        ps.MARK_FAILED_SQL,
+    )
+    for sql in new_sqls:
+        assert "cycle_id" not in sql.lower(), (
+            f"polling-daemon SQL must not reference cycle_id; "
+            f"cycle abstraction is being deleted:\n{sql}"
+        )
+
+
+def test_claim_pending_batch_passes_batch_size_and_age():
+    from datetime import UTC, datetime
+
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchall.return_value = [
+        (
+            1,                                # id
+            "s3://bucket/a.parquet",          # file_path
+            0,                                # writer_ordinal
+            {"0": 100},                       # kafka_offsets
+            {"day": 19000},                   # partition_values
+            42,                               # record_count
+            1234,                             # file_size
+            {"col": {}},                      # parquet_stats
+            datetime.now(UTC),                # inserted_at
+            "pending",                        # result
+            None,                             # result_at
+            None,                             # iceberg_snapshot_id
+        ),
+    ]
+    rows = ps.claim_pending_batch(conn, batch_size=100, age_seconds=60.0)
+    cur.execute.assert_called_once_with(
+        ps.CLAIM_PENDING_BATCH_SQL,
+        {"batch_size": 100, "age_seconds": 60.0},
+    )
+    assert len(rows) == 1
+    assert rows[0].id == 1
+    assert rows[0].file_path == "s3://bucket/a.parquet"
+    assert rows[0].result == "pending"
+
+
+def test_claim_pending_batch_returns_empty_on_no_rows():
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchall.return_value = []
+    rows = ps.claim_pending_batch(conn, batch_size=100, age_seconds=60.0)
+    assert rows == []
+
+
+def test_mark_committed_passes_ids_and_snapshot_id():
+    conn, cur = _mock_conn_with_cursor()
+    ps.mark_committed(conn, ids=[1, 2, 3], snapshot_id=999)
+    cur.execute.assert_called_once_with(
+        ps.MARK_COMMITTED_SQL,
+        {"snapshot_id": 999, "ids": [1, 2, 3]},
+    )
+
+
+def test_mark_committed_noop_on_empty_ids():
+    """Avoid pointless round-trips when callers hand us an empty list
+    (e.g. a vacuous tick that somehow got this far)."""
+    conn, cur = _mock_conn_with_cursor()
+    ps.mark_committed(conn, ids=[], snapshot_id=1)
+    cur.execute.assert_not_called()
+
+
+def test_mark_failed_passes_ids():
+    conn, cur = _mock_conn_with_cursor()
+    ps.mark_failed(conn, ids=[10, 20])
+    cur.execute.assert_called_once_with(
+        ps.MARK_FAILED_SQL, {"ids": [10, 20]}
+    )
+
+
+def test_mark_failed_noop_on_empty_ids():
+    conn, cur = _mock_conn_with_cursor()
+    ps.mark_failed(conn, ids=[])
+    cur.execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Helper call-shape verification
 # ---------------------------------------------------------------------------
 

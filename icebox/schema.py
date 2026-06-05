@@ -95,6 +95,47 @@ CREATE TABLE IF NOT EXISTS status (
 
 SEED_STATUS_ROW = "INSERT INTO status (id) VALUES (1) ON CONFLICT DO NOTHING"
 
+# ---------------------------------------------------------------------------
+# v6 polling-daemon table — alongside the cycle-era `files`/`commit_cycles`
+# tables (which will be removed in a follow-up cleanup commit). The new
+# daemon reads/writes this table only; the old tables can rot in place
+# during the rollout per docs/icebox-self-healing-recovery.md ("just create
+# a whole new table; old one can rot").
+#
+# The `result` column is an explicit enum-as-text rather than a separate
+# `committed_at`/`failed_at` pair so the SELECT predicate stays simple
+# (`result='pending'`) and adding new states later is a non-event.
+#
+# `files_pending_idx` is a partial index on `inserted_at` filtered by
+# `result='pending'`. The daemon's hot SELECT is bounded by O(pending),
+# not O(history), and the index doesn't bloat as `result='committed'`
+# rows accumulate over the table's lifetime.
+# ---------------------------------------------------------------------------
+
+CREATE_ICEBOX_FILES = """
+CREATE TABLE IF NOT EXISTS icebox_files (
+    id                   bigserial PRIMARY KEY,
+    file_path            text NOT NULL UNIQUE,
+    writer_ordinal       int NOT NULL,
+    kafka_offsets        jsonb NOT NULL,
+    partition_values     jsonb NOT NULL,
+    record_count         bigint NOT NULL,
+    file_size            bigint NOT NULL,
+    parquet_stats        jsonb NOT NULL,
+    inserted_at          timestamptz NOT NULL DEFAULT now(),
+    result               text NOT NULL DEFAULT 'pending'
+        CHECK (result IN ('pending', 'committed', 'failed')),
+    result_at            timestamptz,
+    iceberg_snapshot_id  bigint
+)
+"""
+
+CREATE_ICEBOX_FILES_PENDING_IDX = """
+CREATE INDEX IF NOT EXISTS icebox_files_pending_idx
+    ON icebox_files (inserted_at)
+    WHERE result = 'pending'
+"""
+
 # Order matters: parent tables before children, indexes after their
 # tables. The runner executes these in this exact order. CREATE SCHEMA
 # is NOT in this tuple — it runs in postgres_sync.ensure_schema_exists
@@ -107,6 +148,8 @@ ALL_DDL: tuple[str, ...] = (
     CREATE_FILES_IN_FLIGHT_IDX,
     CREATE_STATUS,
     SEED_STATUS_ROW,
+    CREATE_ICEBOX_FILES,
+    CREATE_ICEBOX_FILES_PENDING_IDX,
 )
 
 
@@ -152,3 +195,23 @@ class IceboxStatusRow(BaseModel):
     consecutive_failures: int
     last_cycle_at: datetime | None = None
     last_committer_heartbeat: datetime | None = None
+
+
+# v6 polling-daemon row model. Distinct from `IceboxFileRow` above (cycle-era)
+# until the cycle code is deleted; the daemon doesn't read/write the older
+# columns (`cycle_id`, `staged_at`, `committed_at`, `schema_*`).
+class IceboxPendingFileRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    file_path: str
+    writer_ordinal: int
+    kafka_offsets: dict[str, int]
+    partition_values: dict[str, int]
+    record_count: int
+    file_size: int
+    parquet_stats: dict
+    inserted_at: datetime
+    result: str  # 'pending' | 'committed' | 'failed'
+    result_at: datetime | None = None
+    iceberg_snapshot_id: int | None = None
