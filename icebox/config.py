@@ -163,6 +163,18 @@ class Config:
     # short.
     schema_fingerprint_cache_ttl_seconds: float = 60.0
 
+    # v6 polling-daemon knobs. See docs/icebox-self-healing-recovery.md.
+    # Defaults at the dataclass level so existing tests that hand-build
+    # Config don't break; `load()` reads env-var overrides explicitly.
+    # `iceberg_timeout_s`: wall-clock budget on commit_data_files; the
+    # with_timeout wrapper fires after this. Bounds row-lock hold time
+    # during Lakekeeper degradation.
+    # `age_filter_seconds`: pending rows younger than this are NOT
+    # eligible for the daemon's SELECT — gives the writer time to
+    # accumulate enough files for a worthwhile snapshot.
+    iceberg_timeout_s: float = 5.0
+    age_filter_seconds: float = 60.0
+
 
 def _require(name: str) -> str:
     value = os.environ.get(name)
@@ -310,6 +322,8 @@ def load() -> Config:
         committer_heartbeat_stale_multiple=_float(
             "ICEBOX_COMMITTER_HEARTBEAT_STALE_MULTIPLE", 3.0
         ),
+        iceberg_timeout_s=_float("ICEBOX_ICEBERG_TIMEOUT_S", 5.0),
+        age_filter_seconds=_float("ICEBOX_AGE_FILTER_SECONDS", 60.0),
         api_host=_optional("ICEBOX_API_HOST", "0.0.0.0"),
         api_port=_int("ICEBOX_API_PORT", 8000),
         log_level=_optional("ICEBOX_LOG_LEVEL", "INFO"),
