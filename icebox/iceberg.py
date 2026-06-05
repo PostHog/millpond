@@ -203,17 +203,18 @@ def commit_data_files(
     *,
     table: Table,
     data_files: list[DataFile],
-    cycle_id: UUID,
+    cycle_id: UUID | None = None,
     branch: str = "main",
 ) -> CommitResult:
-    """Commit a batch of DataFiles in a single Iceberg snapshot, tagging
-    the snapshot with the cycle_id for recovery.
+    """Commit a batch of DataFiles in a single Iceberg snapshot.
 
     Args:
-        table: PyIceberg Table (loaded fresh at the start of the cycle).
+        table: PyIceberg Table (loaded fresh per call by the caller).
         data_files: built by build_data_file().
-        cycle_id: the icebox cycle UUID — embedded in snapshot.summary
-            under posthog.icebox.cycle_id so the recovery scan can match.
+        cycle_id: legacy — when provided, embedded in snapshot.summary
+            under posthog.icebox.cycle_id so the cycle-era recovery
+            scan can match. v6 polling-daemon callers pass None; the
+            kwarg goes away entirely once cycle code is removed.
         branch: snapshot branch. Defaults to "main".
 
     Returns:
@@ -229,19 +230,17 @@ def commit_data_files(
 
     Raises:
         Whatever PyIceberg raises if the commit fails (transient FS
-        errors, CommitFailedException, etc.). The committer marks the
-        cycle as failed and the recovery path re-checks Lakekeeper.
+        errors, CommitFailedException, etc.). The caller decides how
+        to classify the failure (transport vs. content) and acts on it.
     """
     if not data_files:
-        # Defense in depth: run_cycle already short-circuits when no files
-        # are claimed, but committing an empty snapshot here would produce
-        # a zero-file snapshot tagged with our cycle_id. On next recovery,
-        # find_snapshot_for_cycle would consider this a successful commit
-        # and complete the cycle, while metadata.json grows with garbage
-        # no-op snapshots. Refuse upstream's bad call loudly.
+        # Defense in depth: callers already short-circuit when no files
+        # are pending, but committing an empty snapshot here would
+        # produce a zero-file snapshot in metadata.json — junk that
+        # grows the manifest list without doing anything useful.
+        # Refuse upstream's bad call loudly.
         raise ValueError(
-            f"commit_data_files: refusing to commit empty data_files list "
-            f"for cycle_id={cycle_id}"
+            "commit_data_files: refusing to commit empty data_files list"
         )
 
     # Capture the snapshot id from the producer directly. Reading
@@ -251,7 +250,9 @@ def commit_data_files(
     # return a STALE pre-commit snapshot id (a permanent lie in PG).
     # The producer's `snapshot_id` is the canonical, version-stable id
     # for the snapshot the producer just built.
-    snapshot_props = {CYCLE_ID_SUMMARY_KEY: str(cycle_id)}
+    snapshot_props = (
+        {CYCLE_ID_SUMMARY_KEY: str(cycle_id)} if cycle_id is not None else {}
+    )
     snapshot_id: int | None = None
     summary: dict[str, str] | None = None
     with table.transaction() as tx:
@@ -293,9 +294,9 @@ def commit_data_files(
 
     if snapshot_id is None:
         raise RuntimeError(
-            f"Iceberg commit completed but producer.snapshot_id is None — "
-            f"cycle_id={cycle_id}; this indicates a PyIceberg API change "
-            f"affecting _append_snapshot_producer"
+            "Iceberg commit completed but producer.snapshot_id is None — "
+            "this indicates a PyIceberg API change affecting "
+            "_append_snapshot_producer"
         )
     return CommitResult(snapshot_id=snapshot_id, summary=summary)
 

@@ -338,6 +338,40 @@ def test_commit_data_files_respects_branch_arg():
     assert tx._append_snapshot_producer.call_args.kwargs["branch"] == "staging"
 
 
+def test_commit_data_files_omits_cycle_id_summary_when_none():
+    """v6 polling-daemon path: callers pass no cycle_id. The snapshot
+    must NOT carry posthog.icebox.cycle_id in that case — the recovery
+    scan that key existed for is gone, and stamping it would be
+    misleading observability data."""
+    table, tx, _ = _wire_producer_mock(snapshot_id=12345)
+
+    commit_data_files(table=table, data_files=[MagicMock(spec=DataFile)])
+
+    call_kwargs = tx._append_snapshot_producer.call_args.kwargs
+    assert call_kwargs["snapshot_properties"] == {}
+    assert CYCLE_ID_SUMMARY_KEY not in call_kwargs["snapshot_properties"]
+
+
+def test_commit_data_files_cycle_id_defaults_to_none():
+    """The kwarg is optional. Existing cycle-era callers pass it; the
+    polling daemon doesn't. Removing the parameter entirely is deferred
+    to the cycle-cleanup commit so this signature change stays
+    backward-compatible during the rollout."""
+    import inspect
+
+    sig = inspect.signature(commit_data_files)
+    assert sig.parameters["cycle_id"].default is None
+
+
+def test_commit_data_files_empty_list_error_drops_cycle_id_reference():
+    """Old error message included cycle_id={...}; the new daemon path
+    has no cycle_id, so the message must be agnostic to it."""
+    table, _, _ = _wire_producer_mock(snapshot_id=1)
+    with pytest.raises(ValueError, match="empty data_files list") as ei:
+        commit_data_files(table=table, data_files=[])
+    assert "cycle_id" not in str(ei.value)
+
+
 def test_commit_data_files_extracts_summary_when_present():
     """The post-commit summary lookup must surface the spec keys we
     chart (total-data-files etc.) into the returned dict so the
