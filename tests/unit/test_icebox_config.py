@@ -52,13 +52,10 @@ def test_load_with_only_required_env(monkeypatch):
     assert cfg.pg_sslmode == "require"
     assert cfg.iceberg_warehouse == "ingest"
     assert cfg.committer_cadence_seconds == 60
-    assert cfg.committer_max_pending_files == 1000
-    assert cfg.committer_degraded_failure_threshold == 2
+    assert cfg.committer_max_pending_files == 100
     assert cfg.committer_heartbeat_stale_multiple == 3.0
     assert cfg.api_host == "0.0.0.0"
     assert cfg.api_port == 8000
-    assert cfg.asyncpg_pool_min == 2
-    assert cfg.asyncpg_pool_max == 8
     assert cfg.psycopg_pool_min == 1
     assert cfg.psycopg_pool_max == 2
     assert cfg.service_namespace == "millpond"
@@ -138,14 +135,11 @@ def test_load_overrides_apply(monkeypatch):
             "ICEBOX_PG_DATABASE": "icebox_test",
             "ICEBOX_PG_USERNAME": "icebox_user",
             "ICEBOX_PG_SSLMODE": "disable",
-            "ICEBOX_ASYNCPG_POOL_MIN": "1",
-            "ICEBOX_ASYNCPG_POOL_MAX": "16",
             "ICEBOX_PSYCOPG_POOL_MIN": "2",
             "ICEBOX_PSYCOPG_POOL_MAX": "4",
             "ICEBOX_ICEBERG_WAREHOUSE": "ingest_test",
             "ICEBOX_COMMITTER_CADENCE_SECONDS": "30",
             "ICEBOX_COMMITTER_MAX_PENDING_FILES": "500",
-            "ICEBOX_COMMITTER_DEGRADED_FAILURE_THRESHOLD": "5",
             "ICEBOX_COMMITTER_HEARTBEAT_STALE_MULTIPLE": "2.5",
             "ICEBOX_API_HOST": "127.0.0.1",
             "ICEBOX_API_PORT": "9000",
@@ -158,14 +152,11 @@ def test_load_overrides_apply(monkeypatch):
     assert cfg.pg_database == "icebox_test"
     assert cfg.pg_username == "icebox_user"
     assert cfg.pg_sslmode == "disable"
-    assert cfg.asyncpg_pool_min == 1
-    assert cfg.asyncpg_pool_max == 16
     assert cfg.psycopg_pool_min == 2
     assert cfg.psycopg_pool_max == 4
     assert cfg.iceberg_warehouse == "ingest_test"
     assert cfg.committer_cadence_seconds == 30
     assert cfg.committer_max_pending_files == 500
-    assert cfg.committer_degraded_failure_threshold == 5
     assert cfg.committer_heartbeat_stale_multiple == 2.5
     assert cfg.api_host == "127.0.0.1"
     assert cfg.api_port == 9000
@@ -406,9 +397,8 @@ def test_default_kafka_extra_config_is_empty_json_object(monkeypatch):
 
 
 def test_pool_size_field_naming_consistent(monkeypatch):
-    """Sanity that the two pool drivers are both surfaced — easy to
-    drop one accidentally when adding new ones."""
+    """Sanity that the pool config is surfaced — easy to drop fields
+    accidentally when refactoring."""
     _set_env(monkeypatch)
     cfg = icebox_config.load()
-    assert cfg.asyncpg_pool_min <= cfg.asyncpg_pool_max
     assert cfg.psycopg_pool_min <= cfg.psycopg_pool_max

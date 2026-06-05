@@ -383,49 +383,8 @@ def test_pin_canary_conversions_path_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# Snapshot.summary — preserves the cycle_id key
-# ---------------------------------------------------------------------------
-
-
-def test_pin_canary_snapshot_summary_preserves_custom_keys():
-    """icebox tags each snapshot with `posthog.icebox.cycle_id` for
-    recovery. If PyIceberg filters/transforms snapshot.summary (e.g.,
-    drops keys with dots, lowercases, etc.), our recovery scan returns
-    None and we silently release file claims that should have been
-    finalized.
-
-    Verifies via constructing a Snapshot directly — bypasses any
-    catalog-side filtering. If PyIceberg's Snapshot model itself
-    transforms keys, this catches it."""
-    from pyiceberg.table.snapshots import Snapshot
-
-    # Snapshot constructor signature varies across PyIceberg versions —
-    # use kwargs that survive across 0.10/0.11.
-    summary = {"operation": "append", "posthog.icebox.cycle_id": "abc-123"}
-    snap = Snapshot(
-        snapshot_id=1,
-        sequence_number=1,
-        timestamp_ms=0,
-        manifest_list="",
-        summary=summary,  # type: ignore[arg-type]
-        schema_id=0,
-    )
-    assert snap.summary is not None
-    # PyIceberg 0.11.1 Summary exposes custom keys via `.get(key)` —
-    # but the dict-style `summary[key]` interface crashes on tuple
-    # access in this version. icebox/iceberg.py:find_snapshot_for_cycle
-    # uses `snap.summary.get(CYCLE_ID_SUMMARY_KEY)`, so verify that
-    # exact call shape works.
-    assert snap.summary.get("posthog.icebox.cycle_id") == "abc-123", (
-        "Snapshot.summary stripped or transformed our cycle_id key — "
-        "icebox/iceberg.py:find_snapshot_for_cycle relies on byte-identical "
-        "round-trip"
-    )
-
-
-# ---------------------------------------------------------------------------
 # In-transaction snapshot summary surface — load-bearing for the table-state
-# Gauges that icebox/committer.py reads from commit_data_files's returned
+# Gauges that icebox/daemon.py reads from commit_data_files's returned
 # CommitResult.summary. If any of these symbols move or rename, the broad
 # try/except in icebox/iceberg.py:commit_data_files degrades to summary=None
 # SILENTLY — operators just stop seeing the gauges advance. Catch the drift

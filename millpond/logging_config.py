@@ -132,10 +132,10 @@ def attach_posthog_otlp(cfg) -> Any | None:
         if cfg.iceberg_table is not None:
             resource_attrs["millpond.iceberg.table"] = cfg.iceberg_table
         if cfg.destination == "icebox":
-            if cfg.icebox_url is not None:
-                resource_attrs["millpond.icebox.url"] = cfg.icebox_url
             if cfg.icebox_bucket is not None:
                 resource_attrs["millpond.icebox.bucket"] = cfg.icebox_bucket
+            if cfg.icebox_pg_host is not None:
+                resource_attrs["millpond.icebox.pg.host"] = cfg.icebox_pg_host
 
     provider = sl.build_otel_logger_provider(
         posthog_token=cfg.posthog_project_token,

@@ -232,8 +232,11 @@ def daemon_tick(
     # roll back the UPDATE; cumulative offset semantics cover any
     # missed commit on the next tick.
     ps.mark_committed(conn, ids=[r.id for r in rows], snapshot_id=snapshot_id)
-    metrics.ICEBOX_FILES_COMMITTED_TOTAL_V6.inc(len(rows))
+    metrics.ICEBOX_FILES_COMMITTED_TOTAL.inc(len(rows))
     metrics.ICEBOX_RECORDS_COMMITTED_TOTAL.inc(sum(r.record_count for r in rows))
+
+    if commit_result.summary is not None:
+        _update_table_state_gauges(commit_result.summary)
 
     _try_commit_kafka_offsets(deps, cfg, rows, context="success")
 
@@ -248,6 +251,32 @@ def daemon_tick(
         file_count=len(rows),
         snapshot_id=snapshot_id,
     )
+
+
+def _update_table_state_gauges(summary: dict[str, str]) -> None:
+    """Push iceberg snapshot summary values onto the table-state Gauges.
+
+    Defensive non-raise per key: spec-defined integer-string values can
+    show up as None (key absent) or non-parseable (producer bug). Skip
+    rather than failing the tick's observability pass.
+    """
+    for key, gauge in (
+        # Cumulative table state — total-after-commit
+        ("total-data-files", metrics.ICEBERG_TABLE_DATA_FILES),
+        ("total-records", metrics.ICEBERG_TABLE_RECORDS),
+        ("total-files-size", metrics.ICEBERG_TABLE_FILES_SIZE_BYTES),
+        # Per-tick deltas — compaction-churn + ingest-rate signals
+        ("added-data-files", metrics.ICEBERG_TABLE_ADDED_DATA_FILES),
+        ("added-records", metrics.ICEBERG_TABLE_ADDED_RECORDS),
+        ("added-files-size", metrics.ICEBERG_TABLE_ADDED_FILES_SIZE_BYTES),
+    ):
+        raw = summary.get(key)
+        if raw is None:
+            continue
+        try:
+            gauge.set(int(raw))
+        except (TypeError, ValueError):
+            continue
 
 
 def _handle_batch_failure(

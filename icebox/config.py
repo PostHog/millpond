@@ -82,8 +82,6 @@ class Config:
 
     # Connection pool sizing — the asyncpg pool serves API requests;
     # the psycopg pool is for the synchronous committer + bootstrap.
-    asyncpg_pool_min: int
-    asyncpg_pool_max: int
     psycopg_pool_min: int
     psycopg_pool_max: int
 
@@ -92,17 +90,12 @@ class Config:
     iceberg_warehouse: str
     # The (namespace, table) pair this icebox serves. Each deployment
     # is per-table; these fields decide which Iceberg table the
-    # committer's `load_table` opens. Also used to validate incoming
-    # POSTs — writers can include `expected_iceberg_namespace` /
-    # `expected_iceberg_table` in the body and we 400 on mismatch
-    # (catches a misconfigured writer hitting the wrong icebox URL).
+    # daemon's `load_table` opens.
     iceberg_namespace: str
     iceberg_table: str
 
-    # Kafka — the committer commits offsets on writers' behalf
+    # Kafka — the daemon commits offsets on writers' behalf
     kafka_bootstrap_servers: str
-    # Topic the writers are consuming. Single topic per icebox instance
-    # (one icebox per (topic, table) pair).
     kafka_topic: str
     # Consumer-group id the writers use as their offset-storage key.
     # Writers DON'T join this group (consumer.assign() only) — group is
@@ -113,59 +106,28 @@ class Config:
     # Used for security.protocol, sasl.mechanism, etc. on WarpStream.
     kafka_extra_config_json: str
 
-    # Committer behavior
+    # Daemon behavior
     committer_cadence_seconds: int
     committer_max_pending_files: int
-    committer_degraded_failure_threshold: int
-
-    # Heartbeat staleness — POSTs are rejected with 503 if the
-    # committer hasn't written a heartbeat within this multiple of
-    # the cadence.
+    # Heartbeat staleness — /healthz returns 503 (k8s liveness
+    # restarts the pod) if the daemon hasn't written a heartbeat
+    # within this multiple of the cadence.
     committer_heartbeat_stale_multiple: float
 
-    # REST API
+    # HTTP server (probes + /metrics only)
     api_host: str
     api_port: int
 
     # Logging
     log_level: str
-    # ``json`` | ``text``. JSON is what mw-prod-us ships; ``text`` is
-    # the friendlier local-dev shape. Defaults at the dataclass level
-    # so test builders that don't set these still work.
     log_format: str = "json"
-    # PostHog Logs (OTLP/HTTP) — ON when ``posthog_project_token`` is
-    # set, OFF otherwise. ``posthog_logs_endpoint`` defaults to the US
-    # PostHog Cloud ingress; override for EU or self-hosted PostHog.
     posthog_project_token: str | None = None
     posthog_logs_endpoint: str = "https://us.i.posthog.com/i/v1/logs"
-    # service.version reported in OTLP resource attributes. Defaults
-    # to the millpond package version. Operators can override via
-    # ICEBOX_SERVICE_VERSION (e.g., to expose the image digest).
     service_version: str = "unknown"
-    # service.namespace per OTel semconv — "logical grouping of related
-    # services in a deployment unit". For PostHog this is the release
-    # family ("millpond"). NOT the data-side namespace (we previously
-    # misused this field for the PG schema; the icebox.* custom attrs
-    # carry the per-(warehouse, namespace, table) facets now).
     service_namespace: str = "millpond"
-    # service.instance.id per OTel semconv — distinguishes instances of
-    # the same service. Set by the chart to the consumer key (e.g.
-    # ``events-icebox``) so PostHog Logs can filter by instance the
-    # same way it does by service. Optional; unset = no attr.
     service_instance_id: str | None = None
 
-    # Schema-fingerprint cache TTL — how long the API perimeter
-    # trusts its in-memory copy of the Iceberg table's current
-    # fingerprint before refreshing from the catalog. Mismatches
-    # force an immediate refresh regardless of TTL, so this is the
-    # max staleness window during which a stale writer would slip a
-    # POST through that the committer would later reject — keep it
-    # short.
-    schema_fingerprint_cache_ttl_seconds: float = 60.0
-
-    # v6 polling-daemon knobs. See docs/icebox-self-healing-recovery.md.
-    # Defaults at the dataclass level so existing tests that hand-build
-    # Config don't break; `load()` reads env-var overrides explicitly.
+    # Daemon knobs. See docs/icebox-self-healing-recovery.md.
     # `iceberg_timeout_s`: wall-clock budget on commit_data_files; the
     # with_timeout wrapper fires after this. Bounds row-lock hold time
     # during Lakekeeper degradation.
@@ -302,8 +264,6 @@ def load() -> Config:
         pg_username=_optional("ICEBOX_PG_USERNAME", "lakekeeper"),
         pg_password=_require("ICEBOX_PG_PASSWORD"),
         pg_sslmode=_optional("ICEBOX_PG_SSLMODE", "require"),
-        asyncpg_pool_min=_int("ICEBOX_ASYNCPG_POOL_MIN", 2),
-        asyncpg_pool_max=_int("ICEBOX_ASYNCPG_POOL_MAX", 8),
         psycopg_pool_min=_int("ICEBOX_PSYCOPG_POOL_MIN", 1),
         psycopg_pool_max=psycopg_pool_max,
         iceberg_catalog_uri=_require("ICEBOX_ICEBERG_CATALOG_URI"),
@@ -315,10 +275,7 @@ def load() -> Config:
         kafka_group_id=_require("ICEBOX_KAFKA_GROUP_ID"),
         kafka_extra_config_json=_optional("ICEBOX_KAFKA_EXTRA_CONFIG", "{}"),
         committer_cadence_seconds=cadence,
-        committer_max_pending_files=_int("ICEBOX_COMMITTER_MAX_PENDING_FILES", 1000),
-        committer_degraded_failure_threshold=_int(
-            "ICEBOX_COMMITTER_DEGRADED_FAILURE_THRESHOLD", 2
-        ),
+        committer_max_pending_files=_int("ICEBOX_COMMITTER_MAX_PENDING_FILES", 100),
         committer_heartbeat_stale_multiple=_float(
             "ICEBOX_COMMITTER_HEARTBEAT_STALE_MULTIPLE", 3.0
         ),
@@ -342,9 +299,6 @@ def load() -> Config:
         service_version=_optional("ICEBOX_SERVICE_VERSION", _default_service_version()),
         service_namespace=_optional("ICEBOX_SERVICE_NAMESPACE", "millpond"),
         service_instance_id=os.environ.get("ICEBOX_SERVICE_INSTANCE_ID") or None,
-        schema_fingerprint_cache_ttl_seconds=_float(
-            "ICEBOX_SCHEMA_FINGERPRINT_CACHE_TTL_SECONDS", 60.0
-        ),
     )
 
 

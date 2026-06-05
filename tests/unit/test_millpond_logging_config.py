@@ -60,12 +60,15 @@ def _minimal_config() -> Config:
         s3_secret_access_key=None,
         s3_region=None,
         s3_endpoint=None,
-        icebox_url=None,
         icebox_bucket=None,
         icebox_warehouse_prefix=None,
-        icebox_max_attempts=6,
-        icebox_max_backoff_s=30.0,
-        icebox_timeout_s=10.0,
+        icebox_pg_host=None,
+        icebox_pg_port=None,
+        icebox_pg_database=None,
+        icebox_pg_username=None,
+        icebox_pg_password=None,
+        icebox_pg_schema=None,
+        icebox_pg_sslmode=None,
         flush_size=104857600,
         flush_interval_ms=60000,
         fetch_min_bytes=1048576,
@@ -203,8 +206,8 @@ def test_resource_attrs_icebox_destination():
         iceberg_warehouse="ingest",
         iceberg_namespace="kafka",
         iceberg_table="events",
-        icebox_url="http://millpond-events-icebox-coord:8000",
         icebox_bucket="posthog-megaberg-mw-dev",
+        icebox_pg_host="megaberg.example.com",
     )
     attrs = _resource_attrs_for(cfg)
     assert attrs["millpond.destination"] == "icebox"
@@ -213,8 +216,8 @@ def test_resource_attrs_icebox_destination():
     assert attrs["millpond.iceberg.namespace"] == "kafka"
     assert attrs["millpond.iceberg.table"] == "events"
     # Icebox-specific routing attrs present
-    assert attrs["millpond.icebox.url"] == "http://millpond-events-icebox-coord:8000"
     assert attrs["millpond.icebox.bucket"] == "posthog-megaberg-mw-dev"
+    assert attrs["millpond.icebox.pg.host"] == "megaberg.example.com"
     # ducklake attrs absent
     assert "millpond.ducklake.table" not in attrs
 

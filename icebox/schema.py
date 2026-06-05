@@ -2,9 +2,7 @@
 
 DDL strings are constants here so the migration runner in
 postgres_sync.py can apply them idempotently on container startup
-(CREATE TABLE IF NOT EXISTS). Pydantic models mirror the row shapes
-so handlers and the committer can construct typed objects from raw
-asyncpg/psycopg records without manual field plucking.
+(CREATE TABLE IF NOT EXISTS).
 
 DDL is split into separate statements (one per CREATE) so the runner
 can execute them one at a time with clear error attribution if a
@@ -13,7 +11,6 @@ migration partially fails.
 from __future__ import annotations
 
 from datetime import datetime
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
@@ -27,90 +24,23 @@ from pydantic import BaseModel, ConfigDict
 # with `options=-csearch_path=<schema>` so unqualified references
 # resolve to that schema. This is what makes "one icebox per
 # (topic, table) sharing a backing PG instance" cleanly isolated —
-# events runs against icebox_events.commit_cycles, person runs
-# against icebox_person.commit_cycles, and neither can accidentally
-# read the other's rows because the unqualified `commit_cycles` only
-# matches the schema in their own connection's search_path.
+# events runs against icebox_events.icebox_files, person runs against
+# icebox_person.icebox_files, and neither can accidentally read the
+# other's rows because the unqualified `icebox_files` only matches the
+# schema in their own connection's search_path.
 #
 # The CREATE SCHEMA itself runs in ensure_schema_exists (with the
 # schema name interpolated as a validated identifier) BEFORE these
 # DDLs are applied. Hence no CREATE SCHEMA entry in ALL_DDL.
 
-CREATE_COMMIT_CYCLES = """
-CREATE TABLE IF NOT EXISTS commit_cycles (
-    cycle_id             uuid PRIMARY KEY,
-    started_at           timestamptz NOT NULL DEFAULT now(),
-    iceberg_snapshot_id  bigint,
-    kafka_committed_at   timestamptz,
-    completed_at         timestamptz
-)
-"""
-
-CREATE_COMMIT_CYCLES_INCOMPLETE_IDX = """
-CREATE INDEX IF NOT EXISTS commit_cycles_incomplete_idx
-    ON commit_cycles (started_at)
-    WHERE completed_at IS NULL
-"""
-
-CREATE_FILES = """
-CREATE TABLE IF NOT EXISTS files (
-    id                   bigserial PRIMARY KEY,
-    file_path            text NOT NULL UNIQUE,
-    writer_ordinal       int NOT NULL,
-    kafka_offsets        jsonb NOT NULL,
-    partition_values     jsonb NOT NULL,
-    record_count         bigint NOT NULL,
-    file_size            bigint NOT NULL,
-    schema_version       text NOT NULL,
-    schema_fingerprint   text NOT NULL,
-    parquet_stats        jsonb NOT NULL,
-    cycle_id             uuid REFERENCES commit_cycles(cycle_id),
-    staged_at            timestamptz NOT NULL DEFAULT now(),
-    committed_at         timestamptz,
-    iceberg_snapshot_id  bigint
-)
-"""
-
-CREATE_FILES_UNCLAIMED_IDX = """
-CREATE INDEX IF NOT EXISTS files_unclaimed_idx
-    ON files (staged_at)
-    WHERE committed_at IS NULL AND cycle_id IS NULL
-"""
-
-CREATE_FILES_IN_FLIGHT_IDX = """
-CREATE INDEX IF NOT EXISTS files_in_flight_idx
-    ON files (cycle_id)
-    WHERE committed_at IS NULL AND cycle_id IS NOT NULL
-"""
-
-CREATE_STATUS = """
-CREATE TABLE IF NOT EXISTS status (
-    id                            int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    last_success_at               timestamptz,
-    consecutive_failures          int NOT NULL DEFAULT 0,
-    last_cycle_at                 timestamptz,
-    last_committer_heartbeat      timestamptz
-)
-"""
-
-SEED_STATUS_ROW = "INSERT INTO status (id) VALUES (1) ON CONFLICT DO NOTHING"
-
-# ---------------------------------------------------------------------------
-# v6 polling-daemon table — alongside the cycle-era `files`/`commit_cycles`
-# tables (which will be removed in a follow-up cleanup commit). The new
-# daemon reads/writes this table only; the old tables can rot in place
-# during the rollout per docs/icebox-self-healing-recovery.md ("just create
-# a whole new table; old one can rot").
-#
-# The `result` column is an explicit enum-as-text rather than a separate
+# `result` is an explicit enum-as-text rather than a separate
 # `committed_at`/`failed_at` pair so the SELECT predicate stays simple
 # (`result='pending'`) and adding new states later is a non-event.
 #
-# `files_pending_idx` is a partial index on `inserted_at` filtered by
-# `result='pending'`. The daemon's hot SELECT is bounded by O(pending),
-# not O(history), and the index doesn't bloat as `result='committed'`
-# rows accumulate over the table's lifetime.
-# ---------------------------------------------------------------------------
+# `icebox_files_pending_idx` is a partial index on `inserted_at`
+# filtered by `result='pending'`. The daemon's hot SELECT is bounded
+# by O(pending), not O(history), and the index doesn't bloat as
+# `result='committed'` rows accumulate over the table's lifetime.
 
 CREATE_ICEBOX_FILES = """
 CREATE TABLE IF NOT EXISTS icebox_files (
@@ -136,70 +66,34 @@ CREATE INDEX IF NOT EXISTS icebox_files_pending_idx
     WHERE result = 'pending'
 """
 
-# Order matters: parent tables before children, indexes after their
-# tables. The runner executes these in this exact order. CREATE SCHEMA
-# is NOT in this tuple — it runs in postgres_sync.ensure_schema_exists
-# before the migration runner connects.
+# Singleton status row: the daemon stamps last_committer_heartbeat
+# every tick; /healthz reads it for the k8s liveness probe.
+CREATE_STATUS = """
+CREATE TABLE IF NOT EXISTS status (
+    id                            int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_committer_heartbeat      timestamptz
+)
+"""
+
+SEED_STATUS_ROW = "INSERT INTO status (id) VALUES (1) ON CONFLICT DO NOTHING"
+
+# Order matters: tables before indexes (the partial index references
+# the table). CREATE SCHEMA is NOT in this tuple — it runs in
+# postgres_sync.ensure_schema_exists before the migration runner
+# connects.
 ALL_DDL: tuple[str, ...] = (
-    CREATE_COMMIT_CYCLES,
-    CREATE_COMMIT_CYCLES_INCOMPLETE_IDX,
-    CREATE_FILES,
-    CREATE_FILES_UNCLAIMED_IDX,
-    CREATE_FILES_IN_FLIGHT_IDX,
-    CREATE_STATUS,
-    SEED_STATUS_ROW,
     CREATE_ICEBOX_FILES,
     CREATE_ICEBOX_FILES_PENDING_IDX,
+    CREATE_STATUS,
+    SEED_STATUS_ROW,
 )
 
 
 # ---------------------------------------------------------------------------
-# Pydantic row models — mirror PG row shapes for typed access
+# Pydantic row models
 # ---------------------------------------------------------------------------
 
 
-class CommitCycleRow(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    cycle_id: UUID
-    started_at: datetime
-    iceberg_snapshot_id: int | None = None
-    kafka_committed_at: datetime | None = None
-    completed_at: datetime | None = None
-
-
-class IceboxFileRow(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    file_path: str
-    writer_ordinal: int
-    kafka_offsets: dict[str, int]
-    partition_values: dict[str, int]
-    record_count: int
-    file_size: int
-    schema_version: str
-    schema_fingerprint: str
-    parquet_stats: dict
-    cycle_id: UUID | None = None
-    staged_at: datetime
-    committed_at: datetime | None = None
-    iceberg_snapshot_id: int | None = None
-
-
-class IceboxStatusRow(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    last_success_at: datetime | None = None
-    consecutive_failures: int
-    last_cycle_at: datetime | None = None
-    last_committer_heartbeat: datetime | None = None
-
-
-# v6 polling-daemon row model. Distinct from `IceboxFileRow` above (cycle-era)
-# until the cycle code is deleted; the daemon doesn't read/write the older
-# columns (`cycle_id`, `staged_at`, `committed_at`, `schema_*`).
 class IceboxPendingFileRow(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -215,3 +109,10 @@ class IceboxPendingFileRow(BaseModel):
     result: str  # 'pending' | 'committed' | 'failed'
     result_at: datetime | None = None
     iceberg_snapshot_id: int | None = None
+
+
+class IceboxStatusRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    last_committer_heartbeat: datetime | None = None

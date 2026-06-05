@@ -119,15 +119,22 @@ def make_sink(cfg: Config) -> Sink:
 
         return DuckLakeSink(cfg)
     if cfg.destination == "icebox":
-        # Lazy import: pulls httpx + fastapi-adjacent transitive deps that
+        # Lazy import: pulls psycopg + pyarrow transitive deps that
         # DuckLake-only deployments don't need.
-        from millpond.icebox_sink import IceboxClient, IceboxSink, build_s3_writer
+        from millpond.icebox_sink import (
+            IceboxClient,
+            IceboxSink,
+            build_s3_writer,
+        )
 
         client = IceboxClient(
-            base_url=cfg.icebox_url,
-            max_attempts=cfg.icebox_max_attempts,
-            max_backoff_s=cfg.icebox_max_backoff_s,
-            timeout_s=cfg.icebox_timeout_s,
+            host=cfg.icebox_pg_host,
+            port=cfg.icebox_pg_port,
+            database=cfg.icebox_pg_database,
+            username=cfg.icebox_pg_username,
+            password=cfg.icebox_pg_password,
+            schema=cfg.icebox_pg_schema,
+            sslmode=cfg.icebox_pg_sslmode or "require",
         )
         s3_writer = build_s3_writer(
             access_key_id=cfg.s3_access_key_id,

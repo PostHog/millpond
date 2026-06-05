@@ -1,4 +1,4 @@
-"""Icebox entrypoint — wires config + pools + committer thread + FastAPI.
+"""Icebox entrypoint — wires config + pool + daemon thread + probe HTTP server.
 
 Run as: `icebox` (the console script registered in pyproject.toml).
 
@@ -7,48 +7,113 @@ Boot sequence:
   2. Configure logging.
   3. Open psycopg pool, run migrations idempotently.
   4. Build Kafka AdminClient.
-  5. Open asyncpg pool.
-  6. Spawn committer thread.
-  7. Start FastAPI under uvicorn on cfg.api_host:api_port.
+  5. Spawn daemon thread.
+  6. Start a minimal HTTP server on cfg.api_host:api_port serving
+     /healthz (k8s liveness) and /metrics (Prometheus).
 
 Shutdown:
-  - SIGTERM → stop_event set → committer thread exits → uvicorn exits.
+  - SIGTERM → stop_event set → daemon thread exits → server exits.
 """
 from __future__ import annotations
 
 import logging
 import signal
 import threading
-from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
-import uvicorn
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pyiceberg.catalog import load_catalog
 
-from icebox import committer as cm
 from icebox import config as icebox_config
+from icebox import daemon as dm
 from icebox import kafka as ikafka
-from icebox import postgres_async as pa
 from icebox import postgres_sync as ps
-from icebox.api import create_app
-from icebox.schema_cache import SchemaFingerprintCache
 from icebox.structured_logging import setup_logging
 
 log = logging.getLogger(__name__)
 
 # Sentinel log line emitted at the end of main() iff the drain
-# completed and pools closed cleanly. Bound as a module constant so
-# integration tests can import it — otherwise a rename here would
-# silently rot the test that pins clean-shutdown behavior.
+# completed and the pool closed cleanly. Bound as a module constant so
+# integration tests can import it.
 SHUTDOWN_COMPLETE_MARKER = "icebox: shutdown complete"
+
+
+def _read_heartbeat(pg_pool) -> datetime | None:
+    """Read last_committer_heartbeat from the status table. Returns
+    None on no row or on PG error (callers treat the latter as
+    'unhealthy' for probe purposes)."""
+    try:
+        with pg_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT last_committer_heartbeat FROM status WHERE id = 1"
+                )
+                row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        log.warning("icebox: /healthz could not read heartbeat", exc_info=True)
+        return None
+
+
+def _make_probe_handler(*, cfg, pg_pool):
+    """Build the BaseHTTPRequestHandler subclass for /healthz + /metrics.
+
+    /healthz reads the daemon heartbeat from PG; stale (> N × cadence)
+    or missing → 503 → k8s liveness restarts the pod.
+    /metrics calls prometheus_client.generate_latest.
+    """
+    stale_after_s = float(cfg.committer_cadence_seconds) * float(
+        cfg.committer_heartbeat_stale_multiple
+    )
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002 — match stdlib API
+            # Suppress the default per-request stderr line; k8s probes
+            # and Prometheus scrape hits would otherwise dominate the
+            # log volume.
+            return
+
+        def do_GET(self):  # noqa: N802 — stdlib API
+            if self.path == "/healthz":
+                hb = _read_heartbeat(pg_pool)
+                if hb is None:
+                    self._reply(503, "no heartbeat\n")
+                    return
+                age = (datetime.now(UTC) - hb).total_seconds()
+                if age > stale_after_s:
+                    self._reply(
+                        503,
+                        f"heartbeat stale ({age:.1f}s > {stale_after_s:.1f}s)\n",
+                    )
+                    return
+                self._reply(200, f"ok heartbeat_age={age:.1f}s\n")
+                return
+            if self.path == "/metrics":
+                payload = generate_latest()
+                self.send_response(200)
+                self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self._reply(404, "not found\n")
+
+        def _reply(self, status: int, body: str) -> None:
+            payload = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    return _Handler
 
 
 def main() -> None:
     """Console-script entrypoint."""
     cfg = icebox_config.load()
-    # Structured logging (JSON by default; text for local-dev when
-    # ICEBOX_LOG_FORMAT=text) + optional OTLP export to PostHog Logs.
-    # Returns the OTel LoggerProvider when PostHog is enabled so we
-    # can flush it on shutdown.
     logger_provider = setup_logging(
         level=cfg.log_level,
         fmt=cfg.log_format,
@@ -66,7 +131,7 @@ def main() -> None:
     )
     log.info("icebox starting on %s:%d", cfg.api_host, cfg.api_port)
 
-    # ---- DB + schema bootstrap + psycopg pool + migrations -----------
+    # ---- DB + schema bootstrap + psycopg pool + migrations ----------
     # Tactical hacks: create the database and schema if they don't
     # exist so a fresh deployment doesn't boot-loop. Proper provisioning
     # belongs in Terraform — these are stopgaps.
@@ -86,10 +151,10 @@ def main() -> None:
     log.info("icebox: kafka admin client built")
 
     # ---- Iceberg catalog ---------------------------------------------
-    def _load_table():
-        # Caller-of-the-callable runs in the committer thread; loading
-        # is cheap (Lakekeeper REST GET) and fresh metadata is required
-        # at the start of every cycle.
+    def _load_table() -> Any:
+        # Called once per tick. Loading is cheap (Lakekeeper REST GET)
+        # and fresh metadata is required because the catalog can
+        # advance underneath us between ticks.
         catalog = load_catalog(
             "icebox",
             **{
@@ -98,108 +163,69 @@ def main() -> None:
                 "warehouse": cfg.iceberg_warehouse,
             },
         )
-        # Each icebox deployment serves exactly one (namespace, table),
-        # configured explicitly via ICEBOX_ICEBERG_NAMESPACE and
-        # ICEBOX_ICEBERG_TABLE. Previously this was parsed from
-        # cfg.kafka_topic with a "<ns>.<table>" or fallback "kafka.<topic>"
-        # convention — fragile and hidden. Explicit env vars make the
-        # mapping visible in chart values.
         return catalog.load_table((cfg.iceberg_namespace, cfg.iceberg_table))
 
-    deps = cm.CommitterDeps(
+    deps = dm.DaemonDeps(
         load_table=_load_table,
         kafka_admin=admin,
     )
 
-    # ---- Committer thread --------------------------------------------
+    # ---- Daemon thread -----------------------------------------------
     stop_event = threading.Event()
-    committer_thread = threading.Thread(
-        target=cm.committer_loop,
-        kwargs={"cfg": cfg, "pg_pool": sync_pool, "deps": deps, "stop_event": stop_event},
+    daemon_thread = threading.Thread(
+        target=dm.daemon_loop,
+        kwargs={
+            "cfg": cfg,
+            "pg_pool": sync_pool,
+            "deps": deps,
+            "stop_event": stop_event,
+        },
         daemon=True,
-        name="icebox-committer",
+        name="icebox-daemon",
     )
-    committer_thread.start()
-    log.info("icebox: committer thread started")
+    daemon_thread.start()
+    log.info("icebox: daemon thread started")
 
-    # ---- FastAPI lifecycle wraps async PG pool -----------------------
-    @asynccontextmanager
-    async def lifespan(_app):
-        pool = await pa.build_asyncpg_pool(cfg)
-        _app.state.pool = pool
-        try:
-            yield
-        finally:
-            await pool.close()
-
-    # Schema-fingerprint cache for API-perimeter validation. Shares
-    # the same ``_load_table`` callable the committer thread uses
-    # (each invocation builds a fresh ``Catalog`` and issues a REST
-    # GET), so any catalog-side schema change is visible to both
-    # paths after the cache TTL elapses.
-    fp_cache = SchemaFingerprintCache(
-        load_table=_load_table,
-        ttl_seconds=cfg.schema_fingerprint_cache_ttl_seconds,
-    )
-
-    # build_app with a placeholder pool — lifespan swaps it in
-    app = create_app(  # type: ignore[arg-type]
-        cfg=cfg, pool=None, schema_fingerprint_cache=fp_cache
-    )
-    app.router.lifespan_context = lifespan
+    # ---- Probe HTTP server -------------------------------------------
+    handler_cls = _make_probe_handler(cfg=cfg, pg_pool=sync_pool)
+    server = ThreadingHTTPServer((cfg.api_host, cfg.api_port), handler_cls)
+    log.info("icebox: probe server listening on %s:%d", cfg.api_host, cfg.api_port)
 
     # ---- Graceful shutdown wiring ------------------------------------
     def _on_signal(signum, _frame):
         log.info("icebox: signal %d, requesting shutdown", signum)
         stop_event.set()
+        # Wake the HTTP server's serve_forever() loop; it polls
+        # _shutdown_request on a short interval so this returns quickly.
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    # ---- Run uvicorn -------------------------------------------------
-    uvicorn.run(
-        app,
-        host=cfg.api_host,
-        port=cfg.api_port,
-        log_config=None,  # we configured logging above
-        # ``access_log=False`` is what actually stops uvicorn from
-        # emitting one INFO line per kubelet probe / Prometheus scrape /
-        # writer POST. The ``logging.getLogger("uvicorn.access")
-        # .setLevel(WARNING)`` call in setup_logging is belt-and-suspenders
-        # — it runs BEFORE uvicorn boots and uvicorn's ``Server.run()``
-        # can quietly reset logger levels during startup, defeating the
-        # silencing. Disabling at the source is bulletproof; the
-        # logger-level silencing stays in place so any code path that
-        # constructs a ``uvicorn.access`` record outside ``access_log``
-        # (e.g. a future middleware hook) also gets suppressed.
-        access_log=False,
-    )
+    # Block here until server.shutdown() is called from the signal
+    # handler. ThreadingHTTPServer's serve_forever spawns a thread per
+    # request, so /healthz and /metrics can run concurrently with each
+    # other and with the daemon thread.
+    server.serve_forever()
 
-    log.info("icebox: uvicorn exited, waiting for committer thread")
+    log.info("icebox: probe server exited, waiting for daemon thread")
     stop_event.set()
     # Drain budget = cadence × 5, capped at MAX_DRAIN_BUDGET_S so a
     # misconfigured high cadence doesn't produce a 50-minute drain that
-    # outlives K8s `terminationGracePeriodSeconds`. The cap covers
-    # realistic Lakekeeper commit-tail latency without becoming a
-    # liveness foot-gun.
+    # outlives K8s `terminationGracePeriodSeconds`.
     MAX_DRAIN_BUDGET_S = 600  # 10 minutes
     drain_budget_s = min(cfg.committer_cadence_seconds * 5, MAX_DRAIN_BUDGET_S)
     log.info("icebox: SIGTERM drain budget = %.0fs", drain_budget_s)
-    committer_thread.join(timeout=drain_budget_s)
-    if committer_thread.is_alive():
+    daemon_thread.join(timeout=drain_budget_s)
+    if daemon_thread.is_alive():
         log.error(
-            "icebox: committer thread did not drain within %.0fs — "
-            "process will exit with daemon thread still running mid-cycle. "
-            "Recovery on next boot will rationalize via cycle_id.",
+            "icebox: daemon thread did not drain within %.0fs — process "
+            "will exit with daemon thread still running mid-tick.",
             drain_budget_s,
         )
     else:
-        log.info("icebox: committer thread drained cleanly")
+        log.info("icebox: daemon thread drained cleanly")
     sync_pool.close()
-    # Flush any in-flight OTLP log batches before exiting so logs
-    # generated during the drain itself reach PostHog. shutdown()
-    # blocks until the BatchLogRecordProcessor's queue is drained
-    # (or its export-timeout elapses).
     if logger_provider is not None:
         try:
             logger_provider.shutdown()

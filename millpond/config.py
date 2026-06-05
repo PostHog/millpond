@@ -64,20 +64,22 @@ class Config:
     s3_endpoint: str | None
 
     # Icebox — required when destination == "icebox", else None.
-    # icebox_url is the in-cluster HTTP base URL of the icebox service
-    # (e.g. "http://icebox-events.megaberg.svc:8000").
     # icebox_bucket + icebox_warehouse_prefix are the deterministic-path
     # components the sink uses when writing staged parquet to S3 — they
     # MUST match the icebox-side warehouse config or files land where
     # the catalog can't find them.
-    icebox_url: str | None
     icebox_bucket: str | None
     icebox_warehouse_prefix: str | None
-    # Sink-side HTTP retry knobs. Defaults inherited from IceboxClient if
-    # not set via env.
-    icebox_max_attempts: int
-    icebox_max_backoff_s: float
-    icebox_timeout_s: float
+    # PG connection for the writer-side IceboxClient (direct INSERT
+    # into icebox_files). All seven fields are required together when
+    # destination == "icebox".
+    icebox_pg_host: str | None
+    icebox_pg_port: int | None
+    icebox_pg_database: str | None
+    icebox_pg_username: str | None
+    icebox_pg_password: str | None
+    icebox_pg_schema: str | None
+    icebox_pg_sslmode: str | None
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
@@ -361,8 +363,18 @@ def load() -> Config:
         None,
     )
 
-    icebox_kwargs: dict[str, str | None] = dict.fromkeys(
-        ("icebox_url", "icebox_bucket", "icebox_warehouse_prefix"),
+    icebox_kwargs: dict[str, str | int | None] = dict.fromkeys(
+        (
+            "icebox_bucket",
+            "icebox_warehouse_prefix",
+            "icebox_pg_host",
+            "icebox_pg_port",
+            "icebox_pg_database",
+            "icebox_pg_username",
+            "icebox_pg_password",
+            "icebox_pg_schema",
+            "icebox_pg_sslmode",
+        ),
         None,
     )
 
@@ -372,14 +384,20 @@ def load() -> Config:
     elif destination == "iceberg":
         iceberg_kwargs.update(_load_iceberg_fields())
         table_label_part = iceberg_kwargs["iceberg_table"]
-    else:  # icebox: writer ships parquet + POSTs to the icebox service
+    else:  # icebox: writer ships parquet to S3 + INSERTs to icebox_files
         # Icebox writers still need to know the Iceberg target (namespace
-        # + table) so the deterministic file path matches what the icebox
-        # registers. The catalog handle itself lives on the icebox side.
+        # + table) so the deterministic file path matches what the daemon
+        # registers. The catalog handle itself lives on the daemon side.
         iceberg_kwargs.update(_load_iceberg_fields())
-        icebox_kwargs["icebox_url"] = _require("ICEBOX_URL")
         icebox_kwargs["icebox_bucket"] = _require("ICEBOX_BUCKET")
         icebox_kwargs["icebox_warehouse_prefix"] = _require("ICEBOX_WAREHOUSE_PREFIX")
+        icebox_kwargs["icebox_pg_host"] = _require("ICEBOX_PG_HOST")
+        icebox_kwargs["icebox_pg_port"] = int(os.environ.get("ICEBOX_PG_PORT", "5432"))
+        icebox_kwargs["icebox_pg_database"] = _require("ICEBOX_PG_DATABASE")
+        icebox_kwargs["icebox_pg_username"] = _require("ICEBOX_PG_USERNAME")
+        icebox_kwargs["icebox_pg_password"] = _require("ICEBOX_PG_PASSWORD")
+        icebox_kwargs["icebox_pg_schema"] = _require("ICEBOX_PG_SCHEMA")
+        icebox_kwargs["icebox_pg_sslmode"] = os.environ.get("ICEBOX_PG_SSLMODE", "require")
         table_label_part = iceberg_kwargs["iceberg_table"]
 
     group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{table_label_part}")
@@ -406,9 +424,6 @@ def load() -> Config:
         **ducklake_kwargs,
         **iceberg_kwargs,
         **icebox_kwargs,
-        icebox_max_attempts=int(os.environ.get("ICEBOX_MAX_ATTEMPTS", "6")),
-        icebox_max_backoff_s=float(os.environ.get("ICEBOX_MAX_BACKOFF_S", "30")),
-        icebox_timeout_s=float(os.environ.get("ICEBOX_TIMEOUT_S", "10")),
         flush_size=int(os.environ.get("FLUSH_SIZE", "104857600")),
         flush_interval_ms=int(os.environ.get("FLUSH_INTERVAL_MS", "60000")),
         fetch_min_bytes=int(os.environ.get("FETCH_MIN_BYTES", "1048576")),

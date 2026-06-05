@@ -1,5 +1,5 @@
 """Unit tests for icebox/structured_logging.py — the JSON formatter,
-the cycle_id ContextVar, and the setup_logging() builder.
+and the setup_logging() builder.
 """
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import pytest
 
 from icebox.structured_logging import (
     JsonFormatter,
-    cycle_id_var,
     setup_logging,
 )
 
@@ -58,23 +57,6 @@ def test_json_formatter_emits_required_fields():
     datetime.fromisoformat(out["ts"])
 
 
-def test_json_formatter_includes_cycle_id_when_contextvar_set():
-    token = cycle_id_var.set("c-123")
-    try:
-        record = _make_record(msg="claiming files")
-        out = json.loads(JsonFormatter().format(record))
-        assert out["cycle_id"] == "c-123"
-    finally:
-        cycle_id_var.reset(token)
-
-
-def test_json_formatter_omits_cycle_id_when_unset():
-    # Make sure no leakage from prior tests; reset is unconditional.
-    if cycle_id_var.get() is not None:
-        cycle_id_var.set(None)
-    record = _make_record(msg="no cycle context here")
-    out = json.loads(JsonFormatter().format(record))
-    assert "cycle_id" not in out
 
 
 def test_json_formatter_inlines_extra_fields():
@@ -133,30 +115,6 @@ def test_setup_logging_text_mode_installs_plain_formatter():
     assert len(root.handlers) == 1
     assert not isinstance(root.handlers[0].formatter, JsonFormatter)
 
-
-def test_setup_logging_silences_uvicorn_access_logger():
-    """uvicorn.access ships one line per probe + per writer POST and
-    swamps the useful committer logs. Effective behavior: an INFO
-    record on that logger after setup_logging() must NOT reach the
-    captured stream. Asserting on the logger.level value alone would
-    miss the case where uvicorn (or anything else) flips the level
-    back at server start."""
-    import io
-
-    setup_logging(level="DEBUG", fmt="json")
-    # Add a capture sink to the same root handler chain
-    captured = io.StringIO()
-    root = logging.getLogger()
-    capture_handler = logging.StreamHandler(captured)
-    capture_handler.setLevel(logging.DEBUG)
-    root.addHandler(capture_handler)
-    try:
-        logging.getLogger("uvicorn.access").info(
-            'GET /healthz HTTP/1.1" 200'
-        )
-        assert "/healthz" not in captured.getvalue()
-    finally:
-        root.removeHandler(capture_handler)
 
 
 def test_setup_logging_clears_prior_handlers_on_repeat_call():
@@ -339,80 +297,5 @@ def test_setup_logging_app_passed_attrs_win_over_otel_resource_attributes_env(mo
         setup_logging(level="INFO", fmt="json")
 
 
-def test_cycle_id_attr_filter_stamps_record_when_contextvar_set():
-    """The OTel-side filter must surface ``icebox.cycle_id`` as a
-    record attribute so PostHog Logs can filter on it directly,
-    independent of the JSON body shape on stdout."""
-    from icebox.structured_logging import _CycleIdAttrFilter
-
-    flt = _CycleIdAttrFilter()
-    token = cycle_id_var.set("c-xyz")
-    try:
-        record = _make_record(msg="inside cycle")
-        flt.filter(record)
-        # Dot-keyed attrs aren't accessible via getattr-with-dots syntax;
-        # OTel reads them from __dict__ directly.
-        assert record.__dict__["icebox.cycle_id"] == "c-xyz"
-    finally:
-        cycle_id_var.reset(token)
 
 
-def test_cycle_id_attr_filter_noop_when_contextvar_unset():
-    from icebox.structured_logging import _CycleIdAttrFilter
-
-    if cycle_id_var.get() is not None:
-        cycle_id_var.set(None)
-    flt = _CycleIdAttrFilter()
-    record = _make_record(msg="no cycle context")
-    flt.filter(record)
-    assert "icebox.cycle_id" not in record.__dict__
-
-
-def test_cycle_id_survives_logging_makerecord_plumbing():
-    """Records produced via the public logging API path
-    (`logger.info(..., extra={...})` → `Logger.makeRecord` →
-    `LogRecord.__init__`) must carry the dotted attribute the filter
-    sets — not just hand-built `LogRecord` instances. Some
-    implementations of `LogRecord` go through `__dict__.update(extra)`
-    which can mishandle dotted keys; this test exercises the real
-    plumbing once so a regression there can't slip through."""
-    from icebox.structured_logging import _CycleIdAttrFilter
-
-    token = cycle_id_var.set("c-from-real-logger")
-    try:
-        flt = _CycleIdAttrFilter()
-        logger = logging.getLogger("test_cycle_id_real_logger")
-        logger.addFilter(flt)
-        # Add a capturing handler whose emit() inspects the record
-        # AFTER the filter runs — same lifecycle the OTel handler sees.
-        captured: list[logging.LogRecord] = []
-
-        class _Capture(logging.Handler):
-            def emit(self, record: logging.LogRecord) -> None:
-                captured.append(record)
-
-        cap = _Capture()
-        logger.addHandler(cap)
-        logger.setLevel(logging.INFO)
-        try:
-            logger.info("hello from a real logger", extra={"file_count": 7})
-            assert len(captured) == 1
-            rec = captured[0]
-            assert rec.__dict__["icebox.cycle_id"] == "c-from-real-logger"
-            # The non-dotted `extra` field came through normally too.
-            assert rec.__dict__["file_count"] == 7
-        finally:
-            logger.removeHandler(cap)
-            logger.removeFilter(flt)
-    finally:
-        cycle_id_var.reset(token)
-
-
-@pytest.fixture(autouse=True)
-def _reset_root_logger():
-    """Reset root logger handlers between tests so log lines from one
-    test don't pile up in another's handler chain."""
-    yield
-    root = logging.getLogger()
-    for h in list(root.handlers):
-        root.removeHandler(h)
