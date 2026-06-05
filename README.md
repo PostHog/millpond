@@ -57,7 +57,7 @@ Millpond writes to one of two lake formats, selected at startup by `MILLPOND_DES
 
 The selection is a thin Protocol-based abstraction (`millpond/sink.py`) — `main.py` only sees `Sink.write(batch)`, `reset_caches()`, `close()`. Both implementations are in their own module (`ducklake.py`, `iceberg.py`).
 
-For Iceberg at production scale, writers do not commit to the catalog directly. They emit parquet to S3 and `POST /v1/files` to **[icebox](icebox/README.md)** — a writer/committer split that serializes commits from many concurrent writer pods through a single committer thread per `(namespace, table)`, eliminating PyIceberg's REST-catalog optimistic-concurrency contention. See [`icebox/README.md`](icebox/README.md) for the full design, endpoint contract, and operational notes.
+For Iceberg at production scale, writers do not commit to the catalog directly. They emit parquet to S3 and INSERT file metadata into an `icebox_files` PG table that lives in a per-deployment PG schema (one schema per `(namespace, table)`). A **[icebox](icebox/README.md)** polling daemon per `(namespace, table)` then commits batches to Iceberg and advances Kafka offsets. The split serializes commits from many concurrent writer pods through a single committer, eliminating PyIceberg's REST-catalog optimistic-concurrency contention. See [`icebox/README.md`](icebox/README.md) for the design and operational notes; the v6 polling-daemon rewrite is documented in [`docs/icebox-self-healing-recovery.md`](docs/icebox-self-healing-recovery.md).
 
 ## Record Handling
 
@@ -222,18 +222,21 @@ All configuration via environment variables.
 
 ### icebox (required when `MILLPOND_DESTINATION=icebox`)
 
-The icebox path reuses the entire `Iceberg` env-var block above (writers still need to know the catalog URI, warehouse, namespace, table, and S3 credentials so the catalog/file metadata they POST to the icebox is correctly addressed) and adds the writer-to-icebox transport variables:
+The icebox path reuses the entire `Iceberg` env-var block above (writers still need the catalog URI, warehouse, namespace, table, and S3 credentials so the staged file's catalog/path metadata is correct) and adds the writer-to-icebox PG transport variables:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ICEBOX_URL` | yes | | In-cluster base URL of the icebox service (e.g. `http://icebox-events.megaberg.svc:8000`) |
-| `ICEBOX_BUCKET` | yes | | S3 bucket the writer drops parquet into (the icebox reads the path from the POST body; it does not re-derive it) |
+| `ICEBOX_BUCKET` | yes | | S3 bucket the writer drops parquet into |
 | `ICEBOX_WAREHOUSE_PREFIX` | yes | | Prefix under `ICEBOX_BUCKET` for staged parquet files (e.g. `kafka/events/data`) |
-| `ICEBOX_MAX_ATTEMPTS` | no | `6` | Max attempts for `POST /v1/files` against the icebox (the writer's flush-side retry loop, separate from the lake-write retry) |
-| `ICEBOX_MAX_BACKOFF_S` | no | `30` | Max backoff between icebox POST retries (exponential, capped at this value) |
-| `ICEBOX_TIMEOUT_S` | no | `10` | Per-request timeout against the icebox API |
+| `ICEBOX_PG_HOST` | yes | | Hostname of the Postgres backing the icebox (the writer INSERTs file metadata directly) |
+| `ICEBOX_PG_PORT` | no | `5432` | Postgres port |
+| `ICEBOX_PG_DATABASE` | yes | | Postgres database |
+| `ICEBOX_PG_USERNAME` | yes | | Postgres user (writes only `icebox_files`) |
+| `ICEBOX_PG_PASSWORD` | yes | | Postgres password (typically ESO-synced) |
+| `ICEBOX_PG_SCHEMA` | yes | | Per-deployment Postgres schema (e.g. `icebox_events`) |
+| `ICEBOX_PG_SSLMODE` | no | `require` | Standard libpq sslmode |
 
-The icebox itself has its own env-var contract (`ICEBOX_*` consumed by `icebox/main.py` — Postgres connection, committer cadence, etc.). Those are documented in [`icebox/README.md`](icebox/README.md) and live in the icebox deployment, not the writer.
+The icebox daemon itself has its own env-var contract (`ICEBOX_*` consumed by `icebox/main.py` — Postgres connection, daemon cadence, iceberg timeout, etc.). Those are documented in [`icebox/README.md`](icebox/README.md) and live in the icebox deployment, not the writer.
 
 ### Optional record handling
 
@@ -349,7 +352,7 @@ The flush path has two failure points, each with its own retry policy:
 
 Both use `errors_total{type="write_retry"}` and `errors_total{type="offset_commit"}` counters so transient vs persistent failures are distinguishable in dashboards.
 
-The write-retry loop catches `Exception` broadly to cover every backend's failure modes — `duckdb.Error` for DuckLake; `pyiceberg.exceptions.CommitFailedException`, `CommitStateUnknownException`, `ServerError`, `ServiceUnavailableError` for direct-Iceberg REST catalog 5xx; `httpx.HTTPError` + the `IceboxResponseError` / `IceboxBackpressureExhausted` raised by `millpond/icebox_sink.py` for the icebox-path POST failures; `OSError` for S3; `KafkaException` for broker disconnects. Each retry invokes `sink.reset_caches()` to drop cached table/schema state so the next attempt re-checks the catalog (covers the case where another pod evolved the schema or recreated the table between attempts).
+The write-retry loop catches `Exception` broadly to cover every backend's failure modes — `duckdb.Error` for DuckLake; `pyiceberg.exceptions.CommitFailedException`, `CommitStateUnknownException`, `ServerError`, `ServiceUnavailableError` for direct-Iceberg REST catalog 5xx; `psycopg.Error` raised by `millpond/icebox_sink.py`'s `IceboxClient.register_file` for the icebox-path INSERT failures; `OSError` for S3; `KafkaException` for broker disconnects. Each retry invokes `sink.reset_caches()` to drop cached table/schema state so the next attempt re-checks the catalog (covers the case where another pod evolved the schema or recreated the table between attempts).
 
 **Why crash after exhausting retries?** A persistent write failure means S3 or the catalog is down — continuing would just accumulate pending data in memory until OOM. A persistent commit failure means the Kafka coordinator is unreachable — the write already succeeded, but without committed offsets the next restart will replay the batch (at-least-once duplicates). In both cases, crashing lets K8s apply its restart backoff, and Kafka holds the data safely until the dependency recovers.
 
