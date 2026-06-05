@@ -57,7 +57,7 @@ def test_load_with_only_required_env(monkeypatch):
     assert cfg.api_host == "0.0.0.0"
     assert cfg.api_port == 8000
     assert cfg.psycopg_pool_min == 1
-    assert cfg.psycopg_pool_max == 2
+    assert cfg.psycopg_pool_max == 4
     assert cfg.service_namespace == "millpond"
     assert cfg.service_instance_id is None
 
@@ -190,26 +190,28 @@ def test_cadence_negative_rejected(monkeypatch):
         icebox_config.load()
 
 
-def test_psycopg_pool_max_below_2_rejected(monkeypatch):
-    """PE review #5: psycopg_pool_max=1 deadlocks because the committer
-    holds 1 connection (advisory lock) for the lifetime of the thread,
-    leaving zero slots for cycle work."""
-    _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "1"})
-    with pytest.raises(RuntimeError, match="ICEBOX_PSYCOPG_POOL_MAX must be >= 2"):
+def test_psycopg_pool_max_below_3_rejected(monkeypatch):
+    """PE review: psycopg_pool_max < 3 starves the probe server. The
+    daemon holds one conn across the Iceberg commit (up to
+    iceberg_timeout_s) while /healthz reads PG on every kubelet probe
+    and Prometheus scrape. Min 3 leaves room for tick + one
+    concurrent probe."""
+    _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "2"})
+    with pytest.raises(RuntimeError, match="ICEBOX_PSYCOPG_POOL_MAX must be >= 3"):
         icebox_config.load()
 
 
 def test_psycopg_pool_max_zero_rejected(monkeypatch):
     _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "0"})
-    with pytest.raises(RuntimeError, match="ICEBOX_PSYCOPG_POOL_MAX must be >= 2"):
+    with pytest.raises(RuntimeError, match="ICEBOX_PSYCOPG_POOL_MAX must be >= 3"):
         icebox_config.load()
 
 
-def test_psycopg_pool_max_exactly_2_accepted(monkeypatch):
-    """The floor must be inclusive — 2 is the documented minimum."""
-    _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "2"})
+def test_psycopg_pool_max_exactly_3_accepted(monkeypatch):
+    """The floor must be inclusive — 3 is the documented minimum."""
+    _set_env(monkeypatch, {"ICEBOX_PSYCOPG_POOL_MAX": "3"})
     cfg = icebox_config.load()
-    assert cfg.psycopg_pool_max == 2
+    assert cfg.psycopg_pool_max == 3
 
 
 def test_pg_schema_defaults_to_icebox(monkeypatch):

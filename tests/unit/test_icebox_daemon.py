@@ -139,7 +139,11 @@ def test_vacuous_tick_heartbeats_and_returns():
     deps.kafka_commit_offsets.assert_not_called()
 
 
-def test_success_tick_marks_committed_commits_offsets_and_heartbeats():
+def test_success_tick_marks_committed_returns_rows_to_commit_offsets():
+    """The tick itself no longer commits Kafka offsets — that moved to
+    daemon_loop so the offset advance happens AFTER the PG tx commits.
+    The tick returns the rows whose offsets should be advanced; the
+    loop walks them post-tx."""
     cfg = _make_cfg()
     deps, table = _make_deps(snapshot_id=999)
     rows = [_make_row(1, offset=100), _make_row(2, offset=200)]
@@ -150,23 +154,21 @@ def test_success_tick_marks_committed_commits_offsets_and_heartbeats():
     assert result.outcome == dm.OUTCOME_SUCCESS
     assert result.file_count == 2
     assert result.snapshot_id == 999
+    # The tick MUST NOT touch the Kafka AdminClient — the loop does
+    # that after the tx commits. (Q1 / B2 from the PE review.)
+    deps.kafka_commit_offsets.assert_not_called()
+    # Rows surface in the result for the loop's post-tx Kafka commit.
+    assert sorted(r.id for r in result.rows_to_commit_offsets) == [1, 2]
 
     executed_sql = [c[0][0] for c in cur.execute.call_args_list]
     assert ps.MARK_COMMITTED_SQL in executed_sql
     assert ps.UPDATE_HEARTBEAT_SQL in executed_sql
-    # mark_committed parameters carry the snapshot id + the row ids.
     mark_call = [
         c for c in cur.execute.call_args_list
         if c[0][0] == ps.MARK_COMMITTED_SQL
     ][0]
     assert mark_call[0][1]["snapshot_id"] == 999
     assert sorted(mark_call[0][1]["ids"]) == [1, 2]
-    # Kafka commit ran with merged offsets {0: 200}.
-    deps.kafka_commit_offsets.assert_called_once()
-    kw = deps.kafka_commit_offsets.call_args.kwargs
-    assert kw["max_offsets"] == {0: 200}
-    assert kw["group_id"] == cfg.kafka_group_id
-    assert kw["topic"] == cfg.kafka_topic
 
 
 @pytest.mark.parametrize("exc", [
@@ -240,11 +242,10 @@ def test_batch_failure_marks_failed_advances_offsets_and_heartbeats():
     assert ps.MARK_FAILED_SQL in executed_sql
     assert ps.MARK_COMMITTED_SQL not in executed_sql
     assert ps.UPDATE_HEARTBEAT_SQL in executed_sql
-    # Kafka offsets ADVANCED past the batch even though the commit
-    # failed — that's the "make progress" semantic.
-    deps.kafka_commit_offsets.assert_called_once()
-    kw = deps.kafka_commit_offsets.call_args.kwargs
-    assert kw["max_offsets"] == {0: 400}
+    # Kafka commit moved to daemon_loop (post-tx). The tick surfaces
+    # the rows whose offsets the loop should advance.
+    deps.kafka_commit_offsets.assert_not_called()
+    assert sorted(r.id for r in result.rows_to_commit_offsets) == [1, 2]
 
 
 def test_build_data_file_error_treated_as_batch_failure():
@@ -268,9 +269,29 @@ def test_build_data_file_error_treated_as_batch_failure():
     deps.commit_data_files.assert_not_called()
 
 
-def test_kafka_commit_failure_swallowed_on_success_path():
+def test_try_commit_kafka_offsets_swallows_exceptions():
+    """`_try_commit_kafka_offsets` (called from daemon_loop AFTER the
+    PG tx commits) must NOT re-raise a Kafka AdminClient failure. The
+    cumulative-offset semantic covers any gap on the next tick; re-
+    raising would crash the loop and lose the heartbeat-stamping
+    contract for subsequent ticks."""
+    cfg = _make_cfg()
+    deps, _ = _make_deps()
+    deps.kafka_commit_offsets = MagicMock(side_effect=RuntimeError("broker down"))
+    rows = [_make_row(1), _make_row(2)]
+    # Should NOT raise.
+    dm._try_commit_kafka_offsets(deps, cfg, rows, context="success")
+    deps.kafka_commit_offsets.assert_called_once()
+
+
+# Kept for symmetry: the cycle-era separate-paths test stayed because
+# the new pattern still needs to verify the success path doesn't
+# accidentally re-invoke the Kafka call from inside the tick. (Below.)
+def test_kafka_commit_not_invoked_from_tick_on_success(deprecated_for_loop=None):
     """A Kafka AdminClient hiccup must NOT undo the PG commit. The
-    cumulative-offset semantic covers any gap on the next tick."""
+    tick body never calls Kafka directly anymore (the loop does, post-
+    tx); this is a contract-preservation test in case someone re-adds
+    the inline call."""
     cfg = _make_cfg()
     deps, table = _make_deps(snapshot_id=42)
     deps.kafka_commit_offsets = MagicMock(side_effect=RuntimeError("broker down"))
@@ -281,15 +302,15 @@ def test_kafka_commit_failure_swallowed_on_success_path():
 
     assert result.outcome == dm.OUTCOME_SUCCESS
     assert result.snapshot_id == 42
-    # Rows were marked committed despite the Kafka failure.
+    # Rows were marked committed; Kafka was NOT invoked from the tick.
     executed_sql = [c[0][0] for c in cur.execute.call_args_list]
     assert ps.MARK_COMMITTED_SQL in executed_sql
+    deps.kafka_commit_offsets.assert_not_called()
 
 
-def test_kafka_commit_failure_swallowed_on_batch_failure_path():
-    """Same on the batch-failure branch — Kafka commit failures don't
-    re-raise. The cumulative semantic covers the gap, and re-raising
-    here would prevent the heartbeat + lose the outcome metric."""
+def test_kafka_commit_not_invoked_from_tick_on_batch_failure():
+    """Same on the batch-failure branch — the tick must not invoke
+    Kafka. The loop does it post-tx using TickResult.rows_to_commit_offsets."""
     cfg = _make_cfg()
     deps, table = _make_deps(commit_raises=ValueError("bad data"))
     deps.kafka_commit_offsets = MagicMock(side_effect=RuntimeError("broker down"))
@@ -301,6 +322,80 @@ def test_kafka_commit_failure_swallowed_on_batch_failure_path():
     assert result.outcome == dm.OUTCOME_BATCH_FAILURE
     executed_sql = [c[0][0] for c in cur.execute.call_args_list]
     assert ps.UPDATE_HEARTBEAT_SQL in executed_sql
+    deps.kafka_commit_offsets.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Per-row batch partitioning (PE-M1 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_build_data_file_partial_failure_only_marks_bad_rows():
+    """One bad row in a 3-row batch must NOT poison the other two.
+    The good rows are committed; the bad row is marked failed; both
+    sets land in the SAME PG tx so the kafka commit (post-tx, in the
+    loop) advances offsets past all three."""
+    cfg = _make_cfg()
+    deps, table = _make_deps(snapshot_id=777)
+
+    # build_data_file raises on row id=2 only.
+    def _build(table, file_path, **kw):
+        if file_path == "s3://bucket/2.parquet":
+            raise KeyError("partition_values missing 'day'")
+        return MagicMock()
+    deps.build_data_file = MagicMock(side_effect=_build)
+
+    rows = [_make_row(1, offset=100), _make_row(2, offset=200), _make_row(3, offset=300)]
+    conn, cur = _mock_conn_returning(rows)
+
+    result = dm.daemon_tick(conn, cfg=cfg, table=table, deps=deps)
+
+    assert result.outcome == dm.OUTCOME_SUCCESS
+    assert result.file_count == 2  # 1 + 3 succeeded; 2 failed
+    # Iceberg got only the good rows (2 DataFiles).
+    assert deps.commit_data_files.call_count == 1
+    submitted = deps.commit_data_files.call_args.kwargs["data_files"]
+    assert len(submitted) == 2
+
+    executed_sql = [c[0][0] for c in cur.execute.call_args_list]
+    assert ps.MARK_COMMITTED_SQL in executed_sql
+    assert ps.MARK_FAILED_SQL in executed_sql
+
+    mark_committed = [
+        c[0][1] for c in cur.execute.call_args_list
+        if c[0][0] == ps.MARK_COMMITTED_SQL
+    ][0]
+    assert sorted(mark_committed["ids"]) == [1, 3]
+
+    mark_failed = [
+        c[0][1] for c in cur.execute.call_args_list
+        if c[0][0] == ps.MARK_FAILED_SQL
+    ][0]
+    assert mark_failed["ids"] == [2]
+
+    # rows_to_commit_offsets covers ALL three rows so the writer's
+    # Kafka offsets advance past the bad row too.
+    assert sorted(r.id for r in result.rows_to_commit_offsets) == [1, 2, 3]
+
+
+def test_build_data_file_all_rows_fail_falls_back_to_batch_failure():
+    """If EVERY row fails build_data_file, fall through to the regular
+    batch-failure path: no Iceberg call attempted, all rows marked
+    failed, all offsets advanced."""
+    cfg = _make_cfg()
+    deps, table = _make_deps()
+    deps.build_data_file = MagicMock(side_effect=KeyError("missing partition col"))
+    rows = [_make_row(1, offset=400), _make_row(2, offset=500)]
+    conn, cur = _mock_conn_returning(rows)
+
+    result = dm.daemon_tick(conn, cfg=cfg, table=table, deps=deps)
+
+    assert result.outcome == dm.OUTCOME_BATCH_FAILURE
+    assert result.file_count == 2
+    deps.commit_data_files.assert_not_called()
+    executed_sql = [c[0][0] for c in cur.execute.call_args_list]
+    assert ps.MARK_FAILED_SQL in executed_sql
+    assert sorted(r.id for r in result.rows_to_commit_offsets) == [1, 2]
 
 
 # ---------------------------------------------------------------------------

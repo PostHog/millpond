@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import psycopg
+import psycopg_pool
 import requests.exceptions
 from psycopg_pool import ConnectionPool
 from pyiceberg.exceptions import CommitFailedException, CommitStateUnknownException
@@ -86,12 +87,21 @@ MIN_INTER_TICK_SLEEP_SECONDS = 5.0
 class TickResult:
     """Outcome of one tick — surface for tests and for the loop's
     metrics step. The loop bumps icebox_ticks_total / observes
-    icebox_tick_duration_seconds against `outcome`."""
+    icebox_tick_duration_seconds against `outcome`.
+
+    `rows_to_commit_offsets` is the list of rows whose Kafka offsets the
+    loop should commit AFTER the PG transaction commits. This split
+    keeps the ordering invariant "Kafka offset committed iff S3 file
+    exists AND Iceberg accepted-or-rejected": the PG UPDATE landing in
+    `result='committed'` or `'failed'` becomes the durable witness
+    BEFORE the Kafka offset moves. Empty list = no Kafka work.
+    """
 
     outcome: str
     file_count: int = 0
     snapshot_id: int | None = None
     error: str | None = None
+    rows_to_commit_offsets: Sequence[IceboxPendingFileRow] = ()
 
 
 @dataclass
@@ -157,12 +167,17 @@ def daemon_tick(
 
     metrics.ICEBOX_BATCH_SIZE.observe(len(rows))
 
-    # Build DataFiles. A KeyError here (e.g., partition_values missing a
-    # spec column because the writer's partition spec drifted) is a
-    # batch-failure case — handled in the broad except below.
-    try:
-        data_files = [
-            deps.build_data_file(
+    # Build DataFiles per-row so a single bad row (e.g. partition_values
+    # missing a spec column because the writer's partition spec drifted)
+    # doesn't poison the whole batch. Good rows go to Iceberg; bad rows
+    # are marked failed inline and their offsets get advanced together
+    # with the good ones in the loop's post-tx Kafka commit.
+    good_rows: list[IceboxPendingFileRow] = []
+    bad_rows: list[IceboxPendingFileRow] = []
+    data_files: list[Any] = []
+    for r in rows:
+        try:
+            df = deps.build_data_file(
                 table=table,
                 file_path=r.file_path,
                 record_count=r.record_count,
@@ -170,14 +185,24 @@ def daemon_tick(
                 partition_values=r.partition_values,
                 parquet_stats=r.parquet_stats,
             )
-            for r in rows
-        ]
-    except Exception as exc:
-        # Treat data-file construction failures as batch failures: the
-        # row's metadata is wrong for the table's current state.
-        # Mark + advance + heartbeat.
-        log.error("daemon_tick: build_data_file failed: %s", exc, exc_info=True)
-        return _handle_batch_failure(conn, cfg, rows, exc, tick_start, deps)
+        except Exception:
+            log.error(
+                "daemon_tick: build_data_file failed for row id=%d "
+                "(file_path=%s); marking row failed",
+                r.id, r.file_path, exc_info=True,
+            )
+            bad_rows.append(r)
+            continue
+        good_rows.append(r)
+        data_files.append(df)
+
+    if not good_rows:
+        # Every row's metadata was bad — same batch-failure outcome as
+        # before, but we don't even attempt an Iceberg commit.
+        return _handle_batch_failure(
+            conn, cfg, rows, ValueError("all rows failed build_data_file"),
+            tick_start, deps,
+        )
 
     # Iceberg commit. with_timeout defends against a wedged Lakekeeper
     # holding our PG row locks indefinitely.
@@ -227,18 +252,23 @@ def daemon_tick(
     )
     snapshot_id = commit_result.snapshot_id
 
-    # Success path — UPDATE then Kafka commit. The Kafka commit lives
-    # OUTSIDE PG (it's an AdminClient RPC) so a failure there can't
-    # roll back the UPDATE; cumulative offset semantics cover any
-    # missed commit on the next tick.
-    ps.mark_committed(conn, ids=[r.id for r in rows], snapshot_id=snapshot_id)
-    metrics.ICEBOX_FILES_COMMITTED_TOTAL.inc(len(rows))
-    metrics.ICEBOX_RECORDS_COMMITTED_TOTAL.inc(sum(r.record_count for r in rows))
+    # Success path — UPDATE good rows as committed, bad rows as failed.
+    # Both transitions land in the SAME PG transaction; the caller
+    # commits the tx, THEN advances Kafka offsets via the returned
+    # `rows_to_commit_offsets` field. Splitting the Kafka commit out
+    # of the tx is what holds the doc invariant "Kafka offset
+    # committed iff PG knows the file's fate."
+    ps.mark_committed(conn, ids=[r.id for r in good_rows], snapshot_id=snapshot_id)
+    metrics.ICEBOX_FILES_COMMITTED_TOTAL.inc(len(good_rows))
+    metrics.ICEBOX_RECORDS_COMMITTED_TOTAL.inc(
+        sum(r.record_count for r in good_rows)
+    )
+    if bad_rows:
+        ps.mark_failed(conn, ids=[r.id for r in bad_rows])
+        metrics.ICEBOX_FILES_FAILED_TOTAL.inc(len(bad_rows))
 
     if commit_result.summary is not None:
         _update_table_state_gauges(commit_result.summary)
-
-    _try_commit_kafka_offsets(deps, cfg, rows, context="success")
 
     metrics.ICEBOX_LAST_SUCCESS_AT.set_to_current_time()
     ps.update_heartbeat(conn)
@@ -248,8 +278,11 @@ def daemon_tick(
     metrics.ICEBOX_TICKS_TOTAL.labels(outcome=OUTCOME_SUCCESS).inc()
     return TickResult(
         outcome=OUTCOME_SUCCESS,
-        file_count=len(rows),
+        file_count=len(good_rows),
         snapshot_id=snapshot_id,
+        # Advance offsets past BOTH good and bad rows so the writer
+        # makes progress past the bad ones too.
+        rows_to_commit_offsets=tuple(good_rows) + tuple(bad_rows),
     )
 
 
@@ -287,7 +320,8 @@ def _handle_batch_failure(
     tick_start: float,
     deps: DaemonDeps,
 ) -> TickResult:
-    """Mark rows failed, advance Kafka offsets past them, heartbeat.
+    """Mark rows failed in PG; the caller commits the tx then advances
+    Kafka offsets via the returned `rows_to_commit_offsets`.
 
     This is the "make progress" path. We can't fix bad data; better to
     stamp the audit trail and unblock the writer than to loop on the
@@ -297,11 +331,9 @@ def _handle_batch_failure(
     ps.mark_failed(conn, ids=[r.id for r in rows])
     metrics.ICEBOX_FILES_FAILED_TOTAL.inc(len(rows))
 
-    _try_commit_kafka_offsets(deps, cfg, rows, context="batch_failure")
-
     ps.update_heartbeat(conn)
     log.error(
-        "daemon_tick: batch failure; %d row(s) marked failed, offsets advanced: %s",
+        "daemon_tick: batch failure; %d row(s) marked failed: %s",
         len(rows), exc, exc_info=True,
     )
     elapsed = time.monotonic() - tick_start
@@ -311,6 +343,7 @@ def _handle_batch_failure(
         outcome=OUTCOME_BATCH_FAILURE,
         file_count=len(rows),
         error=str(exc),
+        rows_to_commit_offsets=tuple(rows),
     )
 
 
@@ -417,14 +450,36 @@ def daemon_loop(
 
     while not stop_event.is_set():
         start = time.monotonic()
+        tick_result: TickResult | None = None
         try:
             with pg_pool.connection() as conn:
                 with conn.transaction():
                     table = deps.load_table()
-                    daemon_tick(conn, cfg=cfg, table=table, deps=deps)
+                    tick_result = daemon_tick(conn, cfg=cfg, table=table, deps=deps)
                 # State gauges run in their own (read-only) tx so they
                 # don't block the row-lock release from the tick's tx.
                 refresh_state_gauges(conn)
+            # PG conn returned to the pool. ONLY NOW advance Kafka
+            # offsets — both because the doc invariant "Kafka offset
+            # committed iff PG knows the file's fate" requires PG to
+            # commit FIRST, and because the AdminClient RPC can take
+            # up to its own default ~30s, which we don't want to spend
+            # holding one of the 4 pool conns idle (PE re-review
+            # follow-up: keep the M3 sizing rationale honest).
+            if tick_result is not None and tick_result.rows_to_commit_offsets:
+                _try_commit_kafka_offsets(
+                    deps,
+                    cfg,
+                    tick_result.rows_to_commit_offsets,
+                    context=tick_result.outcome,
+                )
+        except psycopg_pool.PoolClosed:
+            # Pool was closed under us, almost certainly because
+            # something else in the process is shutting down. Don't
+            # hot-spin logging on every iteration; treat as the same
+            # signal as stop_event.
+            log.info("daemon_loop: pg_pool closed, exiting")
+            break
         except psycopg.Error as exc:
             metrics.ICEBOX_PG_UNREACHABLE_TOTAL.inc()
             log.warning("daemon_loop: PG error in tick (%s); retrying",

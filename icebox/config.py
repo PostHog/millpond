@@ -243,17 +243,19 @@ def load() -> Config:
             f"do reliably. Pick a different name."
         )
 
-    psycopg_pool_max = _int("ICEBOX_PSYCOPG_POOL_MAX", 2)
-    if psycopg_pool_max < 2:
-        # The committer thread holds ONE pool connection for the
-        # lifetime of the process (the advisory lock conn — see
-        # icebox/committer.py:committer_loop). Cycle work + heartbeat
-        # need at least one additional slot. A pool sized to 1 would
-        # deadlock at the first cycle's pg_pool.connection() call.
+    psycopg_pool_max = _int("ICEBOX_PSYCOPG_POOL_MAX", 4)
+    if psycopg_pool_max < 3:
+        # The daemon's tick holds one connection across the Iceberg
+        # commit (up to iceberg_timeout_s, default 5s); the probe
+        # server's /healthz handler reads PG on every kubelet probe
+        # AND every Prometheus scrape. With max=2 a slow tick can
+        # starve probes → 503 → kubelet restarts a healthy daemon.
+        # Min 3 leaves room for tick + one concurrent probe; default
+        # 4 covers liveness + readiness + a Prometheus scrape stack.
         raise RuntimeError(
-            f"ICEBOX_PSYCOPG_POOL_MAX must be >= 2 (committer holds 1 conn "
-            f"for the advisory lock + needs ≥1 more for cycle work), got "
-            f"{psycopg_pool_max}"
+            f"ICEBOX_PSYCOPG_POOL_MAX must be >= 3 (daemon tick holds 1 conn "
+            f"across the Iceberg commit; probe server needs ≥1 more for "
+            f"concurrent /healthz + /metrics callers), got {psycopg_pool_max}"
         )
 
     return Config(

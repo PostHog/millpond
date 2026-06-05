@@ -143,6 +143,19 @@ def main() -> None:
         ps.apply_migrations(conn)
     log.info("icebox: PG migrations applied")
 
+    # Seed an initial heartbeat BEFORE the daemon thread starts.
+    # status is migrated with last_committer_heartbeat=NULL, which
+    # /healthz returns 503 for. Without a seed, a slow first tick
+    # (cold catalog + Lakekeeper RTT + 5s timeout) would race the
+    # kubelet probe — guaranteed CrashLoopBackOff if initialDelay <
+    # first-tick latency. The seed makes /healthz return 200 the
+    # moment the probe server is up; the daemon's per-tick stamp
+    # takes over from there.
+    with sync_pool.connection() as conn:
+        with conn.transaction():
+            ps.update_heartbeat(conn)
+    log.info("icebox: initial heartbeat stamped")
+
     # ---- Kafka AdminClient -------------------------------------------
     admin = ikafka.build_admin_client(
         bootstrap_servers=cfg.kafka_bootstrap_servers,
