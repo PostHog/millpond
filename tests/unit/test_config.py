@@ -368,6 +368,26 @@ class TestLoadIcebox:
         with pytest.raises(RuntimeError, match=missing):
             load()
 
+    @pytest.mark.parametrize("bad_schema", [
+        "icebox events",      # whitespace — could inject extra -c options
+        "icebox\n-cfoo=bar",  # newline + extra option
+        "public",             # PG-reserved schema; would commingle
+        "pg_temp",            # pg_* prefix; PG refuses CREATE SCHEMA
+        "select",             # SQL keyword
+        "Icebox",             # uppercase — PG case-folds at startup
+        "icebox-events",      # hyphen
+        "",                   # empty
+    ])
+    def test_pg_schema_validated_on_writer_side(self, monkeypatch, bad_schema):
+        """ICEBOX_PG_SCHEMA flows into `options=-csearch_path=<value>` in
+        the writer's conninfo (millpond/icebox_sink.py). A whitespace /
+        newline value could inject additional `-c` options. Validation
+        is shared with the icebox daemon via shared.pg_identifier so the
+        two sides can't disagree on what's safe."""
+        monkeypatch.setenv("ICEBOX_PG_SCHEMA", bad_schema)
+        with pytest.raises(RuntimeError, match="ICEBOX_PG_SCHEMA"):
+            load()
+
 
 class TestFilterConfig:
     """MILLPOND_FILTER_{KEEP,DROP}_FIELD_NAME + MILLPOND_FILTER_VALUES."""

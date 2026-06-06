@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from shared.pg_identifier import validate_pg_schema
+
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _SAFE_NAMESPACE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -397,6 +399,11 @@ def load() -> Config:
         icebox_kwargs["icebox_pg_username"] = _require("ICEBOX_PG_USERNAME")
         icebox_kwargs["icebox_pg_password"] = _require("ICEBOX_PG_PASSWORD")
         icebox_kwargs["icebox_pg_schema"] = _require("ICEBOX_PG_SCHEMA")
+        # Schema lands in `options=-csearch_path=<schema>` in conninfo
+        # (icebox_sink.IceboxClient). Without validation, whitespace or a
+        # stray `-c` could redirect writes; we reject malformed values at
+        # config load so a typo can't silently land rows in `public`.
+        validate_pg_schema(icebox_kwargs["icebox_pg_schema"], "ICEBOX_PG_SCHEMA")
         icebox_kwargs["icebox_pg_sslmode"] = os.environ.get("ICEBOX_PG_SSLMODE", "require")
         table_label_part = iceberg_kwargs["iceberg_table"]
 
