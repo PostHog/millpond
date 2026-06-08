@@ -1,10 +1,13 @@
 """Sync psycopg connection + polling-daemon queries.
 
 This module exposes:
-  - `build_psycopg_pool` — connection pool sized small (defaults to
-    psycopg_pool_min=1, max=2). The daemon rarely needs more than one
-    connection at a time; the second slot covers state-gauge refreshes
-    that run on a separate transaction.
+  - `build_psycopg_pool` — connection pool sized via Config
+    (psycopg_pool_min default 1, psycopg_pool_max default 4 with a
+    hard floor of 3 enforced in config.py). The daemon's tick holds
+    one connection across the Iceberg commit (up to iceberg_timeout_s);
+    the probe server's /healthz handler reads PG on every kubelet
+    probe AND every Prometheus scrape, so min 3 leaves room for
+    tick + concurrent /healthz + /metrics without starvation.
   - `apply_migrations` — applies ALL_DDL in dependency order with
     per-statement error attribution.
   - `claim_pending_batch`, `mark_committed`, `mark_failed`,
@@ -246,9 +249,14 @@ UPDATE status SET last_committer_heartbeat = now() WHERE id = 1
 
 
 def update_heartbeat(conn: psycopg.Connection) -> None:
-    """Stamp the committer's liveness heartbeat. The async API reads
-    this and rejects POSTs with 503 if the heartbeat is stale (more
-    than cfg.committer_heartbeat_stale_multiple × cadence_seconds old).
+    """Stamp the committer's liveness heartbeat. Read by the probe
+    server's /healthz handler (icebox/main.py): if the heartbeat is
+    stale (more than cfg.committer_heartbeat_stale_multiple ×
+    cadence_seconds old), /healthz returns 503 and the kubelet
+    restarts the pod. Called from main.main() once before the daemon
+    thread starts (so a freshly booted pod doesn't fail liveness
+    before its first tick) and from daemon_tick at the end of every
+    successful tick.
     """
     with conn.cursor() as cur:
         cur.execute(UPDATE_HEARTBEAT_SQL)

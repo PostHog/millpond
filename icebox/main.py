@@ -202,6 +202,13 @@ def main() -> None:
     # ---- Probe HTTP server -------------------------------------------
     handler_cls = _make_probe_handler(cfg=cfg, pg_pool=sync_pool)
     server = ThreadingHTTPServer((cfg.api_host, cfg.api_port), handler_cls)
+    # daemon_threads=True so an in-flight /healthz or /metrics request
+    # can't outlive the process: ThreadingMixIn defaults to False, which
+    # would keep the interpreter alive past serve_forever()'s return
+    # until the request handler thread finishes. With daemon=True the
+    # process exit is bounded by the daemon-thread drain budget below,
+    # not by a probe scraper holding a connection open.
+    server.daemon_threads = True
     log.info("icebox: probe server listening on %s:%d", cfg.api_host, cfg.api_port)
 
     # ---- Graceful shutdown wiring ------------------------------------
@@ -222,6 +229,9 @@ def main() -> None:
     server.serve_forever()
 
     log.info("icebox: probe server exited, waiting for daemon thread")
+    # Release the listening socket so kubelet probes get connection
+    # refused (fast-fail) rather than connection-accepted-then-hang.
+    server.server_close()
     stop_event.set()
     # Drain budget = cadence × 5, capped at MAX_DRAIN_BUDGET_S so a
     # misconfigured high cadence doesn't produce a 50-minute drain that
