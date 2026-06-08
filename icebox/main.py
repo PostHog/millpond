@@ -28,6 +28,7 @@ from pyiceberg.catalog import load_catalog
 
 from icebox import config as icebox_config
 from icebox import daemon as dm
+from icebox import iceberg as ib
 from icebox import kafka as ikafka
 from icebox import postgres_sync as ps
 from icebox.structured_logging import setup_logging
@@ -164,11 +165,8 @@ def main() -> None:
     log.info("icebox: kafka admin client built")
 
     # ---- Iceberg catalog ---------------------------------------------
-    def _load_table() -> Any:
-        # Called once per tick. Loading is cheap (Lakekeeper REST GET)
-        # and fresh metadata is required because the catalog can
-        # advance underneath us between ticks.
-        catalog = load_catalog(
+    def _build_catalog() -> Any:
+        return load_catalog(
             "icebox",
             **{
                 "type": "rest",
@@ -176,10 +174,31 @@ def main() -> None:
                 "warehouse": cfg.iceberg_warehouse,
             },
         )
-        return catalog.load_table((cfg.iceberg_namespace, cfg.iceberg_table))
+
+    def _load_table() -> Any:
+        # Called once per tick. Loading is cheap (Lakekeeper REST GET)
+        # and fresh metadata is required because the catalog can
+        # advance underneath us between ticks.
+        return _build_catalog().load_table(
+            (cfg.iceberg_namespace, cfg.iceberg_table)
+        )
+
+    def _bootstrap_table(parquet_s3_path: str) -> Any:
+        # Called by the daemon's NoSuchTableError recovery path. Reads
+        # the parquet footer from S3 (one Range GET via PyIceberg's
+        # FileIO, configured off the same catalog properties as the
+        # rest of the daemon), derives the Iceberg schema, and creates
+        # the table with year/month/day/hour identity partition spec.
+        return ib.bootstrap_table_from_parquet(
+            catalog=_build_catalog(),
+            namespace=cfg.iceberg_namespace,
+            table_name=cfg.iceberg_table,
+            parquet_s3_path=parquet_s3_path,
+        )
 
     deps = dm.DaemonDeps(
         load_table=_load_table,
+        bootstrap_table=_bootstrap_table,
         kafka_admin=admin,
     )
 

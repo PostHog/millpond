@@ -56,7 +56,11 @@ import psycopg
 import psycopg_pool
 import requests.exceptions
 from psycopg_pool import ConnectionPool
-from pyiceberg.exceptions import CommitFailedException, CommitStateUnknownException
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    CommitStateUnknownException,
+    NoSuchTableError,
+)
 
 from icebox import iceberg as ib
 from icebox import kafka as kf
@@ -120,6 +124,10 @@ class DaemonDeps:
     commit_data_files: Callable[..., ib.CommitResult] = ib.commit_data_files
     kafka_admin: Any = None
     kafka_commit_offsets: Callable[..., None] = kf.commit_offsets
+    # Lazy table-bootstrap: invoked when load_table raises
+    # NoSuchTableError and there is at least one pending row whose
+    # parquet can seed the schema. Takes the parquet's s3:// path.
+    bootstrap_table: Callable[[str], Any] | None = None
 
 
 # Exception types that mean "Lakekeeper isn't telling us the commit
@@ -388,6 +396,64 @@ def _try_commit_kafka_offsets(
         )
 
 
+def _try_bootstrap_table(
+    cfg: Config,
+    pg_pool: ConnectionPool,
+    deps: DaemonDeps,
+) -> None:
+    """Recover from NoSuchTableError by inferring the Iceberg schema
+    from a pending row's parquet footer and creating the table.
+
+    Failure modes are quiet on purpose:
+      - No pending rows yet → log INFO, sleep, retry next tick. This
+        is the common case on a fresh consumer: writer flushes will
+        materialise rows in seconds, and the NEXT tick will bootstrap.
+      - deps.bootstrap_table is None → log WARNING. Indicates a
+        mis-wired main.py; we can't recover, but don't crash either.
+      - bootstrap_table raises → log + sleep. Likely Lakekeeper /
+        S3 transient; the next NoSuchTableError catch retries.
+
+    Bootstrap is OUTSIDE the tick's PG transaction: we open a fresh
+    short-lived connection just to peek at one file_path, then call
+    Lakekeeper. The next tick re-enters daemon_loop, load_table()
+    succeeds, and the pending rows commit normally.
+    """
+    if deps.bootstrap_table is None:
+        log.warning(
+            "daemon_loop: NoSuchTableError for %s.%s but deps.bootstrap_table "
+            "is None — table must be pre-created out-of-band",
+            cfg.iceberg_namespace, cfg.iceberg_table,
+        )
+        return
+    try:
+        with pg_pool.connection() as conn:
+            file_path = ps.peek_oldest_pending_file_path(conn)
+    except psycopg.Error as exc:
+        log.warning(
+            "daemon_loop: peek_oldest_pending_file_path failed (%s); "
+            "skipping bootstrap, will retry next tick", exc,
+        )
+        return
+    if file_path is None:
+        log.info(
+            "daemon_loop: %s.%s does not exist in catalog and no pending "
+            "rows yet; waiting for first writer flush",
+            cfg.iceberg_namespace, cfg.iceberg_table,
+        )
+        return
+    log.info(
+        "daemon_loop: bootstrapping %s.%s from staged parquet %s",
+        cfg.iceberg_namespace, cfg.iceberg_table, file_path,
+    )
+    try:
+        deps.bootstrap_table(file_path)
+    except Exception as exc:
+        log.exception(
+            "daemon_loop: bootstrap_table failed (%s); will retry next tick",
+            exc,
+        )
+
+
 def refresh_state_gauges(conn: psycopg.Connection) -> None:
     """Populate the live `icebox_files_count{result}`, oldest-pending,
     and `icebox_files_bytes{result}` gauges from PG. Called by the
@@ -480,6 +546,13 @@ def daemon_loop(
             # signal as stop_event.
             log.info("daemon_loop: pg_pool closed, exiting")
             break
+        except NoSuchTableError:
+            # The Iceberg (namespace, table) doesn't exist yet. If we
+            # have any pending rows, infer the schema from the oldest
+            # one's parquet footer and create the table. Subsequent
+            # ticks then succeed. If we have NO pending rows, the
+            # writer simply hasn't flushed yet — wait it out.
+            _try_bootstrap_table(cfg, pg_pool, deps)
         except psycopg.Error as exc:
             metrics.ICEBOX_PG_UNREACHABLE_TOTAL.inc()
             log.warning("daemon_loop: PG error in tick (%s); retrying",

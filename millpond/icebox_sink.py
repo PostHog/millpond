@@ -188,15 +188,20 @@ class IceboxClient:
                 sslmode=self.sslmode,
                 options=f"-csearch_path={self.schema}",
             )
-            # `open=False` so a malformed conninfo or unreachable PG
-            # fails on first use (during a write retry loop, which
-            # logs it) rather than at construction (which would fail
-            # the whole pod boot silently from the operator's POV).
+            # min_size=0 means construction doesn't try to open any
+            # connections (psycopg_pool only eager-connects up to
+            # min_size); the first register_file() call lazy-creates
+            # one. `open=True` therefore doesn't block boot on PG
+            # reachability — and the previous `open=False` was a
+            # latent bug because nothing else here ever called
+            # `.open()`, so register_file always raised PoolClosed.
+            # Explicit `open=True` because psycopg_pool will flip the
+            # default to False in a future release.
             self._pool = ConnectionPool(
                 conninfo,
                 min_size=self.pool_min,
                 max_size=self.pool_max,
-                open=False,
+                open=True,
             )
 
     def close(self) -> None:

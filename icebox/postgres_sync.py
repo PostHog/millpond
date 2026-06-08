@@ -328,6 +328,27 @@ def claim_pending_batch(
     ]
 
 
+PEEK_OLDEST_PENDING_FILE_PATH_SQL = """
+SELECT file_path FROM icebox_files
+WHERE result='pending'
+ORDER BY inserted_at
+LIMIT 1
+"""
+
+
+def peek_oldest_pending_file_path(conn: psycopg.Connection) -> str | None:
+    """Return the file_path of the oldest pending row, or None if the
+    table is empty / has no pending rows. Used by the daemon's
+    NoSuchTableError recovery path to find any staged parquet whose
+    schema can seed table bootstrap. No row lock — we're just reading
+    a path, not claiming work.
+    """
+    with conn.cursor() as cur:
+        cur.execute(PEEK_OLDEST_PENDING_FILE_PATH_SQL)
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 MARK_COMMITTED_SQL = """
 UPDATE icebox_files
 SET result='committed', result_at=now(), iceberg_snapshot_id=%(snapshot_id)s

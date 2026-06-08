@@ -414,3 +414,194 @@ def test_commit_data_files_returns_none_summary_when_lookup_fails():
     assert result.summary is None
 
 
+
+
+# ---------------------------------------------------------------------------
+# bootstrap_table_from_parquet
+# ---------------------------------------------------------------------------
+
+
+def _stage_parquet_bytes() -> bytes:
+    """Build the smallest parquet that mirrors what
+    millpond/icebox_sink._add_metadata_columns stamps: a few data
+    columns plus year/month/day/hour int32 partition columns and an
+    _inserted_at timestamp."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table({
+        "team_id": pa.array([1, 2], type=pa.int64()),
+        "event": pa.array(["a", "b"], type=pa.string()),
+        "_inserted_at": pa.array([0, 0], type=pa.timestamp("us", tz="UTC")),
+        "year": pa.array([2026, 2026], type=pa.int32()),
+        "month": pa.array([6, 6], type=pa.int32()),
+        "day": pa.array([8, 8], type=pa.int32()),
+        "hour": pa.array([16, 16], type=pa.int32()),
+    })
+    buf = pa.BufferOutputStream()
+    with pq.ParquetWriter(buf, table.schema) as w:
+        w.write_table(table)
+    return buf.getvalue().to_pybytes()
+
+
+def _fake_catalog_with_parquet(parquet_bytes: bytes):
+    """Catalog double whose `properties` are empty and whose FileIO
+    resolves to a single in-memory parquet, regardless of path. Returns
+    (catalog, create_table_calls) so tests can inspect what was created.
+    """
+    import io
+    from unittest.mock import MagicMock
+
+    catalog = MagicMock()
+    catalog.properties = {}
+    return catalog, _patch_file_io_to_return(parquet_bytes)
+
+
+def _patch_file_io_to_return(parquet_bytes: bytes):
+    """Return a monkeypatch helper bound at call time."""
+    return parquet_bytes
+
+
+def test_bootstrap_table_creates_table_with_inferred_schema_and_partition_spec(
+    monkeypatch,
+):
+    """Round-trip: bootstrap_table_from_parquet reads the parquet
+    footer, derives an Iceberg schema with deterministic field ids,
+    builds the year/month/day/hour identity PartitionSpec, and calls
+    catalog.create_table with both."""
+    import io
+    from unittest.mock import MagicMock
+
+    from icebox import iceberg as ib_mod
+
+    parquet_bytes = _stage_parquet_bytes()
+
+    # Patch load_file_io so we don't actually hit S3 — return a FileIO
+    # whose new_input(path).open() returns a BytesIO of our parquet.
+    fake_input = MagicMock()
+    fake_input.open.return_value.__enter__ = lambda self: io.BytesIO(parquet_bytes)
+    fake_input.open.return_value.__exit__ = lambda self, *a: None
+    fake_io = MagicMock()
+    fake_io.new_input.return_value = fake_input
+    monkeypatch.setattr(ib_mod, "load_file_io", lambda properties, location: fake_io)
+
+    catalog = MagicMock()
+    catalog.properties = {}
+    created_table = MagicMock()
+    catalog.create_table.return_value = created_table
+
+    result = ib_mod.bootstrap_table_from_parquet(
+        catalog=catalog,
+        namespace="kafka",
+        table_name="ai_events",
+        parquet_s3_path="s3://b/foo.parquet",
+    )
+
+    assert result is created_table
+    # create_table called exactly once with (identifier, schema, partition_spec).
+    catalog.create_table.assert_called_once()
+    call = catalog.create_table.call_args
+    assert call.args == (("kafka", "ai_events"),)
+    assert "schema" in call.kwargs and "partition_spec" in call.kwargs
+    schema = call.kwargs["schema"]
+    spec = call.kwargs["partition_spec"]
+
+    # Schema has every data column the parquet had.
+    names = {f.name for f in schema.fields}
+    assert {"team_id", "event", "_inserted_at", "year", "month", "day", "hour"} <= names
+
+    # PartitionSpec: 4 identity transforms on the int32 partition cols.
+    from pyiceberg.transforms import IdentityTransform
+    assert len(spec.fields) == 4
+    spec_by_name = {pf.name: pf for pf in spec.fields}
+    for name, expected_field_id in (
+        ("year", 1000), ("month", 1001), ("day", 1002), ("hour", 1003),
+    ):
+        assert name in spec_by_name
+        pf = spec_by_name[name]
+        assert pf.field_id == expected_field_id
+        assert isinstance(pf.transform, IdentityTransform)
+        # source_id points at the partition column itself (identity),
+        # NOT at _inserted_at.
+        assert schema.find_field(pf.source_id).name == name
+
+
+def test_bootstrap_table_returns_loaded_table_on_replica_race(monkeypatch):
+    """If another replica wins the create race, catalog.create_table
+    raises TableAlreadyExistsError; the helper falls back to load_table
+    and returns its result. Multiple icebox replicas can call this
+    concurrently without one crashing out."""
+    import io
+    from unittest.mock import MagicMock
+
+    from pyiceberg.exceptions import TableAlreadyExistsError
+
+    from icebox import iceberg as ib_mod
+
+    fake_input = MagicMock()
+    fake_input.open.return_value.__enter__ = lambda self: io.BytesIO(_stage_parquet_bytes())
+    fake_input.open.return_value.__exit__ = lambda self, *a: None
+    fake_io = MagicMock()
+    fake_io.new_input.return_value = fake_input
+    monkeypatch.setattr(ib_mod, "load_file_io", lambda properties, location: fake_io)
+
+    catalog = MagicMock()
+    catalog.properties = {}
+    catalog.create_table.side_effect = TableAlreadyExistsError("losing the race")
+    raced_table = MagicMock()
+    catalog.load_table.return_value = raced_table
+
+    result = ib_mod.bootstrap_table_from_parquet(
+        catalog=catalog,
+        namespace="kafka",
+        table_name="ai_events",
+        parquet_s3_path="s3://b/foo.parquet",
+    )
+
+    assert result is raced_table
+    catalog.load_table.assert_called_once_with(("kafka", "ai_events"))
+
+
+def test_bootstrap_table_rejects_parquet_missing_partition_column(monkeypatch):
+    """A parquet without year/month/day/hour stamped on isn't safe to
+    bootstrap from — the partition_values dict the writer ships would
+    fail to map to any field in the resulting table. Fail loudly."""
+    import io
+    from unittest.mock import MagicMock
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from icebox import iceberg as ib_mod
+
+    # Same shape as _stage_parquet_bytes but without the "hour" column.
+    table = pa.table({
+        "team_id": pa.array([1], type=pa.int64()),
+        "year": pa.array([2026], type=pa.int32()),
+        "month": pa.array([6], type=pa.int32()),
+        "day": pa.array([8], type=pa.int32()),
+        # NOTE: no "hour"
+    })
+    buf = pa.BufferOutputStream()
+    with pq.ParquetWriter(buf, table.schema) as w:
+        w.write_table(table)
+    parquet_bytes = buf.getvalue().to_pybytes()
+
+    fake_input = MagicMock()
+    fake_input.open.return_value.__enter__ = lambda self: io.BytesIO(parquet_bytes)
+    fake_input.open.return_value.__exit__ = lambda self, *a: None
+    fake_io = MagicMock()
+    fake_io.new_input.return_value = fake_input
+    monkeypatch.setattr(ib_mod, "load_file_io", lambda properties, location: fake_io)
+
+    catalog = MagicMock()
+    catalog.properties = {}
+
+    with pytest.raises(ValueError, match="hour"):
+        ib_mod.bootstrap_table_from_parquet(
+            catalog=catalog,
+            namespace="kafka",
+            table_name="ai_events",
+            parquet_s3_path="s3://b/foo.parquet",
+        )
+    catalog.create_table.assert_not_called()

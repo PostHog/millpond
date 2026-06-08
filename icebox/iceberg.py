@@ -30,15 +30,34 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import pyarrow.parquet as pq
+from pyiceberg.catalog import Catalog
+from pyiceberg.exceptions import TableAlreadyExistsError
+from pyiceberg.io import load_file_io
+from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
-from pyiceberg.partitioning import PartitionSpec
-from pyiceberg.schema import Schema
+from pyiceberg.partitioning import PartitionField, PartitionSpec
+from pyiceberg.schema import Schema, assign_fresh_schema_ids
 from pyiceberg.table import Table
+from pyiceberg.transforms import IdentityTransform
 from pyiceberg.typedef import Record
 
 from shared.bounds import encode_bounds
 
 log = logging.getLogger(__name__)
+
+
+# Partition field ids by Iceberg convention start at 1000. Names match
+# what millpond/icebox_sink._add_metadata_columns stamps into the
+# parquet (int32 year/month/day/hour columns), so an IdentityTransform
+# off each column is what the writer's partition_values dict assumes.
+# All icebox-sink consumers share this layout — no per-table tuning.
+_PARTITION_FIELDS = (
+    ("year", 1000),
+    ("month", 1001),
+    ("day", 1002),
+    ("hour", 1003),
+)
 
 
 @dataclass(frozen=True)
@@ -283,3 +302,85 @@ def commit_data_files(
             "_append_snapshot_producer"
         )
     return CommitResult(snapshot_id=snapshot_id, summary=summary)
+
+
+def bootstrap_table_from_parquet(
+    *,
+    catalog: Catalog,
+    namespace: str,
+    table_name: str,
+    parquet_s3_path: str,
+) -> Table:
+    """Create (namespace, table_name) in the catalog by inferring the
+    schema from a staged parquet's footer. Returns the loaded Table.
+
+    Idempotent: if a concurrent icebox replica wins the create race,
+    catches TableAlreadyExistsError and loads instead. Safe to call
+    from every tick that would otherwise crash on NoSuchTableError —
+    the create only fires once per (namespace, table) lifetime.
+
+    Schema derivation: read arrow_schema from the parquet footer (one
+    S3 GET with a Range header — no full-file download), then apply
+    `assign_fresh_schema_ids(_pyarrow_to_schema_without_ids(...))`.
+    This is the same conversion the writer does at first-flush time
+    (millpond/icebox_sink._ensure_schema), so the resulting Iceberg
+    field ids match the ones the writer's parquet_stats are keyed by.
+
+    Partition spec: IdentityTransform on each of year/month/day/hour —
+    matches _add_metadata_columns + partition_tuple_from_spec. The
+    writer always stamps these four int32 columns; we assume their
+    presence and fail loudly otherwise so a schema regression on the
+    writer side surfaces clearly here rather than silently producing
+    an unpartitioned table.
+    """
+    file_io = load_file_io(properties=catalog.properties, location=parquet_s3_path)
+    with file_io.new_input(parquet_s3_path).open() as f:
+        arrow_schema = pq.ParquetFile(f).schema_arrow
+
+    ice_schema: Schema = assign_fresh_schema_ids(
+        _pyarrow_to_schema_without_ids(arrow_schema)
+    )
+
+    partition_fields = []
+    for name, field_id in _PARTITION_FIELDS:
+        try:
+            source = ice_schema.find_field(name)
+        except ValueError as exc:
+            raise ValueError(
+                f"bootstrap_table_from_parquet: parquet at {parquet_s3_path!r} "
+                f"missing required partition column {name!r}; expected an "
+                f"int32 stamped by millpond/icebox_sink._add_metadata_columns"
+            ) from exc
+        partition_fields.append(
+            PartitionField(
+                source_id=source.field_id,
+                field_id=field_id,
+                transform=IdentityTransform(),
+                name=name,
+            )
+        )
+    spec = PartitionSpec(*partition_fields)
+
+    log.info(
+        "bootstrap_table_from_parquet: creating %s.%s (schema=%d fields, "
+        "partition_spec=year/month/day/hour identity) from %s",
+        namespace, table_name, len(ice_schema.fields), parquet_s3_path,
+    )
+    try:
+        return catalog.create_table(
+            (namespace, table_name),
+            schema=ice_schema,
+            partition_spec=spec,
+        )
+    except TableAlreadyExistsError:
+        # Another replica beat us. Load the table they created — its
+        # schema/spec might differ from ours if writers shipped
+        # different shapes, but at THIS point any rows we held in PG
+        # already match this parquet's schema and will commit
+        # successfully or fail loudly at append time.
+        log.info(
+            "bootstrap_table_from_parquet: %s.%s already exists (replica "
+            "race); loading instead",
+            namespace, table_name,
+        )
+        return catalog.load_table((namespace, table_name))

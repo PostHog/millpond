@@ -24,7 +24,10 @@ pytestmark = pytest.mark.integration
 
 
 def _make_client(cfg) -> IceboxClient:
-    client = IceboxClient(
+    # No manual pool.open() here — the production main loop doesn't
+    # open the pool either; the previous test helper masked a real
+    # PoolClosed regression by opening it explicitly.
+    return IceboxClient(
         host=cfg.pg_host,
         port=cfg.pg_port,
         database=cfg.pg_database,
@@ -33,8 +36,6 @@ def _make_client(cfg) -> IceboxClient:
         schema=cfg.pg_schema,
         sslmode=cfg.pg_sslmode,
     )
-    client._pool.open(wait=True)
-    return client
 
 
 def _make_request(file_path: str = "s3://b/file.parquet", *, offset: int = 100) -> RegisterFileRequest:

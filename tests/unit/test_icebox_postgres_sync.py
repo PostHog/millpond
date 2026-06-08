@@ -172,6 +172,30 @@ def test_update_heartbeat_executes_without_args():
     cur.execute.assert_called_once_with(ps.UPDATE_HEARTBEAT_SQL)
 
 
+def test_peek_oldest_pending_file_path_returns_path_when_row_exists():
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchone.return_value = ("s3://b/oldest.parquet",)
+    assert ps.peek_oldest_pending_file_path(conn) == "s3://b/oldest.parquet"
+    cur.execute.assert_called_once_with(ps.PEEK_OLDEST_PENDING_FILE_PATH_SQL)
+
+
+def test_peek_oldest_pending_file_path_returns_none_when_empty():
+    """No pending rows = the caller (daemon's bootstrap path) skips
+    table creation and waits for the next writer flush."""
+    conn, cur = _mock_conn_with_cursor()
+    cur.fetchone.return_value = None
+    assert ps.peek_oldest_pending_file_path(conn) is None
+
+
+def test_peek_oldest_pending_file_path_sql_filters_pending_and_orders():
+    """FIFO + result='pending' so we don't seed table bootstrap off a
+    row that's already been committed or failed."""
+    sql = ps.PEEK_OLDEST_PENDING_FILE_PATH_SQL.lower()
+    assert "result='pending'" in sql
+    assert re.search(r"order\s+by\s+inserted_at", sql)
+    assert "limit 1" in sql
+
+
 class TestEnsureDatabaseExists:
     """Tactical DB-create-if-missing bootstrap. Mocked at the
     psycopg.connect boundary; the integration test exercises the real

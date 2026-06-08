@@ -54,6 +54,38 @@ def _valid_register_req():
 # ---------------------------------------------------------------------------
 
 
+def test_pg_client_pool_is_open_after_construction():
+    """Regression: __post_init__ used to construct the pool with
+    `open=False` "to fail loud on first use", but nothing else here
+    ever called `.open()`, so `register_file` immediately raised
+    `psycopg_pool.PoolClosed: the pool 'pool-1' is not open yet`
+    against real PG.
+
+    With min_size=0 there's no eager-connection hazard at boot, so
+    letting psycopg_pool's default (open=True) hold is correct.
+
+    `pool.closed` is True both before .open() and after .close();
+    asserting it's False right after construction pins the open state.
+    """
+    client = IceboxClient(
+        host="bogus.invalid",  # never contacted at min_size=0
+        port=5432,
+        database="icebox",
+        username="megaberg",
+        password="secret",
+        schema="icebox_events",
+        sslmode="require",
+    )
+    try:
+        assert client._pool is not None
+        assert client._pool.closed is False, (
+            "IceboxClient._pool must be open after construction — see "
+            "the PoolClosed regression in icebox_sink.py __post_init__"
+        )
+    finally:
+        client.close()
+
+
 def _pg_client_with_mock_pool():
     """Build an IceboxClient with its connection pool replaced by a
     MagicMock that surfaces the cursor's fetchone()."""

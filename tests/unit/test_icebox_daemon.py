@@ -608,3 +608,124 @@ def test_transient_exception_tuple_covers_requests_and_pyiceberg():
         CommitStateUnknownException,
     }
     assert set(dm._TRANSIENT_EXCEPTIONS) == expected
+
+
+# ---------------------------------------------------------------------------
+# NoSuchTableError → bootstrap_table recovery
+# ---------------------------------------------------------------------------
+
+
+def test_loop_calls_bootstrap_table_on_no_such_table_with_pending_row():
+    """daemon_loop's NoSuchTableError catch-block must:
+      1. peek_oldest_pending_file_path on its own pool conn
+      2. invoke deps.bootstrap_table(file_path) when a row exists
+      3. NOT crash (next tick will load_table successfully)"""
+    import threading as _t
+    import time as _time
+
+    from pyiceberg.exceptions import NoSuchTableError
+
+    cfg = _make_cfg(committer_cadence_seconds=0.05)
+    deps, _ = _make_deps()
+    deps.load_table = MagicMock(side_effect=NoSuchTableError("table not found"))
+    deps.bootstrap_table = MagicMock(return_value=MagicMock())
+
+    # PG pool: peek_oldest_pending_file_path issues SELECT → fetchone
+    # returns the staged parquet path. Same conn handles the tick's
+    # load_table failure (which throws before any cursor is touched).
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.fetchone.return_value = ("s3://b/seed.parquet",)
+    conn.cursor.return_value.__enter__ = lambda self: cursor
+    conn.cursor.return_value.__exit__ = lambda self, *a: None
+    pg_pool = MagicMock()
+    pg_pool.connection.return_value.__enter__ = lambda self: conn
+    pg_pool.connection.return_value.__exit__ = lambda self, *a: None
+
+    stop = _t.Event()
+    runner = _t.Thread(
+        target=dm.daemon_loop,
+        kwargs={"cfg": cfg, "pg_pool": pg_pool, "deps": deps, "stop_event": stop},
+        daemon=True,
+    )
+    runner.start()
+    _time.sleep(0.3)
+    stop.set()
+    runner.join(timeout=2.0)
+
+    deps.bootstrap_table.assert_called_with("s3://b/seed.parquet")
+    assert deps.bootstrap_table.call_count >= 1
+
+
+def test_loop_no_such_table_with_no_pending_rows_skips_bootstrap():
+    """No pending rows yet — we can't infer a schema, so don't call
+    bootstrap_table. The next tick will retry; eventually a writer
+    flushes and the bootstrap fires."""
+    import threading as _t
+    import time as _time
+
+    from pyiceberg.exceptions import NoSuchTableError
+
+    cfg = _make_cfg(committer_cadence_seconds=0.05)
+    deps, _ = _make_deps()
+    deps.load_table = MagicMock(side_effect=NoSuchTableError("table not found"))
+    deps.bootstrap_table = MagicMock()
+
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None  # peek → no pending rows
+    conn.cursor.return_value.__enter__ = lambda self: cursor
+    conn.cursor.return_value.__exit__ = lambda self, *a: None
+    pg_pool = MagicMock()
+    pg_pool.connection.return_value.__enter__ = lambda self: conn
+    pg_pool.connection.return_value.__exit__ = lambda self, *a: None
+
+    stop = _t.Event()
+    runner = _t.Thread(
+        target=dm.daemon_loop,
+        kwargs={"cfg": cfg, "pg_pool": pg_pool, "deps": deps, "stop_event": stop},
+        daemon=True,
+    )
+    runner.start()
+    _time.sleep(0.3)
+    stop.set()
+    runner.join(timeout=2.0)
+
+    deps.bootstrap_table.assert_not_called()
+
+
+def test_loop_no_such_table_without_bootstrap_dep_logs_and_continues(caplog):
+    """If deps.bootstrap_table is None (mis-wired main.py), the loop
+    must log a WARNING and NOT crash. The daemon's one job is to stay
+    up."""
+    import logging as _logging
+    import threading as _t
+    import time as _time
+
+    from pyiceberg.exceptions import NoSuchTableError
+
+    cfg = _make_cfg(committer_cadence_seconds=0.05)
+    deps, _ = _make_deps()
+    deps.load_table = MagicMock(side_effect=NoSuchTableError("table not found"))
+    deps.bootstrap_table = None  # mis-wired
+
+    pg_pool = MagicMock()
+    pg_pool.connection.return_value.__enter__ = lambda self: MagicMock()
+    pg_pool.connection.return_value.__exit__ = lambda self, *a: None
+
+    stop = _t.Event()
+    runner = _t.Thread(
+        target=dm.daemon_loop,
+        kwargs={"cfg": cfg, "pg_pool": pg_pool, "deps": deps, "stop_event": stop},
+        daemon=True,
+    )
+    with caplog.at_level(_logging.WARNING, logger="icebox.daemon"):
+        runner.start()
+        _time.sleep(0.3)
+        stop.set()
+        runner.join(timeout=2.0)
+
+    assert any(
+        "bootstrap_table is None" in rec.message
+        for rec in caplog.records
+    ), "expected a WARNING when deps.bootstrap_table is missing"
