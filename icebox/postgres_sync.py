@@ -1,43 +1,29 @@
-"""Sync psycopg connection + state-machine queries for the committer.
-
-The committer runs in a dedicated thread (NOT an asyncio task) because
-PyIceberg's commit path is synchronous; calling it from within FastAPI's
-asyncio loop would block incoming POST handlers.
+"""Sync psycopg connection + polling-daemon queries.
 
 This module exposes:
-  - `build_psycopg_pool` — connection pool sized small (defaults to
-    psycopg_pool_min=1, max=2). The committer rarely needs more than
-    one connection at a time; the second slot is for the migration
-    runner and the (sync) heartbeat writer if any other sync caller
-    ever pops up.
+  - `build_psycopg_pool` — connection pool sized via Config
+    (psycopg_pool_min default 1, psycopg_pool_max default 4 with a
+    hard floor of 3 enforced in config.py). The daemon's tick holds
+    one connection across the Iceberg commit (up to iceberg_timeout_s);
+    the probe server's /healthz handler reads PG on every kubelet
+    probe AND every Prometheus scrape, so min 3 leaves room for
+    tick + concurrent /healthz + /metrics without starvation.
   - `apply_migrations` — applies ALL_DDL in dependency order with
     per-statement error attribution.
-  - State-machine helpers: claim_files, insert_cycle,
-    mark_iceberg_committed, mark_kafka_committed, complete_cycle,
-    incomplete_cycles, update_heartbeat, record_failure, record_success.
-
-SQL invariants:
-  - All UPDATEs target one row by primary key (cycle_id or file id) so
-    they're index-only and lock-bounded.
-  - The "claim" UPDATE uses FOR UPDATE SKIP LOCKED so two recovering
-    committers don't double-claim the same unclaimed files.
-  - All state-mutating helpers run inside a single transaction the
-    caller opens and commits; this lets the committer batch
-    cycle-progression + status updates atomically when it makes sense.
+  - `claim_pending_batch`, `mark_committed`, `mark_failed`,
+    `update_heartbeat` — daemon helpers.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 from collections.abc import Sequence
-from uuid import UUID
 
 import psycopg
 from psycopg import sql
 from psycopg_pool import ConnectionPool
 
 from icebox.config import Config
-from icebox.schema import ALL_DDL, CommitCycleRow
+from icebox.schema import ALL_DDL, IceboxPendingFileRow
 
 log = logging.getLogger(__name__)
 
@@ -257,362 +243,135 @@ def apply_migrations(conn: psycopg.Connection) -> None:
     conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# Cycle state machine — SQL constants + helpers
-# ---------------------------------------------------------------------------
-
-
-CLAIM_FILES_SQL = """
-WITH candidates AS (
-    SELECT id FROM files
-    WHERE cycle_id IS NULL AND committed_at IS NULL
-    ORDER BY staged_at
-    LIMIT %(max_files)s
-    FOR UPDATE SKIP LOCKED
-)
-UPDATE files f
-SET cycle_id = %(cycle_id)s
-FROM candidates c
-WHERE f.id = c.id
-RETURNING f.id
-"""
-
-
-def claim_files(
-    conn: psycopg.Connection,
-    *,
-    cycle_id: UUID,
-    max_files: int,
-) -> list[int]:
-    """Atomically claim up to `max_files` unclaimed files for this cycle.
-
-    Returns the list of file ids claimed. Empty list means there's
-    nothing pending (vacuous cycle — committer should not proceed).
-
-    Uses FOR UPDATE SKIP LOCKED so two recovering committers running
-    concurrently don't double-claim the same rows. v1 runs a single
-    committer replica but the SKIP LOCKED is cheap insurance.
-    """
-    with conn.cursor() as cur:
-        cur.execute(CLAIM_FILES_SQL, {"cycle_id": cycle_id, "max_files": max_files})
-        return [row[0] for row in cur.fetchall()]
-
-
-INSERT_CYCLE_SQL = """
-INSERT INTO commit_cycles (cycle_id) VALUES (%(cycle_id)s)
-"""
-
-
-def insert_cycle(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
-    """Insert a fresh commit_cycles row at the start of a cycle.
-
-    started_at gets the PG default `now()`. No other state columns are
-    populated until the cycle progresses.
-    """
-    with conn.cursor() as cur:
-        cur.execute(INSERT_CYCLE_SQL, {"cycle_id": cycle_id})
-
-
-MARK_ICEBERG_COMMITTED_SQL = """
-UPDATE commit_cycles
-SET iceberg_snapshot_id = %(snapshot_id)s
-WHERE cycle_id = %(cycle_id)s
-"""
-
-
-def mark_iceberg_committed(
-    conn: psycopg.Connection,
-    *,
-    cycle_id: UUID,
-    snapshot_id: int,
-) -> None:
-    """Record the Iceberg snapshot ID after a successful PyIceberg
-    commit. After this point, recovery can skip the Iceberg-commit step
-    on retry.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            MARK_ICEBERG_COMMITTED_SQL,
-            {"cycle_id": cycle_id, "snapshot_id": snapshot_id},
-        )
-
-
-MARK_KAFKA_COMMITTED_SQL = """
-UPDATE commit_cycles
-SET kafka_committed_at = now()
-WHERE cycle_id = %(cycle_id)s
-"""
-
-
-def mark_kafka_committed(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
-    """Record Kafka offset-commit success. After this, the cycle just
-    needs file-row finalization."""
-    with conn.cursor() as cur:
-        cur.execute(MARK_KAFKA_COMMITTED_SQL, {"cycle_id": cycle_id})
-
-
-COMPLETE_CYCLE_SQL = """
-UPDATE commit_cycles
-SET completed_at = now()
-WHERE cycle_id = %(cycle_id)s
-"""
-
-MARK_FILES_COMMITTED_SQL = """
-UPDATE files
-SET committed_at = now(), iceberg_snapshot_id = %(snapshot_id)s
-WHERE cycle_id = %(cycle_id)s
-"""
-
-
-def complete_cycle(
-    conn: psycopg.Connection,
-    *,
-    cycle_id: UUID,
-    snapshot_id: int,
-) -> None:
-    """Mark the cycle complete and propagate the snapshot_id to its
-    files. Called as the final step after Iceberg + Kafka commits."""
-    with conn.cursor() as cur:
-        cur.execute(
-            MARK_FILES_COMMITTED_SQL,
-            {"cycle_id": cycle_id, "snapshot_id": snapshot_id},
-        )
-        cur.execute(COMPLETE_CYCLE_SQL, {"cycle_id": cycle_id})
-
-
-INCOMPLETE_CYCLES_SQL = """
-SELECT cycle_id, started_at, iceberg_snapshot_id, kafka_committed_at, completed_at
-FROM commit_cycles
-WHERE completed_at IS NULL
-ORDER BY started_at
-LIMIT %(limit)s
-"""
-
-# Safety bound for recovery scans. If we ever return this many rows
-# we're in trouble (stuck cycles accumulating) and ops should page.
-# Surfaced as a function-arg default below so tests can pin smaller.
-INCOMPLETE_CYCLES_LIMIT_DEFAULT = 100
-
-
-def incomplete_cycles(
-    conn: psycopg.Connection,
-    *,
-    limit: int = INCOMPLETE_CYCLES_LIMIT_DEFAULT,
-) -> list[CommitCycleRow]:
-    """Return rows for cycles that haven't reached completed_at — the
-    recovery scan.
-
-    Indexed by commit_cycles_incomplete_idx (partial index on
-    completed_at IS NULL), so even in deep history this is O(in-flight)
-    not O(history).
-    """
-    with conn.cursor() as cur:
-        cur.execute(INCOMPLETE_CYCLES_SQL, {"limit": limit})
-        rows = cur.fetchall()
-    return [
-        CommitCycleRow(
-            cycle_id=r[0],
-            started_at=r[1],
-            iceberg_snapshot_id=r[2],
-            kafka_committed_at=r[3],
-            completed_at=r[4],
-        )
-        for r in rows
-    ]
-
-
 UPDATE_HEARTBEAT_SQL = """
 UPDATE status SET last_committer_heartbeat = now() WHERE id = 1
 """
 
 
 def update_heartbeat(conn: psycopg.Connection) -> None:
-    """Stamp the committer's liveness heartbeat. The async API reads
-    this and rejects POSTs with 503 if the heartbeat is stale (more
-    than cfg.committer_heartbeat_stale_multiple × cadence_seconds old).
+    """Stamp the committer's liveness heartbeat. Read by the probe
+    server's /healthz handler (icebox/main.py): if the heartbeat is
+    stale (more than cfg.committer_heartbeat_stale_multiple ×
+    cadence_seconds old), /healthz returns 503 and the kubelet
+    restarts the pod. Called from main.main() once before the daemon
+    thread starts (so a freshly booted pod doesn't fail liveness
+    before its first tick) and from daemon_tick at the end of every
+    successful tick.
     """
     with conn.cursor() as cur:
         cur.execute(UPDATE_HEARTBEAT_SQL)
 
 
-RECORD_FAILURE_SQL = """
-UPDATE status
-SET consecutive_failures = consecutive_failures + 1
-WHERE id = 1
-"""
-
-RECORD_SUCCESS_SQL = """
-UPDATE status
-SET consecutive_failures = 0,
-    last_success_at = now(),
-    last_cycle_at = now()
-WHERE id = 1
-"""
+# ---------------------------------------------------------------------------
+# v6 polling-daemon helpers. Operate on the `icebox_files` table only;
+# the cycle-era helpers above will be removed once the new daemon is
+# in place. See docs/icebox-self-healing-recovery.md.
+# ---------------------------------------------------------------------------
 
 
-def record_failure(conn: psycopg.Connection) -> None:
-    """Increment consecutive_failures. Crossing the degraded threshold
-    flips POST handlers to 503-degraded mode."""
-    with conn.cursor() as cur:
-        cur.execute(RECORD_FAILURE_SQL)
-
-
-def record_success(conn: psycopg.Connection) -> None:
-    """Reset consecutive_failures to 0 and stamp last_success_at +
-    last_cycle_at to now()."""
-    with conn.cursor() as cur:
-        cur.execute(RECORD_SUCCESS_SQL)
-
-
-FILES_FOR_CYCLE_SQL = """
+# Hot-path SELECT: pending rows older than the age filter, batch-limited,
+# row-locked via FOR UPDATE SKIP LOCKED so a second daemon (rollout
+# overlap, or future multi-replica) takes a disjoint slice.
+#
+# The interval is parameterized so tests can pin a small value without
+# wall-clock waiting. Production callers pass `cfg.age_filter_seconds`.
+CLAIM_PENDING_BATCH_SQL = """
 SELECT id, file_path, writer_ordinal, kafka_offsets, partition_values,
-       record_count, file_size, schema_version, schema_fingerprint,
-       parquet_stats, cycle_id, staged_at, committed_at, iceberg_snapshot_id
-FROM files
-WHERE cycle_id = %(cycle_id)s
-ORDER BY id
+       record_count, file_size, parquet_stats, inserted_at,
+       result, result_at, iceberg_snapshot_id
+FROM icebox_files
+WHERE result = 'pending'
+  AND inserted_at < now() - make_interval(secs => %(age_seconds)s)
+ORDER BY inserted_at
+LIMIT %(batch_size)s
+FOR UPDATE SKIP LOCKED
 """
 
 
-def files_for_cycle(
+def claim_pending_batch(
     conn: psycopg.Connection,
     *,
-    cycle_id: UUID,
-) -> Sequence[tuple]:
-    """Return all rows claimed by `cycle_id`. The committer builds
-    DataFiles from each row. Used both in the steady-state path AND in
-    the recovery path."""
-    with conn.cursor() as cur:
-        cur.execute(FILES_FOR_CYCLE_SQL, {"cycle_id": cycle_id})
-        return cur.fetchall()
+    batch_size: int,
+    age_seconds: float,
+) -> list[IceboxPendingFileRow]:
+    """Lock up to `batch_size` pending rows older than `age_seconds`.
 
+    Returns the locked rows as IceboxPendingFileRow models. The caller
+    is in the same transaction; row locks survive until the tx commits
+    or rolls back.
 
-RELEASE_CYCLE_CLAIM_SQL = """
-UPDATE files
-SET cycle_id = NULL
-WHERE cycle_id = %(cycle_id)s AND committed_at IS NULL
-"""
-
-DELETE_CYCLE_ROW_SQL = """
-DELETE FROM commit_cycles WHERE cycle_id = %(cycle_id)s
-"""
-
-
-def release_cycle_claim(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
-    """Release a failed cycle's file claims so the next cycle can re-claim.
-
-    Used when the cycle failed before reaching mark_iceberg_committed:
-    no Iceberg snapshot exists, so the files are safe to re-batch into
-    a fresh cycle_id. If we already recorded an iceberg_snapshot_id on
-    the cycle row, the recovery path completes the cycle instead of
-    releasing.
+    Empty list means there's nothing eligible — the daemon's tick
+    treats this as a vacuous tick (heartbeat and return).
     """
     with conn.cursor() as cur:
-        cur.execute(RELEASE_CYCLE_CLAIM_SQL, {"cycle_id": cycle_id})
-
-
-# Advisory-lock key namespace for the icebox committer.
-#
-# PG advisory locks are 64-bit signed ints, shared across the whole
-# database. Multiple iceboxes share one PG instance (one schema per
-# deployment); the LOCK ID must be PER-SCHEMA so an events icebox and
-# a person icebox can each hold their own lock without conflict.
-#
-# Derivation: SHA-256 of f"posthog.icebox.committer.{schema}", take
-# the first 8 bytes, interpret as signed int8 (PG advisory_lock
-# parameter type). Stable across runs, distinct per schema.
-#
-# Per the icebox plan, the deployment uses Recreate strategy +
-# replicas=1. This lock is the ONLY runtime defense against two
-# committers racing — if topology guarantees are violated (chart
-# accidentally flipped to RollingUpdate), the lock is what prevents
-# two committers from both running cycles. NOT a "secondary defense":
-# if it's bypassed, OCC contention is the failure mode the entire
-# icebox exists to eliminate.
-#
-# DO NOT version-tag this derivation and DO NOT change the prefix
-# string. Either change rotates every pod's lock id; during the
-# transition both old-pod-with-old-id and new-pod-with-new-id believe
-# they hold the singleton lock — exactly the failure mode the lock
-# prevents. If you ever need to coordinate a rotation, write a
-# documented migration playbook (drain old pods, then deploy new) —
-# don't bake rotation into a knob.
-
-
-def committer_advisory_lock_id(schema: str) -> int:
-    """Derive the 64-bit signed advisory-lock id for a given schema.
-
-    Pure function: same schema → same lock id, forever. Tests pin
-    EXACT values for every deployed schema — any change to this
-    derivation (algorithm, prefix string, byte order, truncation
-    length) fails CI loudly."""
-    digest = hashlib.sha256(
-        f"posthog.icebox.committer.{schema}".encode()
-    ).digest()
-    # Take 8 bytes, interpret as signed int8 (PG advisory_lock takes
-    # int8). big-endian for stability across architectures.
-    return int.from_bytes(digest[:8], byteorder="big", signed=True)
-
-
-TRY_ADVISORY_LOCK_SQL = "SELECT pg_try_advisory_lock(%(key)s)"
-UNLOCK_ADVISORY_LOCK_SQL = "SELECT pg_advisory_unlock(%(key)s)"
-
-
-def try_acquire_committer_lock(
-    conn: psycopg.Connection,
-    *,
-    lock_id: int,
-) -> bool:
-    """Try to acquire the singleton committer advisory lock.
-
-    Returns True on success (caller now holds the lock until the
-    connection closes or pg_advisory_unlock is called). Returns False
-    if another committer already holds it.
-
-    Use on the committer thread's PG connection. The lock is
-    session-scoped: it's automatically released when this connection
-    is closed (e.g., pool eviction, process exit). That's the
-    primary recovery mechanism — a dead committer's lock evaporates
-    with its TCP connection.
-
-    Raises `RuntimeError` if the query returns no row or a NULL value
-    (transport corruption, catalog issue). The previous behavior was
-    to coerce NULL to False, which would misclassify a transport
-    error as "lock held by another committer" — six pods spinning on
-    a phantom lock while PG is actually degraded. PE-review #6.
-    """
-    with conn.cursor() as cur:
-        cur.execute(TRY_ADVISORY_LOCK_SQL, {"key": lock_id})
-        row = cur.fetchone()
-    if row is None or row[0] is None:
-        raise RuntimeError(
-            f"pg_try_advisory_lock({lock_id}) returned no row or NULL — "
-            f"PG protocol or catalog error, NOT 'lock held'. Caller "
-            f"should treat this as a transport failure, retry, and "
-            f"page ops if it persists."
+        cur.execute(
+            CLAIM_PENDING_BATCH_SQL,
+            {"batch_size": batch_size, "age_seconds": age_seconds},
         )
-    return bool(row[0])
+        rows = cur.fetchall()
+    return [
+        IceboxPendingFileRow(
+            id=r[0],
+            file_path=r[1],
+            writer_ordinal=r[2],
+            kafka_offsets=r[3],
+            partition_values=r[4],
+            record_count=r[5],
+            file_size=r[6],
+            parquet_stats=r[7],
+            inserted_at=r[8],
+            result=r[9],
+            result_at=r[10],
+            iceberg_snapshot_id=r[11],
+        )
+        for r in rows
+    ]
 
 
-def release_committer_lock(
+MARK_COMMITTED_SQL = """
+UPDATE icebox_files
+SET result='committed', result_at=now(), iceberg_snapshot_id=%(snapshot_id)s
+WHERE id = ANY(%(ids)s)
+"""
+
+
+def mark_committed(
     conn: psycopg.Connection,
     *,
-    lock_id: int,
+    ids: Sequence[int],
+    snapshot_id: int,
 ) -> None:
-    """Explicit release. Optional — closing the connection releases
-    automatically — but exposing this lets the committer call it on
-    graceful shutdown so a fast pod restart doesn't have to wait for
-    TCP timeout on the dead connection."""
-    with conn.cursor() as cur:
-        cur.execute(UNLOCK_ADVISORY_LOCK_SQL, {"key": lock_id})
+    """Mark a batch of rows as successfully committed to Iceberg.
 
-
-def delete_cycle_row(conn: psycopg.Connection, *, cycle_id: UUID) -> None:
-    """Delete a commit_cycles row that never produced a snapshot. Used
-    in the released-no-iceberg recovery branch: the cycle didn't
-    happen from Iceberg's perspective, so the bookkeeping row is
-    just a zombie. Deleting it prevents accumulation against the
-    incomplete_cycles LIMIT.
+    Stamps `iceberg_snapshot_id` for traceability. Caller is inside a
+    transaction.
     """
+    if not ids:
+        return
     with conn.cursor() as cur:
-        cur.execute(DELETE_CYCLE_ROW_SQL, {"cycle_id": cycle_id})
+        cur.execute(
+            MARK_COMMITTED_SQL,
+            {"snapshot_id": snapshot_id, "ids": list(ids)},
+        )
+
+
+MARK_FAILED_SQL = """
+UPDATE icebox_files
+SET result='failed', result_at=now()
+WHERE id = ANY(%(ids)s)
+"""
+
+
+def mark_failed(
+    conn: psycopg.Connection,
+    *,
+    ids: Sequence[int],
+) -> None:
+    """Mark a batch of rows as failed-non-transport. The daemon's caller
+    advances Kafka offsets past the batch separately; these rows stay
+    in PG as the audit trail (see v6 doc "Failed-row runbook").
+    """
+    if not ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(MARK_FAILED_SQL, {"ids": list(ids)})

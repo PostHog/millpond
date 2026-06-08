@@ -1,22 +1,20 @@
 """Tests for millpond.icebox_sink — the writer-side icebox client.
 
 Covers:
-  - IceboxClient retry behavior (201/409 success, 400 raises, 429/503
-    backoff, transport errors).
+  - IceboxClient: INSERT path (201/409 success, jsonb encoding,
+    impossible-state guard).
   - parquet_stats_from_metadata correctness against a real PyArrow-
     written parquet buffer.
   - IceboxSink end-to-end: produces correct S3 path, correct stats wire
     format, correct RegisterFileRequest body. Uses injectable
-    s3_writer + a mock IceboxClient to stay in unit-test scope.
+    s3_writer + a mock IceboxClient (PG pool) to stay in unit-test scope.
 """
 from __future__ import annotations
 
 import base64
-import time
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
-import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -24,38 +22,16 @@ from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.schema import assign_fresh_schema_ids
 
 from millpond.icebox_sink import (
-    IceboxBackpressureExhausted,
     IceboxClient,
-    IceboxResponseError,
     IceboxSink,
     _wire_encode,
     parquet_stats_from_metadata,
 )
 
-# ---------------------------------------------------------------------------
-# IceboxClient — retry semantics
-# ---------------------------------------------------------------------------
-
-
-def _client_with_mock_httpx(*responses) -> IceboxClient:
-    """Build an IceboxClient where the underlying httpx.Client.post is
-    a MagicMock returning the given sequence of responses."""
-    mock_http = MagicMock(spec=httpx.Client)
-    mock_http.post.side_effect = list(responses)
-    client = IceboxClient(base_url="http://icebox:8000", _client=mock_http)
-    return client
-
-
-def _make_response(status: int, json_body: dict | None = None, headers: dict | None = None) -> MagicMock:
-    resp = MagicMock(spec=httpx.Response)
-    resp.status_code = status
-    resp.json.return_value = json_body or {}
-    resp.text = "" if not json_body else str(json_body)
-    resp.headers = headers or {}
-    return resp
-
 
 def _valid_register_req():
+    """Build a RegisterFileRequest with all required fields populated
+    for IceboxClient tests."""
     from shared.models import ParquetStats, RegisterFileRequest
     return RegisterFileRequest(
         file_path="s3://b/foo.parquet",
@@ -73,123 +49,152 @@ def _valid_register_req():
     )
 
 
-def test_register_file_201_returns_body_and_201(monkeypatch):
-    monkeypatch.setattr(time, "sleep", lambda s: None)
-    client = _client_with_mock_httpx(
-        _make_response(201, {"row_id": 42, "queued_at": "2026-06-01T00:00:00Z"}),
+# ---------------------------------------------------------------------------
+# IceboxClient — psycopg INSERT
+# ---------------------------------------------------------------------------
+
+
+def _pg_client_with_mock_pool():
+    """Build an IceboxClient with its connection pool replaced by a
+    MagicMock that surfaces the cursor's fetchone()."""
+    client = IceboxClient(
+        host="megaberg.example.com",
+        port=5432,
+        database="icebox",
+        username="megaberg",
+        password="secret",
+        schema="icebox_events",
+        sslmode="require",
     )
+    pool = MagicMock()
+    cursor = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__ = lambda self: cursor
+    conn.cursor.return_value.__exit__ = lambda self, *a: None
+    pool.connection.return_value.__enter__ = lambda self: conn
+    pool.connection.return_value.__exit__ = lambda self, *a: None
+    client._pool = pool
+    return client, cursor
+
+
+def test_pg_register_file_201_on_new_insert():
+    """INSERT inserted a row → fetchone returns (id, inserted_at) →
+    return ({row_id, queued_at}, 201). Status 201 matches HTTP
+    'created' so IceboxSink callers don't need to special-case PG."""
+    client, cur = _pg_client_with_mock_pool()
+    inserted = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
+    cur.fetchone.return_value = (42, inserted)
+
     body, status = client.register_file(_valid_register_req())
+
     assert status == 201
     assert body["row_id"] == 42
+    assert body["queued_at"] == inserted.isoformat()
+    # Exactly one execute on the happy path — the INSERT.
+    assert cur.execute.call_count == 1
 
 
-def test_register_file_409_treated_as_success(monkeypatch):
-    """409 means 'already registered' — same body shape as 201.
-    Writer treats as success and moves on."""
-    monkeypatch.setattr(time, "sleep", lambda s: None)
-    client = _client_with_mock_httpx(
-        _make_response(409, {"row_id": 7, "queued_at": "2026-06-01T00:00:00Z"}),
-    )
+def test_pg_register_file_409_on_conflict():
+    """ON CONFLICT DO NOTHING returned no row → fall back to a
+    SELECT for the existing row's id/inserted_at → return 409."""
+    client, cur = _pg_client_with_mock_pool()
+    existing = datetime(2026, 6, 5, 11, 0, 0, tzinfo=UTC)
+    # First fetchone (INSERT...RETURNING) returns None; second
+    # (lookup SELECT) returns the existing row.
+    cur.fetchone.side_effect = [None, (99, existing)]
+
     body, status = client.register_file(_valid_register_req())
+
     assert status == 409
-    assert body["row_id"] == 7
+    assert body["row_id"] == 99
+    assert body["queued_at"] == existing.isoformat()
+    # Two executes on the replay path.
+    assert cur.execute.call_count == 2
 
 
-def test_register_file_400_raises_response_error(monkeypatch):
-    """400 = protocol mismatch or invalid body — not retryable."""
-    monkeypatch.setattr(time, "sleep", lambda s: None)
-    client = _client_with_mock_httpx(
-        _make_response(400, {"error": "protocol_version_mismatch"}),
-    )
-    with pytest.raises(IceboxResponseError):
+def test_pg_register_file_serializes_jsonb_params():
+    """psycopg's parameter binding doesn't auto-encode dicts as jsonb
+    in our version; the client must json.dumps() the dict-shaped
+    columns. A regression that passes a raw dict would surface as a
+    psycopg.errors.ProgrammingError at the boundary."""
+    client, cur = _pg_client_with_mock_pool()
+    cur.fetchone.return_value = (1, datetime.now(UTC))
+
+    client.register_file(_valid_register_req())
+
+    # Single execute call carries the bind dict.
+    params = cur.execute.call_args.args[1]
+    assert isinstance(params["kafka_offsets"], str)
+    assert isinstance(params["partition_values"], str)
+    assert isinstance(params["parquet_stats"], str)
+    # round-trip through json to confirm it's valid JSON.
+    import json as _json
+    assert _json.loads(params["kafka_offsets"]) == {"0": 100}
+    assert _json.loads(params["partition_values"]) == {
+        "year": 2026, "month": 6, "day": 1, "hour": 14,
+    }
+
+
+def test_pg_register_file_carries_file_path_to_lookup_on_conflict():
+    """The lookup SQL params on the 409 path must include the same
+    file_path the INSERT tried — otherwise we'd be doing a useless
+    full-table read."""
+    client, cur = _pg_client_with_mock_pool()
+    cur.fetchone.side_effect = [None, (1, datetime.now(UTC))]
+
+    client.register_file(_valid_register_req())
+
+    lookup_call = cur.execute.call_args_list[1]
+    assert lookup_call.args[1] == {"file_path": "s3://b/foo.parquet"}
+
+
+def test_pg_register_file_raises_on_impossible_state():
+    """If INSERT returns no row AND the lookup also finds nothing, the
+    icebox state is impossible without a concurrent DELETE (which the
+    icebox daemon never issues). Raise loudly so the operator sees the
+    invariant violation rather than silently passing wrong status."""
+    client, cur = _pg_client_with_mock_pool()
+    cur.fetchone.side_effect = [None, None]
+
+    with pytest.raises(RuntimeError, match="this should be impossible"):
         client.register_file(_valid_register_req())
 
 
-def test_register_file_retries_on_429(monkeypatch):
-    """429 → sleep Retry-After → retry."""
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-    client = _client_with_mock_httpx(
-        _make_response(429, {"retry_after_s": 2}, headers={"Retry-After": "2"}),
-        _make_response(201, {"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}),
+def test_pg_register_file_quotes_search_path_in_conninfo():
+    """The schema is interpolated into the conninfo options string. A
+    regression that drops or escapes the search_path setter would
+    cause INSERTs to land in the public schema. Sanity-check the
+    raw conninfo string the client builds."""
+    client = IceboxClient(
+        host="megaberg.example.com",
+        port=5432,
+        database="icebox",
+        username="megaberg",
+        password="secret",
+        schema="icebox_events",
+        sslmode="require",
     )
-    body, status = client.register_file(_valid_register_req())
-    assert status == 201
-    assert sleeps == [2.0]
+    # Reach into the pool's conninfo. ConnectionPool stores it as
+    # `kwargs["conninfo"]` when constructed positionally; check
+    # the public attribute.
+    assert "search_path=icebox_events" in client._pool.conninfo
 
 
-def test_register_file_retries_on_503(monkeypatch):
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-    client = _client_with_mock_httpx(
-        _make_response(503, {"retry_after_s": 5}),
-        _make_response(503, {"retry_after_s": 5}),
-        _make_response(201, {"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}),
-    )
-    body, status = client.register_file(_valid_register_req())
-    assert status == 201
-    assert len(sleeps) == 2
+def test_pg_register_file_sql_uses_on_conflict_do_nothing():
+    """Without ON CONFLICT, the writer's idempotent-replay POST would
+    raise UniqueViolation instead of mapping to 409."""
+    from millpond.icebox_sink import _ICEBOX_INSERT_SQL
+    sql = _ICEBOX_INSERT_SQL.lower()
+    assert "on conflict (file_path) do nothing" in sql
+    assert "returning id, inserted_at" in sql
 
 
-def test_register_file_exhausts_after_max_attempts(monkeypatch):
-    """Persistent 503 → IceboxBackpressureExhausted after max_attempts."""
-    monkeypatch.setattr(time, "sleep", lambda s: None)
-    responses = [_make_response(503, {"retry_after_s": 1}) for _ in range(6)]
-    client = _client_with_mock_httpx(*responses)
-    client.max_attempts = 6
-    with pytest.raises(IceboxBackpressureExhausted):
-        client.register_file(_valid_register_req())
-
-
-def test_register_file_retries_on_5xx_other_than_503(monkeypatch):
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-    client = _client_with_mock_httpx(
-        _make_response(502),
-        _make_response(201, {"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}),
-    )
-    body, status = client.register_file(_valid_register_req())
-    assert status == 201
-
-
-def test_register_file_uses_header_retry_after_over_body(monkeypatch):
-    """Header takes precedence — RFC-conformant behavior."""
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-    client = _client_with_mock_httpx(
-        _make_response(429, {"retry_after_s": 5}, headers={"Retry-After": "1"}),
-        _make_response(201, {"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}),
-    )
-    body, status = client.register_file(_valid_register_req())
-    assert sleeps == [1.0]
-
-
-def test_register_file_caps_retry_after_at_max_backoff(monkeypatch):
-    """If icebox tells us to retry in an hour, we cap at max_backoff_s
-    so the writer doesn't stall indefinitely."""
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-    client = _client_with_mock_httpx(
-        _make_response(429, headers={"Retry-After": "3600"}),
-        _make_response(201, {"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}),
-    )
-    client.max_backoff_s = 30.0
-    body, _ = client.register_file(_valid_register_req())
-    assert sleeps == [30.0]
-
-
-def test_register_file_retries_on_http_error(monkeypatch):
-    """Transport errors (broken connection, timeout) trigger backoff."""
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-    mock_http = MagicMock(spec=httpx.Client)
-    mock_http.post.side_effect = [
-        httpx.ConnectError("conn refused"),
-        _make_response(201, {"row_id": 1, "queued_at": "2026-06-01T00:00:00Z"}),
-    ]
-    client = IceboxClient(base_url="http://icebox:8000", _client=mock_http)
-    body, status = client.register_file(_valid_register_req())
-    assert status == 201
+def test_pg_register_file_sql_targets_icebox_files():
+    """The v6 daemon reads only icebox_files; INSERTing into the
+    cycle-era `files` table during the rollout would silently land in
+    the wrong place. Pin the target table name."""
+    from millpond.icebox_sink import _ICEBOX_INSERT_SQL
+    assert "insert into icebox_files" in _ICEBOX_INSERT_SQL.lower()
 
 
 # ---------------------------------------------------------------------------

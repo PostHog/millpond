@@ -6,7 +6,7 @@ pieces:
 
   - ``JsonFormatter`` — base JSON formatter. Subclasses override
     ``extra_context()`` to inject per-record fields from ContextVars
-    or similar (the icebox subclass reads ``cycle_id_var``).
+    or similar.
   - ``text_formatter`` — plain-text formatter for local dev.
   - ``install_root_handlers`` — clear + reattach the root logger.
   - ``build_otel_logger_provider`` — construct a LoggerProvider with

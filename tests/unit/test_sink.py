@@ -34,12 +34,15 @@ def _cfg(destination: str) -> MagicMock:
     cfg.s3_endpoint = None
     # Icebox-side fields — populated only when destination == "icebox",
     # but the MagicMock returns sane values for the other sinks too.
-    cfg.icebox_url = "http://icebox:8000"
     cfg.icebox_bucket = "bucket"
     cfg.icebox_warehouse_prefix = "warehouses/ingest"
-    cfg.icebox_max_attempts = 6
-    cfg.icebox_max_backoff_s = 30.0
-    cfg.icebox_timeout_s = 10.0
+    cfg.icebox_pg_host = "megaberg.example.com"
+    cfg.icebox_pg_port = 5432
+    cfg.icebox_pg_database = "icebox"
+    cfg.icebox_pg_username = "megaberg"
+    cfg.icebox_pg_password = "secret"
+    cfg.icebox_pg_schema = "icebox_events"
+    cfg.icebox_pg_sslmode = "require"
     cfg.ordinal = 0
     return cfg
 
@@ -83,6 +86,18 @@ class TestMakeSinkDispatch:
         assert sink.warehouse_prefix == "warehouses/ingest"
         assert sink.namespace == "millpond"
         assert sink.table == "events"
+
+    def test_icebox_dispatch_constructs_pg_client(self):
+        """destination='icebox' constructs IceboxClient (psycopg-backed)
+        with the connection fields wired from config."""
+        from millpond.icebox_sink import IceboxClient, IceboxSink
+
+        sink = sink_mod.make_sink(_cfg("icebox"))
+        assert isinstance(sink, IceboxSink)
+        assert isinstance(sink.client, IceboxClient)
+        assert sink.client.host == "megaberg.example.com"
+        assert sink.client.database == "icebox"
+        assert sink.client.schema == "icebox_events"
 
 
 class TestSinkProtocolConformance:

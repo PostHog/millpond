@@ -116,21 +116,26 @@ while not shutdown:
 - **If a pod dies**, its partitions stop being consumed until K8s restarts it. No rebalance.
 
 
-## icebox — writer/committer split for Iceberg
+## icebox — polling-daemon committer for Iceberg
 
-The Iceberg path doesn't commit to the catalog from the writer pod. It POSTs file metadata to **icebox**, a separate service that fronts the Iceberg REST catalog and serializes commits from many concurrent writer pods through a single committer thread per `(namespace, table)`. See [`icebox/README.md`](icebox/README.md) for the full design and operational notes. Summary:
+The Iceberg path doesn't commit to the catalog from the writer pod. Writers stage parquet to S3 and INSERT file metadata into a shared `icebox_files` PG table; a separate **icebox** daemon per `(namespace, table)` polls the table on cadence, commits batches to Iceberg, and advances Kafka offsets on the writer's behalf. See [`icebox/README.md`](icebox/README.md) for the full operational notes and [`docs/icebox-self-healing-recovery.md`](docs/icebox-self-healing-recovery.md) for the v6 design rationale. Summary:
 
 ```
-32× millpond writers ──POST /v1/files──▶ icebox ──cycle──▶ Lakekeeper
-                                          │
-                                          └──cycle──▶ Kafka offset commit
+32× millpond writers ──INSERT───▶ icebox_files (PG)
+                       (Parquet to S3)              │
+                                                    ▼
+                                              icebox daemon
+                                                    │
+                                                    ├──tick──▶ Lakekeeper
+                                                    └──tick──▶ Kafka offset commit
 ```
 
-- One icebox deployment per `(Iceberg namespace, table)` per environment. Each owns its own Postgres schema (`ICEBOX_PG_SCHEMA`); the committer's singleton invariant is enforced by a per-schema PG advisory lock derived from the schema name.
-- Writer-side change is contained in [`millpond/icebox_sink.py`](millpond/icebox_sink.py) (an alternative Sink implementation) — the rest of the writer pipeline is unchanged.
-- The committer batches every claimed file row into one cycle and produces one Iceberg snapshot per cadence (`ICEBOX_COMMITTER_CADENCE_SECONDS`, default 60s). Many writers, one committer per table → zero OCC contention. This is what makes the prod target of 32 concurrent writer pods per Iceberg table viable.
-- The icebox also owns Kafka offset commit on the writers' behalf — writers use `consumer.assign()` and never join the consumer group; the icebox commits offsets atomically with each cycle's Iceberg snapshot. This guarantees exactly-once-from-Kafka through the writer-committer split.
-- Endpoints: `POST /v1/files` (writer perimeter), `GET /v1/status`, `GET /readyz`, `GET /healthz`, `GET /metrics` (Prometheus). Logs are JSON-by-default and stamped with `cycle_id` via a `ContextVar`. PostHog Logs export is wired through standard OTLP/HTTP when `POSTHOG_PROJECT_TOKEN` is set.
+- One icebox deployment per `(Iceberg namespace, table)` per environment. Each owns its own Postgres schema (`ICEBOX_PG_SCHEMA`). Chart enforces `replicas: 1` + `strategy.type: Recreate`; SKIP LOCKED on the daemon's hot SELECT is belt-and-suspenders in case two daemons ever overlap during a rollout.
+- Writer-side change is contained in [`millpond/icebox_sink.py`](millpond/icebox_sink.py) (an alternative Sink implementation that wraps a psycopg pool for the INSERT) — the rest of the writer pipeline is unchanged.
+- The daemon's tick runs `SELECT … WHERE result='pending' AND inserted_at < now() - <age_filter> FOR UPDATE SKIP LOCKED LIMIT <batch_size>` (default cadence 60s, age filter 60s, batch size 100) and produces one Iceberg snapshot per non-vacuous tick. Many writers, one daemon per table → zero OCC contention. This is what makes the prod target of 32 concurrent writer pods per Iceberg table viable.
+- The daemon also owns Kafka offset commit on the writers' behalf — writers use `consumer.assign()` and never join the consumer group. Offset commit runs **after** the PG transaction commits AND after the pool connection is returned, so the invariant *Kafka offset committed iff PG knows the file's fate* survives daemon crashes between PG COMMIT and AdminClient ack (next tick covers the gap via cumulative-offset semantics).
+- Endpoints: `GET /healthz` (k8s liveness; reads `status.last_committer_heartbeat` from PG against `cadence × stale_multiple`), `GET /metrics` (Prometheus). No HTTP writer-facing surface; writers INSERT directly. The probe HTTP server is a stdlib `ThreadingHTTPServer` — no FastAPI/uvicorn.
+- Logs are JSON-by-default. PostHog Logs export is wired through standard OTLP/HTTP when `POSTHOG_PROJECT_TOKEN` is set.
 - The same Docker image carries both binaries; the chart's `deployment.yaml` selects with `command: ["icebox"]` vs `command: ["millpond"]`.
 
 
@@ -529,15 +534,13 @@ Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTP
 | `prometheus-client>=0.21` | Metrics exposition |
 | `pytz>=2024.1` | Required by duckdb's TIMESTAMPTZ Python conversion (1.5.x doesn't accept stdlib zoneinfo) |
 | `pyyaml>=6.0.3` | `tools/ducklake_metrics.py` query definitions |
-| `asyncpg>=0.30` | Async Postgres driver for the icebox API hot path (POST /v1/files insert + status read) |
-| `psycopg[binary,pool]>=3.2` | Sync Postgres driver for the icebox committer thread + DB/schema bootstrap |
-| `fastapi>=0.115` | icebox HTTP API (POST /v1/files, GET /v1/status, /readyz, /healthz, /metrics) |
-| `uvicorn>=0.32` | ASGI server hosting the icebox FastAPI app |
-| `httpx>=0.27` | HTTP client used by the writer-side IcebergSink to POST to icebox; also used in tests |
+| `psycopg[binary,pool]>=3.2` | Sync Postgres driver for both the writer-side `IceboxClient.register_file` (INSERT path) and the icebox daemon (claim / mark / heartbeat / migrations) |
 | `opentelemetry-sdk>=1.30` | Structured-log OTLP export plumbing for the icebox |
 | `opentelemetry-exporter-otlp-proto-http>=1.30` | OTLP/HTTP exporter — ships icebox logs to PostHog Logs when `POSTHOG_PROJECT_TOKEN` is set |
 
-`duckdb`, `pyiceberg`, and the icebox-stack deps (`asyncpg`, `psycopg`, `fastapi`, `uvicorn`, `opentelemetry-*`) are always installed — there is no "ducklake-only" / "iceberg-only" / "writer-only" / "icebox-only" build variant. The lazy import in `make_sink()` means a deployment that only uses one destination doesn't pay the other's import cost at startup; the icebox modules are similarly imported lazily by the `icebox` console script entry point. The dependency footprint on disk is identical regardless of which binary the pod runs.
+The v6 polling-daemon rewrite deleted the icebox HTTP service: `fastapi`, `uvicorn`, `httpx`, and `asyncpg` are no longer dependencies. The probe HTTP server in `icebox/main.py` is a stdlib `ThreadingHTTPServer`.
+
+`duckdb`, `pyiceberg`, and the icebox-stack deps (`psycopg`, `opentelemetry-*`) are always installed — there is no "ducklake-only" / "iceberg-only" / "writer-only" / "icebox-only" build variant. The lazy import in `make_sink()` means a deployment that only uses one destination doesn't pay the other's import cost at startup; the icebox modules are similarly imported lazily by the `icebox` console script entry point. The dependency footprint on disk is identical regardless of which binary the pod runs.
 
 ## Project Structure
 
@@ -565,33 +568,32 @@ millpond/
 │   ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + numeric normalization)
 │   ├── ducklake.py           # DuckLake backend: connect, write, DuckLakeSink class
 │   ├── iceberg.py            # Iceberg backend (direct-commit path): connect, write, SchemaManager
-│   ├── icebox_sink.py        # Iceberg backend (icebox-coordinated path): POST /v1/files to icebox
+│   ├── icebox_sink.py        # Iceberg backend (icebox-coordinated path): psycopg IceboxClient + IceboxSink
 │   ├── schema.py             # DuckLake SchemaManager (Iceberg's is embedded in iceberg.py)
 │   ├── consumer.py           # Kafka consumer + AdminClient for partition discovery
 │   ├── backpressure.py       # Adaptive batch sizing
 │   ├── metrics.py            # Prometheus metric definitions
 │   └── server.py             # HTTP server for /metrics, /healthz, /readyz
-├── icebox/                   # The icebox: writer/committer-split service fronting Lakekeeper
+├── icebox/                   # The icebox: polling-daemon committer fronting Lakekeeper
 │   ├── __init__.py
-│   ├── main.py               # `icebox` console-script entry point; lifespan + signal wiring
-│   ├── api.py                # FastAPI app: POST /v1/files, GET /v1/status, /readyz, /healthz, /metrics
-│   ├── committer.py          # Singleton committer thread + 9-step cycle + 3-branch recovery
+│   ├── main.py               # `icebox` console-script entry point; signal wiring + stdlib probe HTTP server
+│   ├── daemon.py             # daemon_tick + daemon_loop + TickResult + DaemonDeps
 │   ├── config.py             # Env-driven Config dataclass (ICEBOX_*)
 │   ├── iceberg.py            # commit_data_files + DataFile builder + snapshot_id helpers
 │   ├── kafka.py              # AdminClient + alter_consumer_group_offsets (offset commit on writers' behalf)
-│   ├── postgres_async.py     # asyncpg pool for the API hot path
-│   ├── postgres_sync.py      # psycopg pool + cycle state-machine SQL + advisory lock
-│   ├── schema.py             # PG DDL + Pydantic row models
-│   ├── schema_cache.py       # TTL cache for the table's current schema fingerprint
-│   ├── metrics.py            # Prometheus gauges/counters/histogram for the icebox
-│   ├── structured_logging.py # JSON formatter + cycle_id ContextVar + optional OTLP/HTTP export
+│   ├── postgres_sync.py      # psycopg pool + claim_pending_batch / mark_committed / mark_failed / update_heartbeat + migrations
+│   ├── schema.py             # PG DDL (icebox_files, status) + Pydantic row models
+│   ├── timeout.py            # with_timeout — thread-based wrapper for commit_data_files (PyIceberg has no native timeout)
+│   ├── metrics.py            # Prometheus gauges/counters/histogram for the daemon
+│   ├── structured_logging.py # JSON formatter + optional OTLP/HTTP export
 │   └── README.md             # icebox-specific design + operational notes
 ├── shared/                   # Wire format + helpers used by both millpond/icebox_sink and icebox/
 │   ├── __init__.py
 │   ├── models.py             # Pydantic wire models (RegisterFileRequest, ParquetStats, etc.)
 │   ├── bounds.py             # Typed-JSON ↔ Iceberg single-value-serialization bytes
-│   ├── fingerprint.py        # Iceberg-schema → SHA-256 fingerprint for the cache + writer perimeter
-│   └── paths.py              # Deterministic S3 path helpers
+│   ├── fingerprint.py        # Iceberg-schema → SHA-256 fingerprint
+│   ├── paths.py              # Deterministic S3 path helpers
+│   └── structured_logging.py # JsonFormatter base + OTLP logger-provider builder (subclassed by icebox/structured_logging.py)
 ├── tools/
 │   ├── ducklake_maintenance.py     # Self-contained DuckLake maintenance script (K8s CronJob, DuckLake-only)
 │   ├── ducklake_maintenance.sql    # Macros loaded at session start

@@ -1,72 +1,141 @@
 # icebox
 
-A writer/committer split for high-concurrency Iceberg writes. Each
+A polling-daemon committer for high-concurrency Iceberg writes. Each
 icebox instance fronts exactly one Iceberg `(namespace, table)` pair
-and serializes commits from many concurrent millpond writer pods
-through a single committer thread, eliminating PyIceberg's REST-catalog
-optimistic-concurrency contention.
+and serializes commits from many concurrent millpond writer pods,
+eliminating PyIceberg's REST-catalog optimistic-concurrency contention.
+
+The v6 polling-daemon design is documented in
+[`../docs/icebox-self-healing-recovery.md`](../docs/icebox-self-healing-recovery.md);
+this README is the operational quick-reference for the running code.
 
 ## Why
 
-The millpond writer's Iceberg sink path commits via PyIceberg's REST
-client. Each writer-to-Lakekeeper commit attaches a branch-snapshot
-requirement (`expected id != actual id`); two writers committing at
-the same flush cadence race against the catalog and the loser retries
-with exponential backoff. Under sustained dual-writer load with
-`FLUSH_INTERVAL_MS=5000` (let alone the 32 writers the production
-deployment targets), retries pile up on the *next* round of commits
-and exhaust the budget. The pod exits. The original discovery is
-also commented in `docker-compose.iceberg.yaml`.
+The millpond writer's direct Iceberg sink commits via PyIceberg's REST
+client. Each commit attaches a branch-snapshot requirement
+(`expected id != actual id`); two writers committing at the same flush
+cadence race against the catalog and the loser retries with
+exponential backoff. Under sustained dual-writer load at
+`FLUSH_INTERVAL_MS=5000` (let alone the 32 writers production targets),
+retries pile up and the pod exits.
 
-icebox solves this with a producer/consumer split:
+icebox solves this with a writer/daemon split:
 
 ```
-32× millpond writers ──POST /v1/files──▶ icebox ──cycle──▶ Lakekeeper
-                                          │
-                                          └──cycle──▶ Kafka offset commit
+32× millpond writers ──INSERT───▶ icebox_files (PG)
+                       (Parquet to S3)              │
+                                                    ▼
+                                              icebox daemon
+                                                    │
+                                                    ├──tick──▶ Lakekeeper
+                                                    └──tick──▶ Kafka offset commit
 ```
 
-- **Writers write parquet to S3** as before, but instead of calling
-  PyIceberg's commit, they `POST /v1/files` with file metadata to the
-  icebox. The POST returns 201 once the row lands in the icebox's
-  Postgres.
-- **One icebox per (Iceberg namespace, table) per environment.** Each
-  deployment owns its own PG schema and serves exactly one table. The
-  committer thread inside the icebox is a singleton enforced via a
-  per-schema PG advisory lock derived from the schema name.
-- **The committer batches** every claimed file row into one cycle and
-  produces one Iceberg snapshot per cycle (default cadence 60s). Many
-  writers, one committer per table → zero OCC contention.
-- **Offsets are committed by the icebox**, not by the writers. The
-  writers use `consumer.assign()` and never join the consumer group;
-  the icebox holds the offset-commit responsibility for the group
-  on the writers' behalf. This is what guarantees the
-  exactly-one-snapshot-per-cycle / exactly-once-from-Kafka invariant
-  through the writer-committer split.
+- **Writers write parquet to S3** and INSERT a row into the
+  `icebox_files` PG table (the writer-side `IceboxClient` uses a small
+  psycopg pool; see [`millpond/icebox_sink.py`](../millpond/icebox_sink.py)).
+  `ON CONFLICT (file_path) DO NOTHING` makes writer replay idempotent
+  (201 on a new row, 409 on a same-path replay).
+- **One icebox per `(Iceberg namespace, table)` per environment.** Each
+  deployment owns its own PG schema (`ICEBOX_PG_SCHEMA`) and serves
+  exactly one Iceberg table. The chart enforces `replicas: 1` +
+  `strategy.type: Recreate`; SKIP LOCKED is belt-and-suspenders in case
+  two daemons ever overlap during a rollout.
+- **The daemon polls** `icebox_files` every `ICEBOX_COMMITTER_CADENCE_SECONDS`
+  (default 60s) with `SELECT … WHERE result='pending' AND inserted_at <
+  now() - interval '<age_filter_seconds>' FOR UPDATE SKIP LOCKED LIMIT
+  <batch_size>`. Each tick commits one batch (default 100 rows) to
+  Iceberg as a single snapshot.
+- **Kafka offsets are advanced by the daemon**, not by the writers.
+  Writers use `consumer.assign()` and never join the consumer group;
+  the daemon holds the offset-commit responsibility for the group via
+  the Kafka AdminClient. The offset commit runs **after** the PG
+  transaction commits — so the invariant *Kafka offset committed iff
+  PG knows the file's fate* survives daemon crashes between PG COMMIT
+  and AdminClient ack (next tick covers the gap via cumulative-offset
+  semantics).
 
-## Endpoints
+## Failure model
+
+| Failure | What the daemon does |
+|---|---|
+| No pending rows | Vacuous tick — stamp heartbeat, return |
+| Iceberg transport failure (`requests.{Timeout, ConnectionError, HTTPError, RequestException}` / `TimeoutError` from `with_timeout` / `CommitFailedException` / `CommitStateUnknownException`) | Rows stay `pending` (no UPDATE). No Kafka commit. Stamp heartbeat. Next tick retries |
+| Iceberg rejects a single row at `build_data_file` (e.g., partition_values missing) | That row marked `failed` inline; the rest of the batch proceeds normally. Kafka offsets advance past the full batch (the failed row's events are lost from Iceberg; downstream UUID dedup is irrelevant here — operator audits via `result='failed'`) |
+| Iceberg rejects the whole batch with a non-transport error | Every row marked `failed`. Kafka offsets advanced past the batch (the "make progress" tradeoff: pipeline keeps moving, operator audits later) |
+| Daemon dies mid-tick | PG tx rolls back; rows stay `pending`. Next tick re-claims them |
+| Daemon dies after Iceberg commit, before PG UPDATE | Iceberg has the files; PG rolled back. Next tick re-commits — PyIceberg silently accepts the duplicate file_path (verified against pinned 0.11.1). Downstream UUID dedup absorbs the duplicate at query time. Cost: 2x read of those events until snapshot expiration |
+| Daemon dies after PG COMMIT, before Kafka offset commit | PG committed; Kafka behind. Writer replays from Kafka; same deterministic file_path hits `ON CONFLICT DO NOTHING`. Next tick advances offsets cumulatively |
+| Lakekeeper unreachable | Tick increments `icebox_lakekeeper_failures_total` and returns. After enough failed ticks the heartbeat goes stale → `/healthz` 503 → k8s restarts the pod (no longer doing useful work anyway) |
+| PG unreachable | `daemon_loop` catches `psycopg.Error`, increments `icebox_pg_unreachable_total`, sleeps the cadence, retries. If the pool is closed (e.g., shutdown), the loop exits |
+
+The doc's "Failure modes" table and the v6 invariants section have the
+full discussion: <../docs/icebox-self-healing-recovery.md>.
+
+## Probe endpoints
+
+The daemon binds `ICEBOX_API_HOST:ICEBOX_API_PORT` (default
+`0.0.0.0:8000`) with a `ThreadingHTTPServer` serving:
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/files` | Writer registers a parquet file. 201 on accept, 409 on idempotent replay, 400 on body/schema mismatch, 429 on queue full, 503 on degraded or stale heartbeat. |
-| `GET /v1/status` | Operator-facing observability snapshot (pending files, last cycle, last committed snapshot id, consecutive failures). |
-| `GET /readyz` | Readiness: PG reachable AND committer heartbeat fresh. Downstream (Lakekeeper, Kafka) outages do NOT fail readyz — the icebox keeps accepting POSTs and stages files for future cycles. |
-| `GET /healthz` | Liveness only — the API process is responsive. No PG round-trip. |
-| `GET /metrics` | Prometheus exposition: pending files, oldest pending age, consecutive failures, committer heartbeat age, cycle counts and duration histogram, post counts by HTTP status, schema-fingerprint cache misses (by `reason`), and **Iceberg table state** — `icebox_iceberg_table_data_files`, `_records`, `_files_size_bytes` (cumulative after last cycle) plus `_added_data_files`, `_added_records`, `_added_files_size_bytes` (per-cycle deltas). Table-state gauges are read free from each cycle's snapshot summary — no thread, no extra Lakekeeper round-trip. |
+| `GET /healthz` | k8s liveness. 200 if `status.last_committer_heartbeat` is within `cadence × heartbeat_stale_multiple` (default 3×). 503 on stale, NULL, or PG unreachable. Boot-seeded by `main.py` before the daemon thread starts so a slow first tick doesn't race the kubelet probe |
+| `GET /metrics` | Prometheus exposition |
+
+There is no `/v1/files` / `POST` surface anymore — writers INSERT
+directly. The v6 rewrite [removed the HTTP API
+entirely](../docs/icebox-self-healing-recovery.md#what-this-doesnt-try-to-do).
+
+## Metrics
+
+See `icebox/metrics.py` for the full list with descriptions and bucket
+boundaries. Headline metrics for dashboards/alerting:
+
+| Metric | Type | Use |
+|---|---|---|
+| `icebox_files_count{result}` | gauge | Backlog signal (`pending`), audit queue size (`failed`), throughput trend (`committed`) |
+| `icebox_files_oldest_pending_seconds` | gauge | Drain-rate signal. -1 when no pending rows |
+| `icebox_files_bytes{result}` | gauge | "How much data is stuck" — alert on `pending` / `failed` sum |
+| `icebox_tick_duration_seconds{outcome}` | histogram | End-to-end tick budget. Outcomes: `success`, `vacuous`, `transport_failure`, `batch_failure` |
+| `icebox_iceberg_commit_duration_seconds` | histogram | Lakekeeper p99 visible without Lakekeeper-side instrumentation |
+| `icebox_kafka_commit_duration_seconds` | histogram | AdminClient cost (runs post-tx, outside the pool conn) |
+| `icebox_batch_size` | histogram | Tick batch size. Saturating the top bucket = increase `ICEBOX_COMMITTER_MAX_PENDING_FILES` |
+| `icebox_files_committed_total` / `_failed_total` / `icebox_records_committed_total` | counter | Throughput / audit growth rate |
+| `icebox_last_success_at` | gauge (unix time) | Alert: `now() - last_success_at > N AND files_count{result='pending'} > 0` |
+| `icebox_ticks_total{outcome}` | counter | Combined with `last_success_at` distinguishes "alive but stuck" from "alive and progressing" |
+| `icebox_lakekeeper_failures_total` / `icebox_batch_failures_total` / `icebox_iceberg_timeout_total` / `icebox_pg_unreachable_total` | counter | Failure-mode partitioning for incident attribution |
+| `icebox_iceberg_table_*` (6 gauges) | gauge | Iceberg snapshot summary values (cumulative + per-tick delta). Updated free on every successful commit — no extra Lakekeeper round-trip |
+
+## Configuration
+
+All config is env-driven via `icebox/config.py`. The chart's
+`icebox.yaml` template wires values 1:1 to env vars. Selected
+high-impact knobs:
+
+| Env var | Default | Notes |
+|---|---|---|
+| `ICEBOX_PG_HOST` / `DATABASE` / `PASSWORD` / `SCHEMA` | (required) | Postgres connection essentials |
+| `ICEBOX_PG_PORT` / `SSLMODE` / `USERNAME` | `5432` / `require` / `lakekeeper` | The username default exists because the icebox reuses Lakekeeper's PG role (see "Operator prereqs" below) |
+| `ICEBOX_ICEBERG_CATALOG_URI` / `NAMESPACE` / `TABLE` | (required) | Lakekeeper catalog + this deployment's table |
+| `ICEBOX_ICEBERG_WAREHOUSE` | `ingest` | Warehouse name on the catalog |
+| `ICEBOX_KAFKA_BOOTSTRAP_SERVERS` / `TOPIC` / `GROUP_ID` | (required) | Kafka group whose offsets the daemon advances on the writer's behalf |
+| `ICEBOX_KAFKA_EXTRA_CONFIG` | `{}` | JSON dict merged into the AdminClient config (e.g., security.protocol, sasl.*) |
+| `ICEBOX_COMMITTER_CADENCE_SECONDS` | `60` | Tick interval |
+| `ICEBOX_COMMITTER_MAX_PENDING_FILES` | `100` | Max rows per tick. Lower → bad-batch blast radius smaller; higher → fewer Iceberg snapshots per unit ingest |
+| `ICEBOX_AGE_FILTER_SECONDS` | `60` | Pending rows younger than this aren't eligible — gives the writer time to accumulate enough files for a worthwhile snapshot |
+| `ICEBOX_ICEBERG_TIMEOUT_S` | `5` | Wall-clock budget for the Iceberg commit (via `with_timeout`). Bounds row-lock hold time during Lakekeeper degradation |
+| `ICEBOX_COMMITTER_HEARTBEAT_STALE_MULTIPLE` | `3.0` | `/healthz` returns 503 when `now() - heartbeat > cadence × stale_multiple` |
+| `ICEBOX_PSYCOPG_POOL_MIN` / `_MAX` | `1` / `4` | Pool budget. Daemon tick holds 1 conn across the Iceberg commit; `refresh_state_gauges` holds 1; probes need ≥1 more. Max floor is 3 |
+| `ICEBOX_API_HOST` / `_PORT` | `0.0.0.0` / `8000` | Bind address for the probe HTTP server (`/healthz` + `/metrics`) |
 
 ## Structured logging + PostHog Logs
 
-Logs are JSON-by-default (`ICEBOX_LOG_FORMAT=json`). Every log line
-emitted inside a committer cycle is automatically stamped with
-`cycle_id` via a `ContextVar` — no per-call-site plumbing — so a
-cycle's complete trace is grep-friendly.
-
-When `POSTHOG_PROJECT_TOKEN` is set, the icebox additionally exports
-log records to PostHog Logs via standard OTLP/HTTP
-(`https://us.i.posthog.com/i/v1/logs` by default; override via
-`POSTHOG_LOGS_ENDPOINT`). The `BatchLogRecordProcessor` is flushed on
-the SIGTERM drain path so in-flight batches make it out before the
-process exits.
+JSON-by-default (`ICEBOX_LOG_FORMAT=json`). When `POSTHOG_PROJECT_TOKEN`
+is set the daemon additionally exports log records to PostHog Logs via
+standard OTLP/HTTP (`https://us.i.posthog.com/i/v1/logs` by default;
+override via `POSTHOG_LOGS_ENDPOINT`). The `BatchLogRecordProcessor` is
+flushed on the SIGTERM drain path so in-flight batches reach PostHog
+before the process exits.
 
 ### Resource attribute taxonomy
 
@@ -76,145 +145,80 @@ Split by ownership so the app and the chart never set the same key.
 
 | Attr | Value | Why |
 |---|---|---|
-| `service.name` | `icebox` (constant) | One binary, one service. Per-instance differentiation is on `service.instance.id`. |
-| `service.namespace` | `millpond` (default; override via `ICEBOX_SERVICE_NAMESPACE`) | OTel-semconv "logical service grouping". **Note:** earlier versions misused this for the PG schema. Filters that targeted the old per-deployment value (`service.namespace=icebox_events_icebox` etc.) must migrate to `service.instance.id=<consumer-key>`. |
-| `service.instance.id` | The consumer key, e.g. `events-icebox` (from `ICEBOX_SERVICE_INSTANCE_ID`) | This IS the per-(namespace, table) axis. |
+| `service.name` | `icebox` (constant) | One binary, one service. Per-instance differentiation is on `service.instance.id` |
+| `service.namespace` | `millpond` (override via `ICEBOX_SERVICE_NAMESPACE`) | OTel-semconv "logical service grouping" |
+| `service.instance.id` | The consumer key, e.g. `events-icebox` (from `ICEBOX_SERVICE_INSTANCE_ID`) | The per-`(namespace, table)` axis |
 | `service.version` | The millpond package version | |
-| `messaging.system` | `kafka` (only when Kafka attrs are set) | OTel messaging semconv. |
-| `messaging.destination.name` | The Kafka topic | OTel messaging semconv (chosen over vendor-prefixed `icebox.kafka.topic` for interop with OTel-aware tooling). |
-| `messaging.kafka.consumer.group` | The icebox-side consumer group id | OTel messaging semconv. |
-| `icebox.iceberg.warehouse` / `namespace` / `table` | Lakekeeper warehouse, namespace, table | Vendor-prefixed because OTel semconv has no Iceberg coverage today. |
+| `messaging.system` | `kafka` (only when Kafka attrs are set) | OTel messaging semconv |
+| `messaging.destination.name` | The Kafka topic | OTel messaging semconv |
+| `messaging.kafka.consumer.group` | The icebox-side consumer group id | OTel messaging semconv |
+| `icebox.iceberg.warehouse` / `namespace` / `table` | Lakekeeper warehouse, namespace, table | Vendor-prefixed (no OTel semconv coverage for Iceberg today) |
 
-**Chart-owned** (set via the chart's `OTEL_RESOURCE_ATTRIBUTES` env on
-the icebox Deployment — auto-merged into the resource by
-`Resource.create()`):
+**Chart-owned** (`OTEL_RESOURCE_ATTRIBUTES` env on the icebox
+Deployment — auto-merged into the resource):
 
 - `deployment.environment` (e.g. `managed-warehouse-prod-us`)
 - `k8s.cluster.name`, `k8s.namespace.name`, `k8s.pod.name`, `k8s.deployment.name`
 - `host.hostname`
 
-These are not passed by the app — keeping env/cluster concerns out of
-icebox code.
-
-### Per-record attributes
-
-| Attr | Source | Why |
-|---|---|---|
-| `icebox.cycle_id` | The `cycle_id_var` ContextVar set by `committer.run_cycle` | Per-record, NOT Resource. Resource attrs describe the *process*; `cycle_id` describes a *single cycle* inside it. Moving it to Resource would silently break per-cycle filtering. |
-
-The stdout JSON formatter additionally emits a plain `cycle_id` field
-in the body for stdout-only readers. PostHog Logs queries should use
-`attributes.icebox.cycle_id`.
-
 ## Tests
 
 | Path | Scope |
 |---|---|
-| `tests/unit/test_icebox_*.py` | Unit tests for each module: API perimeter checks (backpressure ordering, fingerprint mismatch, namespace/table mismatch, redaction), committer state machine, recovery branches, schema-fingerprint cache, JSON formatter + ContextVar propagation, metric accounting. |
-| `tests/integration/test_icebox_e2e.py` | In-process e2e against testcontainers Postgres + a PyIceberg `SqlCatalog` against SQLite. Fast feedback for refactor regressions. |
-| `tests/integration/test_icebox_docker.py` | End-to-end against the actual `icebox` Docker image built from the repo Dockerfile, talking to testcontainers Postgres + MinIO + tabulario/iceberg-rest + Redpanda. Covers image boot path, real cycle producing real Iceberg snapshot, SIGKILL recovery, SIGTERM drain (idle + mid-cycle), 32-concurrent POST burst, same-schema advisory-lock contention, and downstream-outage graceful degradation. |
+| `tests/unit/test_icebox_*.py` | Unit tests for each module: schema/DDL, postgres_sync SQL + helpers, daemon tick paths (success / vacuous / transport failure / batch failure / per-row partitioning), `with_timeout`, iceberg commit shape, structured logging |
+| `tests/integration/test_icebox_*.py` | testcontainers Postgres + mocked Lakekeeper. Covers happy path, age filter, SKIP LOCKED concurrency (event-gated to actually exercise the disjoint claim), transport failure, batch failure, crash mid-tick (PG side), heartbeat-on-every-exit-path, daemon-loop drain budget, Kafka commit ordering (post-tx, outside the pool conn), writer-side INSERT + replay 409, probe `/healthz` (200/503 stale/503 NULL/503 PG-unreachable) + `/metrics`, migration idempotency, boot-sequence heartbeat seed |
 
-The Docker integration suite pins the build platform to `linux/amd64`
-by default to match what the chart publishes; Apple-Silicon devs are
-auto-detected and fall back to `linux/arm64` for native iteration
-(see `_resolve_test_platform` in the test module).
+Real-Lakekeeper docker-compose coverage is deferred (per the v6 doc's
+"Out of scope" section).
+
+## Known design constraints
+
+- One icebox per `(Iceberg namespace, table)`. Each deployment owns its
+  own PG schema; schema isolation is enforced via
+  `options=-csearch_path=<schema>` on every pool connection.
+- Schema names are validated as lowercase ASCII identifiers at
+  config-load time (no PG protocol support for parameterized session
+  options).
+- Chart enforces `replicas: 1` + `strategy.type: Recreate`. SKIP LOCKED
+  is the row-coordination primitive; if multi-replica becomes
+  warranted, the design is natively safe (writer replay absorbs the
+  brief Kafka-offset reorder window).
+- The PG advisory lock that the cycle-era code used is **gone**. The
+  v6 rewrite replaces it with SKIP LOCKED + chart-level singleton; the
+  Aurora-failover concern that previously applied to the lock is no
+  longer relevant.
 
 ## Operational notes
 
-The rest of this file captures **deferred operational concerns** and
-**known limitations** for operators reading the code. Everything here
-is intentional non-coverage in the current PR — not undiscovered.
-
-## Deferred operational concerns
-
-### Aurora failover and the advisory lock
-
-The committer holds a session-scoped PG advisory lock on a dedicated
-connection (see `postgres_sync.committer_advisory_lock_id` +
-`committer.committer_loop`). The session-scoped semantics mean the lock
-evaporates with its TCP socket — a dead committer's lock auto-releases,
-which is the design's primary recovery mechanism.
-
-**What this design does NOT handle today**: an Aurora failover (or any
-TCP RST) on the held lock connection mid-cycle. The pool doesn't
-health-check held connections; the committer keeps running, believing
-it still holds the lock, while a freshly-elected Aurora primary has no
-record of the lock. If a second pod were running at that instant, it
-could acquire its own "lock" and the singleton-committer invariant
-would be briefly violated.
-
-At the current deployment shape — replicas=1 with `strategy.type:
-Recreate` — there's no second pod to acquire, so this is benign. If
-anyone bumps replicas to 2 (e.g., to attempt blue/green), the lock
-becomes load-bearing during a failover window.
-
-**Mitigations to add when this becomes a real risk:**
-- Add a `pg_advisory_lock_is_held(<lock_id>)` check at cycle start; if
-  False, log + re-acquire (or shut down and let K8s restart).
-- Add a periodic heartbeat query on the lock_conn (e.g., `SELECT 1`)
-  so the pool catches the dead TCP within seconds instead of at
-  next-shutdown.
-
 ### TCP keepalives
 
-Neither pool (`psycopg_pool.ConnectionPool` nor `asyncpg.create_pool`)
-sets TCP keepalives. NLB/ELB default idle timeout is 350s; an idle
-asyncpg connection beyond that gets silently RST and the next query
-races dead-connection detection.
-
-**To add:** `keepalives=1 keepalives_idle=30 keepalives_interval=10
-keepalives_count=3` on the psycopg conninfo, equivalent settings on
-asyncpg. Both reviewers flagged this; it's separate-concern and not
-required for mw-dev rollout.
+Neither the psycopg pool nor the Kafka AdminClient sets TCP keepalives
+explicitly. NLB/ELB default idle timeout is 350s; an idle connection
+beyond that gets silently RST and the next query races
+dead-connection detection. Add `keepalives=1 keepalives_idle=30
+keepalives_interval=10 keepalives_count=3` on the psycopg conninfo if
+this becomes operationally visible.
 
 ### Operator prereqs for the bootstrap helpers
 
 `ensure_database_exists` requires the icebox PG user to have
 `CREATEDB`. `ensure_schema_exists` requires `CREATE` on the configured
-database. The bootstrap helpers wrap `InsufficientPrivilege` errors
-with actionable messages pointing at the required GRANTs, but the
-preferred long-term fix is provisioning the database + schema via
-Terraform so the helpers become no-ops.
-
-The reuse of Lakekeeper's PG user means the icebox inherits whatever
-grants the Lakekeeper installer configured. As of this writing, that
-user does NOT have `CREATEDB`. Operator action item: either grant
-`CREATEDB` to the lakekeeper user OR provision the icebox database
-manually before first pod deploy.
+database. The helpers wrap `InsufficientPrivilege` errors with
+actionable messages pointing at the required GRANTs, but the preferred
+long-term fix is provisioning the database + schema via Terraform so
+the helpers become no-ops.
 
 ### Connection budget at scale
 
-Per-pod budget: 1 lock conn (held outside the pool) + asyncpg pool
-(max 8) + psycopg pool (max 2) = up to 11 connections per pod. At 6
-iceboxes per env that's 66 connections to a single PG instance,
-shared with Lakekeeper's own pool. Confirmed sufficient on the
-megaberg PG; revisit if instance class drops or if writer pods start
-holding PG connections too.
+Per-pod budget: `ICEBOX_PSYCOPG_POOL_MAX` (default 4) connections per
+icebox pod. At 6 iceboxes per env that's 24 conns to a single PG
+instance, shared with Lakekeeper's own pool. Confirmed comfortable on
+the megaberg PG.
 
-## Known design constraints
+### Snapshot expiration
 
-- One icebox per (Iceberg namespace, table). Each deployment is
-  configured with `ICEBOX_PG_SCHEMA`, `ICEBOX_ICEBERG_NAMESPACE`,
-  `ICEBOX_ICEBERG_TABLE` and serves exactly one Iceberg table.
-- Each deployment owns its own PG schema; schema isolation is enforced
-  via `options=-csearch_path=<schema>` on every pool connection.
-- Schema names are validated as lowercase ASCII identifiers at
-  config-load time. The validation comment in `config.py` explains
-  why (no PG protocol support for parameterized session options).
-- Advisory lock id is derived deterministically from the schema name
-  (SHA-256 prefix → signed int8). **DO NOT** rotate the derivation —
-  it has no documented migration playbook and would silently break
-  the singleton-committer invariant during a transition.
-
-## Schema fingerprint validation
-
-Writers send `schema_fingerprint` (SHA-256 of the Iceberg-Schema
-`model_dump_json` of the augmented batch schema). The committer
-validates against the table's current schema fingerprint and rejects
-mismatches with 400. This is the only defense against silent schema
-drift between writer and committer.
-
-The fingerprint check currently happens at the committer (after the
-file is registered in PG). Moving it to the API perimeter (where the
-mismatch can be rejected synchronously instead of stalling the whole
-cycle batch) is a planned follow-up.
+Out of scope for this PR. Per-tick commits produce one Iceberg
+snapshot per non-vacuous tick; the `metadata.json` manifest list
+grows monotonically without an external `expire_snapshots` job.
+Filed as a separate concern; the v6 doc has the operational
+discussion.

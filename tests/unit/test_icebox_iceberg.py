@@ -1,17 +1,15 @@
-"""Tests for icebox.iceberg — DataFile construction + cycle_id recovery scan.
+"""Tests for icebox.iceberg — DataFile construction + commit_data_files
+call-shape verification.
 
 The DataFile.from_args path is exercised by building a real DataFile
 against a real PartitionSpec + Schema; no S3/Lakekeeper touch needed.
-The commit_data_files / find_snapshot_for_cycle paths are exercised
-against mocked Table objects since spinning up a real catalog in unit
-tests is overkill for the call-shape verification we want here.
-
-The end-to-end committer test (real Lakekeeper, real S3) lives elsewhere.
+The commit_data_files path is exercised against mocked Table objects
+since spinning up a real catalog in unit tests is overkill for the
+call-shape verification we want here.
 """
 from __future__ import annotations
 
 from unittest.mock import MagicMock
-from uuid import UUID, uuid4
 
 import pytest
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
@@ -22,10 +20,8 @@ from pyiceberg.typedef import Record
 from pyiceberg.types import IntegerType, NestedField, StringType, TimestamptzType
 
 from icebox.iceberg import (
-    CYCLE_ID_SUMMARY_KEY,
     build_data_file,
     commit_data_files,
-    find_snapshot_for_cycle,
     partition_tuple_from_spec,
 )
 
@@ -269,28 +265,11 @@ def _wire_producer_mock(snapshot_id: int | None = 12345, summary: object | None 
     return table, tx, producer
 
 
-def test_commit_data_files_uses_cycle_id_summary_key():
-    """The snapshot summary MUST be tagged with our cycle_id under
-    posthog.icebox.cycle_id. Recovery walks the snapshot_log scanning
-    for this key — wrong key name → cycles look 'lost' and committer
-    retries forever."""
-    table, tx, _ = _wire_producer_mock(snapshot_id=12345)
-
-    cycle = uuid4()
-    dummy_df = MagicMock(spec=DataFile)
-    result = commit_data_files(table=table, data_files=[dummy_df], cycle_id=cycle)
-
-    tx._append_snapshot_producer.assert_called_once()
-    call_kwargs = tx._append_snapshot_producer.call_args.kwargs
-    assert call_kwargs["snapshot_properties"] == {CYCLE_ID_SUMMARY_KEY: str(cycle)}
-    assert result.snapshot_id == 12345
-    assert result.summary is None  # mock tx returns no snapshot lookup
-
 
 def test_commit_data_files_appends_each_file_to_producer():
     table, _, producer = _wire_producer_mock(snapshot_id=1)
     files = [MagicMock(spec=DataFile) for _ in range(3)]
-    commit_data_files(table=table, data_files=files, cycle_id=uuid4())
+    commit_data_files(table=table, data_files=files)
     assert producer.append_data_file.call_count == 3
 
 
@@ -305,7 +284,7 @@ def test_commit_data_files_reads_snapshot_id_from_producer_not_table():
     table.current_snapshot.return_value = MagicMock(snapshot_id=42)  # wrong id
 
     result = commit_data_files(
-        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4(),
+        table=table, data_files=[MagicMock(spec=DataFile)],
     )
     assert result.snapshot_id == 999, (
         "commit_data_files must read snapshot_id from the producer, "
@@ -323,7 +302,7 @@ def test_commit_data_files_raises_if_producer_snapshot_id_is_none():
 
     with pytest.raises(RuntimeError, match="producer.snapshot_id is None"):
         commit_data_files(
-            table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4(),
+            table=table, data_files=[MagicMock(spec=DataFile)],
         )
 
 
@@ -332,10 +311,23 @@ def test_commit_data_files_respects_branch_arg():
     table, tx, _ = _wire_producer_mock(snapshot_id=1)
 
     commit_data_files(
-        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4(),
+        table=table, data_files=[MagicMock(spec=DataFile)],
         branch="staging",
     )
     assert tx._append_snapshot_producer.call_args.kwargs["branch"] == "staging"
+
+
+def test_commit_data_files_passes_empty_snapshot_properties():
+    """The daemon path stamps nothing into snapshot.summary — the cycle_id
+    summary key is gone with the cycle abstraction."""
+    table, tx, _ = _wire_producer_mock(snapshot_id=12345)
+
+    commit_data_files(table=table, data_files=[MagicMock(spec=DataFile)])
+
+    call_kwargs = tx._append_snapshot_producer.call_args.kwargs
+    assert call_kwargs["snapshot_properties"] == {}
+
+
 
 
 def test_commit_data_files_extracts_summary_when_present():
@@ -357,7 +349,7 @@ def test_commit_data_files_extracts_summary_when_present():
 
     table, _, _ = _wire_producer_mock(snapshot_id=777, summary=fake_snapshot)
     result = commit_data_files(
-        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
+        table=table, data_files=[MagicMock(spec=DataFile)]
     )
     assert result.snapshot_id == 777
     assert result.summary is not None
@@ -391,7 +383,7 @@ def test_commit_data_files_preserves_partial_summary_when_operation_fails():
     fake_snapshot.summary = _PartialSummary()
     table, _, _ = _wire_producer_mock(snapshot_id=42, summary=fake_snapshot)
     result = commit_data_files(
-        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
+        table=table, data_files=[MagicMock(spec=DataFile)]
     )
     assert result.snapshot_id == 42
     assert result.summary is not None
@@ -416,132 +408,9 @@ def test_commit_data_files_returns_none_summary_when_lookup_fails():
     fake_snapshot.summary = _BoomSummary()
     table, _, _ = _wire_producer_mock(snapshot_id=555, summary=fake_snapshot)
     result = commit_data_files(
-        table=table, data_files=[MagicMock(spec=DataFile)], cycle_id=uuid4()
+        table=table, data_files=[MagicMock(spec=DataFile)]
     )
     assert result.snapshot_id == 555
     assert result.summary is None
 
 
-# ---------------------------------------------------------------------------
-# find_snapshot_for_cycle — recovery scan
-# ---------------------------------------------------------------------------
-
-
-def _stub_snapshot(snapshot_id: int, cycle_id: UUID | None) -> MagicMock:
-    snap = MagicMock()
-    snap.snapshot_id = snapshot_id
-    snap.summary = (
-        {CYCLE_ID_SUMMARY_KEY: str(cycle_id), "other.key": "x"} if cycle_id else None
-    )
-    return snap
-
-
-def test_find_snapshot_for_cycle_returns_id_on_match():
-    """Recovery's happy path: the committer crashed after Iceberg
-    commit but before marking the cycle complete. The cycle_id we
-    expect is in the snapshot_log — we found our snapshot, can mark
-    cycle complete."""
-    cid = uuid4()
-    table = MagicMock()
-    table.snapshots.return_value = [
-        _stub_snapshot(101, cycle_id=uuid4()),  # an older cycle
-        _stub_snapshot(102, cycle_id=cid),  # ours
-        _stub_snapshot(103, cycle_id=None),  # tag-less (e.g. via add_files)
-    ]
-    assert find_snapshot_for_cycle(table, cid) == 102
-
-
-def test_find_snapshot_for_cycle_returns_none_when_absent():
-    """Recovery's other path: the committer crashed BEFORE Iceberg
-    commit landed. cycle_id not in snapshot_log → we retry."""
-    cid = uuid4()
-    table = MagicMock()
-    table.snapshots.return_value = [
-        _stub_snapshot(101, cycle_id=uuid4()),
-        _stub_snapshot(102, cycle_id=uuid4()),
-    ]
-    assert find_snapshot_for_cycle(table, cid) is None
-
-
-def test_find_snapshot_for_cycle_handles_empty_log():
-    """A fresh icebox with no committed snapshots yet."""
-    table = MagicMock()
-    table.snapshots.return_value = []
-    assert find_snapshot_for_cycle(table, uuid4()) is None
-
-
-def test_find_snapshot_for_cycle_walks_full_log_not_just_current():
-    """If our snapshot is anywhere in the log, we find it — even if a
-    later cycle's snapshot is current. current_snapshot() alone is not
-    sufficient because parallel writers might commit after us before
-    our recovery scan runs."""
-    cid = uuid4()
-    table = MagicMock()
-    table.snapshots.return_value = [
-        _stub_snapshot(101, cycle_id=cid),  # ours (older)
-        _stub_snapshot(102, cycle_id=uuid4()),  # someone else's (current)
-    ]
-    assert find_snapshot_for_cycle(table, cid) == 101
-
-
-def test_find_snapshot_for_cycle_handles_snapshot_with_none_summary():
-    """Older snapshots may have summary=None (or just lack our key).
-    Skip them silently rather than crashing."""
-    cid = uuid4()
-    table = MagicMock()
-    table.snapshots.return_value = [
-        _stub_snapshot(101, cycle_id=None),
-        _stub_snapshot(102, cycle_id=cid),
-    ]
-    assert find_snapshot_for_cycle(table, cid) == 102
-
-
-# ---------------------------------------------------------------------------
-# Review-driven: defensive guards
-# ---------------------------------------------------------------------------
-
-
-def test_commit_data_files_empty_list_raises():
-    """PE #6: an empty data_files list would still commit a no-op
-    Iceberg snapshot tagged with our cycle_id. Recovery would then
-    consider this a successful commit and metadata.json would grow
-    forever with zero-file snapshots. Refuse loudly."""
-    table = MagicMock()
-    with pytest.raises(ValueError, match="empty data_files list"):
-        commit_data_files(table=table, data_files=[], cycle_id=uuid4())
-    # And: no transaction was opened
-    table.transaction.assert_not_called()
-
-
-def test_build_data_file_rejects_unknown_field_id_in_column_sizes():
-    """QE re-review: a writer shipping stats for field id 99 against a
-    schema with only ids 1..7 would silently produce a manifest with
-    garbage column_sizes for the wrong field. Validate at construction."""
-    table = _mock_table()
-    stats = _valid_stats()
-    stats["column_sizes"]["99"] = 4096  # field id 99 not in events schema
-    with pytest.raises(KeyError, match="99"):
-        build_data_file(
-            table=table,
-            file_path="s3://b/foo.parquet",
-            record_count=10,
-            file_size=100,
-            partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
-            parquet_stats=stats,
-        )
-
-
-def test_build_data_file_rejects_unknown_field_id_in_value_counts():
-    """Same defense across all the field-id-keyed stat dicts."""
-    table = _mock_table()
-    stats = _valid_stats()
-    stats["value_counts"]["42"] = 1000
-    with pytest.raises(KeyError, match="42"):
-        build_data_file(
-            table=table,
-            file_path="s3://b/foo.parquet",
-            record_count=10,
-            file_size=100,
-            partition_values={"year": 2026, "month": 6, "day": 1, "hour": 14},
-            parquet_stats=stats,
-        )

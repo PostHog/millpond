@@ -1,52 +1,49 @@
-"""Sink that ships parquet to S3 and registers it with the icebox service.
+"""Sink that ships parquet to S3 and registers it via direct PG INSERT.
 
 Replaces the direct PyIceberg-commit path for high-concurrency writers.
 Writers compute a deterministic S3 path, write the parquet, extract
-column stats from the ParquetWriter metadata, and POST a
-RegisterFileRequest to icebox. The icebox owns Iceberg commit + Kafka
-offset commit in a batched cycle. See ``icebox/README.md`` for the
-service design.
+column stats from the ParquetWriter metadata, and INSERT a row into
+the icebox_files table. The icebox daemon (see icebox/daemon.py) polls
+that table and commits the files to Iceberg in batches, advancing
+Kafka offsets on the writer's behalf.
 
 Key responsibility distinctions vs IcebergSink:
-  - No `table.append()` — the icebox does that for us.
+  - No `table.append()` — the daemon does that for us.
   - No `kafka.commit()` from main.py — must be turned off when this
-    sink is selected; the icebox advances offsets atomically with its
-    Iceberg snapshot commit.
-  - Schema is resolved against the icebox-side Iceberg table; locally
+    sink is selected; the daemon advances offsets atomically (per
+    cumulative semantics) with its Iceberg snapshot commit.
+  - Schema is resolved against the daemon-side Iceberg table; locally
     we only need the field IDs + fingerprint.
 
 This module exposes:
-  - `IceboxClient` — httpx-based REST client with internal 429/503
-    backoff. Bounded retry budget; after it's exhausted, raises and the
-    surrounding millpond _write_with_retry loop handles pod-restart.
+  - `IceboxClient` — psycopg-pool wrapper. INSERT ... ON CONFLICT
+    (file_path) DO NOTHING RETURNING id, inserted_at. Replaced the
+    earlier httpx-based REST client when the polling-daemon design
+    landed (docs/icebox-self-healing-recovery.md).
   - `parquet_stats_from_metadata` — extract column-level stats from a
-    ParquetWriter's metadata, conform to the icebox wire format.
+    ParquetWriter's metadata.
   - `IceboxSink` — Sink-protocol implementation. Holds the IceboxClient
     and the Iceberg schema (for field IDs + fingerprint).
 
 The sink itself doesn't write Arrow → parquet — that's PyArrow's job;
 we wire it into a BytesIO/S3 stream the same way IcebergSink does.
-
-Integration with the main consumer loop (millpond/main.py:_flush) is
-in place: when cfg.destination == "icebox", _flush passes kafka_offsets
-to sink.write and SKIPS the local kafka.commit() — the icebox commits
-offsets atomically with its Iceberg snapshot.
 """
 
 from __future__ import annotations
 
 import base64
 import datetime
+import json
 import logging
-import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
+import psycopg
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from psycopg_pool import ConnectionPool
 from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.schema import Schema as IcebergSchema
 from pyiceberg.schema import assign_fresh_schema_ids
@@ -60,7 +57,6 @@ from pyiceberg.types import (
 
 from shared.fingerprint import schema_fingerprint
 from shared.models import (
-    PROTOCOL_VERSION,
     ParquetStats,
     RegisterFileRequest,
 )
@@ -126,129 +122,146 @@ def build_s3_writer(
     return _writer
 
 
-class IceboxResponseError(RuntimeError):
-    """Non-retryable error response from icebox (400, validation errors)."""
+# Status code mapping (preserved from the earlier HTTP-mode protocol
+# so IceboxSink's contract with callers is unchanged):
+#   - INSERT succeeded → 201
+#   - ON CONFLICT (file_path) DO NOTHING with no row inserted → 409
+#     (idempotent writer replay)
+#
+# psycopg errors propagate to main.py's _write_with_retry which retries
+# on generic Exception with exponential backoff before crashing the pod.
 
+_ICEBOX_INSERT_SQL = """
+INSERT INTO icebox_files (
+    file_path, writer_ordinal, kafka_offsets, partition_values,
+    record_count, file_size, parquet_stats
+) VALUES (
+    %(file_path)s, %(writer_ordinal)s, %(kafka_offsets)s::jsonb,
+    %(partition_values)s::jsonb, %(record_count)s, %(file_size)s,
+    %(parquet_stats)s::jsonb
+)
+ON CONFLICT (file_path) DO NOTHING
+RETURNING id, inserted_at
+"""
 
-class IceboxBackpressureExhausted(RuntimeError):
-    """Internal retry budget exhausted after sustained 429/503 from icebox.
-    The surrounding _write_with_retry path takes over from here."""
+_ICEBOX_LOOKUP_SQL = """
+SELECT id, inserted_at FROM icebox_files WHERE file_path = %(file_path)s
+"""
 
 
 @dataclass
 class IceboxClient:
-    """Thin httpx wrapper that POSTs RegisterFileRequest and absorbs
-    backpressure responses (429/503) with bounded backoff.
+    """psycopg-backed client that INSERTs RegisterFileRequest rows into
+    icebox_files. The icebox daemon picks them up via SELECT FOR UPDATE
+    SKIP LOCKED on its tick cadence.
 
-    Attributes:
-        base_url: e.g. "http://icebox.megaberg:8000"
-        max_attempts: how many times to try (default 6). Each attempt
-            backs off by Retry-After if present, else exponential.
-        max_backoff_s: cap on the exponential portion of backoff.
-        timeout_s: per-request HTTP timeout.
+    Attributes mirror PG connect parameters. The pool is built lazily
+    in __post_init__; `close()` drains it. INSERTs run against the
+    schema configured via `options=-csearch_path=<schema>` so the
+    unqualified `icebox_files` reference resolves to the right
+    per-deployment schema (matches icebox's own setup).
+
+    Pool sized small (min=0, max=2) because the writer flushes at most
+    ~1/min per pod; one connection at a time is enough, and lazy is
+    fine — let it grow on demand.
     """
 
-    base_url: str
-    max_attempts: int = 6
-    max_backoff_s: float = 30.0
-    timeout_s: float = 10.0
-    _client: httpx.Client | None = None
+    host: str
+    port: int
+    database: str
+    username: str
+    password: str
+    schema: str
+    sslmode: str = "require"
+    pool_min: int = 0
+    pool_max: int = 2
+    _pool: ConnectionPool | None = field(default=None, init=False)
 
-    def __post_init__(self):
-        if self._client is None:
-            self._client = httpx.Client(timeout=self.timeout_s)
+    def __post_init__(self) -> None:
+        if self._pool is None:
+            conninfo = psycopg.conninfo.make_conninfo(
+                host=self.host,
+                port=self.port,
+                dbname=self.database,
+                user=self.username,
+                password=self.password,
+                sslmode=self.sslmode,
+                options=f"-csearch_path={self.schema}",
+            )
+            # `open=False` so a malformed conninfo or unreachable PG
+            # fails on first use (during a write retry loop, which
+            # logs it) rather than at construction (which would fail
+            # the whole pod boot silently from the operator's POV).
+            self._pool = ConnectionPool(
+                conninfo,
+                min_size=self.pool_min,
+                max_size=self.pool_max,
+                open=False,
+            )
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
+        if self._pool is not None:
+            self._pool.close()
 
     def register_file(self, req: RegisterFileRequest) -> tuple[dict, int]:
-        """POST /v1/files with bounded backoff on 429/503.
+        """INSERT one row into icebox_files. Returns (body, status).
 
-        Returns:
-            (response_body, status_code). 201/409 are treated as success.
+        Body shape matches the HTTP RegisteredFile model
+        (`{row_id, queued_at}`) so callers that inspected the body
+        keep working — but in practice nobody reads it; sink.write
+        returns it verbatim to main.py which only checks `status in
+        (201, 409)`.
+
+        Status:
+          - 201 if the INSERT inserted a new row.
+          - 409 if a row with the same file_path already existed
+            (idempotent replay).
 
         Raises:
-            IceboxResponseError: on 400 (protocol mismatch, validation).
-            IceboxBackpressureExhausted: max_attempts reached with 429/503.
-            httpx.HTTPError: transport-level errors after exhausting
-                retries (the surrounding _write_with_retry handles these).
+          psycopg.Error: transport / SQL errors. Surrounding
+            _write_with_retry catches and retries.
         """
-        url = f"{self.base_url.rstrip('/')}/v1/files"
-        body = req.model_dump(mode="json")
-        last_exc: BaseException | None = None
-        for attempt in range(1, self.max_attempts + 1):
-            try:
-                resp = self._client.post(url, json=body)
-            except httpx.HTTPError as e:
-                last_exc = e
-                self._sleep_for_attempt(attempt, retry_after=None)
-                continue
-
-            if resp.status_code in (201, 409):
-                return resp.json(), resp.status_code
-            if resp.status_code == 400:
-                raise IceboxResponseError(f"icebox rejected request as invalid: {resp.text}")
-            if resp.status_code in (429, 503):
-                retry_after = self._parse_retry_after(resp)
-                log.warning(
-                    "icebox returned %d on attempt %d/%d; sleeping %.1fs",
-                    resp.status_code,
-                    attempt,
-                    self.max_attempts,
-                    retry_after,
+        assert self._pool is not None  # set in __post_init__
+        params = {
+            "file_path": req.file_path,
+            "writer_ordinal": req.writer_ordinal,
+            "kafka_offsets": json.dumps(dict(req.kafka_offsets)),
+            "partition_values": json.dumps(dict(req.partition_values)),
+            "record_count": req.record_count,
+            "file_size": req.file_size,
+            "parquet_stats": req.parquet_stats.model_dump_json(),
+        }
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_ICEBOX_INSERT_SQL, params)
+                row = cur.fetchone()
+            if row is not None:
+                # New row inserted. Body shape matches the HTTP
+                # RegisteredFile model for caller compatibility.
+                return (
+                    {"row_id": row[0], "queued_at": row[1].isoformat()},
+                    201,
                 )
-                # Final attempt — surface the exhausted error WITHOUT
-                # sleeping again
-                if attempt >= self.max_attempts:
-                    break
-                self._sleep_for_attempt(attempt, retry_after=retry_after)
-                continue
-            # 5xx other than 503 — retry with backoff but no Retry-After
-            if resp.status_code >= 500:
-                log.warning(
-                    "icebox returned %d on attempt %d/%d; backing off",
-                    resp.status_code,
-                    attempt,
-                    self.max_attempts,
-                )
-                if attempt >= self.max_attempts:
-                    raise IceboxBackpressureExhausted(f"icebox 5xx after {attempt} attempts: {resp.text}")
-                self._sleep_for_attempt(attempt, retry_after=None)
-                continue
-            # Anything else (e.g., 422 from FastAPI on body validation)
-            raise IceboxResponseError(f"icebox returned unexpected {resp.status_code}: {resp.text}")
-        # Loop exit without success
-        if last_exc is not None:
-            raise last_exc
-        raise IceboxBackpressureExhausted(f"icebox backpressure persisted across {self.max_attempts} attempts")
-
-    def _parse_retry_after(self, resp: httpx.Response) -> float:
-        """Respect Retry-After header; fall back to body's retry_after_s
-        field, then exponential."""
-        header = resp.headers.get("Retry-After")
-        if header is not None:
-            try:
-                return float(header)
-            except ValueError:
-                pass
-        try:
-            body = resp.json()
-            v = body.get("retry_after_s")
-            if v is not None:
-                return float(v)
-        except (ValueError, AttributeError):
-            pass
-        return 1.0
-
-    def _sleep_for_attempt(self, attempt: int, *, retry_after: float | None) -> None:
-        """If the server gave us a Retry-After, use it (capped). Otherwise
-        exponential backoff capped at max_backoff_s."""
-        if retry_after is not None:
-            time.sleep(min(retry_after, self.max_backoff_s))
-            return
-        backoff = min(2**attempt, self.max_backoff_s)
-        time.sleep(backoff)
+            # Conflict: look up the existing row's id/timestamp.
+            # Costs a second round-trip but happens only on writer
+            # replay, which is rare.
+            with conn.cursor() as cur:
+                cur.execute(_ICEBOX_LOOKUP_SQL, {"file_path": req.file_path})
+                existing = cur.fetchone()
+        if existing is None:
+            # Same impossibility guard as icebox/postgres_async.py:
+            # ON CONFLICT DO NOTHING returning no row AND the lookup
+            # finding nothing would require a concurrent DELETE, which
+            # icebox never does.
+            raise RuntimeError(
+                f"INSERT...DO NOTHING returned no row AND lookup returned "
+                f"no row for file_path={req.file_path!r}: this should be "
+                f"impossible without a concurrent DELETE."
+            )
+        return (
+            {"row_id": existing[0], "queued_at": existing[1].isoformat()},
+            409,
+        )
 
 
 def parquet_stats_from_metadata(
@@ -432,12 +445,12 @@ def _partition_values_from_batch(batch: pa.Table) -> dict[str, int]:
 
 @dataclass
 class IceboxSink:
-    """Sink that POSTs parquet files to the icebox service instead of
-    committing them via PyIceberg directly.
+    """Sink that ships parquet files to S3 and INSERTs them into the
+    icebox_files table for the icebox daemon to commit to Iceberg.
 
     The sink owns:
       - The Iceberg schema (for field IDs + fingerprint).
-      - The IceboxClient (HTTP).
+      - The IceboxClient (psycopg pool).
       - The deterministic-path constants (bucket, warehouse prefix).
       - An s3_writer callable for shipping parquet bytes to S3.
 
@@ -445,9 +458,7 @@ class IceboxSink:
 
     Field-ID resolution: on first non-empty batch, derive the Iceberg
     schema from the batch's Arrow schema (after metadata columns are
-    added) via the same helpers millpond/iceberg.py uses. The icebox-
-    side table must have the same fingerprint or the icebox will
-    reject our POSTs with 400.
+    added) via the same helpers millpond/iceberg.py uses.
     """
 
     client: IceboxClient
@@ -515,8 +526,7 @@ class IceboxSink:
         Raises:
             ValueError: zero-row batch, or kafka_offsets / inserted_at /
                 s3_writer missing.
-            IceboxResponseError, IceboxBackpressureExhausted: see
-                IceboxClient.register_file.
+            psycopg.Error: see IceboxClient.register_file.
         """
         if len(batch) == 0:
             raise ValueError("IceboxSink.write called with zero-row batch")
@@ -580,13 +590,10 @@ class IceboxSink:
         writer(s3_uri, parquet_bytes)
 
         req = RegisterFileRequest(
-            protocol_version=PROTOCOL_VERSION,
-            # Validation-only: tell the icebox what (ns, table) this
-            # writer thinks it's targeting. Icebox 400s on mismatch,
-            # catching writers POSTing to the wrong icebox URL before
-            # the file silently lands in the wrong Iceberg table.
-            expected_iceberg_namespace=self.namespace,
-            expected_iceberg_table=self.table,
+            # protocol_version + expected_iceberg_namespace / _table
+            # were validation handshakes against the HTTP perimeter.
+            # The PG INSERT doesn't store them (icebox_files doesn't
+            # have those columns); leaving them at their defaults.
             file_path=s3_uri,
             writer_ordinal=self.writer_ordinal,
             kafka_offsets=dict(kafka_offsets),

@@ -29,7 +29,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Any
-from uuid import UUID
 
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
 from pyiceberg.partitioning import PartitionSpec
@@ -64,12 +63,6 @@ class CommitResult:
 
     snapshot_id: int
     summary: dict[str, str] | None
-
-
-# Snapshot summary key for cycle_id — the recovery scan looks for this
-# in `snapshot.summary` to identify whether a cycle's iceberg-commit
-# step had actually landed in Lakekeeper.
-CYCLE_ID_SUMMARY_KEY = "posthog.icebox.cycle_id"
 
 
 def partition_tuple_from_spec(
@@ -203,45 +196,38 @@ def commit_data_files(
     *,
     table: Table,
     data_files: list[DataFile],
-    cycle_id: UUID,
     branch: str = "main",
 ) -> CommitResult:
-    """Commit a batch of DataFiles in a single Iceberg snapshot, tagging
-    the snapshot with the cycle_id for recovery.
+    """Commit a batch of DataFiles in a single Iceberg snapshot.
 
     Args:
-        table: PyIceberg Table (loaded fresh at the start of the cycle).
+        table: PyIceberg Table (loaded fresh per call by the caller).
         data_files: built by build_data_file().
-        cycle_id: the icebox cycle UUID — embedded in snapshot.summary
-            under posthog.icebox.cycle_id so the recovery scan can match.
         branch: snapshot branch. Defaults to "main".
 
     Returns:
         A ``CommitResult(snapshot_id, summary)``. ``snapshot_id`` is the
-        committed Iceberg snapshot ID — persisted to PG so subsequent
-        recovery doesn't need to rescan the snapshot_log. ``summary``
-        is the snapshot's Iceberg-spec summary dict (with keys like
-        ``total-data-files``, ``total-records``, ``added-records``,
-        etc.) extracted from the transaction's updated metadata in
-        the same scope as the commit — no extra Lakekeeper round-trip.
-        ``summary`` is ``None`` only if a future PyIceberg API drift
-        in the in-tx metadata view defeats the lookup; defensive.
+        committed Iceberg snapshot ID. ``summary`` is the snapshot's
+        Iceberg-spec summary dict (with keys like ``total-data-files``,
+        ``total-records``, ``added-records``, etc.) extracted from the
+        transaction's updated metadata in the same scope as the commit
+        — no extra Lakekeeper round-trip. ``summary`` is ``None`` only
+        if a future PyIceberg API drift in the in-tx metadata view
+        defeats the lookup; defensive.
 
     Raises:
         Whatever PyIceberg raises if the commit fails (transient FS
-        errors, CommitFailedException, etc.). The committer marks the
-        cycle as failed and the recovery path re-checks Lakekeeper.
+        errors, CommitFailedException, etc.). The caller decides how
+        to classify the failure (transport vs. content) and acts on it.
     """
     if not data_files:
-        # Defense in depth: run_cycle already short-circuits when no files
-        # are claimed, but committing an empty snapshot here would produce
-        # a zero-file snapshot tagged with our cycle_id. On next recovery,
-        # find_snapshot_for_cycle would consider this a successful commit
-        # and complete the cycle, while metadata.json grows with garbage
-        # no-op snapshots. Refuse upstream's bad call loudly.
+        # Defense in depth: callers already short-circuit when no files
+        # are pending, but committing an empty snapshot here would
+        # produce a zero-file snapshot in metadata.json — junk that
+        # grows the manifest list without doing anything useful.
+        # Refuse upstream's bad call loudly.
         raise ValueError(
-            f"commit_data_files: refusing to commit empty data_files list "
-            f"for cycle_id={cycle_id}"
+            "commit_data_files: refusing to commit empty data_files list"
         )
 
     # Capture the snapshot id from the producer directly. Reading
@@ -251,12 +237,11 @@ def commit_data_files(
     # return a STALE pre-commit snapshot id (a permanent lie in PG).
     # The producer's `snapshot_id` is the canonical, version-stable id
     # for the snapshot the producer just built.
-    snapshot_props = {CYCLE_ID_SUMMARY_KEY: str(cycle_id)}
     snapshot_id: int | None = None
     summary: dict[str, str] | None = None
     with table.transaction() as tx:
         with tx._append_snapshot_producer(
-            snapshot_properties=snapshot_props,
+            snapshot_properties={},
             branch=branch,
         ) as producer:
             for df in data_files:
@@ -293,36 +278,8 @@ def commit_data_files(
 
     if snapshot_id is None:
         raise RuntimeError(
-            f"Iceberg commit completed but producer.snapshot_id is None — "
-            f"cycle_id={cycle_id}; this indicates a PyIceberg API change "
-            f"affecting _append_snapshot_producer"
+            "Iceberg commit completed but producer.snapshot_id is None — "
+            "this indicates a PyIceberg API change affecting "
+            "_append_snapshot_producer"
         )
     return CommitResult(snapshot_id=snapshot_id, summary=summary)
-
-
-def find_snapshot_for_cycle(table: Table, cycle_id: UUID) -> int | None:
-    """Walk the table's snapshot_log looking for our cycle_id.
-
-    The recovery path uses this after a committer crash: did our
-    Iceberg commit actually land in Lakekeeper, or do we need to retry?
-
-    Args:
-        table: a freshly-loaded Table (DON'T pass a stale handle).
-        cycle_id: the UUID of the in-flight cycle we're investigating.
-
-    Returns:
-        snapshot_id if a snapshot tagged with this cycle_id exists in
-        the table's snapshot_log; None if no such snapshot.
-
-    Note:
-        Walks the full snapshots() — current_snapshot() alone is not
-        enough (another cycle could have committed after ours).
-    """
-    target = str(cycle_id)
-    for snap in table.snapshots():
-        if snap.summary is None:
-            continue
-        summary_cycle = snap.summary.get(CYCLE_ID_SUMMARY_KEY) if snap.summary else None
-        if summary_cycle == target:
-            return snap.snapshot_id
-    return None
