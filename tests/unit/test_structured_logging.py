@@ -1,5 +1,5 @@
-"""Unit tests for shared/structured_logging.py — the building blocks
-both millpond and icebox compose from."""
+"""Unit tests for millpond/structured_logging.py — the building blocks
+millpond's logging_config composes from."""
 from __future__ import annotations
 
 import io
@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from shared import structured_logging as sl
+from millpond import structured_logging as sl
 
 
 @pytest.fixture(autouse=True)
@@ -47,8 +47,7 @@ def test_json_formatter_inlines_extra_kwargs():
 
 
 def test_json_formatter_extra_context_subclass_hook():
-    """Subclasses (e.g. icebox's IceboxJsonFormatter) inject per-record
-    fields by overriding extra_context()."""
+    """Subclasses inject per-record fields by overriding extra_context()."""
 
     class _Fmt(sl.JsonFormatter):
         def extra_context(self):

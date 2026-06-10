@@ -1,9 +1,9 @@
-# Millpond — Kafka to DuckLake or Iceberg
+# Millpond — Kafka to DuckLake
 
-A standalone Python app that consumes from a Kafka topic and writes to a lake table. Single thread, single loop, no Kafka Connect. One deployment writes to exactly one destination — either [DuckLake](https://github.com/duckdb/ducklake), [Apache Iceberg](https://iceberg.apache.org/) via direct PyIceberg commit, or Iceberg via the bundled [**icebox**](icebox/README.md) writer/committer split (production-scale Iceberg). Selected via `MILLPOND_DESTINATION` (`ducklake` | `iceberg` | `icebox`).
+A standalone Python app that consumes from a Kafka topic and writes to a [DuckLake](https://github.com/duckdb/ducklake) table. Single thread, single loop, no Kafka Connect. One deployment writes to exactly one table.
 
 **Contents:**
-[Naming](#naming) | [Why](#why) | [Architecture](#architecture) | [Destinations](#destinations) | [icebox](icebox/README.md) | [Record Handling](#record-handling) | [Adaptive Backpressure](#adaptive-backpressure) | [Performance](#performance) | [Resource Footprint](#resource-footprint) | [Setup](#setup) | [Development](#development) | [Configuration](#configuration) | [Releases](#releases) | [Deployment](#deployment) | [Partitioning](#partitioning) | [Object Sizing](#object-sizing) | [Error Handling](#error-handling-and-retries) | [Multiple Pipelines](#multiple-pipelines) | [AWS Credential Isolation](#aws-credential-isolation) | [Operational Notes](#operational-notes) | [tools](tools/README.md)
+[Naming](#naming) | [Why](#why) | [Architecture](#architecture) | [Destination](#destination) | [Record Handling](#record-handling) | [Adaptive Backpressure](#adaptive-backpressure) | [Performance](#performance) | [Resource Footprint](#resource-footprint) | [Setup](#setup) | [Development](#development) | [Configuration](#configuration) | [Releases](#releases) | [Deployment](#deployment) | [Partitioning](#partitioning) | [Object Sizing](#object-sizing) | [Error Handling](#error-handling-and-retries) | [Multiple Pipelines](#multiple-pipelines) | [AWS Credential Isolation](#aws-credential-isolation) | [Operational Notes](#operational-notes) | [tools](tools/README.md)
 
 ## Naming
 
@@ -40,24 +40,22 @@ K8s StatefulSet (N replicas)
 - If a pod dies, its partitions stop being consumed until K8s restarts it
 - Optional filter and sort stages — see [Record Handling](#record-handling) below
 
-## Destinations
+## Destination
 
-Millpond writes to one of two lake formats, selected at startup by `MILLPOND_DESTINATION` (default `ducklake`). A single deployment writes to exactly one — there is no per-batch routing. Switching destinations requires redeploying with different env vars; the at-rest data is not portable between the two without a separate migration.
+Millpond writes to DuckLake. A single deployment writes to exactly one table — there is no per-batch routing.
 
-|  | DuckLake | Iceberg |
-|---|---|---|
-| Catalog | Postgres (via DuckDB ducklake extension) | REST catalog (e.g. Polaris, Tabular, AWS Glue REST adapter) |
-| Storage | S3 / S3-compatible | S3 / S3-compatible |
-| Reader ecosystem | DuckDB-native; growing third-party support | Broad (Spark, Trino, Athena, Snowflake, DuckDB ≥1.5) |
-| Partitioning | Caller-supplied via `DUCKLAKE_PARTITION_BY`; arbitrary DDL expression | Hardcoded identity transforms on derived `year`/`month`/`day`/`hour` int32 columns; Hive-style layout |
-| Schema evolution | DuckDB DDL (`ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN SET DATA TYPE` with widening enforcement) | PyIceberg `update_schema()` transaction (single commit per flush) |
-| Maintenance tooling | Bundled (`tools/ducklake_maintenance.py` CronJob, `tools/ducklake_metrics.py` daemon) | Not bundled — use your catalog's native compaction/expiry |
-| `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) | Added at write time in Python (single timestamp shared by every row in a flush) |
-| Multi-pod concurrent writes | Native; idempotent DDL handles races | Native; PyIceberg optimistic concurrency + retry loop handles races |
+|  | DuckLake |
+|---|---|
+| Catalog | Postgres (via DuckDB ducklake extension) |
+| Storage | S3 / S3-compatible |
+| Reader ecosystem | DuckDB-native; growing third-party support |
+| Partitioning | Caller-supplied via `DUCKLAKE_PARTITION_BY`; arbitrary DDL expression |
+| Schema evolution | DuckDB DDL (`ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN SET DATA TYPE` with widening enforcement) |
+| Maintenance tooling | Bundled (`tools/ducklake_maintenance.py` CronJob, `tools/ducklake_metrics.py` daemon) |
+| `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) |
+| Multi-pod concurrent writes | Native; idempotent DDL handles races |
 
-The selection is a thin Protocol-based abstraction (`millpond/sink.py`) — `main.py` only sees `Sink.write(batch)`, `reset_caches()`, `close()`. Both implementations are in their own module (`ducklake.py`, `iceberg.py`).
-
-For Iceberg at production scale, writers do not commit to the catalog directly. They emit parquet to S3 and INSERT file metadata into an `icebox_files` PG table that lives in a per-deployment PG schema (one schema per `(namespace, table)`). A **[icebox](icebox/README.md)** polling daemon per `(namespace, table)` then commits batches to Iceberg and advances Kafka offsets. The split serializes commits from many concurrent writer pods through a single committer, eliminating PyIceberg's REST-catalog optimistic-concurrency contention. See [`icebox/README.md`](icebox/README.md) for the design and operational notes; the v6 polling-daemon rewrite is documented in [`docs/icebox-self-healing-recovery.md`](docs/icebox-self-healing-recovery.md).
+The sink (`millpond/ducklake.py`) exposes three methods to `main.py`: `write(batch)`, `reset_caches()`, `close()`.
 
 ## Record Handling
 
@@ -83,7 +81,7 @@ Two skip reasons are tracked on `millpond_records_skipped_total`:
 
 ### Pre-write sort
 
-Sorts the consolidated batch by one or more columns ascending, right before `sink.write()`. Both DuckLake and Iceberg sinks see pre-sorted data, which improves Parquet compression (especially for low-cardinality keys like `team_id`) and downstream reader predicate pushdown.
+Sorts the consolidated batch by one or more columns ascending, right before `sink.write()`. The sink sees pre-sorted data, which improves Parquet compression (especially for low-cardinality keys like `team_id`) and downstream reader predicate pushdown.
 
 ```
 MILLPOND_SORT_BY=team_id,timestamp
@@ -135,8 +133,8 @@ just run
 ```bash
 just fmt               # format code
 just lint              # lint code
-just test              # run unit tests (includes both backends' suites + cross-backend equivalence)
-just test-integration  # run integration tests (local DuckDB + MinIO/iceberg-rest via testcontainers)
+just test              # run unit tests
+just test-integration  # run integration tests (in-memory DuckDB — fast, no docker stack)
 just test-e2e          # run E2E tests (docker-compose, builds stack automatically)
 just ci                # format check + lint + unit tests
 just up                # start docker-compose stack (DuckLake — plaintext Kafka)
@@ -144,8 +142,6 @@ just up-ssl            # start docker-compose stack (DuckLake — SSL Kafka, clo
 just down              # stop docker-compose stack
 just down-ssl          # stop SSL docker-compose stack
 ```
-
-The `just up` / `just up-ssl` dev stacks are DuckLake-only. For Iceberg local dev, the integration test fixture in `tests/integration/compose.yaml` brings up MinIO + a tabulario/iceberg-rest catalog; that stack is what the iceberg integration tests use and what to point at for ad-hoc Iceberg work.
 
 ### SSL Kafka Testing
 
@@ -166,24 +162,24 @@ Subcommand and YAML schema reference, full env-var contract, and the `just` reci
 
 All configuration via environment variables.
 
-### Shared (always required)
+### Core (always required)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `KAFKA_BOOTSTRAP_SERVERS` | yes | | Kafka broker addresses |
 | `KAFKA_TOPIC` | yes | | Topic to consume |
 | `REPLICA_COUNT` | yes | | Number of StatefulSet replicas (must match `spec.replicas`) |
-| `MILLPOND_DESTINATION` | no | `ducklake` | Destination: `ducklake`, `iceberg` (direct PyIceberg commit), or `icebox` (Iceberg via the bundled writer/committer split — see [icebox/README.md](icebox/README.md)). Case-insensitive; empty/whitespace falls back to `ducklake`. |
+| `MILLPOND_DESTINATION` | no | `ducklake` | Destination — `ducklake` is the only accepted value; anything else raises at startup. Case-insensitive; empty/whitespace falls back to `ducklake`. |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
-| `GROUP_ID` | no | `millpond-{topic}-{table_label_part}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. `{table_label_part}` is derived from the destination table identifier in `millpond/config.py` (the namespace prefix only shows up in metrics/client.id, not group.id). |
+| `GROUP_ID` | no | `millpond-{topic}-{ducklake_table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
 | `CONSUME_BATCH_SIZE` | no | `1000` | Max messages per `consume()` call — amortizes Python↔C boundary cost |
 | `FETCH_MIN_BYTES` | no | `1048576` | Broker accumulates at least this many bytes before responding (1MB) |
 | `FETCH_MAX_WAIT_MS` | no | `500` | Max broker wait when `fetch.min.bytes` not yet satisfied |
 | `STATS_INTERVAL_MS` | no | `5000` | librdkafka internal stats emission interval (0 to disable) |
 | `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
 
-### DuckLake (required when `MILLPOND_DESTINATION=ducklake`)
+### DuckLake
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -202,41 +198,6 @@ All configuration via environment variables.
 | `DUCKDB_S3_ENDPOINT` | no | | S3 endpoint override (MinIO, etc.) |
 | `DUCKDB_S3_USE_SSL` | no | | `true` / `false` |
 | `DUCKDB_S3_URL_STYLE` | no | | `vhost` / `path` |
-
-### Iceberg (required when `MILLPOND_DESTINATION=iceberg`)
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `ICEBERG_CATALOG_URI` | yes | | REST catalog endpoint (e.g. `https://catalog.example.com`) |
-| `ICEBERG_WAREHOUSE` | yes | | Warehouse identifier, typically the S3 root (`s3://warehouse/`) |
-| `ICEBERG_NAMESPACE` | yes | | Catalog namespace (validated as a safe identifier) |
-| `ICEBERG_TABLE` | yes | | Target table name within the namespace |
-| `ICEBERG_TABLE_LOCATION` | no | | Explicit `s3://...` table location; if unset, catalog picks |
-| `ICEBERG_CATALOG_TOKEN` | no | | Bearer / OAuth token for the REST catalog |
-| `MILLPOND_S3_ACCESS_KEY_ID` | yes | | Static S3 access key for PyIceberg's PyArrow S3 filesystem |
-| `MILLPOND_S3_SECRET_ACCESS_KEY` | yes | | Static S3 secret |
-| `MILLPOND_S3_REGION` | yes | | S3 region |
-| `MILLPOND_S3_ENDPOINT` | no | | S3 endpoint override (MinIO, etc.) |
-
-`MILLPOND_S3_*` is a separate env var family from `DUCKDB_S3_*` deliberately — they target different client libraries, and a deployment switch from DuckLake to Iceberg should be a clean swap of env vars rather than re-using the DuckDB-specific names.
-
-### icebox (required when `MILLPOND_DESTINATION=icebox`)
-
-The icebox path reuses the entire `Iceberg` env-var block above (writers still need the catalog URI, warehouse, namespace, table, and S3 credentials so the staged file's catalog/path metadata is correct) and adds the writer-to-icebox PG transport variables:
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `ICEBOX_BUCKET` | yes | | S3 bucket the writer drops parquet into |
-| `ICEBOX_WAREHOUSE_PREFIX` | yes | | Prefix under `ICEBOX_BUCKET` for staged parquet files (e.g. `kafka/events/data`) |
-| `ICEBOX_PG_HOST` | yes | | Hostname of the Postgres backing the icebox (the writer INSERTs file metadata directly) |
-| `ICEBOX_PG_PORT` | no | `5432` | Postgres port |
-| `ICEBOX_PG_DATABASE` | yes | | Postgres database |
-| `ICEBOX_PG_USERNAME` | yes | | Postgres user (writes only `icebox_files`) |
-| `ICEBOX_PG_PASSWORD` | yes | | Postgres password (typically ESO-synced) |
-| `ICEBOX_PG_SCHEMA` | yes | | Per-deployment Postgres schema (e.g. `icebox_events`) |
-| `ICEBOX_PG_SSLMODE` | no | `require` | Standard libpq sslmode |
-
-The icebox daemon itself has its own env-var contract (`ICEBOX_*` consumed by `icebox/main.py` — Postgres connection, daemon cadence, iceberg timeout, etc.). Those are documented in [`icebox/README.md`](icebox/README.md) and live in the icebox deployment, not the writer.
 
 ### Optional record handling
 
@@ -286,10 +247,6 @@ Downtime = drain time + startup time (~2-3 min). Kafka buffers trivially.
 
 ## Partitioning
 
-Partitioning is per-destination — DuckLake takes a caller-supplied expression, Iceberg is hardcoded.
-
-### DuckLake
-
 Set `DUCKLAKE_PARTITION_BY` to enable Hive-style partitioning on S3. Files are written into `key=value/` directories (e.g. `year=2026/month=3/day=23/hour=21/*.parquet`), enabling S3 prefix filtering, bulk lifecycle rules, and partition discovery by external tools.
 
 ```bash
@@ -297,12 +254,6 @@ DUCKLAKE_PARTITION_BY="year(_inserted_at),month(_inserted_at),day(_inserted_at),
 ```
 
 Partition on `_inserted_at` (always a real TIMESTAMP), not source `timestamp` fields (typically VARCHAR). Applied via `ALTER TABLE SET PARTITIONED BY` on first write — idempotent, safe for multiple pods and restarts. If added to an existing unpartitioned table, new files get HSP layout while old files remain flat; DuckLake queries both transparently via metadata.
-
-### Iceberg
-
-The partition spec is hardcoded: identity transforms on four int32 columns (`year`, `month`, `day`, `hour`) derived from `_inserted_at` at write time. This produces the same Hive-style layout as DuckLake — `year=2026/month=3/day=23/hour=21/*.parquet` — for the same S3-prefix-filter and lifecycle reasons. There is no env var; every Iceberg deployment gets the same spec.
-
-Trade-off: Iceberg doesn't know the four columns are derived from `_inserted_at`, so reader queries need to filter on the partition columns explicitly to get pruning. A future spec evolution can layer hidden partitioning on top without rewriting data if reader ergonomics start to matter; not needed today.
 
 ## Object Sizing
 
@@ -352,7 +303,7 @@ The flush path has two failure points, each with its own retry policy:
 
 Both use `errors_total{type="write_retry"}` and `errors_total{type="offset_commit"}` counters so transient vs persistent failures are distinguishable in dashboards.
 
-The write-retry loop catches `Exception` broadly to cover every backend's failure modes — `duckdb.Error` for DuckLake; `pyiceberg.exceptions.CommitFailedException`, `CommitStateUnknownException`, `ServerError`, `ServiceUnavailableError` for direct-Iceberg REST catalog 5xx; `psycopg.Error` raised by `millpond/icebox_sink.py`'s `IceboxClient.register_file` for the icebox-path INSERT failures; `OSError` for S3; `KafkaException` for broker disconnects. Each retry invokes `sink.reset_caches()` to drop cached table/schema state so the next attempt re-checks the catalog (covers the case where another pod evolved the schema or recreated the table between attempts).
+The write-retry loop catches `Exception` broadly to cover the backend's failure modes — `duckdb.Error` for DuckLake; `OSError` for S3; `KafkaException` for broker disconnects. Each retry invokes `sink.reset_caches()` to drop cached table/schema state so the next attempt re-checks the catalog (covers the case where another pod evolved the schema or recreated the table between attempts).
 
 **Why crash after exhausting retries?** A persistent write failure means S3 or the catalog is down — continuing would just accumulate pending data in memory until OOM. A persistent commit failure means the Kafka coordinator is unreachable — the write already succeeded, but without committed offsets the next restart will replay the batch (at-least-once duplicates). In both cases, crashing lets K8s apply its restart backoff, and Kafka holds the data safely until the dependency recovers.
 
@@ -389,11 +340,11 @@ Millpond uses two separate AWS credential paths that must not interfere with eac
 | Component | Auth | Credential source |
 |---|---|---|
 | Kafka (MSK) | SASL/OAUTHBEARER | IRSA (standard AWS credential chain) |
-| S3 (lake data files) | Static IAM keys | `DUCKDB_S3_*` (DuckLake) or `MILLPOND_S3_*` (Iceberg) |
+| S3 (lake data files) | Static IAM keys | `DUCKDB_S3_*` |
 
-Neither backend uses the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars — those take precedence in the credential chain and would shadow the IRSA role used for Kafka authentication. DuckDB-specific names for DuckLake, Millpond-specific names for Iceberg. The two families are deliberately separate so a deployment switch between destinations is a clean env-var swap rather than a re-use.
+The S3 path does not use the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars — those take precedence in the credential chain and would shadow the IRSA role used for Kafka authentication. Do not rename the `DUCKDB_S3_*` env vars to the standard AWS names.
 
-DuckDB's [aws extension does not support IRSA](https://github.com/duckdb/duckdb-aws/issues/31) — it cannot perform the `AssumeRoleWithWebIdentity` token exchange that IRSA requires. PyIceberg's S3 access is similarly handled via static credentials passed through catalog properties (`s3.access-key-id` etc.) to keep the IRSA token out of the S3 client's credential resolution. Same isolation pattern, different transport.
+DuckDB's [aws extension does not support IRSA](https://github.com/duckdb/duckdb-aws/issues/31) — it cannot perform the `AssumeRoleWithWebIdentity` token exchange that IRSA requires, hence the static keys.
 
 ## Operational Notes
 

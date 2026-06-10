@@ -2,20 +2,13 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Literal
-
-from shared.pg_identifier import validate_pg_schema
 
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-_SAFE_NAMESPACE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Shared with ducklake._validate_partition_expr — keep in sync or import from here.
 SAFE_PARTITION_EXPR = re.compile(r"^[a-zA-Z0-9_(),\s]+$")
 
 log = logging.getLogger(__name__)
-
-Destination = Literal["ducklake", "iceberg", "icebox"]
-_DESTINATIONS: tuple[Destination, ...] = ("ducklake", "iceberg", "icebox")
 
 
 @dataclass(frozen=True)
@@ -29,59 +22,16 @@ class Config:
     replica_count: int
     ordinal: int
 
-    # Destination selection — a pod writes to exactly one of these for its lifetime.
-    destination: Destination
-
-    # The DuckLake-* and Iceberg-* fields below are kept as `str | None`
-    # rather than split into a tagged union (DuckLakeConfig | IcebergConfig)
-    # because the load-time `if destination == ...` branch already enforces
-    # presence of the right subset, and the Sink constructors raise
-    # RuntimeError on missing fields (so `python -O` doesn't strip the
-    # guards). A tagged-union refactor is a reasonable next step but
-    # doesn't buy correctness on top of what we already have.
-
-    # DuckLake — required when destination == "ducklake", else None.
-    ducklake_table: str | None
-    ducklake_data_path: str | None
-    ducklake_connection: str | None
-    rds_host: str | None
-    rds_port: str | None
-    rds_database: str | None
-    rds_username: str | None
-    rds_password: str | None
+    # DuckLake destination
+    ducklake_table: str
+    ducklake_data_path: str
+    ducklake_connection: str
+    rds_host: str
+    rds_port: str
+    rds_database: str
+    rds_username: str
+    rds_password: str
     partition_by: str | None  # e.g. "year(timestamp),month(timestamp),day(timestamp),hour(timestamp)"
-
-    # Iceberg — required when destination == "iceberg", else None.
-    iceberg_catalog_uri: str | None
-    iceberg_warehouse: str | None
-    iceberg_namespace: str | None
-    iceberg_table: str | None
-    iceberg_table_location: str | None  # explicit s3:// path; None lets the catalog decide
-    iceberg_catalog_token: str | None  # bearer / OAuth token, optional
-
-    # S3 for Iceberg data files. Ducklake uses DUCKDB_S3_* env vars read directly by ducklake.connect.
-    s3_access_key_id: str | None
-    s3_secret_access_key: str | None
-    s3_region: str | None
-    s3_endpoint: str | None
-
-    # Icebox — required when destination == "icebox", else None.
-    # icebox_bucket + icebox_warehouse_prefix are the deterministic-path
-    # components the sink uses when writing staged parquet to S3 — they
-    # MUST match the icebox-side warehouse config or files land where
-    # the catalog can't find them.
-    icebox_bucket: str | None
-    icebox_warehouse_prefix: str | None
-    # PG connection for the writer-side IceboxClient (direct INSERT
-    # into icebox_files). All seven fields are required together when
-    # destination == "icebox".
-    icebox_pg_host: str | None
-    icebox_pg_port: int | None
-    icebox_pg_database: str | None
-    icebox_pg_username: str | None
-    icebox_pg_password: str | None
-    icebox_pg_schema: str | None
-    icebox_pg_sslmode: str | None
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
@@ -113,8 +63,7 @@ class Config:
 
     # Optional pre-write sort. Tuple of column names; sort is ascending
     # in tuple order. Applied to the consolidated batch right before
-    # sink.write() so both DuckLake and Iceberg paths see pre-sorted
-    # data. None disables the sort entirely.
+    # sink.write(). None disables the sort entirely.
     sort_by: tuple[str, ...] | None
 
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
@@ -124,10 +73,9 @@ class Config:
     # ``posthog_project_token`` is set, OFF otherwise. Endpoint
     # defaults to the US PostHog Cloud ingress; override for EU or
     # self-hosted PostHog. service_namespace + service_instance_id
-    # match the icebox taxonomy (see shared/structured_logging.py +
-    # icebox/README.md). service_instance_id is typically the
-    # consumer-key the chart uses for the StatefulSet name, e.g.
-    # "events-icebox" or "events".
+    # feed the OTLP resource attrs (see millpond/structured_logging.py).
+    # service_instance_id is typically the consumer-key the chart uses
+    # for the StatefulSet name, e.g. "events".
     posthog_project_token: str | None = None
     posthog_logs_endpoint: str = "https://us.i.posthog.com/i/v1/logs"
     service_namespace: str = "millpond"
@@ -145,8 +93,6 @@ class Config:
     def table_label(self) -> str:
         """Single human-readable identifier for the destination table.
         Used in metrics pipeline labels and the Kafka client.id."""
-        if self.destination in ("iceberg", "icebox"):
-            return f"{self.iceberg_namespace}.{self.iceberg_table}"
         return self.ducklake_table or "unknown"
 
 
@@ -289,44 +235,21 @@ def _load_ducklake_fields() -> dict[str, str | None]:
     }
 
 
-def _load_iceberg_fields() -> dict[str, str | None]:
-    iceberg_table = _require("ICEBERG_TABLE")
-    if not _SAFE_TABLE_NAME.match(iceberg_table):
-        raise RuntimeError(
-            f"ICEBERG_TABLE {iceberg_table!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
-        )
-
-    iceberg_namespace = _require("ICEBERG_NAMESPACE")
-    if not _SAFE_NAMESPACE.match(iceberg_namespace):
-        raise RuntimeError(
-            f"ICEBERG_NAMESPACE {iceberg_namespace!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
-        )
-
-    return {
-        "iceberg_catalog_uri": _require("ICEBERG_CATALOG_URI"),
-        "iceberg_warehouse": _require("ICEBERG_WAREHOUSE"),
-        "iceberg_namespace": iceberg_namespace,
-        "iceberg_table": iceberg_table,
-        "iceberg_table_location": os.environ.get("ICEBERG_TABLE_LOCATION") or None,
-        "iceberg_catalog_token": os.environ.get("ICEBERG_CATALOG_TOKEN") or None,
-        "s3_access_key_id": _require("MILLPOND_S3_ACCESS_KEY_ID"),
-        "s3_secret_access_key": _require("MILLPOND_S3_SECRET_ACCESS_KEY"),
-        "s3_region": _require("MILLPOND_S3_REGION"),
-        "s3_endpoint": os.environ.get("MILLPOND_S3_ENDPOINT") or None,
-    }
-
-
 def load() -> Config:
     topic = _require("KAFKA_TOPIC")
 
-    # Tolerate the common helm-template gotcha where an unset variable
-    # renders as the empty string instead of being absent. Empty,
-    # whitespace-only, and unset all fall back to the default. Single
-    # collapsed expression: `.strip().lower()` first, then `or` once.
+    # DuckLake is the only destination since the iceberg/icebox sink
+    # removal (see the `final-iceberg` tag for the last commit with it).
+    # Reject any other value loudly so a pod deployed with stale config
+    # fails at startup instead of silently writing to the wrong place.
+    # Empty/whitespace-only values fall back to the default to tolerate
+    # the helm-template gotcha where unset renders as "".
     destination_raw = os.environ.get("MILLPOND_DESTINATION", "").strip().lower() or "ducklake"
-    if destination_raw not in _DESTINATIONS:
-        raise RuntimeError(f"MILLPOND_DESTINATION {destination_raw!r} must be one of: {', '.join(_DESTINATIONS)}")
-    destination: Destination = destination_raw  # type: ignore[assignment]
+    if destination_raw != "ducklake":
+        raise RuntimeError(
+            f"MILLPOND_DESTINATION {destination_raw!r} is not supported; "
+            f"the iceberg/icebox sinks were removed (last shipped at tag final-iceberg)"
+        )
 
     pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME", "millpond-0")
     ordinal = _parse_ordinal(pod_name)
@@ -335,79 +258,8 @@ def load() -> Config:
     if ordinal >= replica_count:
         raise RuntimeError(f"Ordinal {ordinal} >= REPLICA_COUNT {replica_count}")
 
-    ducklake_kwargs: dict[str, str | None] = dict.fromkeys(
-        (
-            "ducklake_table",
-            "ducklake_data_path",
-            "ducklake_connection",
-            "rds_host",
-            "rds_port",
-            "rds_database",
-            "rds_username",
-            "rds_password",
-            "partition_by",
-        ),
-        None,
-    )
-    iceberg_kwargs: dict[str, str | None] = dict.fromkeys(
-        (
-            "iceberg_catalog_uri",
-            "iceberg_warehouse",
-            "iceberg_namespace",
-            "iceberg_table",
-            "iceberg_table_location",
-            "iceberg_catalog_token",
-            "s3_access_key_id",
-            "s3_secret_access_key",
-            "s3_region",
-            "s3_endpoint",
-        ),
-        None,
-    )
-
-    icebox_kwargs: dict[str, str | int | None] = dict.fromkeys(
-        (
-            "icebox_bucket",
-            "icebox_warehouse_prefix",
-            "icebox_pg_host",
-            "icebox_pg_port",
-            "icebox_pg_database",
-            "icebox_pg_username",
-            "icebox_pg_password",
-            "icebox_pg_schema",
-            "icebox_pg_sslmode",
-        ),
-        None,
-    )
-
-    if destination == "ducklake":
-        ducklake_kwargs.update(_load_ducklake_fields())
-        table_label_part = ducklake_kwargs["ducklake_table"]
-    elif destination == "iceberg":
-        iceberg_kwargs.update(_load_iceberg_fields())
-        table_label_part = iceberg_kwargs["iceberg_table"]
-    else:  # icebox: writer ships parquet to S3 + INSERTs to icebox_files
-        # Icebox writers still need to know the Iceberg target (namespace
-        # + table) so the deterministic file path matches what the daemon
-        # registers. The catalog handle itself lives on the daemon side.
-        iceberg_kwargs.update(_load_iceberg_fields())
-        icebox_kwargs["icebox_bucket"] = _require("ICEBOX_BUCKET")
-        icebox_kwargs["icebox_warehouse_prefix"] = _require("ICEBOX_WAREHOUSE_PREFIX")
-        icebox_kwargs["icebox_pg_host"] = _require("ICEBOX_PG_HOST")
-        icebox_kwargs["icebox_pg_port"] = int(os.environ.get("ICEBOX_PG_PORT", "5432"))
-        icebox_kwargs["icebox_pg_database"] = _require("ICEBOX_PG_DATABASE")
-        icebox_kwargs["icebox_pg_username"] = _require("ICEBOX_PG_USERNAME")
-        icebox_kwargs["icebox_pg_password"] = _require("ICEBOX_PG_PASSWORD")
-        icebox_kwargs["icebox_pg_schema"] = _require("ICEBOX_PG_SCHEMA")
-        # Schema lands in `options=-csearch_path=<schema>` in conninfo
-        # (icebox_sink.IceboxClient). Without validation, whitespace or a
-        # stray `-c` could redirect writes; we reject malformed values at
-        # config load so a typo can't silently land rows in `public`.
-        validate_pg_schema(icebox_kwargs["icebox_pg_schema"], "ICEBOX_PG_SCHEMA")
-        icebox_kwargs["icebox_pg_sslmode"] = os.environ.get("ICEBOX_PG_SSLMODE", "require")
-        table_label_part = iceberg_kwargs["iceberg_table"]
-
-    group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{table_label_part}")
+    ducklake_fields = _load_ducklake_fields()
+    group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{ducklake_fields['ducklake_table']}")
 
     # Collect KAFKA_CONSUMER_* env vars as librdkafka config overrides.
     # e.g. KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL -> security.protocol=SASL_SSL
@@ -427,10 +279,7 @@ def load() -> Config:
         group_id=group_id,
         replica_count=replica_count,
         ordinal=ordinal,
-        destination=destination,
-        **ducklake_kwargs,
-        **iceberg_kwargs,
-        **icebox_kwargs,
+        **ducklake_fields,
         flush_size=int(os.environ.get("FLUSH_SIZE", "104857600")),
         flush_interval_ms=int(os.environ.get("FLUSH_INTERVAL_MS", "60000")),
         fetch_min_bytes=int(os.environ.get("FETCH_MIN_BYTES", "1048576")),
@@ -458,8 +307,7 @@ def load() -> Config:
     )
 
     log.info(
-        "Config: destination=%s topic=%s table=%s ordinal=%d/%d group_id=%s",
-        destination,
+        "Config: topic=%s table=%s ordinal=%d/%d group_id=%s",
         topic,
         cfg.table_label,
         ordinal,

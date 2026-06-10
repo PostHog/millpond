@@ -1,4 +1,4 @@
-# Millpond — Dead Simple Kafka to DuckLake or Iceberg
+# Millpond — Dead Simple Kafka to DuckLake
 
 ## Pre-push Checklist
 
@@ -8,12 +8,11 @@ Always run before pushing:
 just lint              # ruff check (currently scoped to millpond/ only — see note)
 just fmt-check         # ruff format --check (currently scoped to millpond/ only — see note)
 just test              # unit tests
-just test-integration  # icebox Docker stack + MinIO + iceberg-rest via testcontainers (~2 min)
+just test-integration  # in-memory DuckDB integration tests — no docker stack, fast
 just test-e2e          # full DuckLake stack (~1m)
-just test-e2e-iceberg  # full Iceberg stack (~1m)
 ```
 
-Note: `just lint` and `just fmt-check` only run against `millpond/` today; the recipes predate the `icebox/`, `shared/`, and `tests/` additions. Pre-commit hooks run ruff project-wide, so lint failures still surface — but the just recipes themselves are scope-narrow until they're updated.
+Note: `just lint` and `just fmt-check` only run against `millpond/` today; `tests/` remains uncovered by the recipes. Pre-commit hooks run ruff project-wide, so lint failures still surface — but the just recipes themselves are scope-narrow until they're updated.
 
 All must pass. Do not push with any lint, test, integration, or e2e failures — CI runs all of these on every push and PR (`.github/workflows/ci.yaml`), and the integration/e2e jobs are gating. Catch failures locally rather than on the runner.
 
@@ -49,7 +48,7 @@ If `PUSHGATEWAY_URL` is set, the script pushes two metrics: `maintenance_start_t
 
 DuckDB's HTTP logging and the postgres extension's `pg_debug_show_queries` are off by default — both add per-call overhead that compounds across tens of thousands of S3 deletes. Pass `--debug` at the ducklake_maintenance.py command level to opt back into both for short-lived debugging.
 
-`tools/justfile` wraps the script for interactive use and is copied to `/justfile` in the Docker image. The `shell` recipe pre-ATTACHes both `lake` and `pg`, configures the S3 SECRET, and `.read`s `tools/ducklake_maintenance.sql` so every session starts with the macros loaded; the `drop` recipe still uses the DuckDB CLI directly. The `DUCKDB` env var can override the duckdb binary path; `DUCKLAKE_MAINTENANCE_SCRIPT`, `DUCKLAKE_MAINTENANCE_SQL`, and `DUCKLAKE_METRICS_SCRIPT` env vars override the in-image paths for dev use.
+`tools/justfile` wraps the script for interactive use and is copied to `/justfile` in the Docker image. The `shell` recipe pre-ATTACHes both `lake` and `pg`, configures the S3 SECRET, and `.read`s `tools/ducklake_maintenance.sql` so every session starts with the macros loaded; the lifecycle recipes wrap `ducklake_maintenance.py` subcommands. The `DUCKDB` env var can override the duckdb binary path; `DUCKLAKE_MAINTENANCE_SCRIPT`, `DUCKLAKE_MAINTENANCE_SQL`, and `DUCKLAKE_METRICS_SCRIPT` env vars override the in-image paths for dev use.
 
 ## State Metrics Daemon
 
@@ -67,7 +66,7 @@ Built-ins are deliberately table-unaware (D8 in `state-metrics-plan.md`): no `ta
 
 ## What This Is
 
-A standalone Python app that replaces Kafka Connect for writing Kafka topic data to a lake table. Single thread, single loop, no framework. One deployment writes to exactly one destination — either DuckLake or Apache Iceberg, selected by `MILLPOND_DESTINATION`.
+A standalone Python app that replaces Kafka Connect for writing Kafka topic data to a lake table. Single thread, single loop, no framework. One deployment writes to exactly one DuckLake table.
 
 Replaces: [PostHog/ducklake-kafka-connect](https://github.com/PostHog/ducklake-kafka-connect) (~1100 lines of lock management, scheduled executors, two-lock protocols imposed by the Kafka Connect framework).
 
@@ -112,31 +111,8 @@ while not shutdown:
 
 - **No consumer groups.** Each pod computes its partitions from its StatefulSet ordinal and total partition count, uses `consumer.assign()`.
 - **No threads, no queues.** Kafka is the queue. Backpressure is implicit: while flushing to the lake, the consumer simply doesn't call `consume()`. Kafka holds the data.
-- **Offset commit** is explicit: only after a successful lake write — DuckLake path commits locally; Iceberg path delegates to the icebox (below).
+- **Offset commit** is explicit: only after a successful lake write.
 - **If a pod dies**, its partitions stop being consumed until K8s restarts it. No rebalance.
-
-
-## icebox — polling-daemon committer for Iceberg
-
-The Iceberg path doesn't commit to the catalog from the writer pod. Writers stage parquet to S3 and INSERT file metadata into a shared `icebox_files` PG table; a separate **icebox** daemon per `(namespace, table)` polls the table on cadence, commits batches to Iceberg, and advances Kafka offsets on the writer's behalf. See [`icebox/README.md`](icebox/README.md) for the full operational notes and [`docs/icebox-self-healing-recovery.md`](docs/icebox-self-healing-recovery.md) for the v6 design rationale. Summary:
-
-```
-32× millpond writers ──INSERT───▶ icebox_files (PG)
-                       (Parquet to S3)              │
-                                                    ▼
-                                              icebox daemon
-                                                    │
-                                                    ├──tick──▶ Lakekeeper
-                                                    └──tick──▶ Kafka offset commit
-```
-
-- One icebox deployment per `(Iceberg namespace, table)` per environment. Each owns its own Postgres schema (`ICEBOX_PG_SCHEMA`). Chart enforces `replicas: 1` + `strategy.type: Recreate`; SKIP LOCKED on the daemon's hot SELECT is belt-and-suspenders in case two daemons ever overlap during a rollout.
-- Writer-side change is contained in [`millpond/icebox_sink.py`](millpond/icebox_sink.py) (an alternative Sink implementation that wraps a psycopg pool for the INSERT) — the rest of the writer pipeline is unchanged.
-- The daemon's tick runs `SELECT … WHERE result='pending' AND inserted_at < now() - <age_filter> FOR UPDATE SKIP LOCKED LIMIT <batch_size>` (default cadence 60s, age filter 60s, batch size 100) and produces one Iceberg snapshot per non-vacuous tick. Many writers, one daemon per table → zero OCC contention. This is what makes the prod target of 32 concurrent writer pods per Iceberg table viable.
-- The daemon also owns Kafka offset commit on the writers' behalf — writers use `consumer.assign()` and never join the consumer group. Offset commit runs **after** the PG transaction commits AND after the pool connection is returned, so the invariant *Kafka offset committed iff PG knows the file's fate* survives daemon crashes between PG COMMIT and AdminClient ack (next tick covers the gap via cumulative-offset semantics).
-- Endpoints: `GET /healthz` (k8s liveness; reads `status.last_committer_heartbeat` from PG against `cadence × stale_multiple`), `GET /metrics` (Prometheus). No HTTP writer-facing surface; writers INSERT directly. The probe HTTP server is a stdlib `ThreadingHTTPServer` — no FastAPI/uvicorn.
-- Logs are JSON-by-default. PostHog Logs export is wired through standard OTLP/HTTP when `POSTHOG_PROJECT_TOKEN` is set.
-- The same Docker image carries both binaries; the chart's `deployment.yaml` selects with `command: ["icebox"]` vs `command: ["millpond"]`.
 
 
 ## Key Design Decisions
@@ -146,9 +122,9 @@ The Iceberg path doesn't commit to the catalog from the writer pod. Writers stag
 Millpond has two independent credential paths that must not interfere:
 
 - **Kafka (MSK)**: SASL/OAUTHBEARER via IRSA. The `aws-msk-iam-sasl-signer-python` library uses the standard AWS credential chain (IRSA projected token → STS → temporary creds).
-- **S3 (lake data)**: Static IAM credentials via destination-specific env vars — `DUCKDB_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` for DuckLake (DuckDB's aws extension does not support IRSA: [duckdb/duckdb-aws#31](https://github.com/duckdb/duckdb-aws/issues/31)); `MILLPOND_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` for Iceberg (passed through PyIceberg catalog properties so PyArrow's S3 filesystem reads them before falling through to the AWS env var chain).
+- **S3 (lake data)**: Static IAM credentials via `DUCKDB_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` (DuckDB's aws extension does not support IRSA: [duckdb/duckdb-aws#31](https://github.com/duckdb/duckdb-aws/issues/31)).
 
-Neither backend's S3 credentials use the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — those take precedence in the credential chain and would shadow IRSA for MSK IAM auth. Do not change either backend's S3 credential env var names to the standard AWS names. The two families are kept distinct so a deployment switch between destinations is a clean swap rather than a re-use.
+The S3 credentials do not use the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — those take precedence in the credential chain and would shadow IRSA for MSK IAM auth. Do not change the S3 credential env var names to the standard AWS names.
 
 `aws-msk-iam-sasl-signer-python` is an optional dependency (`pip install millpond[msk-iam]`) but the Dockerfile always installs it (`--extra msk-iam`). All production deployments use IAM auth. The optional dep is for local dev where boto3/botocore (~15MB) may not be wanted.
 
@@ -197,7 +173,7 @@ Scaling requires updating both `spec.replicas` and the `REPLICA_COUNT` env var.
 
 **`auto.offset.reset=earliest`**: required. With `assign()`, if a partition has no committed offset (new partition, or `GROUP_ID` changed), the default `latest` silently drops all existing data. `earliest` replays from the beginning — safe for at-least-once.
 
-**`group.id`**: defaults to `millpond-{topic}-{table_label_part}` (where `table_label_part` is derived from the destination table identifier in `config.py:353`). Used only for offset storage in `__consumer_offsets` (no consumer group semantics). Changing `group.id` loses all committed offsets and triggers a full replay from `earliest`.
+**`group.id`**: defaults to `millpond-{topic}-{ducklake_table}` (see `load()` in `config.py`). Used only for offset storage in `__consumer_offsets` (no consumer group semantics). Changing `group.id` loses all committed offsets and triggers a full replay from `earliest`.
 
 **Monitoring caveat**: because we use `assign()` instead of `subscribe()`, standard consumer group monitoring tools (`kafka-consumer-groups.sh`, Burrow, etc.) show empty output or stale data. Use Millpond's own `millpond_consumer_lag` metric for lag monitoring, and `millpond_last_committed_offset` for offset tracking.
 
@@ -221,23 +197,21 @@ Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 
 **Caveat**: `pa.Table.from_pylist()` infers the schema from the first record's keys only. `arrow_converter.py` works around this by pre-scanning all records to build the full key union and passing an explicit schema to `from_pylist()`. The pre-scan is effectively free (pointer iteration over dict keys).
 
-**`pa.null()` columns are filtered.** `_drop_null_typed_columns()` runs after type normalization and drops any column whose Arrow type is `pa.null()`. In normal use `_build_schema` falls back to `pa.string()` for keys that are None in every record, so this filter is defensive: if a `pa.null()` column ever slips through (e.g. via a future inference change), the two backends would diverge — DuckLake silently accepts; Iceberg v2 rejects with `ValueError("Null type ... is not supported")`. Dropping at the converter keeps the Sink contract uniform; the column gets reintroduced with a real type on the next batch that has a non-null value.
+**`pa.null()` columns are filtered.** `_drop_null_typed_columns()` runs after type normalization and drops any column whose Arrow type is `pa.null()`. In normal use `_build_schema` falls back to `pa.string()` for keys that are None in every record, so this filter is defensive: a column with no schema information is a column with no data, and dropping it at the converter costs nothing — the column gets reintroduced with a real type on the next batch that has a non-null value.
 
-### Sink Protocol
+### The Sink
 
-`millpond/sink.py` defines a 3-method Protocol: `write(batch)`, `reset_caches()`, `close()`. `main.py` only sees this interface — it does not import either backend module. `make_sink(cfg)` is the factory; it dispatches on `cfg.destination` with lazy imports so a DuckLake-only deployment doesn't pay pyiceberg's ~150ms transitive import cost (cryptography, aiohttp, etc.). The same logic applies in reverse for Iceberg-only deployments.
+`main.py` constructs a `DuckLakeSink` directly (`millpond/ducklake.py`) and calls exactly three methods on it: `write(batch)`, `reset_caches()`, `close()`. One implementation, no abstraction layer.
 
-Per-Sink instance state: the table-ensured cache (set/dict) and the SchemaManager both live on the Sink instance, not at module level. Two Sink instances in the same process correctly do not share cache — each owns its own catalog/connection handle too. `reset_caches()` is called only by the write-retry loop in `main.py` after a failed write; sinks do not self-reset on internal recovery, they surface the failure and let the retry path drive cache invalidation.
+Per-Sink instance state: the table-ensured cache and the SchemaManager both live on the Sink instance, not at module level. Two Sink instances in the same process correctly do not share cache — each owns its own connection handle too. `reset_caches()` is called only by the write-retry loop in `main.py` after a failed write; the sink does not self-reset on internal recovery, it surfaces the failure and lets the retry path drive cache invalidation.
 
-Empty-batch contract: callers must not invoke `write()` with a zero-row batch. `main.py` gates on `pending_records > 0` before flushing. The backends diverge defensively: DuckLake creates the table eagerly on any call (including empty); Iceberg short-circuits and skips the catalog round trip. Neither divergence is exercised in steady state, but both are documented on the `Sink` Protocol docstring so any future caller knows the contract.
+Empty-batch contract: callers must not invoke `write()` with a zero-row batch. `main.py` gates on `pending_records > 0` before flushing. Defensively, DuckLake creates the table eagerly on any call (including empty); the divergence from the gate isn't exercised in steady state, but the contract is documented on the `DuckLakeSink` docstring so any future caller knows it.
 
-Reserved-column contract: source-schema columns must not collide with backend-managed metadata column names. `sink.py` exports a shared `check_reserved_collision(batch_schema, reserved, backend_name)` helper that each backend calls at the top of its module-level `write()` — raises `ValueError("Source schema column(s) [...] collide with X-reserved metadata column names...")` at the Sink boundary before any backend-specific work. The per-backend `RESERVED_COLUMNS` constants currently hold the same set (`{"_inserted_at", "year", "month", "day", "hour"}`) — DuckLake reserves the four partition cols defensively even though it doesn't produce them itself, so a deployment-time destination switch doesn't suddenly start accepting or rejecting batches based on column-name collisions. `SAFE_IDENTIFIER` (the regex for column names safe to embed in generated SQL / pass to PyIceberg's schema constructor) also lives in `sink.py` and is shared by both schema managers.
-
-Cross-backend behaviour and performance are locked by `tests/unit/test_backend_equivalence.py` — same Arrow batch through both Sinks, parametrized assertions over the documented divergences (empty-batch, partition cols, `_inserted_at` provenance), pathological value/name coverage, schema-evolution metric parity, and conservative performance smoke contracts. The suite catches a future "let's silently align these" or "let's silently diverge these" change before merge.
+Reserved-column contract: source-schema columns must not collide with sink-managed metadata column names. `ducklake.py`'s `check_reserved_collision(batch_schema, reserved)` runs at the top of the module-level `write()` — raises `ValueError("Source schema column(s) [...] collide with DuckLake-reserved metadata column names...")` before any sink-specific work. `RESERVED_COLUMNS` is `{"_inserted_at", "year", "month", "day", "hour"}` — DuckLake produces only `_inserted_at` itself; the four partition cols stay reserved for historical reasons and because they're the conventional output names of the `DUCKLAKE_PARTITION_BY` expression. `SAFE_IDENTIFIER` (the regex for column names safe to embed in generated SQL) lives in `schema.py`.
 
 ### Optional record handling (filter + sort)
 
-Two optional pre-sink stages, both backend-agnostic, both implemented in `main.py` so the Sink Protocol stays a pure write surface.
+Two optional pre-sink stages, both implemented in `main.py` so the sink stays a pure write surface.
 
 **Filter** (`_apply_filter` in `main.py`) runs immediately after `_convert_batch` and before records enter the pending buffer. Drops records whose value in `cfg.filter_keep_field` is not in `cfg.filter_values`. Tracks two skip reasons distinctly on `records_skipped_total`:
 
@@ -254,13 +228,13 @@ Cast direction is values → column (the small array to the big one's type), not
 
 `MILLPOND_FILTER_DROP_FIELD_NAME` is reserved at the config layer (mutex with keep, both empty or exactly one set) and explicitly rejected at startup. The denylist implementation lives in a future commit; the namespace is locked today so that change doesn't require operator env-var churn.
 
-**Sort** (`_apply_sort` in `main.py`) runs inside `_flush()` after `pa.concat_tables` but before `sink.write()`. Both backends see pre-sorted data; sink-side partition columns (year/month/day/hour added by IcebergSink, computed by the ducklake extension) are not in scope by design — operators specify sort keys against the source schema.
+**Sort** (`_apply_sort` in `main.py`) runs inside `_flush()` after `pa.concat_tables` but before `sink.write()`. The sink sees pre-sorted data; sink-side partition columns (year/month/day/hour, computed by the ducklake extension) are not in scope by design — operators specify sort keys against the source schema.
 
 Missing-field handling: if any `cfg.sort_by` field is absent from the batch, the whole sort is skipped (rather than partially sorting on available keys, which would silently differ from intent). Records still flow through unsorted. The metric is `sort_skipped_total{reason="field_missing"}`, deliberately distinct from `records_skipped_total` because no data is being dropped — only the layout improvement is.
 
 Log dedup: `_sort_missing_fields_warned` (module-level set) prevents per-flush log floods under sustained misconfiguration. One warning per distinct missing-fields pattern per pod lifetime; the metric is the always-on signal.
 
-Cost: ~50–200 ms per flush at production batch sizes (mostly `pa.Table.take()`'s full-column rewrite); peak memory ~2× the flush buffer during the take. Sort coverage lives in `TestApplySort` in `tests/unit/test_main.py` — the backend-equivalence suite is currently filter/sort-agnostic since both stages run upstream of the Sink boundary; if either feature ever gets per-backend variants (e.g. ORDER BY pushdown into the DuckLake INSERT), the equivalence suite should grow a parameterisation to lock the symmetry.
+Cost: ~50–200 ms per flush at production batch sizes (mostly `pa.Table.take()`'s full-column rewrite); peak memory ~2× the flush buffer during the take. Sort coverage lives in `TestApplySort` in `tests/unit/test_main.py` — both stages run upstream of the sink boundary, so the sink stays a pure write surface.
 
 ### DuckLake Initialization
 
@@ -286,39 +260,7 @@ conn.unregister('arrow_batch')
 
 Zero-copy Arrow scan. Table auto-created and evolved (ADD COLUMN, ALTER COLUMN SET DATA TYPE) to match Arrow schema. `_inserted_at` is added by the SQL `NOW()` at INSERT time, so rows in a single flush can have microsecond drift in their timestamps.
 
-### Iceberg Initialization
-
-```python
-catalog = load_catalog("lake", **{
-    "type": "rest",
-    "uri": cfg.iceberg_catalog_uri,
-    "warehouse": cfg.iceberg_warehouse,
-    "s3.access-key-id": cfg.s3_access_key_id,
-    "s3.secret-access-key": cfg.s3_secret_access_key,
-    "s3.region": cfg.s3_region,
-})
-```
-
-PyIceberg's PyArrow S3 filesystem reads `s3.access-key-id` etc. from the catalog properties before falling back to the AWS env var chain (verified against pyiceberg 0.11.1). Passing them through catalog properties keeps the IRSA token used for Kafka MSK auth out of the S3 client's credential resolution — same isolation pattern `DUCKDB_S3_*` gave DuckDB.
-
-PyIceberg is pinned exactly (`pyiceberg[pyarrow]==0.11.1`) because `millpond/iceberg.py` depends on two private symbols (`_pyarrow_to_schema_without_ids`, `assign_fresh_schema_ids`) to build an Iceberg schema with fresh sequential field IDs before constructing the partition spec. A canary test (`tests/unit/test_pyiceberg_pin.py`) imports both symbols and asserts the version + module path on every CI run — bumping the pin requires revisiting the iceberg module's private-API usage.
-
-### Iceberg Write
-
-```python
-batch = _add_metadata_columns(source_batch)  # appends _inserted_at + year/month/day/hour (int32)
-table.append(batch)                            # commits a snapshot via Table.append
-```
-
-`_inserted_at` is added at write time in Python (single `datetime.datetime.now(UTC)` shared by every row in the flush). Year/month/day/hour are derived from that timestamp via PyArrow compute and cast to int32 — the locked width matters because the partition spec references those columns by field_id, and a width drift between table creation and write would mismatch.
-
-### Iceberg Partition Spec
-
-Hardcoded: identity transforms on `year` / `month` / `day` / `hour` (int32, derived from `_inserted_at`). No env var, no per-deployment customization. The spec is built once at table creation via `_build_partition_spec()` and references the four columns by field_id (starting at `_PARTITION_FIELD_ID_BASE = 1000` to stay well above any plausible source-column count).
-
-Hive-style on-disk layout (`year=2026/month=3/day=23/hour=21/*.parquet`) is preserved so S3-prefix consumers, lifecycle rules, and partition-discovery tooling all work the same as DuckLake. Reader-side ergonomics differ: Iceberg doesn't know the four columns are derived from `_inserted_at`, so queries need explicit partition-column filters to get pruning. A future spec evolution can layer hidden partitioning on top without rewriting data; not needed today.
-
-### Hive-Style Partitioning (DuckLake)
+### Hive-Style Partitioning
 
 If `DUCKLAKE_PARTITION_BY` is set, `_ensure_table()` runs `ALTER TABLE SET PARTITIONED BY (...)` after table creation. DuckLake writes files into Hive-style directories (`year=2026/month=3/day=23/hour=21/*.parquet`).
 
@@ -341,9 +283,7 @@ The ducklake-kafka-connect connector has two custom layers for schema evolution:
 
 **Batch consolidation is also free.** The connector has a 170-line `BatchConsolidator.java` that groups contiguous batches by schema compatibility and does vector-by-vector in-place append — because Java Arrow has no `concat_tables()` equivalent. In Python, `pa.concat_tables(pending)` does schema unification, type promotion, and concatenation in one call. Hundreds of lines of manual memory management and vector arithmetic replaced by a single function call.
 
-Each backend owns its own SchemaManager — neither shares with the other, by design (they target different type systems, different DDL APIs, and different concurrency models).
-
-**DuckLake** (`millpond/schema.py`):
+The SchemaManager (`millpond/schema.py`):
 
 1. `pa.Table.from_pylist()` infers superset schema across all records in the batch
 2. Before write, compare `table.schema` against cached DuckLake table schema
@@ -352,23 +292,9 @@ Each backend owns its own SchemaManager — neither shares with the other, by de
 5. Incompatible change → DuckLake rejects it, log + metric + skip (per-column; does not abort the flush)
 6. `_inserted_at TIMESTAMP` added automatically, set to `NOW()` on write
 
-**Iceberg** (`millpond.iceberg.SchemaManager`, embedded in `iceberg.py`):
+Concurrency: DuckLake's idempotent DDL (`ADD COLUMN IF NOT EXISTS`) handles multi-pod races silently.
 
-1. `pa.Table.from_pylist()` infers superset schema (shared with DuckLake)
-2. Before write, compare against cached Iceberg table schema (read from `Catalog.load_table().schema()`)
-3. New field or widening → collect into one list; apply all in a single `table.update_schema()` transaction (single commit per flush)
-4. Reserved columns (`_inserted_at` + the four partition cols) are filtered out — source schema evolution must not touch them
-5. Incompatible change → `update_schema()` raises (e.g. `pyiceberg.exceptions.ValidationError` for narrowing); the broad `except Exception` in `evolve()` bumps `errors_total{type="schema"}`, invalidates the local cache, and **re-raises** so `_write_with_retry` can drive the recovery (this is different from DuckLake's per-column skip)
-6. `evolve()` returns `True` iff a commit happened, so `write()` can skip the post-evolve table reload when nothing changed
-
-Concurrency model differs too: DuckLake's idempotent DDL (`ADD COLUMN IF NOT EXISTS`) handles multi-pod races silently. Iceberg's `update_schema()` uses optimistic concurrency — a losing writer raises `CommitFailedException` and the retry path re-loads (possibly observing the winner's evolution) and tries again.
-
-**Why DuckLake swallows per-column failures while Iceberg re-raises.** This asymmetry is deliberate, not a bug:
-
-- DuckLake runs one ALTER per column (`ADD COLUMN` or `ALTER COLUMN SET DATA TYPE`). Each statement is its own transaction. If column N's ALTER fails (e.g. an invalid narrowing the extension rejects), columns 1..N-1 have already committed; the rest can still proceed. Aborting the whole flush would discard the legitimate successes. So `SchemaManager.evolve()` logs the failure, bumps `errors_total{type="schema"}`, and continues with the remaining columns; the failed column simply stays at its old type and the batch's values for it land NULL (or get cast if DuckDB can coerce them).
-- Iceberg's `update_schema()` is a single transaction — adds and widenings are batched into one commit at context-manager exit. There is no "partial success" state by construction. A `ValidationError` or `CommitFailedException` means the *whole* schema change rolled back; the subsequent `Table.append()` would write against a schema view that's now provably stale. Continuing would be wrong. So `SchemaManager.evolve()` re-raises and `_write_with_retry` invalidates caches and tries the whole flush again.
-
-Equivalent semantics across backends would require either rolling DuckLake's ALTERs into a single Postgres transaction (DuckDB ducklake extension doesn't expose that today) or splitting Iceberg's evolution into per-column commits (loses atomicity and multiplies catalog round-trips). Neither is worth the cost; the asymmetry is locked by `tests/unit/test_backend_equivalence.py` so any future "let's align these" PR has to explicitly address it.
+**Why schema evolution swallows per-column failures.** This is deliberate, not a bug: DuckLake runs one ALTER per column (`ADD COLUMN` or `ALTER COLUMN SET DATA TYPE`). Each statement is its own transaction. If column N's ALTER fails (e.g. an invalid narrowing the extension rejects), columns 1..N-1 have already committed; the rest can still proceed. Aborting the whole flush would discard the legitimate successes. So `SchemaManager.evolve()` logs the failure, bumps `errors_total{type="schema"}`, and continues with the remaining columns; the failed column simply stays at its old type and the batch's values for it land NULL (or get cast if DuckDB can coerce them).
 
 Source files for reference:
 - `DucklakeTableManager.java` — DDL detection and execution
@@ -431,7 +357,7 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | Risk | Mitigation |
 |------|------------|
 | Partition count desync | Partition count discovered via `admin.list_topics()` at startup — no env var. `REPLICA_COUNT` env var must match `spec.replicas`; desync causes uneven assignment but not data loss (some partitions double-assigned, some unassigned). |
-| Concurrent DDL from multiple pods (two pods both evolve schema simultaneously) | DuckLake: `ADD COLUMN IF NOT EXISTS` is idempotent — multiple pods racing is harmless. `ALTER COLUMN SET DATA TYPE` widening to the same target is also idempotent. Iceberg: `update_schema()` uses optimistic concurrency; the loser raises `CommitFailedException`, the write-retry path invalidates the cache and re-reads (possibly observing the winner's evolution), then tries again. Cannot designate a single schema-owner pod because schema discovery is distributed (new fields can appear in any partition). In practice, schema changes are rare — the primary use case (events) uses a stable schema that relies on maps/dictionaries for extensibility rather than adding columns. |
+| Concurrent DDL from multiple pods (two pods both evolve schema simultaneously) | `ADD COLUMN IF NOT EXISTS` is idempotent — multiple pods racing is harmless. `ALTER COLUMN SET DATA TYPE` widening to the same target is also idempotent. Cannot designate a single schema-owner pod because schema discovery is distributed (new fields can appear in any partition). In practice, schema changes are rare — the primary use case (events) uses a stable schema that relies on maps/dictionaries for extensibility rather than adding columns. |
 | Liveness probe only checks prometheus HTTP, not app health | **Mitigated.** `/healthz` and `/readyz` endpoints at `millpond/server.py` check `last_poll` recency against `max_poll_age_s=300`; pod reports 503 if no poll in the last 5 minutes. |
 
 ### High
@@ -528,19 +454,14 @@ Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTP
 |---------|-----|
 | `confluent-kafka>=2.6` | librdkafka Python wrapper |
 | `duckdb==1.5.2` | DuckDB Python client (pinned; the ducklake extension is sensitive to minor-version moves) |
-| `pyiceberg[pyarrow]==0.11.1` | PyIceberg REST catalog client — pinned exactly because `millpond/iceberg.py` uses two private symbols (`_pyarrow_to_schema_without_ids`, `assign_fresh_schema_ids`). The canary test in `tests/unit/test_pyiceberg_pin.py` fails loudly on any upgrade. |
-| `pyarrow>=18.0` | Arrow tables, zero-copy DuckDB/Iceberg integration |
+| `pyarrow>=18.0` | Arrow tables, zero-copy DuckDB integration |
 | `orjson>=3.10` | Fast JSON parsing (Rust) |
 | `prometheus-client>=0.21` | Metrics exposition |
 | `pytz>=2024.1` | Required by duckdb's TIMESTAMPTZ Python conversion (1.5.x doesn't accept stdlib zoneinfo) |
 | `pyyaml>=6.0.3` | `tools/ducklake_metrics.py` query definitions |
-| `psycopg[binary,pool]>=3.2` | Sync Postgres driver for both the writer-side `IceboxClient.register_file` (INSERT path) and the icebox daemon (claim / mark / heartbeat / migrations) |
-| `opentelemetry-sdk>=1.30` | Structured-log OTLP export plumbing for the icebox |
-| `opentelemetry-exporter-otlp-proto-http>=1.30` | OTLP/HTTP exporter — ships icebox logs to PostHog Logs when `POSTHOG_PROJECT_TOKEN` is set |
-
-The v6 polling-daemon rewrite deleted the icebox HTTP service: `fastapi`, `uvicorn`, `httpx`, and `asyncpg` are no longer dependencies. The probe HTTP server in `icebox/main.py` is a stdlib `ThreadingHTTPServer`.
-
-`duckdb`, `pyiceberg`, and the icebox-stack deps (`psycopg`, `opentelemetry-*`) are always installed — there is no "ducklake-only" / "iceberg-only" / "writer-only" / "icebox-only" build variant. The lazy import in `make_sink()` means a deployment that only uses one destination doesn't pay the other's import cost at startup; the icebox modules are similarly imported lazily by the `icebox` console script entry point. The dependency footprint on disk is identical regardless of which binary the pod runs.
+| `opentelemetry-sdk>=1.30` | Structured-log OTLP export plumbing for millpond's PostHog Logs export |
+| `opentelemetry-exporter-otlp-proto-http>=1.30` | OTLP/HTTP exporter — ships millpond logs to PostHog Logs when `POSTHOG_PROJECT_TOKEN` is set |
+| `opentelemetry-instrumentation-logging>=0.50b0,<0.64` | Ships the non-deprecated `LoggingHandler` (SDK 1.42 deprecated the `sdk._logs` one); ceiling bounds surprise since the handler's module path isn't the package's documented public surface |
 
 ## Project Structure
 
@@ -552,9 +473,8 @@ millpond/
 ├── .github/workflows/
 │   ├── ci.yaml               # Format, lint, unit tests on PR/push
 │   └── release.yaml          # Auto-version, tarball, Docker image, GitHub release
-├── Dockerfile                # Builds one image carrying both `millpond` and `icebox` console scripts
+├── Dockerfile                # Builds one image with the `millpond` console-script entry point
 ├── docker-compose.yaml       # DuckLake dev stack (Kafka, Postgres, MinIO, Grafana)
-├── docker-compose.iceberg.yaml  # Iceberg dev stack (Kafka, MinIO, iceberg-rest)
 ├── docker-compose.ssl.yaml   # Overlay adding SSL Kafka to docker-compose.yaml
 ├── k8s/
 │   ├── statefulset.yaml
@@ -562,38 +482,17 @@ millpond/
 │   └── pdb.yaml              # PodDisruptionBudget
 ├── millpond/                 # The writer
 │   ├── __init__.py
-│   ├── main.py               # Entry point, main loop, signal handling — backend-agnostic via Sink
-│   ├── config.py             # Env var → dataclass; per-destination validation
-│   ├── sink.py               # Sink Protocol + make_sink(cfg) factory (lazy backend imports)
+│   ├── main.py               # Entry point, main loop, signal handling
+│   ├── config.py             # Env var → dataclass; startup validation
 │   ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + numeric normalization)
 │   ├── ducklake.py           # DuckLake backend: connect, write, DuckLakeSink class
-│   ├── iceberg.py            # Iceberg backend (direct-commit path): connect, write, SchemaManager
-│   ├── icebox_sink.py        # Iceberg backend (icebox-coordinated path): psycopg IceboxClient + IceboxSink
-│   ├── schema.py             # DuckLake SchemaManager (Iceberg's is embedded in iceberg.py)
+│   ├── schema.py             # DuckLake SchemaManager
 │   ├── consumer.py           # Kafka consumer + AdminClient for partition discovery
 │   ├── backpressure.py       # Adaptive batch sizing
 │   ├── metrics.py            # Prometheus metric definitions
+│   ├── logging_config.py     # Two-phase logging setup + PostHog Logs OTLP attach
+│   ├── structured_logging.py # JSON formatter + optional OTLP/HTTP export to PostHog Logs
 │   └── server.py             # HTTP server for /metrics, /healthz, /readyz
-├── icebox/                   # The icebox: polling-daemon committer fronting Lakekeeper
-│   ├── __init__.py
-│   ├── main.py               # `icebox` console-script entry point; signal wiring + stdlib probe HTTP server
-│   ├── daemon.py             # daemon_tick + daemon_loop + TickResult + DaemonDeps
-│   ├── config.py             # Env-driven Config dataclass (ICEBOX_*)
-│   ├── iceberg.py            # commit_data_files + DataFile builder + snapshot_id helpers
-│   ├── kafka.py              # AdminClient + alter_consumer_group_offsets (offset commit on writers' behalf)
-│   ├── postgres_sync.py      # psycopg pool + claim_pending_batch / mark_committed / mark_failed / update_heartbeat + migrations
-│   ├── schema.py             # PG DDL (icebox_files, status) + Pydantic row models
-│   ├── timeout.py            # with_timeout — thread-based wrapper for commit_data_files (PyIceberg has no native timeout)
-│   ├── metrics.py            # Prometheus gauges/counters/histogram for the daemon
-│   ├── structured_logging.py # JSON formatter + optional OTLP/HTTP export
-│   └── README.md             # icebox-specific design + operational notes
-├── shared/                   # Wire format + helpers used by both millpond/icebox_sink and icebox/
-│   ├── __init__.py
-│   ├── models.py             # Pydantic wire models (RegisterFileRequest, ParquetStats, etc.)
-│   ├── bounds.py             # Typed-JSON ↔ Iceberg single-value-serialization bytes
-│   ├── fingerprint.py        # Iceberg-schema → SHA-256 fingerprint
-│   ├── paths.py              # Deterministic S3 path helpers
-│   └── structured_logging.py # JsonFormatter base + OTLP logger-provider builder (subclassed by icebox/structured_logging.py)
 ├── tools/
 │   ├── ducklake_maintenance.py     # Self-contained DuckLake maintenance script (K8s CronJob, DuckLake-only)
 │   ├── ducklake_maintenance.sql    # Macros loaded at session start
@@ -601,11 +500,10 @@ millpond/
 │   ├── justfile                    # Interactive wrapper for ducklake_maintenance.py + DuckDB CLI shell
 │   └── sizing-calculator.html      # Interactive flush/object sizing calculator
 ├── tests/
-│   ├── unit/                 # Fast, no external deps; uses PyIceberg SqlCatalog for iceberg-side; covers icebox modules too
-│   ├── integration/          # Local DuckDB + MinIO + iceberg-rest + Redpanda + icebox Docker stack via testcontainers
-│   ├── e2e/                  # Full docker-compose stack via testcontainers (DuckLake + Iceberg matrices)
-│   └── stress/               # Manual-only stress harness (deselected by default; not run in CI)
+│   ├── unit/                 # Fast, no external deps
+│   ├── integration/          # In-memory DuckDB write/metrics tests — no docker stack
+│   └── e2e/                  # Full docker-compose DuckLake stack via testcontainers
 └── test/                     # Dev fixtures (producer.py, ducklake-init.sql)
 ```
 
-`tools/` scripts are DuckLake-specific (maintenance and state-metrics). Iceberg-side tooling lives under `icebox/`: the committer service handles batched commits and is the answer to OCC contention; there is no equivalent of `ducklake_maintenance.py` for Iceberg in this repo (compaction/expiry are still expected to come from the catalog's native tooling).
+`tools/` scripts are DuckLake-specific (maintenance and state-metrics).
