@@ -9,20 +9,35 @@ import pyarrow as pa
 
 from millpond import schema
 from millpond.config import Config
-from millpond.sink import check_reserved_collision
 
 log = logging.getLogger(__name__)
 
 _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
 
 # Column names reserved as metadata. DuckLake itself only writes
-# `_inserted_at`, but the set is kept identical to
-# `millpond.iceberg.RESERVED_COLUMNS` so a deployment-time switch between
-# destinations doesn't suddenly start rejecting (or quietly accepting)
-# batches based on user-column collisions. The shared set is the union of
-# both backends' actual managed columns; DuckLake reserves the extras
-# defensively even though it doesn't produce them itself.
+# `_inserted_at`; year/month/day/hour stay reserved because partition
+# expressions commonly derive them, and tables were created under a
+# regime that reserved them — accepting them now would silently change
+# collision behavior for replayed data.
 RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at", "year", "month", "day", "hour"})
+
+
+def check_reserved_collision(batch_schema: pa.Schema, reserved: frozenset[str]) -> None:
+    """Raise early on source-schema collision with reserved metadata columns.
+
+    `_inserted_at` is appended at write time (with `year/month/day/hour`
+    reserved alongside it). If a source column has the same name, the
+    append step explodes deep in the stack (duplicate column on the
+    post-write projection). Catch it at the top of `write()` with a
+    clear message instead.
+    """
+    collisions = sorted(name for name in batch_schema.names if name in reserved)
+    if collisions:
+        raise ValueError(
+            f"Source schema column(s) {collisions!r} collide with "
+            f"DuckLake-reserved metadata column names; rename them "
+            f"upstream or filter them out before write()."
+        )
 
 
 def _escape_libpq(value: str | None) -> str:
@@ -194,7 +209,7 @@ def write(
     partition_by: str | None = None,
 ) -> None:
     """Write an Arrow table to DuckLake with _inserted_at timestamp."""
-    check_reserved_collision(batch.schema, RESERVED_COLUMNS, "DuckLake")
+    check_reserved_collision(batch.schema, RESERVED_COLUMNS)
     _ensure_table(conn, table_name, batch, tables_ensured, partition_by)
     if schema_mgr is not None:
         schema_mgr.evolve(batch.schema)
@@ -206,12 +221,15 @@ def write(
 
 
 class DuckLakeSink:
-    """`Sink` implementation for DuckLake.
+    """The sink: owns the DuckDB connection, table cache, and schema state.
 
     Thin wrapper around the module-level `connect`/`write` helpers and the
-    existing `schema.SchemaManager`. main.py only sees the Sink protocol;
-    whether schema evolution happens via DuckLake DDL or Iceberg
-    `update_schema()` is none of its business.
+    existing `schema.SchemaManager`. main.py only calls `write()`,
+    `reset_caches()`, and `close()`; schema evolution via DuckLake DDL is
+    none of its business. `write()` must not be called with a zero-row
+    batch (main.py gates on `pending_records > 0`); `reset_caches()` is
+    invoked only by main.py's write-retry loop after a failure; `close()`
+    is called exactly once at pod shutdown.
 
     The table cache and SchemaManager are instance state — each Sink owns
     its own — so multiple Sink instances in the same process (tests, future
@@ -221,9 +239,9 @@ class DuckLakeSink:
     def __init__(self, cfg: Config):
         # Explicit guards rather than assert: `python -O` strips asserts and
         # would forward None to connect(), producing a cryptic libpq
-        # "host=None" failure instead of a clear startup error. Symmetric
-        # with IcebergSink. All fields below are read either by connect()
-        # building the Postgres connstring or by this constructor.
+        # "host=None" failure instead of a clear startup error. All fields
+        # below are read either by connect() building the Postgres
+        # connstring or by this constructor.
         for name in (
             "ducklake_table",
             "ducklake_connection",

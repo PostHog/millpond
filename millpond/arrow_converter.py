@@ -13,12 +13,10 @@ def _drop_null_typed_columns(table: pa.Table) -> pa.Table:
     where every record has None across the whole batch, so ``pa.null()``
     shouldn't appear via this path. This filter is defensive: if a
     ``pa.null()`` column ever slips through (e.g. via a future inference
-    change), both backends would diverge — DuckLake silently accepts it,
-    Iceberg rejects with ``ValueError("Null type ... is not supported in
-    Iceberg format version 2")``. Dropping at the converter keeps the
-    Sink contract uniform across backends: a column with no schema info
-    is a column with no data, and it'll be re-introduced with a real
-    type on the next batch that has a non-null value.
+    change), dropping it at the converter keeps the Sink contract clean —
+    a column with no schema info is a column with no data, and it'll be
+    re-introduced with a real type on the next batch that has a non-null
+    value.
     """
     null_cols = [field.name for field in table.schema if pa.types.is_null(field.type)]
     if not null_cols:

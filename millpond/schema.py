@@ -10,12 +10,17 @@ Schema is cached per table to avoid repeated PRAGMA round-trips.
 """
 
 import logging
+import re
 
 import duckdb
 import pyarrow as pa
 
 from millpond import metrics
-from millpond.sink import SAFE_IDENTIFIER
+
+# Column names safe to embed in generated SQL. Field names that don't
+# match are skipped with a `records_skipped_total{reason="unsafe_field_name"}`
+# metric bump.
+SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 log = logging.getLogger(__name__)
 

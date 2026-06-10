@@ -1,4 +1,4 @@
-# Millpond — Kafka to DuckLake or Iceberg
+# Millpond — Kafka to DuckLake
 
 # Default recipe: list all available recipes
 default:
@@ -58,17 +58,6 @@ test-integration:
 test-e2e:
     uv run python -m pytest tests/e2e/test_e2e.py -v -s
 
-# Run E2E test against the Iceberg stack (docker-compose.iceberg.yaml).
-[group('test')]
-test-e2e-iceberg:
-    uv run python -m pytest tests/e2e/test_e2e_iceberg.py -v -s
-
-# Stress-test Lakekeeper under concurrent commits (manual; not in CI).
-# Brings up tests/stress/compose.lakekeeper.yaml, sweeps writer counts.
-[group('test')]
-stress-lakekeeper:
-    uv run python -m pytest tests/stress/test_lakekeeper_concurrent.py -v -s -m stress
-
 # Full CI check
 [group('test')]
 ci: fmt-check lint test
@@ -80,8 +69,7 @@ ci: fmt-check lint test
 ssl-certs:
     ./test/generate-ssl-certs.sh
 
-# Start the docker-compose dev environment (DuckLake stack — Kafka, Postgres, MinIO, producer, 2 millpond pods).
-# For Iceberg-flavored local dev, use the tests/integration/compose.yaml stack (MinIO + iceberg-rest) directly.
+# Start the docker-compose dev environment (Kafka, Postgres, MinIO, producer, 2 millpond pods).
 [group('docker')]
 up:
     docker compose build
@@ -103,7 +91,7 @@ down:
 down-ssl:
     docker compose -f docker-compose.yaml -f docker-compose.ssl.yaml down -v
 
-# Open a DuckDB shell attached to the local DuckLake (DuckLake stack only; requires `just up` first)
+# Open a DuckDB shell attached to the local DuckLake (requires `just up` first)
 [group('docker')]
 duck:
     duckdb -init test/ducklake-init.sql

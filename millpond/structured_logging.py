@@ -1,6 +1,6 @@
-"""Shared structured-logging building blocks for millpond + icebox.
+"""Structured-logging building blocks.
 
-Both services emit JSON logs to stdout and (optionally) export OTLP/HTTP
+Millpond emits JSON logs to stdout and (optionally) exports OTLP/HTTP
 log records to PostHog Logs. This module provides the service-agnostic
 pieces:
 
@@ -15,11 +15,11 @@ pieces:
     logger, optionally with extra filters (e.g. ContextVar-stamping).
   - ``silence_logger`` — pin a noisy logger at a given level.
 
-Service-specific concerns (icebox ``cycle_id``, millpond pod-ordinal
-prefix, per-service resource-attr taxonomy) stay in
-``icebox/structured_logging.py`` and ``millpond/logging_config.py``;
-they compose these blocks rather than reinventing them.
+Service-specific concerns (pod-ordinal prefix, the resource-attr
+taxonomy) stay in ``millpond/logging_config.py``, which composes these
+blocks rather than reinventing them.
 """
+
 from __future__ import annotations
 
 import json
@@ -28,15 +28,34 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-
 # Standard ``LogRecord`` attrs we do NOT want to inline as JSON keys
 # (they're already in the top-level shape or are noise).
-_STANDARD_LOGRECORD_ATTRS = frozenset({
-    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
-    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
-    "created", "msecs", "relativeCreated", "thread", "threadName",
-    "processName", "process", "message", "taskName",
-})
+_STANDARD_LOGRECORD_ATTRS = frozenset(
+    {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "processName",
+        "process",
+        "message",
+        "taskName",
+    }
+)
 
 
 class JsonFormatter(logging.Formatter):
@@ -51,8 +70,7 @@ class JsonFormatter(logging.Formatter):
     via ``repr``.
 
     Subclasses can override ``extra_context()`` to add fields pulled
-    from ContextVars or other per-call-site sources (e.g. the icebox's
-    ``cycle_id``).
+    from ContextVars or other per-call-site sources.
     """
 
     def extra_context(self) -> dict[str, Any]:  # pragma: no cover - trivial default
@@ -113,9 +131,7 @@ def silence_logger(name: str, level: int = logging.WARNING) -> None:
     """Pin a noisy logger at a given level.
 
     Pre-existing nuisance loggers we know about:
-      - ``uvicorn.access`` (icebox): probes + Prometheus scrape + every
-        POST emit one line each at INFO.
-      - ``confluent_kafka`` (millpond): librdkafka chatter at INFO.
+      - ``confluent_kafka``: librdkafka chatter at INFO.
 
     Idempotent — safe to call if the logger hasn't been created yet
     (Python lazy-creates loggers on first ``getLogger`` reference).
@@ -140,16 +156,15 @@ def build_otel_logger_provider(
     / ``k8s.*`` / ``host.hostname``).
 
     Batch knobs are pinned to explicit values rather than letting the
-    SDK pick. At 32 writer + 6+ icebox pods exporting at the SDK
-    defaults (``schedule_delay_millis=1000``, ``max_export_batch_size=512``,
-    ``max_queue_size=2048``), the aggregate is ~38 batched exports/sec
+    SDK pick. At 32+ writer pods exporting at the SDK defaults
+    (``schedule_delay_millis=1000``, ``max_export_batch_size=512``,
+    ``max_queue_size=2048``), the aggregate is dozens of batched exports/sec
     to a single PostHog Logs endpoint from one deployment family. Our
     defaults are tuned for PostHog Logs ingest: 5s schedule delay (≈ a
     fifth of SDK chatter), the standard 512-record batch, and a 2× queue
     so a stalled exporter doesn't drop logs during transient PostHog
-    ingress backpressure. Operators can override per-service via the
-    Config fields ``posthog_logs_schedule_delay_ms`` /
-    ``posthog_logs_max_batch_size`` / ``posthog_logs_max_queue_size``.
+    ingress backpressure. Callers can override via the keyword
+    arguments above.
 
     Caller owns the returned provider — register
     ``provider.shutdown()`` on the SIGTERM drain path so the
@@ -192,8 +207,8 @@ def attach_otel_handler(
     """Attach the OTel logging handler to the root logger.
 
     ``extra_filters`` (optional) run on the OTel side only, so
-    services can stamp per-record attrs (e.g. icebox's
-    ``icebox.cycle_id``) without touching the stdout shape.
+    callers can stamp per-record attrs without touching the stdout
+    shape.
 
     The handler comes from ``opentelemetry-instrumentation-logging``;
     the older ``opentelemetry.sdk._logs.LoggingHandler`` was deprecated

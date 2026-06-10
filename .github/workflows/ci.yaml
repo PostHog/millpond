@@ -24,7 +24,7 @@ jobs:
       run: uv run ruff check millpond/
 
     - name: Unit tests
-      run: uv run pytest -m "not integration and not e2e and not stress"
+      run: uv run pytest -m "not integration and not e2e"
 
   dependency-review:
     runs-on: ubuntu-latest
@@ -47,18 +47,11 @@ jobs:
         # license" and fails the check even when the actual SPDX
         # expression is in our allow-list above. We whitelist by purl
         # for the specific packages we know are fine:
-        #   - fastapi              MIT
         #   - googleapis-common-*  Apache-2.0
         #   - opentelemetry-*      Apache-2.0
         #   - protobuf             BSD-3-Clause
-        #   - psycopg, *-binary, *-pool  LGPL-3.0-or-later (we link;
-        #     don't modify; LGPL terms are satisfied — accepted as a
-        #     PostHog-cloud-infra precedent).
-        #   - starlette            BSD-3-Clause
-        #   - uvicorn              BSD-3-Clause
         # Remove entries here as the action's PEP 639 parser catches up.
         allow-dependencies-licenses: >-
-          pkg:pypi/fastapi,
           pkg:pypi/googleapis-common-protos,
           pkg:pypi/opentelemetry-api,
           pkg:pypi/opentelemetry-exporter-otlp-proto-common,
@@ -66,12 +59,7 @@ jobs:
           pkg:pypi/opentelemetry-proto,
           pkg:pypi/opentelemetry-sdk,
           pkg:pypi/opentelemetry-semantic-conventions,
-          pkg:pypi/protobuf,
-          pkg:pypi/psycopg,
-          pkg:pypi/psycopg-binary,
-          pkg:pypi/psycopg-pool,
-          pkg:pypi/starlette,
-          pkg:pypi/uvicorn
+          pkg:pypi/protobuf
 
   build:
     runs-on: ubuntu-latest
@@ -83,8 +71,8 @@ jobs:
       run: docker build --build-arg MILLPOND_VERSION=0.0.0.dev0 -t millpond .
 
   integration:
-    # Integration suite: MinIO + iceberg-rest via testcontainers. No Kafka,
-    # no millpond container — drives the library directly. ~10s runtime.
+    # Integration suite: drives ducklake.write() + SchemaManager against
+    # in-memory DuckDB. No containers. ~10s runtime.
     runs-on: ubuntu-latest
     needs: check
     steps:
@@ -92,65 +80,19 @@ jobs:
 
     - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
 
-    # Pre-pull every container image the integration suite needs, with
-    # a 3x retry. GitHub-hosted runners hit Docker Hub registry timeouts
-    # routinely (verified failure mode: dial tcp 54.235.153.191:443:
-    # i/o timeout) which leaves the test session erroring out on the
-    # first pull instead of running the suite. Pre-pulling here means
-    # the warmup pays the registry cost once with retries, and the test
-    # session itself hits a populated local cache.
-    #
-    # Image tags must stay in sync with what tests/integration/ and
-    # the icebox Dockerfile actually request. If a new test brings in
-    # a new image, add it here too.
-    - name: Pre-pull integration test images (3x retry)
-      run: |
-        set -eu
-        images=(
-          python:3.12-slim
-          ghcr.io/astral-sh/uv:0.7
-          postgres:16-alpine
-          minio/minio:RELEASE.2025-04-22T22-12-26Z
-          minio/mc:RELEASE.2025-04-16T18-13-26Z
-          tabulario/iceberg-rest@sha256:3b7d31bdfec626b68e97531c9778a1b9119659e456fe28545a49f6aa6a9ce472
-          docker.redpanda.com/redpandadata/redpanda:v24.3.4
-          testcontainers/ryuk:0.8.1
-        )
-        for image in "${images[@]}"; do
-          for attempt in 1 2 3; do
-            if docker pull "$image"; then
-              break
-            fi
-            if [[ $attempt -eq 3 ]]; then
-              echo "FATAL: failed to pull $image after 3 attempts" >&2
-              exit 1
-            fi
-            sleep_s=$((attempt * 5))
-            echo "pull $image failed; retry $attempt of 3 after ${sleep_s}s..." >&2
-            sleep "$sleep_s"
-          done
-        done
-
     - name: Integration tests
       run: uv run pytest tests/integration -v
 
   e2e:
-    # E2E suites: full docker-compose stacks for both destinations.
-    # Each builds the millpond image, brings up Kafka/MinIO/(Postgres|iceberg-rest),
-    # runs the producer, and verifies records land. ~1 minute per stack.
+    # Full docker-compose stack: builds the millpond image, brings up
+    # Kafka/MinIO/Postgres, runs the producer, and verifies records land.
+    # ~1 minute.
     runs-on: ubuntu-latest
     needs: check
-    strategy:
-      fail-fast: false
-      matrix:
-        suite:
-          - { name: ducklake, path: tests/e2e/test_e2e.py }
-          - { name: iceberg,  path: tests/e2e/test_e2e_iceberg.py }
-    name: e2e (${{ matrix.suite.name }})
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
     - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
 
     - name: E2E tests
-      run: uv run pytest ${{ matrix.suite.path }} -v -s
+      run: uv run pytest tests/e2e/test_e2e.py -v -s

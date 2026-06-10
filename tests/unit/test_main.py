@@ -4,17 +4,10 @@ import duckdb
 import pyarrow as pa
 import pytest
 from confluent_kafka import KafkaException
-from pyiceberg.exceptions import (
-    CommitFailedException,
-    CommitStateUnknownException,
-    ServerError,
-    ServiceUnavailableError,
-)
 
 from millpond.main import (
     _convert_batch,
     _flush,
-    _kafka_offsets_for_icebox,
     _write_with_retry,
 )
 
@@ -29,19 +22,12 @@ def _make_sink() -> MagicMock:
 # fail in CI before the regression reaches production. Includes:
 #   - OSError: S3 / network
 #   - duckdb.Error: DuckLake local execution
-#   - CommitFailedException: Iceberg optimistic-concurrency conflict
-#   - CommitStateUnknownException: REST 5xx after commit submission
-#   - ServerError / ServiceUnavailableError: catalog 5xx, transient
 #   - KafkaException: broker disconnect during a write (rare but possible
 #     if the same Kafka client surfaces an error mid-flush)
 #   - RuntimeError: catch-all for backend-internal surprises
 _RETRYABLE_EXCEPTIONS = [
     OSError("S3 timeout"),
     duckdb.Error("serialization conflict"),
-    CommitFailedException("optimistic-concurrency clash"),
-    CommitStateUnknownException("REST 5xx after submit"),
-    ServerError("catalog 500"),
-    ServiceUnavailableError("catalog 503"),
     KafkaException("broker disconnect"),
     RuntimeError("unexpected"),
 ]
@@ -70,10 +56,6 @@ class TestWriteWithRetry:
         [
             OSError,
             duckdb.Error,
-            CommitFailedException,
-            CommitStateUnknownException,
-            ServerError,
-            ServiceUnavailableError,
             KafkaException,
             RuntimeError,
         ],
@@ -753,149 +735,13 @@ class TestApplySort:
         assert result.column("region").to_pylist() == ["eu-central-1", "us-east-1", "us-west-2"]
 
 
-class TestKafkaOffsetsForIcebox:
-    """The icebox dispatch in _flush flattens the consumer's
-    (topic, partition) → offset map into the {partition_id_str: offset}
-    shape the icebox wire format expects."""
 
-    def test_single_topic_passthrough(self):
-        offsets = {("events", 0): 100, ("events", 1): 200}
-        result = _kafka_offsets_for_icebox(offsets, topic="events")
-        assert result == {"0": 100, "1": 200}
-
-    def test_raises_on_mismatched_topic(self):
-        """An unrelated topic in the offsets dict is a wiring bug —
-        raise loudly so the failure surfaces at flush time. Silently
-        dropping would lose offsets permanently (recovery only sees
-        what was POSTed; dropped offsets become stuck consumer-group
-        offsets and produce replay loops)."""
-        offsets = {("events", 0): 100, ("wrong", 0): 999}
-        with pytest.raises(RuntimeError, match="unexpected topic 'wrong'"):
-            _kafka_offsets_for_icebox(offsets, topic="events")
-
-
-    def test_raises_on_all_mismatched_topics(self):
-        """The all-dropped case must also raise — without this guard,
-        a completely-misconfigured topic would produce empty kafka_offsets,
-        a degenerate POST body, and silent failure."""
-        offsets = {("wrong-a", 0): 100, ("wrong-b", 1): 200}
-        with pytest.raises(RuntimeError, match="unexpected topic"):
-            _kafka_offsets_for_icebox(offsets, topic="events")
-
-    def test_empty_offsets_yields_empty(self):
-        assert _kafka_offsets_for_icebox({}, topic="events") == {}
-
-    def test_partition_keys_are_strings(self):
-        """The icebox wire format requires string keys (jsonb encoding)."""
-        result = _kafka_offsets_for_icebox({("events", 42): 1234}, topic="events")
-        assert "42" in result
-        assert 42 not in result
-
-
-class TestFlushIceboxDispatch:
-    """When cfg.destination == 'icebox', _flush must:
-      1. Pass kafka_offsets to sink.write
-      2. NOT call kafka.commit() — the icebox commits offsets atomically
-         with the Iceberg snapshot
-      3. Still emit committed-offset metrics for dashboards
-    """
-
-    def _icebox_args(self):
+class TestFlushCommit:
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_flush_commits_offsets_synchronously(self, mock_metrics, mock_server):
         sink = _make_sink()
         cfg = MagicMock()
-        cfg.destination = "icebox"
-        cfg.topic = "events"
-        cfg.table_label = "kafka.events"
-        cfg.sort_by = None
-        kafka = MagicMock()
-        table = pa.table({"a": [1, 2]})
-        offsets = {("events", 0): 100, ("events", 1): 200}
-        # Sample MAX Kafka message timestamp in ms-since-epoch
-        max_msg_ts = 1748789445000  # 2025-06-01T14:30:45 UTC
-        return sink, cfg, kafka, table, offsets, max_msg_ts
-
-    @patch("millpond.main.server")
-    @patch("millpond.main.metrics")
-    def test_icebox_path_passes_kafka_offsets_to_sink(self, mock_metrics, mock_server):
-        sink, cfg, kafka, table, offsets, max_msg_ts = self._icebox_args()
-        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, max_msg_timestamp_ms=max_msg_ts)
-        call = sink.write.call_args
-        assert "kafka_offsets" in call.kwargs
-        assert call.kwargs["kafka_offsets"] == {"0": 100, "1": 200}
-
-    @patch("millpond.main.server")
-    @patch("millpond.main.metrics")
-    def test_icebox_path_passes_inserted_at_derived_from_max_msg_ts(self, mock_metrics, mock_server):
-        """The whole point of plumbing max_msg_timestamp_ms: the sink
-        gets a deterministic inserted_at so replay yields the same
-        partition/path."""
-        import datetime as dt_mod
-        sink, cfg, kafka, table, offsets, max_msg_ts = self._icebox_args()
-        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, max_msg_timestamp_ms=max_msg_ts)
-        call = sink.write.call_args
-        assert "inserted_at" in call.kwargs
-        inserted_at = call.kwargs["inserted_at"]
-        assert isinstance(inserted_at, dt_mod.datetime)
-        assert inserted_at.tzinfo is not None  # tz-aware
-        # Same ms → same datetime
-        expected = dt_mod.datetime.fromtimestamp(max_msg_ts / 1000.0, tz=dt_mod.UTC)
-        assert inserted_at == expected
-
-    @patch("millpond.main.server")
-    @patch("millpond.main.metrics")
-    def test_icebox_path_replays_same_max_msg_ts_produce_same_inserted_at(
-        self, mock_metrics, mock_server,
-    ):
-        """The replay determinism property in _flush itself: two flushes
-        with the same max_msg_timestamp_ms must pass the same
-        inserted_at to the sink."""
-        sink, cfg, kafka, table, offsets, max_msg_ts = self._icebox_args()
-        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, max_msg_timestamp_ms=max_msg_ts)
-        first = sink.write.call_args.kwargs["inserted_at"]
-
-        sink.reset_mock()
-        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, max_msg_timestamp_ms=max_msg_ts)
-        second = sink.write.call_args.kwargs["inserted_at"]
-
-        assert first == second
-
-    @patch("millpond.main.server")
-    @patch("millpond.main.metrics")
-    def test_icebox_path_does_not_call_kafka_commit(self, mock_metrics, mock_server):
-        sink, cfg, kafka, table, offsets, max_msg_ts = self._icebox_args()
-        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, max_msg_timestamp_ms=max_msg_ts)
-        kafka.commit.assert_not_called()
-
-    @patch("millpond.main.server")
-    @patch("millpond.main.metrics")
-    def test_icebox_path_does_not_call_kafka_commit_even_on_write_failure(
-        self, mock_metrics, mock_server,
-    ):
-        """If sink.write raises, kafka.commit must STILL not be called
-        (the failed write means we have no Iceberg snapshot; committing
-        Kafka would advance past data we haven't durably stored)."""
-        sink, cfg, kafka, table, offsets, max_msg_ts = self._icebox_args()
-        sink.write.side_effect = OSError("S3 timeout")
-        with pytest.raises(OSError):
-            _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, max_msg_timestamp_ms=max_msg_ts)
-        kafka.commit.assert_not_called()
-
-    @patch("millpond.main.server")
-    @patch("millpond.main.metrics")
-    def test_icebox_path_still_emits_last_committed_offset_metric(self, mock_metrics, mock_server):
-        sink, cfg, kafka, table, offsets, max_msg_ts = self._icebox_args()
-        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, max_msg_timestamp_ms=max_msg_ts)
-        labels_calls = mock_metrics.last_committed_offset.labels.call_args_list
-        partitions = sorted(c.kwargs["partition"] for c in labels_calls)
-        assert partitions == ["0", "1"]
-
-    @patch("millpond.main.server")
-    @patch("millpond.main.metrics")
-    def test_non_icebox_path_still_calls_kafka_commit(self, mock_metrics, mock_server):
-        """Regression guard for the ducklake/iceberg path."""
-        sink = _make_sink()
-        cfg = MagicMock()
-        cfg.destination = "ducklake"
         cfg.table_label = "test_table"
         cfg.sort_by = None
         kafka = MagicMock()
@@ -903,27 +749,6 @@ class TestFlushIceboxDispatch:
         offsets = {("events", 0): 100}
         _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
         kafka.commit.assert_called_once()
-
-    @patch("millpond.main.server")
-    @patch("millpond.main.metrics")
-    @patch("millpond.main.log")
-    def test_icebox_path_falls_back_to_now_when_no_max_msg_ts(
-        self, mock_log, mock_metrics, mock_server,
-    ):
-        """Edge case: zero Kafka messages (impossible for production data
-        but the test path can hit it). Sink still gets a valid datetime
-        but the sentinel -1 triggers a warning log so operators see the
-        determinism compromise."""
-        import datetime as dt_mod
-        sink, cfg, kafka, table, offsets, _ = self._icebox_args()
-        before = dt_mod.datetime.now(dt_mod.UTC)
-        _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0, max_msg_timestamp_ms=-1)
-        after = dt_mod.datetime.now(dt_mod.UTC)
-        # inserted_at should be a recent now()
-        passed = sink.write.call_args.kwargs["inserted_at"]
-        assert before <= passed <= after
-        # And the warning should have fired
-        assert any(
-            "max_msg_timestamp_ms unset" in str(call)
-            for call in mock_log.warning.call_args_list
-        )
+        # Committed offset is next-to-fetch (max consumed + 1).
+        committed = kafka.commit.call_args.kwargs["offsets"]
+        assert [(tp.partition, tp.offset) for tp in committed] == [(0, 101)]

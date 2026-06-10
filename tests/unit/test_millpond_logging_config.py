@@ -1,6 +1,6 @@
 """Unit tests for millpond/logging_config.py — the two-phase
 setup_stdout() / attach_posthog_otlp() flow and the resource-attr
-taxonomy emitted per destination (ducklake / iceberg / icebox).
+taxonomy.
 """
 from __future__ import annotations
 
@@ -40,35 +40,15 @@ def _minimal_config() -> Config:
         group_id="millpond-test",
         replica_count=1,
         ordinal=0,
-        destination="ducklake",
-        ducklake_table=None,
-        ducklake_data_path=None,
-        ducklake_connection=None,
-        rds_host=None,
-        rds_port=None,
-        rds_database=None,
-        rds_username=None,
-        rds_password=None,
+        ducklake_table="events",
+        ducklake_data_path="s3://bucket/data",
+        ducklake_connection=":memory:",
+        rds_host="localhost",
+        rds_port="5432",
+        rds_database="ducklake",
+        rds_username="ducklake",
+        rds_password="pass",
         partition_by=None,
-        iceberg_catalog_uri=None,
-        iceberg_warehouse=None,
-        iceberg_namespace=None,
-        iceberg_table=None,
-        iceberg_table_location=None,
-        iceberg_catalog_token=None,
-        s3_access_key_id=None,
-        s3_secret_access_key=None,
-        s3_region=None,
-        s3_endpoint=None,
-        icebox_bucket=None,
-        icebox_warehouse_prefix=None,
-        icebox_pg_host=None,
-        icebox_pg_port=None,
-        icebox_pg_database=None,
-        icebox_pg_username=None,
-        icebox_pg_password=None,
-        icebox_pg_schema=None,
-        icebox_pg_sslmode=None,
         flush_size=104857600,
         flush_interval_ms=60000,
         fetch_min_bytes=1048576,
@@ -98,7 +78,7 @@ def _make_cfg(**overrides) -> Config:
 
 
 def test_setup_stdout_installs_json_formatter_by_default(monkeypatch):
-    from shared.structured_logging import JsonFormatter
+    from millpond.structured_logging import JsonFormatter
 
     monkeypatch.delenv("MILLPOND_LOG_FORMAT", raising=False)
     logging_config.setup_stdout()
@@ -133,7 +113,7 @@ def test_attach_posthog_otlp_returns_none_when_token_unset():
 
 
 # ---------------------------------------------------------------------------
-# attach_posthog_otlp — resource attrs per destination
+# attach_posthog_otlp — resource attrs
 # ---------------------------------------------------------------------------
 
 
@@ -151,11 +131,10 @@ def _resource_attrs_for(cfg) -> dict[str, str]:
         provider.shutdown()
 
 
-def test_resource_attrs_ducklake_destination():
+def test_resource_attrs():
     cfg = _make_cfg(
         posthog_project_token="phc_test",
         service_instance_id="events",
-        destination="ducklake",
         ducklake_table="events",
         ducklake_data_path="s3://posthog-megaduck-mw-dev/",
     )
@@ -168,58 +147,9 @@ def test_resource_attrs_ducklake_destination():
     assert attrs["messaging.system"] == "kafka"
     assert attrs["messaging.destination.name"] == "clickhouse_events_json"
     assert attrs["messaging.kafka.consumer.group"] == "millpond-test"
-    # Destination dimension + ducklake-specific custom attrs
-    assert attrs["millpond.destination"] == "ducklake"
+    # DuckLake custom attrs
     assert attrs["millpond.ducklake.table"] == "events"
     assert attrs["millpond.ducklake.data_path"] == "s3://posthog-megaduck-mw-dev/"
-    # Iceberg / icebox attrs absent
-    assert "millpond.iceberg.warehouse" not in attrs
-    assert "millpond.icebox.url" not in attrs
-
-
-def test_resource_attrs_iceberg_destination():
-    cfg = _make_cfg(
-        posthog_project_token="phc_test",
-        service_instance_id="events-iceberg",
-        destination="iceberg",
-        iceberg_warehouse="ingest",
-        iceberg_namespace="kafka",
-        iceberg_table="events",
-    )
-    attrs = _resource_attrs_for(cfg)
-    assert attrs["millpond.destination"] == "iceberg"
-    assert attrs["millpond.iceberg.warehouse"] == "ingest"
-    assert attrs["millpond.iceberg.namespace"] == "kafka"
-    assert attrs["millpond.iceberg.table"] == "events"
-    # icebox-only attrs absent for plain iceberg
-    assert "millpond.icebox.url" not in attrs
-    assert "millpond.icebox.bucket" not in attrs
-    # ducklake attrs absent
-    assert "millpond.ducklake.table" not in attrs
-
-
-def test_resource_attrs_icebox_destination():
-    cfg = _make_cfg(
-        posthog_project_token="phc_test",
-        service_instance_id="events-icebox",
-        destination="icebox",
-        iceberg_warehouse="ingest",
-        iceberg_namespace="kafka",
-        iceberg_table="events",
-        icebox_bucket="posthog-megaberg-mw-dev",
-        icebox_pg_host="megaberg.example.com",
-    )
-    attrs = _resource_attrs_for(cfg)
-    assert attrs["millpond.destination"] == "icebox"
-    # Iceberg attrs carried over (icebox writers still target Iceberg)
-    assert attrs["millpond.iceberg.warehouse"] == "ingest"
-    assert attrs["millpond.iceberg.namespace"] == "kafka"
-    assert attrs["millpond.iceberg.table"] == "events"
-    # Icebox-specific routing attrs present
-    assert attrs["millpond.icebox.bucket"] == "posthog-megaberg-mw-dev"
-    assert attrs["millpond.icebox.pg.host"] == "megaberg.example.com"
-    # ducklake attrs absent
-    assert "millpond.ducklake.table" not in attrs
 
 
 def test_resource_attrs_omit_unset_optionals():
@@ -228,13 +158,6 @@ def test_resource_attrs_omit_unset_optionals():
     cfg = _make_cfg(
         posthog_project_token="phc_test",
         service_instance_id=None,
-        destination="ducklake",
-        ducklake_table=None,  # also unset
-        ducklake_data_path=None,
     )
     attrs = _resource_attrs_for(cfg)
     assert "service.instance.id" not in attrs
-    assert "millpond.ducklake.table" not in attrs
-    assert "millpond.ducklake.data_path" not in attrs
-    # But destination IS always emitted — it's the dimension's whole point.
-    assert attrs["millpond.destination"] == "ducklake"

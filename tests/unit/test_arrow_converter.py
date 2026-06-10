@@ -188,9 +188,9 @@ class TestConvert:
 class TestDropNullTypedColumns:
     """Defensive filter against pa.null() columns slipping through to a Sink.
 
-    Backends diverge on pa.null() — DuckLake stores nulls; Iceberg raises
-    `ValueError("Null type ... is not supported in Iceberg format version
-    2")`. Dropping at the converter keeps the Sink contract uniform.
+    A column with no schema info is a column with no data; dropping at
+    the converter keeps the Sink contract clean and lets the column come
+    back with a real type on the next non-null batch.
     """
 
     def test_drops_pa_null_column(self):
