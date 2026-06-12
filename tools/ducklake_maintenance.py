@@ -704,6 +704,7 @@ def compact(
     dry_run: bool,
     threads: int,
     memory_limit: str,
+    max_compacted_files: int,
 ) -> None:
     """Compact files in tier N (1, 2, or 3) for the catalog or one table."""
     spec = TIERS[tier]
@@ -711,11 +712,12 @@ def compact(
     scope = f"table '{table}'" if table else "catalog-wide"
     range_str = f"[{min_b or 0}, {max_b}) bytes"
     log.info(
-        "Compact tier %d (%s): merge files %s into ~%s targets (dry_run=%s)",
+        "Compact tier %d (%s): merge files %s into ~%s targets, max %d files/run (dry_run=%s)",
         tier,
         scope,
         range_str,
         target,
+        max_compacted_files,
         dry_run,
     )
 
@@ -745,7 +747,12 @@ def compact(
         log.info("compact tier-%d: nothing to do, skipping merge", tier)
         return
 
-    args = [f"max_file_size => {max_b}"]
+    # Bound each run: the prod backlog (600k+ tier-1 candidates) is far too
+    # large for one merge transaction — it would blow the cron pod's
+    # activeDeadlineSeconds and produce one giant catalog commit. A capped
+    # run finishes in bounded time and the cron schedule grinds the backlog
+    # down incrementally.
+    args = [f"max_file_size => {max_b}", f"max_compacted_files => {max_compacted_files}"]
     if min_b is not None:
         args.append(f"min_file_size => {min_b}")
     if table:
@@ -863,16 +870,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tier", type=int, choices=[1, 2, 3], required=True)
     p.add_argument("--table", default="", help="Limit to one table; empty = catalog-wide")
     p.add_argument("--dry-run", action="store_true")
+    # Defaults are env-overridable so the K8s CronJob (which runs the bare
+    # `just compact-all-tiers` recipe with no CLI args) can be tuned per
+    # environment from chart values without an image rebuild.
     p.add_argument(
         "--threads",
         type=_positive_int,
-        default=2,
-        help="DuckDB threads during the merge (default 2; raise cautiously, see DuckLake bug c8)",
+        default=_positive_int(os.environ.get("COMPACTION_THREADS", "2")),
+        help="DuckDB threads during the merge (default $COMPACTION_THREADS or 2; raise cautiously, see bug c8)",
     )
     p.add_argument(
         "--memory-limit",
-        default="4GB",
-        help="DuckDB memory_limit during the merge (default 4GB)",
+        default=os.environ.get("COMPACTION_MEMORY_LIMIT", "4GB"),
+        help="DuckDB memory_limit during the merge (default $COMPACTION_MEMORY_LIMIT or 4GB)",
+    )
+    p.add_argument(
+        "--max-compacted-files",
+        type=_positive_int,
+        default=_positive_int(os.environ.get("COMPACTION_MAX_FILES", "100000")),
+        help="Cap on files merged per run (default $COMPACTION_MAX_FILES or 100000)",
     )
 
     # compact-probe
@@ -948,7 +964,15 @@ def main(argv: list[str] | None = None) -> None:
             case "checkpoint":
                 checkpoint(conn)
             case "compact":
-                compact(conn, args.tier, args.table or None, args.dry_run, args.threads, args.memory_limit)
+                compact(
+                    conn,
+                    args.tier,
+                    args.table or None,
+                    args.dry_run,
+                    args.threads,
+                    args.memory_limit,
+                    args.max_compacted_files,
+                )
             case "compact-probe":
                 compact_probe(conn, args.table, args.max_compacted_files)
     except Exception:
