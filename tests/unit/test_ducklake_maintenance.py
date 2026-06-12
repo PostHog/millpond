@@ -161,11 +161,32 @@ class TestArgparse:
         args = self.parser.parse_args(["compact", "--tier", "1"])
         assert args.threads == 2
         assert args.memory_limit == "4GB"
+        assert args.max_compacted_files == 100000
 
     def test_compact_threads_memory_override(self):
-        args = self.parser.parse_args(["compact", "--tier", "2", "--threads", "8", "--memory-limit", "16GB"])
+        args = self.parser.parse_args(
+            ["compact", "--tier", "2", "--threads", "8", "--memory-limit", "16GB", "--max-compacted-files", "5000"]
+        )
         assert args.threads == 8
         assert args.memory_limit == "16GB"
+        assert args.max_compacted_files == 5000
+
+    def test_compact_tuning_env_overrides(self, monkeypatch):
+        """The K8s CronJob passes no CLI args; chart values tune via env."""
+        monkeypatch.setenv("COMPACTION_THREADS", "4")
+        monkeypatch.setenv("COMPACTION_MEMORY_LIMIT", "16GB")
+        monkeypatch.setenv("COMPACTION_MAX_FILES", "50000")
+        parser = ducklake_maintenance.build_parser()
+        args = parser.parse_args(["compact", "--tier", "1"])
+        assert args.threads == 4
+        assert args.memory_limit == "16GB"
+        assert args.max_compacted_files == 50000
+
+    def test_compact_cli_beats_env(self, monkeypatch):
+        monkeypatch.setenv("COMPACTION_MEMORY_LIMIT", "16GB")
+        parser = ducklake_maintenance.build_parser()
+        args = parser.parse_args(["compact", "--tier", "1", "--memory-limit", "8GB"])
+        assert args.memory_limit == "8GB"
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +311,40 @@ class TestSetCompactionTuning:
             ducklake_maintenance._set_compaction_tuning(conn, threads=2, memory_limit="4GB'; DROP TABLE x; --")
         # Sanitization happens before any execute; conn must not have been touched.
         conn.execute.assert_not_called()
+
+
+class TestCompactSql:
+    """compact() must pass the per-run file cap through to the merge CALL."""
+
+    def test_merge_call_includes_max_compacted_files(self):
+        conn = MagicMock()
+        result = MagicMock()
+        # candidate-count read, then ducklake_options read for target_file_size restore
+        result.fetchone.side_effect = [(614342, 242861636470), ("128MiB",)]
+        result.fetchall.return_value = []
+        conn.execute.return_value = result
+
+        ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=100000
+        )
+
+        merge_calls = [c.args[0] for c in conn.execute.call_args_list if "ducklake_merge_adjacent_files" in c.args[0]]
+        assert len(merge_calls) == 1
+        assert "max_compacted_files => 100000" in merge_calls[0]
+        assert "max_file_size =>" in merge_calls[0]
+
+    def test_dry_run_does_not_merge(self):
+        conn = MagicMock()
+        result = MagicMock()
+        result.fetchone.return_value = (614342, 242861636470)
+        conn.execute.return_value = result
+
+        ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=True, threads=2, memory_limit="16GB", max_compacted_files=100000
+        )
+
+        merge_calls = [c.args[0] for c in conn.execute.call_args_list if "ducklake_merge_adjacent_files" in c.args[0]]
+        assert not merge_calls
 
 
 class TestScopedTargetFileSize:
