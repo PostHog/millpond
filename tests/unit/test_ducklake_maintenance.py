@@ -304,6 +304,9 @@ class TestSetCompactionTuning:
         assert "SET memory_limit = '8GB'" in executed
         assert "SET preserve_insertion_order = false" in executed
         assert "SET http_timeout = 600000" in executed
+        # progress tracking is only computed when the progress bar is enabled
+        assert "SET enable_progress_bar = true" in executed
+        assert "SET enable_progress_bar_print = false" in executed
 
     def test_rejects_injection_in_memory_limit(self):
         conn = MagicMock()
@@ -313,8 +316,75 @@ class TestSetCompactionTuning:
         conn.execute.assert_not_called()
 
 
+class TestHeartbeat:
+    """Heartbeat line formatting and degradation; no real threads or sleeps."""
+
+    def test_midway_progress_with_eta_and_rss(self, monkeypatch):
+        monkeypatch.setattr(ducklake_maintenance, "_progress_poll_warned", False)
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: 35.7 * 1024**3)
+        conn = MagicMock()
+        conn.query_progress.return_value = 25.0
+        # 25% in 600s -> 1800s -> 30m remaining
+        line = ducklake_maintenance._heartbeat_line(conn, "compact tier-1 merge", 600.0)
+        assert line == "compact tier-1 merge: 600s elapsed, ~25% merged, est. 30m remaining, rss=35.7GiB"
+
+    def test_no_query_running_elapsed_only(self, monkeypatch):
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        conn = MagicMock()
+        conn.query_progress.return_value = -1.0
+        assert ducklake_maintenance._heartbeat_line(conn, "x", 60.0) == "x: 60s elapsed"
+
+    def test_sub_one_percent_suppressed(self, monkeypatch):
+        """Fractional early readings must not render '~0%' with a noise ETA."""
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        conn = MagicMock()
+        conn.query_progress.return_value = 0.3
+        assert "%" not in ducklake_maintenance._heartbeat_line(conn, "x", 60.0)
+
+    def test_complete_has_no_eta(self, monkeypatch):
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        conn = MagicMock()
+        conn.query_progress.return_value = 100.0
+        line = ducklake_maintenance._heartbeat_line(conn, "x", 60.0)
+        assert "~100% merged" in line
+        assert "remaining" not in line
+
+    def test_poll_failure_warns_once_and_degrades(self, monkeypatch, caplog):
+        monkeypatch.setattr(ducklake_maintenance, "_progress_poll_warned", False)
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        conn = MagicMock()
+        conn.query_progress.side_effect = RuntimeError("gone")
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            assert ducklake_maintenance._heartbeat_line(conn, "x", 60.0) == "x: 60s elapsed"
+            assert ducklake_maintenance._heartbeat_line(conn, "x", 120.0) == "x: 120s elapsed"
+        assert len([r for r in caplog.records if "query_progress" in r.message]) == 1
+
+    def test_rss_bytes_returns_positive_or_none(self):
+        rss = ducklake_maintenance._rss_bytes()
+        assert rss is None or rss > 0
+
+
 class TestCompactSql:
     """compact() must pass the per-run file cap through to the merge CALL."""
+
+    def test_merge_runs_under_heartbeat(self, monkeypatch):
+        """The heartbeat must wrap the merge call and be stopped afterwards."""
+        hb = MagicMock()
+        start = MagicMock(return_value=hb)
+        monkeypatch.setattr(ducklake_maintenance, "_start_heartbeat", start)
+
+        conn = MagicMock()
+        result = MagicMock()
+        result.fetchone.side_effect = [(100, 1000), ("128MiB",)]
+        result.fetchall.return_value = []
+        conn.execute.return_value = result
+
+        ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=1, memory_limit="16GB", max_compacted_files=25000
+        )
+
+        start.assert_called_once_with(conn, "compact tier-1 merge")
+        hb.set.assert_called_once()
 
     def test_merge_call_includes_max_compacted_files(self):
         conn = MagicMock()

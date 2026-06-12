@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -690,11 +691,92 @@ def _set_compaction_tuning(conn: duckdb.DuckDBPyConnection, threads: int, memory
     # Default 30s is too tight for the multi-MB GETs/PUTs that compaction
     # drives; 10 min covers the worst-case S3 hiccup without livelocking.
     conn.execute("SET http_timeout = 600000")
+    # DuckDB only computes query progress when the progress bar is enabled;
+    # print-off keeps it out of the logs. This is what lets the heartbeat's
+    # cross-thread query_progress() poll return a percentage instead of -1.
+    conn.execute("SET enable_progress_bar = true")
+    conn.execute("SET enable_progress_bar_print = false")
     log.info(
         "compaction tuning: threads=%d memory_limit=%s preserve_insertion_order=false http_timeout=600000ms",
         threads,
         memory_limit,
     )
+
+
+def _rss_bytes() -> int | None:
+    """Current process RSS, or None if unreadable.
+
+    Reads /proc/self/status (the prod container is Linux); falls back to
+    getrusage peak RSS elsewhere (macOS dev — note: peak, not current).
+    RSS is the number that matters for compaction OOMs: DuckLake's merge
+    keeps a large working set OUTSIDE DuckDB's memory accounting (bug c8),
+    so the cgroup kills the pod while duckdb's own gauge looks healthy.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak if sys.platform == "darwin" else peak * 1024
+    except Exception:
+        return None
+
+
+_progress_poll_warned = False
+
+
+def _heartbeat_line(conn: duckdb.DuckDBPyConnection, label: str, elapsed: float) -> str:
+    """One heartbeat log line: elapsed, merge percentage + ETA when DuckDB
+    reports one (sub-1% readings are noise on huge merges), and process RSS.
+
+    query_progress() failures degrade to elapsed-only (warned once): the
+    heartbeat is decoration and must never kill the operation it watches.
+    """
+    global _progress_poll_warned
+    parts = [f"{label}: {elapsed:.0f}s elapsed"]
+    try:
+        pct = float(conn.query_progress())
+    except Exception:
+        pct = -1.0
+        if not _progress_poll_warned:
+            _progress_poll_warned = True
+            log.warning("query_progress() poll failed; heartbeat continues without percentages", exc_info=True)
+    if pct >= 100:
+        parts.append("~100% merged")
+    elif pct >= 1:
+        eta = elapsed * (100.0 - pct) / pct
+        parts.append(f"~{pct:.0f}% merged, est. {eta / 60:.0f}m remaining")
+    rss = _rss_bytes()
+    if rss is not None:
+        parts.append(f"rss={rss / 1024**3:.1f}GiB")
+    return ", ".join(parts)
+
+
+def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: float = 60.0) -> threading.Event:
+    """Log a heartbeat line every `interval_s` while a long blocking call runs
+    on `conn` from the main thread. Returns the Event to .set() when done
+    (use try/finally). Daemon thread; safe to leak on crash.
+
+    Cross-thread query_progress() is a lock-free atomic read of executor
+    state (it's how Jupyter's progress bar works) — worst case is a stale
+    reading, never corruption. The connection's single query slot belongs to
+    the watched call, so the percentage can't be someone else's query.
+    """
+    stop = threading.Event()
+    start_t = time.monotonic()
+
+    def _tick() -> None:
+        while not stop.wait(timeout=interval_s):
+            log.info("%s", _heartbeat_line(conn, label, time.monotonic() - start_t))
+
+    threading.Thread(target=_tick, daemon=True).start()
+    return stop
 
 
 def compact(
@@ -761,8 +843,12 @@ def compact(
         sql = f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', {', '.join(args)})"
 
     _set_compaction_tuning(conn, threads, memory_limit)
-    with _scoped_target_file_size(conn, target):
-        result = conn.execute(sql).fetchall()
+    heartbeat = _start_heartbeat(conn, f"compact tier-{tier} merge")
+    try:
+        with _scoped_target_file_size(conn, target):
+            result = conn.execute(sql).fetchall()
+    finally:
+        heartbeat.set()
     for row in result:
         log.info("compact tier-%d: %s", tier, row)
 
