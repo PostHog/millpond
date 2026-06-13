@@ -752,6 +752,15 @@ def _heartbeat_line(conn: duckdb.DuckDBPyConnection, label: str, elapsed: float)
     elif pct >= 1:
         eta = elapsed * (100.0 - pct) / pct
         parts.append(f"~{pct:.0f}% merged, est. {eta / 60:.0f}m remaining")
+    elif pct >= 0:
+        # Sub-1% readings are rendered verbatim rather than suppressed: when the
+        # merge cap is much smaller than the total file population, DuckLake's
+        # progress denominator may cover the full catalog rather than the capped
+        # subset, so the reading stays <1% for the whole run. A slowly climbing
+        # "~0.4% merged" is still a liveness signal and distinguishes a live
+        # merge from a hung one. No ETA: extrapolating from a fraction-of-percent
+        # would produce absurdly large numbers.
+        parts.append(f"~{pct:.1f}% merged (sub-1%; ETA unavailable)")
     rss = _rss_bytes()
     if rss is not None:
         parts.append(f"rss={rss / 1024**3:.1f}GiB")

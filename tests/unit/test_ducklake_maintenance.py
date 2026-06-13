@@ -331,15 +331,25 @@ class TestHeartbeat:
     def test_no_query_running_elapsed_only(self, monkeypatch):
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
         conn = MagicMock()
-        conn.query_progress.return_value = -1.0
+        conn.query_progress.return_value = -0.5  # anything < 0
         assert ducklake_maintenance._heartbeat_line(conn, "x", 60.0) == "x: 60s elapsed"
 
-    def test_sub_one_percent_suppressed(self, monkeypatch):
-        """Fractional early readings must not render '~0%' with a noise ETA."""
+    def test_sub_one_percent_shown_without_eta(self, monkeypatch):
+        """Sub-1% is rendered verbatim (liveness signal) but without an ETA."""
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
         conn = MagicMock()
         conn.query_progress.return_value = 0.3
-        assert "%" not in ducklake_maintenance._heartbeat_line(conn, "x", 60.0)
+        line = ducklake_maintenance._heartbeat_line(conn, "x", 60.0)
+        assert "~0.3% merged" in line
+        assert "remaining" not in line
+
+    def test_negative_progress_elapsed_only(self, monkeypatch):
+        """True -1 (no query running) produces elapsed-only — no % noise."""
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        conn = MagicMock()
+        conn.query_progress.return_value = -1.0
+        line = ducklake_maintenance._heartbeat_line(conn, "x", 60.0)
+        assert "%" not in line
 
     def test_complete_has_no_eta(self, monkeypatch):
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
