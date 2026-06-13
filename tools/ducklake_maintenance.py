@@ -736,15 +736,42 @@ def _rss_bytes() -> int | None:
         return None
 
 
+def _net_bytes() -> tuple[int, int] | None:
+    """Current cumulative (rx_bytes, tx_bytes) for eth0, or None if unreadable.
+
+    Reads /proc/self/net/dev (Linux only). The heartbeat diffs two readings
+    across the interval to compute MB/s — distinguishes the S3 read phase
+    (high RX, rising RSS) from the catalog-scan phase (low network, flat RSS)
+    without manual pod exec sampling.
+    """
+    try:
+        with open("/proc/self/net/dev") as f:
+            for line in f:
+                if "eth0:" in line:
+                    fields = line.split()
+                    return int(fields[1]), int(fields[9])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 _progress_poll_warned = False
 
 
-def _heartbeat_line(conn: duckdb.DuckDBPyConnection, label: str, elapsed: float) -> str:
-    """One heartbeat log line: elapsed, merge percentage + ETA when DuckDB
-    reports one (sub-1% readings are noise on huge merges), and process RSS.
+def _heartbeat_line(
+    conn: duckdb.DuckDBPyConnection,
+    label: str,
+    elapsed: float,
+    prev_net: tuple[int, int] | None,
+    interval_s: float,
+) -> tuple[str, tuple[int, int] | None]:
+    """One heartbeat log line: elapsed, merge percentage + ETA, RSS, network rate.
 
-    query_progress() failures degrade to elapsed-only (warned once): the
-    heartbeat is decoration and must never kill the operation it watches.
+    Returns (line, current_net) so the caller can pass current_net back as
+    prev_net on the next tick to compute the per-interval rate.
+
+    query_progress() failures degrade gracefully (warned once): the heartbeat
+    is decoration and must never kill the operation it watches.
     """
     global _progress_poll_warned
     parts = [f"{label}: {elapsed:.0f}s elapsed"]
@@ -760,10 +787,19 @@ def _heartbeat_line(conn: duckdb.DuckDBPyConnection, label: str, elapsed: float)
     elif pct >= 1:
         eta = elapsed * (100.0 - pct) / pct
         parts.append(f"~{pct:.0f}% merged, est. {eta / 60:.0f}m remaining")
+    elif pct >= 0:
+        parts.append(f"~{pct:.1f}% merged (sub-1%; ETA unavailable)")
     rss = _rss_bytes()
     if rss is not None:
         parts.append(f"rss={rss / 1024**3:.1f}GiB")
-    return ", ".join(parts)
+    cur_net = _net_bytes()
+    if cur_net is not None and prev_net is not None and interval_s > 0:
+        # max(0, ...) guards against 32-bit counter wrap (~4 GiB rolls over at
+        # ~200 MB/s in 20s); a negative delta produces a misleading log line.
+        rx_mbs = max(0, cur_net[0] - prev_net[0]) / interval_s / 1024**2
+        tx_mbs = max(0, cur_net[1] - prev_net[1]) / interval_s / 1024**2
+        parts.append(f"net=↓{rx_mbs:.1f}/↑{tx_mbs:.1f} MiB/s")
+    return ", ".join(parts), cur_net
 
 
 def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: float = 60.0) -> threading.Event:
@@ -780,8 +816,10 @@ def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: fl
     start_t = time.monotonic()
 
     def _tick() -> None:
+        prev_net = _net_bytes()
         while not stop.wait(timeout=interval_s):
-            log.info("%s", _heartbeat_line(conn, label, time.monotonic() - start_t))
+            line, prev_net = _heartbeat_line(conn, label, time.monotonic() - start_t, prev_net, interval_s)
+            log.info("%s", line)
 
     threading.Thread(target=_tick, daemon=True).start()
     return stop
@@ -866,10 +904,20 @@ def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_fil
     if not _SETTING_VALUE_RE.match(table):
         raise ValueError(f"Illegal character in table name: {table!r}")
     log.info("compact-probe: table=%s max_compacted_files=%d", table, max_compacted_files)
-    result = conn.execute(
-        f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', '{table}', "
-        f"max_compacted_files => {max_compacted_files})"
-    ).fetchall()
+    # Enable progress tracking so the heartbeat's query_progress() poll returns
+    # a real percentage rather than -1. Only the bar settings are needed here;
+    # the full _set_compaction_tuning is intentionally skipped (no memory/thread
+    # changes — compact_probe is a lightweight single-table probe).
+    conn.execute("SET enable_progress_bar = true")
+    conn.execute("SET enable_progress_bar_print = false")
+    heartbeat = _start_heartbeat(conn, f"compact-probe {table}")
+    try:
+        result = conn.execute(
+            f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', '{table}', "
+            f"max_compacted_files => {max_compacted_files})"
+        ).fetchall()
+    finally:
+        heartbeat.set()
     for row in result:
         log.info("compact-probe: %s", row)
 
