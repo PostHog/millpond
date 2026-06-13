@@ -319,49 +319,94 @@ class TestSetCompactionTuning:
 class TestHeartbeat:
     """Heartbeat line formatting and degradation; no real threads or sleeps."""
 
+    def _line(self, conn, label, elapsed, prev_net=None, interval_s=60.0):
+        """Helper: call _heartbeat_line and return just the string."""
+        line, _ = ducklake_maintenance._heartbeat_line(conn, label, elapsed, prev_net, interval_s)
+        return line
+
     def test_midway_progress_with_eta_and_rss(self, monkeypatch):
         monkeypatch.setattr(ducklake_maintenance, "_progress_poll_warned", False)
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: 35.7 * 1024**3)
+        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
         conn = MagicMock()
         conn.query_progress.return_value = 25.0
         # 25% in 600s -> 1800s -> 30m remaining
-        line = ducklake_maintenance._heartbeat_line(conn, "compact tier-1 merge", 600.0)
-        assert line == "compact tier-1 merge: 600s elapsed, ~25% merged, est. 30m remaining, rss=35.7GiB"
+        assert self._line(conn, "compact tier-1 merge", 600.0) == \
+            "compact tier-1 merge: 600s elapsed, ~25% merged, est. 30m remaining, rss=35.7GiB"
 
     def test_no_query_running_elapsed_only(self, monkeypatch):
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
         conn = MagicMock()
         conn.query_progress.return_value = -1.0
-        assert ducklake_maintenance._heartbeat_line(conn, "x", 60.0) == "x: 60s elapsed"
+        assert self._line(conn, "x", 60.0) == "x: 60s elapsed"
 
-    def test_sub_one_percent_suppressed(self, monkeypatch):
-        """Fractional early readings must not render '~0%' with a noise ETA."""
+    def test_sub_one_percent_shown_without_eta(self, monkeypatch):
+        """Sub-1% is rendered verbatim (liveness signal) but without an ETA."""
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
         conn = MagicMock()
         conn.query_progress.return_value = 0.3
-        assert "%" not in ducklake_maintenance._heartbeat_line(conn, "x", 60.0)
+        line = self._line(conn, "x", 60.0)
+        assert "~0.3% merged" in line
+        assert "remaining" not in line
 
     def test_complete_has_no_eta(self, monkeypatch):
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
         conn = MagicMock()
         conn.query_progress.return_value = 100.0
-        line = ducklake_maintenance._heartbeat_line(conn, "x", 60.0)
+        line = self._line(conn, "x", 60.0)
         assert "~100% merged" in line
         assert "remaining" not in line
 
     def test_poll_failure_warns_once_and_degrades(self, monkeypatch, caplog):
         monkeypatch.setattr(ducklake_maintenance, "_progress_poll_warned", False)
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
         conn = MagicMock()
         conn.query_progress.side_effect = RuntimeError("gone")
         with caplog.at_level(logging.WARNING, logger="maintenance"):
-            assert ducklake_maintenance._heartbeat_line(conn, "x", 60.0) == "x: 60s elapsed"
-            assert ducklake_maintenance._heartbeat_line(conn, "x", 120.0) == "x: 120s elapsed"
+            assert self._line(conn, "x", 60.0) == "x: 60s elapsed"
+            assert self._line(conn, "x", 120.0) == "x: 120s elapsed"
         assert len([r for r in caplog.records if "query_progress" in r.message]) == 1
+
+    def test_network_rate_shown_when_prev_net_available(self, monkeypatch):
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: (2_000_000_000, 500_000_000))
+        conn = MagicMock()
+        conn.query_progress.return_value = -1.0
+        prev_net = (1_000_000_000, 300_000_000)  # 1GB rx, 300MB tx before
+        # over 10s: rx=(2G-1G)/10/1024^2=95.4MiB/s, tx=(500M-300M)/10/1024^2=19.1MiB/s
+        line = self._line(conn, "x", 60.0, prev_net=prev_net, interval_s=10.0)
+        assert "↓95.4/↑19.1 MiB/s" in line
+
+    def test_network_rate_wrap_shows_zero_not_negative(self, monkeypatch):
+        """32-bit counter wrap must not produce a negative rate in the log."""
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: (100, 100))
+        conn = MagicMock()
+        conn.query_progress.return_value = -1.0
+        prev_net = (2**32 - 1, 2**32 - 1)  # just before wrap
+        line = self._line(conn, "x", 60.0, prev_net=prev_net, interval_s=10.0)
+        assert "↓0.0/↑0.0 MiB/s" in line
+        assert "-" not in line.split("net=")[-1]
+
+    def test_network_rate_absent_without_prev_net(self, monkeypatch):
+        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
+        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: (1_000_000, 1_000_000))
+        conn = MagicMock()
+        conn.query_progress.return_value = -1.0
+        line = self._line(conn, "x", 60.0, prev_net=None)
+        assert "MiB/s" not in line
 
     def test_rss_bytes_returns_positive_or_none(self):
         rss = ducklake_maintenance._rss_bytes()
         assert rss is None or rss > 0
+
+    def test_net_bytes_returns_tuple_or_none(self):
+        net = ducklake_maintenance._net_bytes()
+        assert net is None or (isinstance(net, tuple) and len(net) == 2 and all(v >= 0 for v in net))
 
 
 class TestCompactSql:
