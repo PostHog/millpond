@@ -54,8 +54,8 @@ _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
 # higher tier. Targets are MiB (binary) so they line up with the byte literals.
 _MIB = 1024 * 1024
 TIERS = {
-    1: {"min": None, "max": 1 * _MIB, "target": "5MiB"},  # < 1 MiB    -> ~5 MiB
-    2: {"min": 1 * _MIB, "max": 10 * _MIB, "target": "32MiB"},  # [1, 10) MiB -> ~32 MiB
+    1: {"min": None, "max": 1 * _MIB, "target": "128MiB"},  # < 1 MiB    -> ~128 MiB
+    2: {"min": 1 * _MIB, "max": 10 * _MIB, "target": "128MiB"},  # [1, 10) MiB -> ~128 MiB
     3: {"min": 10 * _MIB, "max": 64 * _MIB, "target": "128MiB"},  # [10, 64) MiB -> ~128 MiB
 }
 
