@@ -173,6 +173,14 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     conn.execute(f"SET enable_http_logging = {str(debug).lower()}")
     conn.execute(f"SET pg_debug_show_queries = {str(debug).lower()}")
 
+    # On a high-frequency write workload (millpond ingest pods writing
+    # continuously), the snapshot_id sequence advances rapidly. A large
+    # compaction commit retries up to ducklake_max_retry_count times on
+    # snapshot ID collision before giving up. The default of 10 is far too
+    # low when millpond is committing hundreds of snapshots per minute.
+    retry_count = int(os.environ.get("COMPACTION_MAX_RETRY_COUNT", "200"))
+    conn.execute(f"SET ducklake_max_retry_count = {retry_count}")
+
     # The legacy SET s3_* settings above are honored by the ducklake catalog
     # driver but not by ad-hoc httpfs ops (`glob('s3://...')`,
     # `read_parquet('s3://...')`) in DuckDB 1.4 — those go through the SECRET
