@@ -221,10 +221,6 @@ compact-all-tiers table="": compact-to-tier-1 compact-to-tier-2 compact-to-tier-
 [group('compaction')]
 compact-all-tiers-dry-run table="": compact-to-tier-1-dry-run compact-to-tier-2-dry-run compact-to-tier-3-dry-run
 
-# Compact tier 1 then immediately clean up eligible S3 files
-[group('compaction')]
-compact-to-tier-1-and-clean table="": (compact-to-tier-1 table) cleanup-all
-
 # ----------------------------------------------------------------------------
 # state-metrics daemon
 # ----------------------------------------------------------------------------
