@@ -304,9 +304,6 @@ class TestSetCompactionTuning:
         assert "SET memory_limit = '8GB'" in executed
         assert "SET preserve_insertion_order = false" in executed
         assert "SET http_timeout = 600000" in executed
-        # progress tracking is only computed when the progress bar is enabled
-        assert "SET enable_progress_bar = true" in executed
-        assert "SET enable_progress_bar_print = false" in executed
 
     def test_rejects_injection_in_memory_limit(self):
         conn = MagicMock()
@@ -324,52 +321,12 @@ class TestHeartbeat:
         line, _ = ducklake_maintenance._heartbeat_line(conn, label, elapsed, prev_net, interval_s)
         return line
 
-    def test_midway_progress_with_eta_and_rss(self, monkeypatch):
-        monkeypatch.setattr(ducklake_maintenance, "_progress_poll_warned", False)
-        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: 35.7 * 1024**3)
-        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
-        conn = MagicMock()
-        conn.query_progress.return_value = 25.0
-        # 25% in 600s -> 1800s -> 30m remaining
-        assert self._line(conn, "compact tier-1 merge", 600.0) == \
-            "compact tier-1 merge: 600s elapsed, ~25% merged, est. 30m remaining, rss=35.7GiB"
-
     def test_no_query_running_elapsed_only(self, monkeypatch):
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
         monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
         conn = MagicMock()
         conn.query_progress.return_value = -1.0
         assert self._line(conn, "x", 60.0) == "x: 60s elapsed"
-
-    def test_sub_one_percent_shown_without_eta(self, monkeypatch):
-        """Sub-1% is rendered verbatim (liveness signal) but without an ETA."""
-        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
-        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
-        conn = MagicMock()
-        conn.query_progress.return_value = 0.3
-        line = self._line(conn, "x", 60.0)
-        assert "~0.3% merged" in line
-        assert "remaining" not in line
-
-    def test_complete_has_no_eta(self, monkeypatch):
-        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
-        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
-        conn = MagicMock()
-        conn.query_progress.return_value = 100.0
-        line = self._line(conn, "x", 60.0)
-        assert "~100% merged" in line
-        assert "remaining" not in line
-
-    def test_poll_failure_warns_once_and_degrades(self, monkeypatch, caplog):
-        monkeypatch.setattr(ducklake_maintenance, "_progress_poll_warned", False)
-        monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)
-        monkeypatch.setattr(ducklake_maintenance, "_net_bytes", lambda: None)
-        conn = MagicMock()
-        conn.query_progress.side_effect = RuntimeError("gone")
-        with caplog.at_level(logging.WARNING, logger="maintenance"):
-            assert self._line(conn, "x", 60.0) == "x: 60s elapsed"
-            assert self._line(conn, "x", 120.0) == "x: 120s elapsed"
-        assert len([r for r in caplog.records if "query_progress" in r.message]) == 1
 
     def test_network_rate_shown_when_prev_net_available(self, monkeypatch):
         monkeypatch.setattr(ducklake_maintenance, "_rss_bytes", lambda: None)

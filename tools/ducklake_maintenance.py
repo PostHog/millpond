@@ -25,6 +25,7 @@ import re
 import sys
 import threading
 import time
+from collections import defaultdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -876,11 +877,6 @@ def _set_compaction_tuning(conn: duckdb.DuckDBPyConnection, threads: int, memory
     # Default 30s is too tight for the multi-MB GETs/PUTs that compaction
     # drives; 10 min covers the worst-case S3 hiccup without livelocking.
     conn.execute("SET http_timeout = 600000")
-    # DuckDB only computes query progress when the progress bar is enabled;
-    # print-off keeps it out of the logs. This is what lets the heartbeat's
-    # cross-thread query_progress() poll return a percentage instead of -1.
-    conn.execute("SET enable_progress_bar = true")
-    conn.execute("SET enable_progress_bar_print = false")
     log.info(
         "compaction tuning: threads=%d memory_limit=%s preserve_insertion_order=false http_timeout=600000ms",
         threads,
@@ -932,9 +928,6 @@ def _net_bytes() -> tuple[int, int] | None:
     return None
 
 
-_progress_poll_warned = False
-
-
 def _heartbeat_line(
     conn: duckdb.DuckDBPyConnection,
     label: str,
@@ -942,30 +935,8 @@ def _heartbeat_line(
     prev_net: tuple[int, int] | None,
     interval_s: float,
 ) -> tuple[str, tuple[int, int] | None]:
-    """One heartbeat log line: elapsed, merge percentage + ETA, RSS, network rate.
-
-    Returns (line, current_net) so the caller can pass current_net back as
-    prev_net on the next tick to compute the per-interval rate.
-
-    query_progress() failures degrade gracefully (warned once): the heartbeat
-    is decoration and must never kill the operation it watches.
-    """
-    global _progress_poll_warned
+    """One heartbeat log line: elapsed, RSS, and network rate."""
     parts = [f"{label}: {elapsed:.0f}s elapsed"]
-    try:
-        pct = float(conn.query_progress())
-    except Exception:
-        pct = -1.0
-        if not _progress_poll_warned:
-            _progress_poll_warned = True
-            log.warning("query_progress() poll failed; heartbeat continues without percentages", exc_info=True)
-    if pct >= 100:
-        parts.append("~100% merged")
-    elif pct >= 1:
-        eta = elapsed * (100.0 - pct) / pct
-        parts.append(f"~{pct:.0f}% merged, est. {eta / 60:.0f}m remaining")
-    elif pct >= 0:
-        parts.append(f"~{pct:.1f}% merged (sub-1%; ETA unavailable)")
     rss = _rss_bytes()
     if rss is not None:
         parts.append(f"rss={rss / 1024**3:.1f}GiB")
@@ -983,11 +954,6 @@ def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: fl
     """Log a heartbeat line every `interval_s` while a long blocking call runs
     on `conn` from the main thread. Returns the Event to .set() when done
     (use try/finally). Daemon thread; safe to leak on crash.
-
-    Cross-thread query_progress() is a lock-free atomic read of executor
-    state (it's how Jupyter's progress bar works) — worst case is a stale
-    reading, never corruption. The connection's single query slot belongs to
-    the watched call, so the percentage can't be someone else's query.
     """
     stop = threading.Event()
     start_t = time.monotonic()
@@ -1067,13 +1033,28 @@ def compact(
 
     _set_compaction_tuning(conn, threads, memory_limit)
     heartbeat = _start_heartbeat(conn, f"compact tier-{tier} merge")
+    t0 = time.monotonic()
     try:
         with _scoped_target_file_size(conn, target):
             result = conn.execute(sql).fetchall()
     finally:
         heartbeat.set()
-    for row in result:
-        log.info("compact tier-%d: %s", tier, row)
+    elapsed = time.monotonic() - t0
+
+    # Aggregate result rows (one per output group: schema, table, input_files, output_files)
+    # into one log line per table rather than one line per group.
+    totals: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0])
+    for schema, tbl, inputs, outputs in result:
+        totals[(schema, tbl)][0] += 1        # groups
+        totals[(schema, tbl)][1] += inputs   # input files
+        totals[(schema, tbl)][2] += outputs  # output files
+    for (schema, tbl), (groups, inputs, outputs) in totals.items():
+        log.info(
+            "compact tier-%d: %d groups, %d files → %d output files (%s.%s), duration=%.1fs",
+            tier, groups, inputs, outputs, schema, tbl, elapsed,
+        )
+    if not totals:
+        log.info("compact tier-%d: 0 groups merged, duration=%.1fs", tier, elapsed)
 
 
 def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_files: int) -> None:
@@ -1081,12 +1062,6 @@ def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_fil
     if not _SETTING_VALUE_RE.match(table):
         raise ValueError(f"Illegal character in table name: {table!r}")
     log.info("compact-probe: table=%s max_compacted_files=%d", table, max_compacted_files)
-    # Enable progress tracking so the heartbeat's query_progress() poll returns
-    # a real percentage rather than -1. Only the bar settings are needed here;
-    # the full _set_compaction_tuning is intentionally skipped (no memory/thread
-    # changes — compact_probe is a lightweight single-table probe).
-    conn.execute("SET enable_progress_bar = true")
-    conn.execute("SET enable_progress_bar_print = false")
     heartbeat = _start_heartbeat(conn, f"compact-probe {table}")
     try:
         result = conn.execute(
