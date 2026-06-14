@@ -217,6 +217,10 @@ compact-to-tier-3-dry-run table="":
 [group('compaction')]
 compact-all-tiers table="": compact-to-tier-1 compact-to-tier-2 compact-to-tier-3
 
+# Run all tiered compactions sequentially (tier 1 -> 2 -> 3) then delete scheduled S3 files
+[group('compaction')]
+compact-all-tiers-and-clean table="": compact-to-tier-1 compact-to-tier-2 compact-to-tier-3 cleanup-all
+
 # Dry-run all tiered compactions sequentially (tier 1 -> 2 -> 3)
 [group('compaction')]
 compact-all-tiers-dry-run table="": compact-to-tier-1-dry-run compact-to-tier-2-dry-run compact-to-tier-3-dry-run

@@ -76,6 +76,15 @@ METADATA_SCHEMA = f"__ducklake_metadata_{ATTACH_NAME}"
 # calls; distinct from the DuckLake-catalog ATTACH (ATTACH_NAME).
 PG_ATTACH_NAME = "pg"
 
+# Postgres schema containing the DuckLake catalog tables. DuckLake 1.5.x on
+# Postgres stores catalog tables in `public` directly (verified on megaduck);
+# the `__ducklake_metadata_lake` name is a DuckDB-side namespace alias that
+# the DuckLake extension exposes for `conn.execute()` queries but does NOT
+# exist as an actual Postgres schema. Any SQL sent through `postgres_execute`
+# or `postgres_query` (which bypass the DuckLake extension and hit Postgres
+# directly) must use PG_CATALOG_SCHEMA, not METADATA_SCHEMA.
+PG_CATALOG_SCHEMA = "public"
+
 # Companion SQL file: header conventions plus runtime-loadable macros.
 MAINTENANCE_SQL_PATH = Path(__file__).resolve().parent / "ducklake_maintenance.sql"
 
@@ -257,6 +266,174 @@ def expire(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
         log.info("expire: %s", row)
 
 
+def _pg_query_one(conn: duckdb.DuckDBPyConnection, sql: str) -> tuple:
+    """Run a SELECT via the pg ATTACH and return the first row."""
+    return conn.execute(
+        f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(sql)})"
+    ).fetchone()
+
+
+def _pg_execute(conn: duckdb.DuckDBPyConnection, sql: str) -> None:
+    """Run a DML statement via the pg ATTACH."""
+    conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(sql)})")
+
+
+def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int, dry_run: bool) -> None:
+    """Postgres-native snapshot expiry that bypasses ducklake_expire_snapshots.
+
+    DuckLake's built-in OOMs on large catalogs because it loads all matching
+    snapshot rows into a DuckDB in-memory vector at bind time, before deleting
+    anything. This function replicates the same DELETE cascade entirely via
+    postgres_execute, in bounded snapshot_id-ordered batches.
+
+    Per batch:
+      1. SELECT next `batch_size` expired snapshot_ids (ORDER BY snapshot_id)
+      2. Find dead DATA files: end_snapshot in batch, no live snapshot covers [begin, end)
+         → INSERT paths into ducklake_files_scheduled_for_deletion
+         → DELETE cascade: column_stats → partition_value → variant_stats → data_file
+      3. Find dead DELETE VECTORS: same liveness check against ducklake_delete_file
+         → INSERT paths into ducklake_files_scheduled_for_deletion
+         → DELETE from ducklake_delete_file
+      4. DELETE ducklake_snapshot_changes, then ducklake_snapshot rows
+
+    After all batches: run cleanup-all to physically delete S3 objects.
+
+    Idempotency: steps 2-4 are separate auto-committed statements. Partial
+    failures are safe to re-run — the NOT EXISTS guard on each INSERT prevents
+    duplicates, and DELETEs against already-deleted rows are no-ops. The one
+    ordering invariant (INSERT to deletion queue BEFORE DELETE from catalog)
+    is preserved within each step.
+
+    Schema note: SQL sent via _pg_execute/_pg_query_one hits Postgres directly
+    and must use PG_CATALOG_SCHEMA ('public'), not METADATA_SCHEMA
+    ('__ducklake_metadata_lake'). The latter is a DuckDB-side alias exposed by
+    the DuckLake extension and does not exist as an actual Postgres schema.
+    """
+    s = PG_CATALOG_SCHEMA  # short alias; all SQL here goes through postgres_execute
+    _acquire_advisory_lock(conn)
+
+    # Capture the expiry cutoff once as a Postgres timestamptz literal so that
+    # every statement in this run uses the identical boundary. Without this,
+    # each postgres_execute call re-evaluates NOW() in its own transaction and
+    # a snapshot right at the boundary could be classified as "expired" by the
+    # batch SELECT but "live" by the NOT EXISTS liveness check (or vice versa).
+    cutoff_text = _pg_query_one(conn, f"SELECT (NOW() - INTERVAL '{days} days')::text")[0]
+    cutoff_sql = f"TIMESTAMPTZ '{cutoff_text}'"
+
+    if dry_run:
+        row = _pg_query_one(
+            conn,
+            f"SELECT COUNT(*) FROM {s}.ducklake_snapshot WHERE snapshot_time < {cutoff_sql}",
+        )
+        log.info(
+            "expire-snapshots dry-run: %d snapshots older than %d days (batch_size=%d); "
+            "run without --dry-run to see per-batch dead file counts",
+            row[0], days, batch_size,
+        )
+        return
+
+    total_snapshots = 0
+    total_dead_data_files = 0
+    total_dead_delete_vectors = 0
+    batch_num = 0
+
+    while True:
+        rows = conn.execute(
+            f"SELECT snapshot_id FROM postgres_query("
+            f"'{PG_ATTACH_NAME}', "
+            f"{_sql_string_literal(f'SELECT snapshot_id FROM {s}.ducklake_snapshot WHERE snapshot_time < {cutoff_sql} ORDER BY snapshot_id LIMIT {batch_size}')})"
+        ).fetchall()
+        if not rows:
+            break
+
+        batch_num += 1
+        snapshot_ids = [row[0] for row in rows]
+        id_list = ", ".join(str(i) for i in snapshot_ids)
+
+        # WHERE clause for both data-file and delete-vector dead checks.
+        # A file/vector is dead when its end_snapshot is in this expired batch
+        # AND no non-expired snapshot bridges its [begin_snapshot, end_snapshot) window.
+        # snapshot_id is assigned via MAX+1 in DuckLake (monotone with snapshot_time),
+        # so the snapshot_id range correctly proxies time-based coverage.
+        # cutoff_sql is a fixed timestamptz literal captured once before the loop
+        # so all statements in this run use an identical boundary.
+        def _dead_where(alias: str) -> str:
+            return (
+                f"{alias}.end_snapshot IN ({id_list}) "
+                f"AND NOT EXISTS ("
+                f"  SELECT 1 FROM {s}.ducklake_snapshot live "
+                f"  WHERE live.snapshot_id >= {alias}.begin_snapshot "
+                f"  AND live.snapshot_id < {alias}.end_snapshot "
+                f"  AND live.snapshot_time >= {cutoff_sql}"
+                f")"
+            )
+
+        # --- Dead data files ---
+        dead_data_where = _dead_where("df")
+        dead_data_id_subq = f"SELECT df.data_file_id FROM {s}.ducklake_data_file df WHERE {dead_data_where}"
+        dead_data_full_subq = f"SELECT df.data_file_id, df.path, df.path_is_relative FROM {s}.ducklake_data_file df WHERE {dead_data_where}"
+
+        dead_data_count = _pg_query_one(conn, f"SELECT COUNT(*) FROM ({dead_data_full_subq}) _d")[0]
+
+        # --- Dead delete vectors (positional delete files) ---
+        dead_dv_where = _dead_where("dv")
+        dead_dv_full_subq = f"SELECT dv.delete_file_id AS data_file_id, dv.path, dv.path_is_relative FROM {s}.ducklake_delete_file dv WHERE {dead_dv_where}"
+        dead_dv_id_subq = f"SELECT dv.delete_file_id FROM {s}.ducklake_delete_file dv WHERE {dead_dv_where}"
+
+        dead_dv_count = _pg_query_one(conn, f"SELECT COUNT(*) FROM ({dead_dv_full_subq}) _d")[0]
+
+        log.info(
+            "expire-snapshots: batch %d: snapshot_ids [%d..%d] (%d), "
+            "dead_data_files=%d dead_delete_vectors=%d",
+            batch_num, snapshot_ids[0], snapshot_ids[-1], len(snapshot_ids),
+            dead_data_count, dead_dv_count,
+        )
+
+        if dead_data_count > 0:
+            _pg_execute(
+                conn,
+                f"INSERT INTO {s}.ducklake_files_scheduled_for_deletion "
+                f"  (data_file_id, path, path_is_relative, schedule_start) "
+                f"SELECT d.data_file_id, d.path, d.path_is_relative, NOW() "
+                f"FROM ({dead_data_full_subq}) d "
+                f"WHERE NOT EXISTS ("
+                f"  SELECT 1 FROM {s}.ducklake_files_scheduled_for_deletion x "
+                f"  WHERE x.data_file_id = d.data_file_id"
+                f")",
+            )
+            _pg_execute(conn, f"DELETE FROM {s}.ducklake_file_column_stats WHERE data_file_id IN ({dead_data_id_subq})")
+            _pg_execute(conn, f"DELETE FROM {s}.ducklake_file_partition_value WHERE data_file_id IN ({dead_data_id_subq})")
+            _pg_execute(conn, f"DELETE FROM {s}.ducklake_file_variant_stats WHERE data_file_id IN ({dead_data_id_subq})")
+            _pg_execute(conn, f"DELETE FROM {s}.ducklake_data_file WHERE data_file_id IN ({dead_data_id_subq})")
+
+        if dead_dv_count > 0:
+            _pg_execute(
+                conn,
+                f"INSERT INTO {s}.ducklake_files_scheduled_for_deletion "
+                f"  (data_file_id, path, path_is_relative, schedule_start) "
+                f"SELECT d.data_file_id, d.path, d.path_is_relative, NOW() "
+                f"FROM ({dead_dv_full_subq}) d "
+                f"WHERE NOT EXISTS ("
+                f"  SELECT 1 FROM {s}.ducklake_files_scheduled_for_deletion x "
+                f"  WHERE x.data_file_id = d.data_file_id"
+                f")",
+            )
+            _pg_execute(conn, f"DELETE FROM {s}.ducklake_delete_file WHERE delete_file_id IN ({dead_dv_id_subq})")
+
+        _pg_execute(conn, f"DELETE FROM {s}.ducklake_snapshot_changes WHERE snapshot_id IN ({id_list})")
+        _pg_execute(conn, f"DELETE FROM {s}.ducklake_snapshot WHERE snapshot_id IN ({id_list})")
+
+        total_snapshots += len(snapshot_ids)
+        total_dead_data_files += dead_data_count
+        total_dead_delete_vectors += dead_dv_count
+
+    log.info(
+        "expire-snapshots: done: %d snapshots expired, %d dead data files + %d delete vectors "
+        "scheduled for deletion (%d batches, batch_size=%d); run cleanup-all to delete S3 objects",
+        total_snapshots, total_dead_data_files, total_dead_delete_vectors, batch_num, batch_size,
+    )
+
+
 def _scheduled_for_deletion_count(conn: duckdb.DuckDBPyConnection) -> int:
     """Queue depth of ducklake_files_scheduled_for_deletion."""
     return conn.execute(f"SELECT COUNT(*) FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion").fetchone()[0]
@@ -366,9 +543,9 @@ def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         return
     _acquire_advisory_lock(conn)
     delete_sql = (
-        f"DELETE FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion "
+        f"DELETE FROM {PG_CATALOG_SCHEMA}.ducklake_files_scheduled_for_deletion "
         f"WHERE ctid NOT IN ("
-        f"SELECT MIN(ctid) FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion GROUP BY path"
+        f"SELECT MIN(ctid) FROM {PG_CATALOG_SCHEMA}.ducklake_files_scheduled_for_deletion GROUP BY path"
         f")"
     )
     conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(delete_sql)})")
@@ -493,7 +670,7 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     paths = [row[0] for row in conn.execute("SELECT path FROM _orphans").fetchall()]
     path_list = ", ".join(_sql_string_literal(p) for p in paths)
     delete_sql = (
-        f"DELETE FROM {METADATA_SCHEMA}.ducklake_files_scheduled_for_deletion "
+        f"DELETE FROM {PG_CATALOG_SCHEMA}.ducklake_files_scheduled_for_deletion "
         f"WHERE path IN ({path_list})"
     )
     conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(delete_sql)})")
@@ -941,6 +1118,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--dry-run", action="store_true")
 
+    # expire-snapshots (postgres-native, no DuckDB memory overhead)
+    p = sub.add_parser(
+        "expire-snapshots",
+        help="Postgres-native snapshot expiry (avoids ducklake_expire_snapshots OOM)",
+    )
+    p.add_argument("--days", type=int, default=7, help="Expire snapshots older than N days (default 7)")
+    p.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=1000,
+        help="Snapshot IDs to process per iteration (default 1000)",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Report counts without making changes")
+
     # cleanup
     p = sub.add_parser("cleanup", help="Delete files scheduled for deletion")
     p.add_argument("--days", type=int, default=1)
@@ -1085,6 +1276,8 @@ def main(argv: list[str] | None = None) -> None:
         match args.command:
             case "expire":
                 expire(conn, args.days, args.dry_run)
+            case "expire-snapshots":
+                expire_snapshots(conn, args.days, args.batch_size, args.dry_run)
             case "cleanup":
                 cleanup(conn, args.days, args.dry_run)
             case "cleanup-all":
