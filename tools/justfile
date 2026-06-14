@@ -97,6 +97,16 @@ expire-dry-run days="7":
 expire days="7":
     python {{ ducklake_maintenance }} expire --days {{ days }}
 
+# Postgres-native snapshot expiry (dry run)
+[group('lifecycle')]
+expire-snapshots-dry-run days="7" batch_size="1000":
+    python {{ ducklake_maintenance }} expire-snapshots --days {{ days }} --batch-size {{ batch_size }} --dry-run
+
+# Postgres-native snapshot expiry — runs at most num_batches batches per invocation
+[group('lifecycle')]
+expire-snapshots days="7" batch_size="1000" num_batches="":
+    python {{ ducklake_maintenance }} expire-snapshots --days {{ days }} --batch-size {{ batch_size }} {{ if num_batches != "" { "--num-batches " + num_batches } else { "" } }}
+
 # Preview files scheduled for deletion
 [group('lifecycle')]
 cleanup-dry-run days="1":

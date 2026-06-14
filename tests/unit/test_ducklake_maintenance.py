@@ -188,6 +188,105 @@ class TestArgparse:
         args = parser.parse_args(["compact", "--tier", "1", "--memory-limit", "8GB"])
         assert args.memory_limit == "8GB"
 
+    def test_expire_snapshots_defaults(self):
+        args = self.parser.parse_args(["expire-snapshots"])
+        assert args.days == 7
+        assert args.batch_size == 1000
+        assert args.num_batches is None
+        assert args.dry_run is False
+
+    def test_expire_snapshots_num_batches(self):
+        args = self.parser.parse_args(["expire-snapshots", "--num-batches", "10"])
+        assert args.num_batches == 10
+
+    def test_expire_snapshots_num_batches_zero_rejected(self):
+        with pytest.raises(SystemExit):
+            self.parser.parse_args(["expire-snapshots", "--num-batches", "0"])
+
+
+# ---------------------------------------------------------------------------
+# Tier B — orchestrators with mocked sub-calls
+# ---------------------------------------------------------------------------
+
+
+class TestExpireSnapshots:
+    """Verify expire_snapshots batch loop and num_batches limit."""
+
+    def _make_conn(self, batch_rows):
+        """Return a mock conn whose execute().fetchall() cycles through batch_rows.
+
+        Each element of batch_rows is either a list of (snapshot_id,) tuples
+        (one batch) or an empty list (signals end-of-data). After the sequence
+        is exhausted, subsequent calls return [].
+
+        The mock also accepts _pg_query_one / _pg_execute call patterns:
+        postgres_query returns a single-row result for the cutoff SELECT and
+        per-batch COUNT queries; postgres_execute is a no-op.
+        """
+        conn = MagicMock()
+        iter_batches = iter(batch_rows + [[]])  # sentinel empty list at end
+
+        def fake_execute(sql, *args, **kwargs):
+            result = MagicMock()
+            if "postgres_query" in sql and "ducklake_snapshot" in sql and "SELECT snapshot_id" in sql:
+                # batch SELECT — return next batch
+                result.fetchall.return_value = next(iter_batches, [])
+            elif "postgres_query" in sql and "NOW()" in sql:
+                # cutoff timestamp query
+                result.fetchone.return_value = ("2026-06-07 00:00:00+00",)
+            elif "postgres_query" in sql and "COUNT(*)" in sql:
+                # dead-file count — return 0 to skip DML
+                result.fetchone.return_value = (0,)
+            elif "postgres_query" in sql and "pg_try_advisory_lock" in sql:
+                result.fetchone.return_value = (True,)
+            else:
+                result.fetchall.return_value = []
+                result.fetchone.return_value = (0,)
+            return result
+
+        conn.execute.side_effect = fake_execute
+        return conn
+
+    def test_processes_all_batches_when_no_limit(self, caplog):
+        batches = [[(1,), (2,)], [(3,), (4,)], [(5,)]]
+        conn = self._make_conn(batches)
+        with caplog.at_level(logging.INFO, logger="maintenance"):
+            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=False)
+        assert any("no expired snapshots remaining" in r.message for r in caplog.records)
+        batch_logs = [r for r in caplog.records if "batch" in r.message and "snapshot_ids" in r.message]
+        assert len(batch_logs) == 3
+
+    def test_stops_after_num_batches(self, caplog):
+        batches = [[(1,), (2,)], [(3,), (4,)], [(5,)]]
+        conn = self._make_conn(batches)
+        with caplog.at_level(logging.INFO, logger="maintenance"):
+            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=2, dry_run=False)
+        batch_logs = [r for r in caplog.records if "snapshot_ids" in r.message]
+        assert len(batch_logs) == 2
+        assert any("reached --num-batches limit" in r.message for r in caplog.records)
+
+    def test_num_batches_one_processes_exactly_one(self, caplog):
+        batches = [[(1,)], [(2,)], [(3,)]]
+        conn = self._make_conn(batches)
+        with caplog.at_level(logging.INFO, logger="maintenance"):
+            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=1, dry_run=False)
+        batch_logs = [r for r in caplog.records if "snapshot_ids" in r.message]
+        assert len(batch_logs) == 1
+
+    def test_dry_run_returns_without_processing(self, caplog):
+        conn = self._make_conn([])
+        with caplog.at_level(logging.INFO, logger="maintenance"):
+            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=True)
+        assert any("dry-run" in r.message for r in caplog.records)
+        # No batch processing log lines
+        assert not any("snapshot_ids" in r.message for r in caplog.records)
+
+    def test_empty_catalog_logs_done(self, caplog):
+        conn = self._make_conn([])
+        with caplog.at_level(logging.INFO, logger="maintenance"):
+            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=False)
+        assert any("no expired snapshots remaining" in r.message for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Tier B — orchestrators with mocked sub-calls
