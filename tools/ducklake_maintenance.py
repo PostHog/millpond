@@ -279,7 +279,7 @@ def _pg_execute(conn: duckdb.DuckDBPyConnection, sql: str) -> None:
     conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(sql)})")
 
 
-def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int, dry_run: bool) -> None:
+def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int, num_batches: int | None, dry_run: bool) -> None:
     """Postgres-native snapshot expiry that bypasses ducklake_expire_snapshots.
 
     DuckLake's built-in OOMs on large catalogs because it loads all matching
@@ -345,6 +345,10 @@ def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int
             f"{_sql_string_literal(f'SELECT snapshot_id FROM {s}.ducklake_snapshot WHERE snapshot_time < {cutoff_sql} ORDER BY snapshot_id LIMIT {batch_size}')})"
         ).fetchall()
         if not rows:
+            log.info("expire-snapshots: no expired snapshots remaining, done")
+            break
+        if num_batches is not None and batch_num >= num_batches:
+            log.info("expire-snapshots: reached --num-batches limit (%d), stopping", num_batches)
             break
 
         batch_num += 1
@@ -430,8 +434,9 @@ def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int
 
     log.info(
         "expire-snapshots: done: %d snapshots expired, %d dead data files + %d delete vectors "
-        "scheduled for deletion (%d batches, batch_size=%d); run cleanup-all to delete S3 objects",
+        "scheduled for deletion (%d batches, batch_size=%d, num_batches=%s); run cleanup-all to delete S3 objects",
         total_snapshots, total_dead_data_files, total_dead_delete_vectors, batch_num, batch_size,
+        str(num_batches) if num_batches is not None else "unlimited",
     )
 
 
@@ -1050,11 +1055,16 @@ def compact(
         totals[(schema, tbl)][2] += outputs  # output files
     for (schema, tbl), (groups, inputs, outputs) in totals.items():
         log.info(
-            "compact tier-%d: %d groups, %d files → %d output files (%s.%s), duration=%.1fs",
-            tier, groups, inputs, outputs, schema, tbl, elapsed,
+            "compact tier-%d: %s.%s: %d groups, %d files → %d output files",
+            tier, schema, tbl, groups, inputs, outputs,
         )
-    if not totals:
-        log.info("compact tier-%d: 0 groups merged, duration=%.1fs", tier, elapsed)
+    total_groups = sum(v[0] for v in totals.values())
+    total_inputs = sum(v[1] for v in totals.values())
+    total_outputs = sum(v[2] for v in totals.values())
+    log.info(
+        "compact tier-%d: %d groups total, %d files → %d output files, duration=%.1fs",
+        tier, total_groups, total_inputs, total_outputs, elapsed,
+    )
 
 
 def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_files: int) -> None:
@@ -1104,6 +1114,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=1000,
         help="Snapshot IDs to process per iteration (default 1000)",
+    )
+    p.add_argument(
+        "--num-batches",
+        type=_positive_int,
+        default=None,
+        help="Stop after processing this many batches (default: unlimited)",
     )
     p.add_argument("--dry-run", action="store_true", help="Report counts without making changes")
 
@@ -1252,7 +1268,7 @@ def main(argv: list[str] | None = None) -> None:
             case "expire":
                 expire(conn, args.days, args.dry_run)
             case "expire-snapshots":
-                expire_snapshots(conn, args.days, args.batch_size, args.dry_run)
+                expire_snapshots(conn, args.days, args.batch_size, args.num_batches, args.dry_run)
             case "cleanup":
                 cleanup(conn, args.days, args.dry_run)
             case "cleanup-all":
