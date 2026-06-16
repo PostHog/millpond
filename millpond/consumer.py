@@ -124,7 +124,7 @@ def create(cfg: Config) -> Consumer:
     consumer_config = {
         **_base_kafka_config(cfg),
         "group.id": cfg.group_id,
-        "auto.offset.reset": "earliest",
+        "auto.offset.reset": cfg.auto_offset_reset,
         "enable.auto.commit": False,
         "enable.auto.offset.store": False,
         "fetch.min.bytes": cfg.fetch_min_bytes,
@@ -140,7 +140,9 @@ def create(cfg: Config) -> Consumer:
     consumer = Consumer(consumer_config)
 
     # OFFSET_STORED: resume from committed offset in __consumer_offsets.
-    # Falls back to auto.offset.reset (earliest) if no offset committed.
+    # Falls back to auto.offset.reset (cfg.auto_offset_reset) if no offset
+    # committed — set this to "latest" for fresh NRT consumers so they don't
+    # replay the entire retention window before catching up.
     # Critical for replica count changes — new pods must resume from offsets
     # committed by whichever pod previously owned each partition.
     consumer.assign([TopicPartition(cfg.topic, p, OFFSET_STORED) for p in my_partitions])

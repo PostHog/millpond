@@ -58,6 +58,7 @@ class TestLoad:
         assert cfg.fetch_max_wait_ms == 500
         assert cfg.consume_batch_size == 1000
         assert cfg.stats_interval_ms == 5000
+        assert cfg.auto_offset_reset == "earliest"
         # PostHog Logs export: off by default.
         assert cfg.posthog_project_token is None
         assert cfg.posthog_logs_endpoint == "https://us.i.posthog.com/i/v1/logs"
@@ -145,6 +146,38 @@ class TestLoad:
     def test_kafka_consumer_overrides_default_empty(self):
         cfg = load()
         assert cfg.kafka_config_overrides == ()
+
+    def test_auto_offset_reset_latest(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_AUTO_OFFSET_RESET", "latest")
+        cfg = load()
+        assert cfg.auto_offset_reset == "latest"
+
+    def test_auto_offset_reset_is_case_and_whitespace_insensitive(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_AUTO_OFFSET_RESET", "  LATEST ")
+        cfg = load()
+        assert cfg.auto_offset_reset == "latest"
+
+    def test_auto_offset_reset_invalid_rejected(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_AUTO_OFFSET_RESET", "error")
+        with pytest.raises(RuntimeError, match="KAFKA_AUTO_OFFSET_RESET"):
+            load()
+
+    def test_auto_offset_reset_empty_string_rejected(self, monkeypatch):
+        """Empty string fails validation rather than falling back to default.
+
+        Fail-loud matches the rest of the validation philosophy in this file —
+        an unintentionally-empty env var (e.g. unset chart value rendering as
+        "") is a config bug, not a silent default trigger."""
+        monkeypatch.setenv("KAFKA_AUTO_OFFSET_RESET", "")
+        with pytest.raises(RuntimeError, match="KAFKA_AUTO_OFFSET_RESET"):
+            load()
+
+    def test_auto_offset_reset_collision_with_kafka_consumer_passthrough(self, monkeypatch):
+        """KAFKA_CONSUMER_AUTO_OFFSET_RESET would silently lose to the explicit
+        cfg.auto_offset_reset write in consumer.create(); refuse the ambiguity."""
+        monkeypatch.setenv("KAFKA_CONSUMER_AUTO_OFFSET_RESET", "latest")
+        with pytest.raises(RuntimeError, match="KAFKA_CONSUMER_AUTO_OFFSET_RESET is not honored"):
+            load()
 
     def test_table_label(self):
         cfg = load()

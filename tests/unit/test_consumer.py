@@ -150,6 +150,7 @@ def _make_cfg(**overrides) -> Config:
         fetch_max_wait_ms=500,
         consume_batch_size=1000,
         stats_interval_ms=5000,
+        auto_offset_reset="earliest",
         broker_source="",
         filter_keep_field=None,
         filter_drop_field=None,
@@ -352,13 +353,23 @@ class TestCreate:
 
     @patch("millpond.consumer.Consumer")
     @patch("millpond.consumer.discover_partition_count", return_value=8)
-    def test_auto_offset_reset_is_earliest(self, mock_discover, mock_consumer_cls):
-        """Verify auto.offset.reset=earliest for partitions with no committed offset."""
+    def test_auto_offset_reset_defaults_earliest(self, mock_discover, mock_consumer_cls):
+        """Verify auto.offset.reset is plumbed through from cfg.auto_offset_reset (default earliest)."""
         cfg = _make_cfg()
         create(cfg)
 
         consumer_config = mock_consumer_cls.call_args[0][0]
         assert consumer_config["auto.offset.reset"] == "earliest"
+
+    @patch("millpond.consumer.Consumer")
+    @patch("millpond.consumer.discover_partition_count", return_value=8)
+    def test_auto_offset_reset_latest_is_plumbed(self, mock_discover, mock_consumer_cls):
+        """NRT consumers set auto_offset_reset=latest so a fresh group skips the retention backlog."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        create(cfg)
+
+        consumer_config = mock_consumer_cls.call_args[0][0]
+        assert consumer_config["auto.offset.reset"] == "latest"
 
     @patch("millpond.consumer.Consumer")
     @patch("millpond.consumer.discover_partition_count", return_value=2)
