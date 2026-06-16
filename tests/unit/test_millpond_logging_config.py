@@ -2,6 +2,7 @@
 setup_stdout() / attach_posthog_otlp() flow and the resource-attr
 taxonomy.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -55,6 +56,7 @@ def _minimal_config() -> Config:
         fetch_max_wait_ms=500,
         consume_batch_size=1000,
         stats_interval_ms=5000,
+        auto_offset_reset="earliest",
         broker_source="warpstream",
         filter_keep_field=None,
         filter_drop_field=None,

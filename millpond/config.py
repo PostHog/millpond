@@ -42,6 +42,11 @@ class Config:
     fetch_max_wait_ms: int
     consume_batch_size: int
     stats_interval_ms: int
+    # Applied only when no offset is committed for (group_id, partition).
+    # "earliest" replays the whole retention window — appropriate for catch-up
+    # / backfill consumers. "latest" starts at the head — appropriate for NRT
+    # consumers (filter-keep workflows) where backlog replay is wasted I/O.
+    auto_offset_reset: str
 
     # Broker source label for metrics (e.g. "msk", "warpstream")
     broker_source: str
@@ -209,6 +214,22 @@ def _load_sort_by() -> tuple[str, ...] | None:
     return fields
 
 
+_VALID_AUTO_OFFSET_RESET = ("earliest", "latest")
+
+
+def _load_auto_offset_reset() -> str:
+    """Parse KAFKA_AUTO_OFFSET_RESET (default: 'earliest' for back-compat).
+
+    librdkafka also accepts 'error', but for a streaming sink that's never
+    what you want — every fresh consumer group would crash. Restrict to the
+    two policies that make sense in this codebase.
+    """
+    raw = os.environ.get("KAFKA_AUTO_OFFSET_RESET", "earliest").strip().lower()
+    if raw not in _VALID_AUTO_OFFSET_RESET:
+        raise RuntimeError(f"KAFKA_AUTO_OFFSET_RESET={raw!r} must be one of {_VALID_AUTO_OFFSET_RESET}")
+    return raw
+
+
 def _load_ducklake_fields() -> dict[str, str | None]:
     ducklake_table = _require("DUCKLAKE_TABLE")
     if not _SAFE_TABLE_NAME.match(ducklake_table):
@@ -269,6 +290,17 @@ def load() -> Config:
         for k, v in os.environ.items()
         if k.startswith(_KAFKA_CONSUMER_PREFIX)
     )
+    # auto.offset.reset has a dedicated env var with validation + an
+    # earliest/latest allowlist. The KAFKA_CONSUMER_* passthrough would
+    # silently lose to consumer.create()'s explicit `cfg.auto_offset_reset`
+    # write, so an operator setting KAFKA_CONSUMER_AUTO_OFFSET_RESET=latest
+    # would deploy thinking it set the policy and instead get the default.
+    # Refuse the ambiguous configuration loudly at startup.
+    if any(k == "auto.offset.reset" for k, _ in kafka_overrides):
+        raise RuntimeError(
+            "KAFKA_CONSUMER_AUTO_OFFSET_RESET is not honored — use KAFKA_AUTO_OFFSET_RESET "
+            "(allowed: earliest, latest) so the value gets validated."
+        )
 
     filter_keep_field, filter_drop_field, filter_values = _load_filter_fields()
     sort_by = _load_sort_by()
@@ -286,6 +318,7 @@ def load() -> Config:
         fetch_max_wait_ms=int(os.environ.get("FETCH_MAX_WAIT_MS", "500")),
         consume_batch_size=int(os.environ.get("CONSUME_BATCH_SIZE", "1000")),
         stats_interval_ms=int(os.environ.get("STATS_INTERVAL_MS", "5000")),
+        auto_offset_reset=_load_auto_offset_reset(),
         broker_source=os.environ.get("BROKER_SOURCE", "").strip().lower(),
         filter_keep_field=filter_keep_field,
         filter_drop_field=filter_drop_field,
