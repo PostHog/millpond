@@ -2,13 +2,14 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-from confluent_kafka import OFFSET_STORED
+from confluent_kafka import OFFSET_INVALID, OFFSET_STORED, KafkaException
 
 from millpond.config import Config
 from millpond.consumer import (
     _base_kafka_config,
     _maybe_attach_oauth_cb,
     _on_stats,
+    _recover_stale_committed_offsets,
     compute_assignment,
     create,
     discover_partition_count,
@@ -377,3 +378,247 @@ class TestCreate:
         cfg = _make_cfg(ordinal=3, replica_count=4)
         with pytest.raises(RuntimeError, match="No partitions assigned"):
             create(cfg)
+
+
+class _FakeAdminContext:
+    """Patches AdminClient inside millpond.consumer so list_offsets returns
+    the watermarks the test wants. Use via the helper below; AdminClient is
+    constructed by the SUT, not the test, so we can't pass a Mock directly."""
+
+    def __init__(self, watermarks, raise_on_dispatch=False, raise_on_partition=None):
+        self.watermarks = watermarks
+        self.raise_on_dispatch = raise_on_dispatch
+        self.raise_on_partition = raise_on_partition or set()
+
+    def __enter__(self):
+        self._patcher = patch("millpond.consumer.AdminClient")
+        admin_cls = self._patcher.start()
+        admin_inst = admin_cls.return_value
+
+        def list_offsets(spec_dict, request_timeout=None):
+            if self.raise_on_dispatch:
+                raise KafkaException("dispatch failed")
+            # spec_dict is {TopicPartition: OffsetSpec}. We return per-tp
+            # futures whose .result().offset gives the watermark value.
+            from millpond.consumer import OffsetSpec
+
+            futures = {}
+            for tp, spec in spec_dict.items():
+                fut = MagicMock()
+                if tp.partition in self.raise_on_partition:
+                    fut.result.side_effect = KafkaException("partition error")
+                else:
+                    info = MagicMock()
+                    low, high = self.watermarks[tp.partition]
+                    info.offset = low if isinstance(spec, OffsetSpec.earliest().__class__) else high
+                    fut.result.return_value = info
+                futures[tp] = fut
+            return futures
+
+        admin_inst.list_offsets.side_effect = list_offsets
+        return admin_inst
+
+    def __exit__(self, *a):
+        self._patcher.stop()
+
+
+class TestRecoverStaleCommittedOffsets:
+    """Recovery runs BEFORE assign() — queries committed offsets via the
+    consumer, watermarks via AdminClient.list_offsets (batched), then
+    commits the auto.offset.reset target for any partition whose committed
+    offset has aged out of retention."""
+
+    def _make_consumer(self, committed_offsets, *, errors=None):
+        """Build a Mock consumer responding to .committed() and .commit().
+
+        committed_offsets: dict[int, int]   partition -> committed offset
+                                             (OFFSET_INVALID for never-committed)
+        errors:            dict[int, str]   partition -> error string for
+                                             that partition's committed entry
+
+        Note: real TopicPartition.error is a read-only C attribute, so the
+        fake uses SimpleNamespace with the four fields the SUT reads
+        (.topic, .partition, .offset, .error). Functionally identical for
+        our recovery code's purposes.
+        """
+        from types import SimpleNamespace
+
+        errors = errors or {}
+        consumer = MagicMock()
+
+        def fake_committed(tps, timeout=None):
+            return [
+                SimpleNamespace(
+                    topic=tp.topic,
+                    partition=tp.partition,
+                    offset=committed_offsets.get(tp.partition, OFFSET_INVALID),
+                    error=errors.get(tp.partition),
+                )
+                for tp in tps
+            ]
+
+        consumer.committed.side_effect = fake_committed
+        return consumer
+
+    def test_no_committed_offsets_makes_no_commit(self):
+        """Fresh consumer group (OFFSET_INVALID everywhere) — recovery is a no-op.
+        auto.offset.reset handles fresh subscriptions correctly on first fetch."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(
+            committed_offsets={0: OFFSET_INVALID, 1: OFFSET_INVALID},
+        )
+        with _FakeAdminContext(watermarks={0: (100, 200), 1: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0, 1])
+        consumer.commit.assert_not_called()
+
+    def test_in_retention_offsets_make_no_commit(self):
+        """All committed offsets are within [low, high] — nothing to recover."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 150, 1: 180})
+        with _FakeAdminContext(watermarks={0: (100, 200), 1: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0, 1])
+        consumer.commit.assert_not_called()
+
+    def test_stale_offsets_commit_high_for_latest_policy(self):
+        """Committed below low + auto.offset.reset=latest → commit the high watermark."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 50, 1: 50})  # below low=100 for both
+        with _FakeAdminContext(watermarks={0: (100, 200), 1: (100, 250)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0, 1])
+
+        consumer.commit.assert_called_once()
+        committed = consumer.commit.call_args[1]["offsets"]
+        committed_by_partition = {tp.partition: tp.offset for tp in committed}
+        assert committed_by_partition == {0: 200, 1: 250}
+        assert consumer.commit.call_args[1]["asynchronous"] is False
+
+    def test_stale_offsets_commit_low_for_earliest_policy(self):
+        """Committed below low + auto.offset.reset=earliest → commit the low
+        watermark. "low" is itself a record we haven't read — but it's the
+        first available, matching what auto.offset.reset=earliest would seek to."""
+        cfg = _make_cfg(auto_offset_reset="earliest")
+        consumer = self._make_consumer(committed_offsets={0: 50})
+        with _FakeAdminContext(watermarks={0: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0])
+
+        consumer.commit.assert_called_once()
+        committed = consumer.commit.call_args[1]["offsets"]
+        assert committed[0].offset == 100
+
+    def test_mixed_partitions_only_stale_recovered(self):
+        """Stale + in-retention + never-committed → only the stale partition
+        is committed; the others are left to auto.offset.reset / current consumer
+        position. A partial sweep must not blow away healthy commits."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(
+            committed_offsets={
+                0: 50,  # stale
+                1: 150,  # in retention
+                2: OFFSET_INVALID,  # never committed
+            },
+        )
+        with _FakeAdminContext(watermarks={0: (100, 200), 1: (100, 200), 2: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0, 1, 2])
+
+        consumer.commit.assert_called_once()
+        committed = consumer.commit.call_args[1]["offsets"]
+        partitions = [tp.partition for tp in committed]
+        assert partitions == [0], f"Expected only partition 0 to be recovered, got {partitions}"
+        assert committed[0].offset == 200
+
+    def test_committed_query_failure_skips_recovery(self):
+        """KafkaException on .committed() bails out without raising — the
+        auto.offset.reset fallback in librdkafka still works.
+
+        Recovery is an optimization. If it can't run, fail open."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = MagicMock()
+        consumer.committed.side_effect = KafkaException("broker unreachable")
+
+        _recover_stale_committed_offsets(consumer, cfg, [0, 1])
+        consumer.commit.assert_not_called()
+
+    def test_watermark_dispatch_failure_skips_recovery(self):
+        """KafkaException on AdminClient.list_offsets dispatch bails out.
+        Recovery is best-effort; the auto.offset.reset path still kicks in."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 50, 1: 50})
+        with _FakeAdminContext(watermarks={}, raise_on_dispatch=True):
+            _recover_stale_committed_offsets(consumer, cfg, [0, 1])
+        consumer.commit.assert_not_called()
+
+    def test_per_partition_watermark_failure_skips_that_partition(self):
+        """A per-partition future raising mid-batch logs and continues;
+        recovery still commits for partitions whose futures succeeded."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 50, 1: 50})
+        with _FakeAdminContext(
+            watermarks={0: (100, 200), 1: (100, 200)},
+            raise_on_partition={0},
+        ):
+            _recover_stale_committed_offsets(consumer, cfg, [0, 1])
+
+        consumer.commit.assert_called_once()
+        committed = consumer.commit.call_args[1]["offsets"]
+        partitions = [tp.partition for tp in committed]
+        assert partitions == [1], f"Expected only partition 1 (watermark succeeded), got {partitions}"
+
+    def test_commit_failure_does_not_raise(self):
+        """If the final .commit() fails, log warning and return — librdkafka's
+        auto.offset.reset still triggers on first fetch. Don't crash the pod."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 50})
+        consumer.commit.side_effect = KafkaException("group coordinator unavailable")
+        with _FakeAdminContext(watermarks={0: (100, 200)}):
+            # Should not raise
+            _recover_stale_committed_offsets(consumer, cfg, [0])
+
+    def test_committed_equal_to_low_is_in_retention(self):
+        """Boundary: committed == low is the earliest *available* record. Not stale."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 100})
+        with _FakeAdminContext(watermarks={0: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0])
+        consumer.commit.assert_not_called()
+
+    def test_empty_partition_low_equals_high(self):
+        """Empty partition: low == high == 0. A committed value of 0 is
+        "in retention" (committed == low). No commit fires."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 0})
+        with _FakeAdminContext(watermarks={0: (0, 0)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0])
+        consumer.commit.assert_not_called()
+
+    def test_empty_partitions_list_is_noop(self):
+        """If the caller passes [] (e.g. ordinal owns no partitions, which
+        actually raises in create() — but defensive), recovery does nothing.
+        Don't hit the broker, don't log a confusing "Recovering 0" line."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = MagicMock()
+        # AdminClient must not even be constructed in this path.
+        with patch("millpond.consumer.AdminClient") as admin_cls:
+            _recover_stale_committed_offsets(consumer, cfg, [])
+        consumer.committed.assert_not_called()
+        consumer.commit.assert_not_called()
+        admin_cls.assert_not_called()
+
+    def test_committed_partition_error_skipped(self):
+        """consumer.committed() returns per-partition entries with an `error`
+        attribute. If set, `.offset` may be garbage from librdkafka — must not
+        feed it into the watermark check. Skip with a warning instead."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(
+            # Without the error skip, partition 0's offset 50 would look "stale"
+            # against low=100 and trigger a spurious commit. The error must
+            # short-circuit before that.
+            committed_offsets={0: 50, 1: 50},
+            errors={0: "UNKNOWN_TOPIC_OR_PARTITION"},
+        )
+        with _FakeAdminContext(watermarks={0: (100, 200), 1: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0, 1])
+
+        consumer.commit.assert_called_once()
+        committed = consumer.commit.call_args[1]["offsets"]
+        partitions = [tp.partition for tp in committed]
+        assert partitions == [1], f"Expected only partition 1 (no error), got {partitions}"

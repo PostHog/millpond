@@ -2,8 +2,8 @@ import logging
 import os
 
 import orjson
-from confluent_kafka import OFFSET_STORED, Consumer, TopicPartition
-from confluent_kafka.admin import AdminClient
+from confluent_kafka import OFFSET_INVALID, OFFSET_STORED, Consumer, KafkaException, TopicPartition
+from confluent_kafka.admin import AdminClient, OffsetSpec
 
 from millpond import metrics
 from millpond.config import Config
@@ -108,6 +108,182 @@ def compute_assignment(partition_count: int, replica_count: int, ordinal: int) -
     return [p for p in range(partition_count) if p % replica_count == ordinal]
 
 
+_RECOVERY_TIMEOUT_S = 10.0
+
+
+def _query_watermarks(admin: AdminClient, tps: list[TopicPartition]) -> dict[int, tuple[int, int]]:
+    """Batched watermark fetch via AdminClient.list_offsets.
+
+    Returns dict[partition_id, (low, high)]. Partitions whose
+    per-partition future raises are silently absent from the result — the
+    caller treats "no watermark" as "skip this partition" so a per-leader
+    metadata blip doesn't take down the whole recovery sweep.
+
+    Two RPCs total (one OffsetSpec.earliest, one OffsetSpec.latest), each
+    fan-out at the broker side; with 128+ partitions this is ~2-3s vs the
+    >20min worst case of per-partition consumer.get_watermark_offsets().
+    """
+    if not tps:
+        return {}
+
+    try:
+        earliest_futs = admin.list_offsets(
+            {tp: OffsetSpec.earliest() for tp in tps},
+            request_timeout=_RECOVERY_TIMEOUT_S,
+        )
+        latest_futs = admin.list_offsets(
+            {tp: OffsetSpec.latest() for tp in tps},
+            request_timeout=_RECOVERY_TIMEOUT_S,
+        )
+    except KafkaException:
+        log.warning(
+            "Skipping stale-offset recovery: AdminClient.list_offsets dispatch failed",
+            exc_info=True,
+        )
+        return {}
+
+    out: dict[int, tuple[int, int]] = {}
+    for tp in tps:
+        try:
+            low = earliest_futs[tp].result().offset
+            high = latest_futs[tp].result().offset
+        except Exception:
+            log.warning("Skipping watermark for %s [%d]", tp.topic, tp.partition, exc_info=True)
+            continue
+        out[tp.partition] = (low, high)
+    return out
+
+
+def _recover_stale_committed_offsets(consumer: Consumer, cfg: Config, partitions: list[int]) -> None:
+    """Eagerly bring committed offsets within retention for assigned partitions.
+
+    Without this, partitions whose stored offset is below the broker's
+    log-start-offset only "recover" the next time librdkafka actually fetches a
+    message from them: `auto.offset.reset` seeks the local position to
+    EARLIEST/LATEST, but millpond's offsets dict (and therefore the next
+    commit) is only advanced by *delivered* messages (main.py:_main_loop). On
+    quiet partitions that receive zero messages during a pod's lifetime, no
+    commit ever happens and the stale offset re-trips `offset_out_of_range` on
+    every restart and reports inflated `millpond_consumer_lag` for those
+    partitions until something delivers — see PostHog/millpond docs from
+    2026-06-16.
+
+    The recovery is a one-shot at startup:
+
+      1. Query committed offsets for every assigned partition. Partitions that
+         have never been committed (OFFSET_INVALID) are skipped — letting
+         `auto.offset.reset` apply normally on first fetch is the correct
+         fresh-consumer behaviour. Partitions whose committed-query carries an
+         error are skipped (we'd otherwise read garbage from `.offset`).
+      2. Batched query of [low, high] watermarks for every remaining partition
+         via AdminClient.list_offsets (two RPCs, not 1-per-partition).
+      3. If committed >= low the offset is still within retention; do nothing.
+      4. Committed < low: stale. Commit the `auto.offset.reset` target —
+         `low` for "earliest", `high` for "latest". This is the same position
+         librdkafka would seek to on first fetch, just made durable across
+         restarts. `low` is the next-to-fetch (first available record) and
+         `high` is the next-to-be-produced; both match Kafka commit semantics
+         where the committed value IS the next-to-fetch.
+
+    We intentionally drop `leader_epoch` on the recovered TopicPartition. The
+    epoch reported alongside the stale committed offset refers to a leader era
+    in which our target offset (low or high *now*) didn't exist; carrying it
+    would be semantically wrong. Modern brokers accept `-1`/None and resolve
+    the current epoch from metadata on next fetch.
+
+    Bails gracefully on per-partition errors (logs and continues) and on the
+    overall commit (logs warning). The auto.offset.reset fallback still works
+    if this function fails entirely — it's an optimization, not a correctness
+    requirement.
+    """
+    if not partitions:
+        return
+
+    tps = [TopicPartition(cfg.topic, p) for p in partitions]
+    try:
+        committed = consumer.committed(tps, timeout=_RECOVERY_TIMEOUT_S)
+    except KafkaException:
+        log.warning("Skipping stale-offset recovery: failed to query committed offsets", exc_info=True)
+        return
+
+    # Filter to partitions that actually need a watermark check.
+    needs_watermark: list[TopicPartition] = []
+    n_fresh = 0
+    n_error = 0
+    for tp in committed:
+        if tp.error is not None:
+            log.warning(
+                "Stale-offset recovery: committed() returned error for %s [%d]: %s",
+                tp.topic,
+                tp.partition,
+                tp.error,
+            )
+            n_error += 1
+            continue
+        if tp.offset == OFFSET_INVALID:
+            n_fresh += 1
+            continue
+        needs_watermark.append(tp)
+
+    admin = AdminClient(_base_kafka_config(cfg))
+    watermarks = _query_watermarks(admin, [TopicPartition(tp.topic, tp.partition) for tp in needs_watermark])
+
+    to_recover: list[TopicPartition] = []
+    n_in_retention = 0
+    n_no_watermark = 0
+    for tp in needs_watermark:
+        if tp.partition not in watermarks:
+            n_no_watermark += 1
+            continue
+        low, high = watermarks[tp.partition]
+        if tp.offset >= low:
+            n_in_retention += 1
+            continue
+        # Stale: records at tp.offset are gone from the broker. Commit the
+        # auto.offset.reset target so OFFSET_STORED resolves to something
+        # in-range. Per-partition WARNING so an operator triaging weird lag can
+        # see exactly which partition recovered and from where.
+        target = high if cfg.auto_offset_reset == "latest" else low
+        log.warning(
+            "Stale committed offset on %s [%d]: committed=%d, low=%d, high=%d, recovering to %d (%s)",
+            tp.topic,
+            tp.partition,
+            tp.offset,
+            low,
+            high,
+            target,
+            cfg.auto_offset_reset,
+        )
+        to_recover.append(TopicPartition(tp.topic, tp.partition, target))
+
+    if not to_recover:
+        log.info(
+            "Committed offsets healthy at startup (fresh=%d, in_retention=%d, errored=%d, no_watermark=%d)",
+            n_fresh,
+            n_in_retention,
+            n_error,
+            n_no_watermark,
+        )
+        return
+
+    log.info(
+        "Recovering %d stale committed offsets (target=%s, fresh=%d, in_retention=%d, errored=%d, no_watermark=%d)",
+        len(to_recover),
+        cfg.auto_offset_reset,
+        n_fresh,
+        n_in_retention,
+        n_error,
+        n_no_watermark,
+    )
+    try:
+        consumer.commit(offsets=to_recover, asynchronous=False)
+    except KafkaException:
+        log.warning(
+            "Failed to commit recovered offsets; auto.offset.reset fallback still applies",
+            exc_info=True,
+        )
+
+
 def create(cfg: Config) -> Consumer:
     """Create and configure the Kafka consumer with static partition assignment."""
     partition_count = discover_partition_count(cfg)
@@ -138,6 +314,14 @@ def create(cfg: Config) -> Consumer:
     consumer_config.setdefault("queued.max.messages.kbytes", 16384)
 
     consumer = Consumer(consumer_config)
+
+    # Recover stale committed offsets BEFORE assign() so the OFFSET_STORED
+    # resolution below picks up the fresh committed value rather than the
+    # ancient out-of-retention one. Without this, quiet partitions whose
+    # committed offset is below the broker's log-start-offset stay logging
+    # `offset_out_of_range` on every restart and report misleading lag in
+    # millpond_consumer_lag.
+    _recover_stale_committed_offsets(consumer, cfg, my_partitions)
 
     # OFFSET_STORED: resume from committed offset in __consumer_offsets.
     # Falls back to auto.offset.reset (cfg.auto_offset_reset) if no offset
