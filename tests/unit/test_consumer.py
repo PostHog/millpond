@@ -2,7 +2,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-from confluent_kafka import OFFSET_INVALID, OFFSET_STORED, KafkaException
+from confluent_kafka import OFFSET_INVALID, OFFSET_STORED, KafkaException, TopicPartition
 
 from millpond.config import Config
 from millpond.consumer import (
@@ -10,6 +10,7 @@ from millpond.consumer import (
     _maybe_attach_oauth_cb,
     _on_stats,
     _recover_stale_committed_offsets,
+    _seed_startup_gauges,
     compute_assignment,
     create,
     discover_partition_count,
@@ -622,3 +623,254 @@ class TestRecoverStaleCommittedOffsets:
         committed = consumer.commit.call_args[1]["offsets"]
         partitions = [tp.partition for tp in committed]
         assert partitions == [1], f"Expected only partition 1 (no error), got {partitions}"
+
+    @patch("millpond.consumer._seed_startup_gauges")
+    def test_seeding_called_after_successful_recovery(self, mock_seed):
+        """Recovery committed successfully → seeding gets the to_recover list as
+        `recovered`, so the seeder uses the recovery target (not the pre-recovery
+        stale committed value) when computing the gauge."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 50})  # stale
+        with _FakeAdminContext(watermarks={0: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0])
+
+        mock_seed.assert_called_once()
+        _cfg, _committed, watermarks, recovered = mock_seed.call_args[0]
+        assert watermarks == {0: (100, 200)}
+        assert [tp.partition for tp in recovered] == [0]
+        assert recovered[0].offset == 200  # high (latest policy)
+
+    @patch("millpond.consumer._seed_startup_gauges")
+    def test_seeding_called_with_empty_recovered_when_commit_fails(self, mock_seed):
+        """commit() raised → recovery couldn't persist. Seed with recovered=[]
+        so the seeder falls back to the auto.offset.reset target rather than
+        falsely claiming the partition is "at the recovery position".
+
+        librdkafka's STORED fallback will land at that same position on first
+        fetch, so the gauge stays correct without us having to pretend recovery
+        succeeded."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 50})  # stale
+        consumer.commit.side_effect = KafkaException("group coordinator unavailable")
+        with _FakeAdminContext(watermarks={0: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0])
+
+        mock_seed.assert_called_once()
+        _cfg, _committed, _watermarks, recovered = mock_seed.call_args[0]
+        assert recovered == []
+
+    @patch("millpond.consumer._seed_startup_gauges")
+    def test_seeding_called_when_no_recovery_needed(self, mock_seed):
+        """All offsets healthy → recovery is a no-op, but seeding still runs.
+        This is the steady-state case where a quiet partition's gauge would
+        otherwise be stuck at the previous pod's last reported lag."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: 150})  # in retention
+        with _FakeAdminContext(watermarks={0: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0])
+
+        consumer.commit.assert_not_called()
+        mock_seed.assert_called_once()
+        _cfg, _committed, _watermarks, recovered = mock_seed.call_args[0]
+        assert recovered == []
+
+
+def _make_committed(committed_offsets: dict, errors: dict | None = None) -> list:
+    """Build the `committed` list the seeder expects: SimpleNamespace entries
+    with topic/partition/offset/error. Mirrors what consumer.committed()
+    returns at runtime. Real TopicPartition.error is C-only and read-only,
+    so the test fake uses SimpleNamespace."""
+    from types import SimpleNamespace
+
+    errors = errors or {}
+    return [
+        SimpleNamespace(
+            topic="test-topic",
+            partition=p,
+            offset=offset,
+            error=errors.get(p),
+        )
+        for p, offset in committed_offsets.items()
+    ]
+
+
+class TestSeedStartupGauges:
+    """Direct tests for _seed_startup_gauges. Verifies the gauge values written
+    for each per-partition state: recovered, in-retention, fresh, errored, and
+    stale-but-not-recovered. The integration-level wiring (does the recovery
+    function call this?) is covered by TestRecoverStaleCommittedOffsets."""
+
+    @patch("millpond.consumer.metrics")
+    def test_recovered_partition_uses_target_offset_latest(self, mock_metrics):
+        """auto.offset.reset=latest → recovery target = high → gauge lag is 0
+        and last_committed_offset is high. After recovery, the consumer is
+        caught up by definition."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        committed = _make_committed({0: 50})  # the pre-recovery stale value
+        watermarks = {0: (100, 200)}
+        recovered = [TopicPartition("test-topic", 0, 200)]
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered)
+
+        mock_metrics.consumer_lag.labels.assert_called_once_with(partition="0")
+        mock_metrics.consumer_lag.labels.return_value.set.assert_called_once_with(0)
+        mock_metrics.last_committed_offset.labels.return_value.set.assert_called_once_with(200)
+
+    @patch("millpond.consumer.metrics")
+    def test_recovered_partition_uses_target_offset_earliest(self, mock_metrics):
+        """auto.offset.reset=earliest → recovery target = low → gauge lag is
+        high-low. The consumer has the full in-retention backlog ahead of it."""
+        cfg = _make_cfg(auto_offset_reset="earliest")
+        committed = _make_committed({0: 50})
+        watermarks = {0: (100, 200)}
+        recovered = [TopicPartition("test-topic", 0, 100)]
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered)
+
+        mock_metrics.consumer_lag.labels.return_value.set.assert_called_once_with(100)
+        mock_metrics.last_committed_offset.labels.return_value.set.assert_called_once_with(100)
+
+    @patch("millpond.consumer.metrics")
+    def test_in_retention_committed_uses_committed_offset(self, mock_metrics):
+        """committed value within [low, high] → use committed offset directly.
+        This is steady-state. Lag = high - committed."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        committed = _make_committed({0: 150})
+        watermarks = {0: (100, 200)}
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered=[])
+
+        mock_metrics.consumer_lag.labels.return_value.set.assert_called_once_with(50)
+        mock_metrics.last_committed_offset.labels.return_value.set.assert_called_once_with(150)
+
+    @patch("millpond.consumer.metrics")
+    def test_fresh_partition_uses_high_for_latest(self, mock_metrics):
+        """OFFSET_INVALID (never committed) + auto.offset.reset=latest →
+        position=high. librdkafka will seek to high on first fetch, so the
+        gauge starts at lag=0 matching where consumption will resume."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        committed = _make_committed({0: OFFSET_INVALID})
+        watermarks = {0: (100, 200)}
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered=[])
+
+        mock_metrics.consumer_lag.labels.return_value.set.assert_called_once_with(0)
+        mock_metrics.last_committed_offset.labels.return_value.set.assert_called_once_with(200)
+
+    @patch("millpond.consumer.metrics")
+    def test_fresh_partition_uses_low_for_earliest(self, mock_metrics):
+        """OFFSET_INVALID + auto.offset.reset=earliest → position=low. The
+        consumer will replay the full retention window, so lag starts at
+        high - low."""
+        cfg = _make_cfg(auto_offset_reset="earliest")
+        committed = _make_committed({0: OFFSET_INVALID})
+        watermarks = {0: (100, 200)}
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered=[])
+
+        mock_metrics.consumer_lag.labels.return_value.set.assert_called_once_with(100)
+        mock_metrics.last_committed_offset.labels.return_value.set.assert_called_once_with(100)
+
+    @patch("millpond.consumer.metrics")
+    def test_errored_committed_uses_auto_offset_reset_target(self, mock_metrics):
+        """tp.error set → tp.offset is unreliable. Use the auto.offset.reset
+        target, same as fresh. Without this the seeder would publish a gauge
+        built from a garbage offset."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        committed = _make_committed({0: 999_999}, errors={0: "UNKNOWN_TOPIC_OR_PARTITION"})
+        watermarks = {0: (100, 200)}
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered=[])
+
+        mock_metrics.consumer_lag.labels.return_value.set.assert_called_once_with(0)
+        mock_metrics.last_committed_offset.labels.return_value.set.assert_called_once_with(200)
+
+    @patch("millpond.consumer.metrics")
+    def test_stale_not_recovered_uses_auto_offset_reset_target(self, mock_metrics):
+        """Committed is stale (below low) AND recovered=[] (commit failed
+        upstream) → fall through to the auto.offset.reset target. That's where
+        librdkafka's STORED fallback will land on first fetch, so the seeded
+        gauge matches what the next delivery will confirm."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        committed = _make_committed({0: 50})  # below low
+        watermarks = {0: (100, 200)}
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered=[])
+
+        mock_metrics.consumer_lag.labels.return_value.set.assert_called_once_with(0)
+        mock_metrics.last_committed_offset.labels.return_value.set.assert_called_once_with(200)
+
+    @patch("millpond.consumer.metrics")
+    def test_committed_equal_to_low_is_in_retention(self, mock_metrics):
+        """Boundary: committed == low is still in retention (the earliest
+        available record). Match the recovery code's `tp.offset >= low` check
+        so the two stay consistent — a partition not flagged for recovery
+        must not be seeded as if it were."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        committed = _make_committed({0: 100})
+        watermarks = {0: (100, 200)}
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered=[])
+
+        mock_metrics.consumer_lag.labels.return_value.set.assert_called_once_with(100)
+        mock_metrics.last_committed_offset.labels.return_value.set.assert_called_once_with(100)
+
+    @patch("millpond.consumer.metrics")
+    def test_partition_without_watermark_skipped(self, mock_metrics):
+        """Watermark query failed for a partition → it's absent from `watermarks`.
+        Skip rather than guess: setting consumer_lag without a real `high` would
+        publish a wrong value, and overwriting last_committed_offset with the
+        raw committed value (without a verified `high`) is meaningless to the
+        dashboard's lag panel."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        committed = _make_committed({0: 150, 1: 150})
+        watermarks = {0: (100, 200)}  # partition 1 missing
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered=[])
+
+        # Only partition 0 should be seeded
+        assert mock_metrics.consumer_lag.labels.call_count == 1
+        mock_metrics.consumer_lag.labels.assert_called_with(partition="0")
+
+    @patch("millpond.consumer.metrics")
+    def test_empty_watermarks_no_gauge_calls(self, mock_metrics):
+        """No partitions in `watermarks` → no gauges set, no log spam.
+        Defensive against the all-watermark-queries-failed case."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+
+        _seed_startup_gauges(cfg, committed=[], watermarks={}, recovered=[])
+
+        mock_metrics.consumer_lag.labels.assert_not_called()
+        mock_metrics.last_committed_offset.labels.assert_not_called()
+
+    @patch("millpond.consumer.metrics")
+    def test_multiple_partitions_each_state(self, mock_metrics):
+        """Mixed bag in a single call: recovered, in-retention, fresh, and
+        errored. Each gets its own per-partition gauge with the right value.
+        Verifies the recovered-list lookup doesn't bleed across partitions."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        committed = _make_committed(
+            {
+                0: 50,  # stale, will be recovered
+                1: 150,  # in retention
+                2: OFFSET_INVALID,  # fresh
+                3: 999_999,  # errored
+            },
+            errors={3: "UNKNOWN_TOPIC_OR_PARTITION"},
+        )
+        watermarks = {0: (100, 200), 1: (100, 200), 2: (100, 200), 3: (100, 200)}
+        recovered = [TopicPartition("test-topic", 0, 200)]
+
+        _seed_startup_gauges(cfg, committed, watermarks, recovered)
+
+        # Collect per-partition .set() calls. Each .labels(partition=X) returns
+        # the same mock, so we inspect call_args_list on the chained .set.
+        lag_calls_by_partition = {}
+        offset_calls_by_partition = {}
+        for call in mock_metrics.consumer_lag.labels.call_args_list:
+            lag_calls_by_partition[call.kwargs["partition"]] = None
+        for call in mock_metrics.last_committed_offset.labels.call_args_list:
+            offset_calls_by_partition[call.kwargs["partition"]] = None
+
+        assert set(lag_calls_by_partition) == {"0", "1", "2", "3"}
+        assert set(offset_calls_by_partition) == {"0", "1", "2", "3"}

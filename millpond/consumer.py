@@ -256,7 +256,26 @@ def _recover_stale_committed_offsets(consumer: Consumer, cfg: Config, partitions
         )
         to_recover.append(TopicPartition(tp.topic, tp.partition, target))
 
-    if not to_recover:
+    if to_recover:
+        log.info(
+            "Recovering %d stale committed offsets (target=%s, fresh=%d, in_retention=%d, errored=%d, no_watermark=%d)",
+            len(to_recover),
+            cfg.auto_offset_reset,
+            n_fresh,
+            n_in_retention,
+            n_error,
+            n_no_watermark,
+        )
+        commit_ok = True
+        try:
+            consumer.commit(offsets=to_recover, asynchronous=False)
+        except KafkaException:
+            log.warning(
+                "Failed to commit recovered offsets; auto.offset.reset fallback still applies",
+                exc_info=True,
+            )
+            commit_ok = False
+    else:
         log.info(
             "Committed offsets healthy at startup (fresh=%d, in_retention=%d, errored=%d, no_watermark=%d)",
             n_fresh,
@@ -264,24 +283,66 @@ def _recover_stale_committed_offsets(consumer: Consumer, cfg: Config, partitions
             n_error,
             n_no_watermark,
         )
-        return
+        commit_ok = True
 
-    log.info(
-        "Recovering %d stale committed offsets (target=%s, fresh=%d, in_retention=%d, errored=%d, no_watermark=%d)",
-        len(to_recover),
-        cfg.auto_offset_reset,
-        n_fresh,
-        n_in_retention,
-        n_error,
-        n_no_watermark,
-    )
-    try:
-        consumer.commit(offsets=to_recover, asynchronous=False)
-    except KafkaException:
-        log.warning(
-            "Failed to commit recovered offsets; auto.offset.reset fallback still applies",
-            exc_info=True,
-        )
+    # Seed gauges unconditionally so the dashboard isn't haunted by stale
+    # values from prior pod runs. See _seed_startup_gauges docstring.
+    _seed_startup_gauges(cfg, committed, watermarks, to_recover if commit_ok else [])
+
+
+def _seed_startup_gauges(
+    cfg: Config,
+    committed: list,
+    watermarks: dict[int, tuple[int, int]],
+    recovered: list[TopicPartition],
+) -> None:
+    """Set `millpond_consumer_lag` and `millpond_last_committed_offset` for every
+    assigned partition with a known position so the dashboard isn't haunted by
+    stale gauge values from prior pod runs.
+
+    main.py's _update_lag_metrics / _flush only set these gauges for partitions
+    that delivered messages in *this* pod's lifetime. For quiet partitions
+    (zero deliveries during a run) the gauges retain whatever previous pods
+    last set — which for the stale-offset case is an inflated lag value that
+    keeps showing on the dashboard well after recovery has fixed
+    __consumer_offsets. Seed here so the gauges read truth at startup.
+
+    For each partition with a known [low, high]:
+      - Just recovered → position = recovered target (lag is 0 for "latest"
+        policy, high-low for "earliest").
+      - In retention (committed offset valid + within range) → position =
+        committed offset.
+      - Fresh (OFFSET_INVALID), errored committed, or stale-but-not-recovered
+        (recovery commit failed) → position = the auto.offset.reset target.
+        That's where OFFSET_STORED resolves to via librdkafka's fallback on
+        first fetch, so seeding to it matches what the next delivery will
+        confirm.
+
+    Partitions without a watermark are skipped — we can't compute lag without
+    `high`, and we shouldn't overwrite the gauge with a wrong value.
+    """
+    recovered_by_partition = {tp.partition: tp.offset for tp in recovered}
+    committed_by_partition = {tp.partition: tp for tp in committed}
+
+    n_seeded = 0
+    for partition_id, (low, high) in watermarks.items():
+        if partition_id in recovered_by_partition:
+            position = recovered_by_partition[partition_id]
+        else:
+            tp = committed_by_partition.get(partition_id)
+            if tp is not None and tp.error is None and tp.offset != OFFSET_INVALID and tp.offset >= low:
+                position = tp.offset
+            else:
+                # Fresh, errored, or stale-but-not-recovered: use the
+                # auto.offset.reset target librdkafka will seek to.
+                position = high if cfg.auto_offset_reset == "latest" else low
+
+        metrics.consumer_lag.labels(partition=str(partition_id)).set(high - position)
+        metrics.last_committed_offset.labels(partition=str(partition_id)).set(position)
+        n_seeded += 1
+
+    if n_seeded:
+        log.info("Seeded startup lag/offset gauges for %d partitions", n_seeded)
 
 
 def create(cfg: Config) -> Consumer:
