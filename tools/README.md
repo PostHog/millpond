@@ -115,7 +115,10 @@ Groups visible in `just --list`:
 - `[interactive]` — `shell` opens a DuckDB session with `lake` and `pg` ATTACHed, S3 SECRET configured, `ducklake_maintenance.sql` macros loaded
 - `[lifecycle]` — every snapshot/file maintenance subcommand of `ducklake_maintenance.py`, both `*` and `*-dry-run` variants
 - `[compaction]` — tiered compaction recipes plus `compact-probe`
+- `[bootstrap]` — `bootstrap-index-*` per-index recipes (idempotent `CREATE INDEX CONCURRENTLY IF NOT EXISTS` against the DuckLake catalog schema) and `bootstrap-indexes` umbrella; one-shot use against a freshly instantiated DuckLake
 - `[metrics]` — `ducklake-metrics`, `ducklake-metrics-with-config`, `ducklake-metrics-list`
+
+The bootstrap recipes shell out to `psql` directly rather than going through the DuckDB ATTACH path used by everything else: `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, and the duckdb postgres extension wraps every `postgres_execute` call in one. They reuse the same `DUCKLAKE_RDS_*` env vars; `PGPASSWORD` is exported via env (not args) so the password doesn't show up in `ps`, and every interpolated credential goes through just's `quote()` builtin so values containing `'`, `"`, `$`, or `\` are shell-safe. The umbrella runs the 8 builds sequentially — same-relation `CONCURRENTLY` builds serialize on Postgres's `ShareUpdateExclusiveLock` anyway, and sequential output keeps the operator log linear.
 
 Path overrides for dev use: `DUCKDB` (binary path), `DUCKLAKE_MAINTENANCE_SCRIPT`, `DUCKLAKE_MAINTENANCE_SQL`, `DUCKLAKE_METRICS_SCRIPT`.
 
