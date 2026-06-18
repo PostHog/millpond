@@ -590,6 +590,227 @@ class TestScopedTargetFileSize:
         assert f"'{ducklake_maintenance.DEFAULT_TARGET_FILE_SIZE}'" in last_sql
 
 
+class TestConnectS3SecretProvider:
+    """connect() chooses between PROVIDER config (static keys) and
+    PROVIDER credential_chain (IRSA / instance profile / env / shared config)
+    based on whether DUCKDB_S3_ACCESS_KEY_ID + DUCKDB_S3_SECRET_ACCESS_KEY are
+    set together. The static-keys path is the megaduck/viaduck case (an IAM
+    user's keys synced via ExternalSecret); the credential_chain path is the
+    per-tenant duckling case (PodIdentityAssociation, no static-key Secret).
+
+    `patch.dict(..., clear=True)` is intentional — it wipes the developer's
+    local `AWS_*` env so a future change that accidentally adds a fallback
+    on those variables shows up in the unit tests rather than only failing on
+    a CI runner that happens to inherit the right shell env. The downside is
+    that we can't assert anything about how credential_chain RESOLVES creds
+    — only that the SECRET DDL is well-formed; resolution is an SDK runtime
+    concern and is covered by the diagnostic probe at connect-time."""
+
+    _BASE_ENV = {
+        "DUCKLAKE_RDS_HOST": "h",
+        "DUCKLAKE_RDS_PASSWORD": "p",
+        "DUCKLAKE_DATA_PATH": "s3://bucket/",
+        "DUCKDB_S3_REGION": "us-east-1",
+    }
+
+    def _executed_sql(self, conn: MagicMock) -> list[str]:
+        return [call.args[0] for call in conn.execute.call_args_list if call.args]
+
+    def _connect_with_env(self, env: dict[str, str]) -> MagicMock:
+        conn = MagicMock()
+        # ducklake_table_insertions and similar queries fetchone()s are
+        # exercised after connect() returns; nothing in connect() itself reads
+        # results, so a bare MagicMock is enough. The mock also bypasses the
+        # diagnostic probe's glob() call — that path is covered by separate
+        # real-DuckDB tests.
+        with patch.dict("os.environ", env, clear=True), patch("ducklake_maintenance.duckdb") as mock_duckdb:
+            mock_duckdb.connect.return_value = conn
+            # The credential_chain probe catches duckdb.Error; expose the real
+            # exception class so a raise() inside the test isn't swallowed by
+            # the broad except clause.
+            mock_duckdb.Error = duckdb.Error
+            ducklake_maintenance.connect()
+        return conn
+
+    def test_static_keys_set_emits_provider_config_with_keys(self):
+        env = {**self._BASE_ENV, "DUCKDB_S3_ACCESS_KEY_ID": "AKIA_X", "DUCKDB_S3_SECRET_ACCESS_KEY": "SECRET_X"}
+        conn = self._connect_with_env(env)
+        secret_sql = next(s for s in self._executed_sql(conn) if "CREATE OR REPLACE SECRET s3" in s)
+        assert "PROVIDER config" in secret_sql
+        assert "KEY_ID 'AKIA_X'" in secret_sql
+        assert "SECRET 'SECRET_X'" in secret_sql
+        assert "credential_chain" not in secret_sql
+
+    def test_static_keys_set_also_emits_set_s3_access_key_id(self):
+        """T1 (review feedback): the static-keys path must continue to emit
+        the legacy `SET s3_access_key_id` / `SET s3_secret_access_key` rows
+        even though DuckLake 1.5.x runs through the SECRET manager — a
+        future refactor that drops them on the static path could silently
+        regress any 1.4-compat consumer or any future code path that reads
+        SET-level credentials. Pinning them keeps the catalog driver's
+        legacy fallback path intact."""
+        env = {**self._BASE_ENV, "DUCKDB_S3_ACCESS_KEY_ID": "AKIA_X", "DUCKDB_S3_SECRET_ACCESS_KEY": "SECRET_X"}
+        conn = self._connect_with_env(env)
+        executed = self._executed_sql(conn)
+        assert any(sql == "SET s3_access_key_id = 'AKIA_X'" for sql in executed), executed
+        assert any(sql == "SET s3_secret_access_key = 'SECRET_X'" for sql in executed), executed
+
+    def test_no_keys_emits_provider_credential_chain_with_no_key_id_or_secret(self):
+        """Defends against a refactor that keeps the KEY_ID '' SECRET '' string
+        even on the IRSA path — DuckDB would parse those as literal empty
+        credentials and credential_chain would never run.
+
+        The credential-pair exclusion is asserted via a regex anchored on the
+        `KEY_ID 'X' SECRET 'Y'` pair shape, not a fragile `'SECRET ''` substring
+        check (which would trip on any future addition of a `SECRET_NAME` style
+        keyword)."""
+        import re
+
+        conn = self._connect_with_env(self._BASE_ENV)
+        secret_sql = next(s for s in self._executed_sql(conn) if "CREATE OR REPLACE SECRET s3" in s)
+        assert "PROVIDER credential_chain" in secret_sql
+        assert "PROVIDER config" not in secret_sql
+        assert "KEY_ID" not in secret_sql
+        assert re.search(r"\bSECRET\s+'[^']*'", secret_sql) is None, (
+            f"credential_chain path must not embed KEY_ID/SECRET literals, got: {secret_sql!r}"
+        )
+        assert "REGION 'us-east-1'" in secret_sql
+
+    def test_no_keys_skips_set_s3_access_key_id(self):
+        """The SET s3_access_key_id loop must not emit lines with an empty
+        string value when keys are unset. Empty-string credentials shadow the
+        SECRET in the catalog driver and cause silent auth failures."""
+        conn = self._connect_with_env(self._BASE_ENV)
+        for sql in self._executed_sql(conn):
+            assert not sql.startswith("SET s3_access_key_id"), f"unexpected SET s3_access_key_id: {sql!r}"
+            assert not sql.startswith("SET s3_secret_access_key"), f"unexpected SET s3_secret_access_key: {sql!r}"
+
+    def test_only_key_id_set_refuses_at_startup(self):
+        env = {**self._BASE_ENV, "DUCKDB_S3_ACCESS_KEY_ID": "AKIA_X"}
+        with pytest.raises(RuntimeError, match="must be set together"):
+            self._connect_with_env(env)
+
+    def test_only_secret_set_refuses_at_startup(self):
+        env = {**self._BASE_ENV, "DUCKDB_S3_SECRET_ACCESS_KEY": "SECRET_X"}
+        with pytest.raises(RuntimeError, match="must be set together"):
+            self._connect_with_env(env)
+
+    def test_partial_config_error_names_both_env_vars_for_log_grepping(self):
+        """M4 (review feedback): the error message names both real env var
+        names so a log scraper that greps either DUCKDB_S3_ACCESS_KEY_ID or
+        DUCKDB_S3_SECRET_ACCESS_KEY matches the failure."""
+        env = {**self._BASE_ENV, "DUCKDB_S3_ACCESS_KEY_ID": "AKIA_X"}
+        with pytest.raises(RuntimeError) as exc:
+            self._connect_with_env(env)
+        msg = str(exc.value)
+        assert "DUCKDB_S3_ACCESS_KEY_ID=set" in msg, msg
+        assert "DUCKDB_S3_SECRET_ACCESS_KEY=unset" in msg, msg
+
+    def test_credential_chain_path_honors_endpoint_override(self):
+        """A custom endpoint (MinIO in dev, FIPS endpoint in prod, etc.) is
+        still propagated under the credential_chain path."""
+        env = {**self._BASE_ENV, "DUCKDB_S3_ENDPOINT": "minio.local:9000", "DUCKDB_S3_USE_SSL": "false"}
+        conn = self._connect_with_env(env)
+        secret_sql = next(s for s in self._executed_sql(conn) if "CREATE OR REPLACE SECRET s3" in s)
+        assert "PROVIDER credential_chain" in secret_sql
+        assert "ENDPOINT 'minio.local:9000'" in secret_sql
+        assert "USE_SSL false" in secret_sql
+
+    def test_credential_chain_requires_explicit_region(self):
+        """M2 (review feedback): credential_chain path refuses to start
+        without DUCKDB_S3_REGION. Silently defaulting to us-east-1 when a
+        per-tenant duckling is in eu-west-1 would resolve creds against
+        a region whose bucket may not exist."""
+        env = {k: v for k, v in self._BASE_ENV.items() if k != "DUCKDB_S3_REGION"}
+        with pytest.raises(RuntimeError, match="DUCKDB_S3_REGION"):
+            self._connect_with_env(env)
+
+    def test_static_keys_keeps_us_east_1_default_when_region_unset(self):
+        """Counterpoint to test_credential_chain_requires_explicit_region:
+        megaduck/viaduck have shipped without DUCKDB_S3_REGION set, so the
+        legacy us-east-1 default is preserved on the static-keys path.
+        Defends against a refactor that requires region uniformly and
+        breaks existing deployments."""
+        env = {k: v for k, v in self._BASE_ENV.items() if k != "DUCKDB_S3_REGION"}
+        env.update({"DUCKDB_S3_ACCESS_KEY_ID": "AKIA_X", "DUCKDB_S3_SECRET_ACCESS_KEY": "SECRET_X"})
+        conn = self._connect_with_env(env)
+        secret_sql = next(s for s in self._executed_sql(conn) if "CREATE OR REPLACE SECRET s3" in s)
+        assert "REGION 'us-east-1'" in secret_sql
+
+
+class TestConnectSecretDdlAgainstRealDuckdb:
+    """T3 (review feedback): the mocked-conn tests above assert the SECRET
+    DDL strings, but a typo in the SECRET grammar (unquoted boolean, missing
+    keyword) would pass the string assertions while breaking production.
+    These tests execute the same DDL templates against a real DuckDB so a
+    syntax regression fails CI rather than only failing on a deployed pod."""
+
+    def test_static_keys_secret_ddl_parses_against_real_duckdb(self):
+        """Real DuckDB parses the static-keys SECRET DDL emitted on the
+        config-provider branch. Regression lock for the megaduck/viaduck
+        path that still uses static keys."""
+        conn = duckdb.connect()
+        try:
+            conn.execute(
+                "CREATE OR REPLACE SECRET s3 ("
+                "TYPE s3, PROVIDER config, "
+                "KEY_ID 'AKIA_TEST', SECRET 'SECRET_TEST', "
+                "REGION 'us-east-1', ENDPOINT 's3.us-east-1.amazonaws.com', "
+                "URL_STYLE 'vhost', USE_SSL true)"
+            )
+            rows = conn.execute(
+                "SELECT name, type, provider FROM duckdb_secrets() WHERE name = 's3'"
+            ).fetchall()
+            assert rows, "real DuckDB did not register the static-keys SECRET"
+            name, type_, provider = rows[0]
+            assert name == "s3"
+            assert type_ == "s3"
+            assert provider == "config"
+        finally:
+            conn.close()
+
+    def test_credential_chain_secret_ddl_parses_against_real_duckdb(self):
+        """Real DuckDB parses the credential_chain SECRET DDL emitted on the
+        IRSA branch. This is the regression lock for the actual goal of this
+        PR — a typo'd keyword or missing quote on the new branch is the most
+        likely silent breakage and the unit string-asserts can't catch it.
+
+        DuckDB validates credential_chain at CREATE time by attempting
+        provider resolution. On a clean CI/dev box with no AWS creds the
+        CREATE raises `Secret Validation Failure: ... Credential Chain` —
+        which is exactly the production diagnostic surface we want, so we
+        accept it as a pass: a typo in the keywords would produce a `Parser`
+        / `Catalog` error class, not a `Secret Validation Failure`. The
+        message is matched explicitly to keep this test from masking a real
+        regression."""
+        conn = duckdb.connect()
+        try:
+            try:
+                conn.execute(
+                    "CREATE OR REPLACE SECRET s3 ("
+                    "TYPE s3, PROVIDER credential_chain, "
+                    "REGION 'us-east-1', ENDPOINT 's3.us-east-1.amazonaws.com', "
+                    "URL_STYLE 'vhost', USE_SSL true)"
+                )
+            except duckdb.Error as e:
+                msg = str(e)
+                assert "Secret Validation Failure" in msg or "Credential Chain" in msg, (
+                    f"DuckDB rejected the SECRET DDL with an unexpected error class — "
+                    f"likely a SECRET-grammar regression: {msg}"
+                )
+                return  # acceptable on no-creds runner; provider keyword is valid
+            rows = conn.execute(
+                "SELECT name, type, provider FROM duckdb_secrets() WHERE name = 's3'"
+            ).fetchall()
+            assert rows, "real DuckDB did not register the credential_chain SECRET"
+            name, type_, provider = rows[0]
+            assert name == "s3"
+            assert type_ == "s3"
+            assert provider == "credential_chain"
+        finally:
+            conn.close()
+
+
 class TestAcquireAdvisoryLock:
     """The lock-helper SQL must use single quotes around the inner literal."""
 

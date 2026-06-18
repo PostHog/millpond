@@ -2,6 +2,8 @@
 
 Operational utilities that ship in the millpond Docker image but live outside the `millpond` package. Same env vars as the main app (`DUCKLAKE_RDS_*`, `DUCKDB_S3_*`, `DUCKLAKE_DATA_PATH`); none of these import from `millpond`.
 
+S3 credentials are optional. If `DUCKDB_S3_ACCESS_KEY_ID` and `DUCKDB_S3_SECRET_ACCESS_KEY` are both set, DuckDB uses `PROVIDER config` with the static keys (megaduck/viaduck path: an IAM user's keys synced via ExternalSecret). If both are unset, DuckDB uses `PROVIDER credential_chain` and resolves credentials from the standard AWS chain — IRSA, instance profile, env vars, shared config. This is the per-tenant duckling path, where the pod is associated with a `PodIdentityAssociation` and there's no static-key Secret to sync. Setting exactly one of the two is refused at startup as a misconfiguration.
+
 In the image:
 
 ```

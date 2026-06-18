@@ -10,11 +10,17 @@ by ``DUCKLAKE_METRICS_CONFIG``.
 
 Reuses ``ducklake_maintenance.connect()`` so the daemon inherits the same lake +
 postgres ATTACH, S3 secret, and session tunables that ducklake_maintenance.py runs
-under. Same env vars as the ducklake_maintenance script:
-  DUCKLAKE_RDS_HOST, DUCKLAKE_RDS_PORT, DUCKLAKE_RDS_DATABASE,
-  DUCKLAKE_RDS_USERNAME, DUCKLAKE_RDS_PASSWORD, DUCKLAKE_DATA_PATH,
-  DUCKDB_S3_REGION, DUCKDB_S3_ACCESS_KEY_ID, DUCKDB_S3_SECRET_ACCESS_KEY
-  (plus optional DUCKDB_S3_ENDPOINT, DUCKDB_S3_USE_SSL, DUCKDB_S3_URL_STYLE)
+under — see that module's docstring for the full env-var contract (RDS_* and
+DUCKDB_S3_REGION required; DUCKDB_S3_ACCESS_KEY_ID/_SECRET_ACCESS_KEY optional —
+omit both to use DuckDB's credential_chain provider).
+
+Caveat for long-running deployments: ``connect()`` resolves S3 credentials via
+``CREATE SECRET`` at startup. Under credential_chain, the SDK-resolved temporary
+credentials (e.g. an IRSA STS token) are valid for ~1h and are NOT refreshed by
+the secret over the connection lifetime. Once the underlying creds expire the
+daemon will see ExpiredToken errors and only recover after the consecutive-
+failure threshold trips a reconnect. The compactor CronJob is unaffected
+(short-lived). Refresh handling is a known follow-up.
 
 Optional:
   DUCKLAKE_METRICS_PORT     — HTTP listen port (default 9100)
