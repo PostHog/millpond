@@ -240,6 +240,79 @@ compact-all-tiers-dry-run table="": compact-to-tier-1-dry-run compact-to-tier-2-
 compact-to-tier-1-and-clean table="": (compact-to-tier-1 table) cleanup-all
 
 # ----------------------------------------------------------------------------
+# bootstrap indexes on the DuckLake metadata Postgres
+# ----------------------------------------------------------------------------
+# DuckLake ships its catalog tables (`ducklake_data_file`,
+# `ducklake_delete_file`, `ducklake_file_column_stats`,
+# `ducklake_file_partition_value`) without indexes. On any non-trivial catalog
+# the compaction candidate scans, snapshot-range reads, and per-file joins
+# end up doing seq scans, which gets painful fast.
+#
+# Each recipe creates one btree. The `bootstrap-indexes` umbrella runs them
+# all in sequence. All statements use CREATE INDEX CONCURRENTLY IF NOT
+# EXISTS, so re-running the umbrella on a partially-indexed catalog is safe.
+#
+# CONCURRENTLY cannot run inside a transaction block, which rules out the
+# DuckDB ATTACH path (`postgres_execute` wraps each call in a txn). These
+# recipes shell out to psql directly with autocommit on.
+
+# psql command with credentials bound. PGPASSWORD goes via env so the
+# password doesn't leak into `ps`; `quote()` shell-escapes each value.
+_psql := "PGPASSWORD=" + quote(rds_password) + " psql --host=" + quote(rds_host) + " --port=" + quote(rds_port) + " --dbname=" + quote(rds_db) + " --username=" + quote(rds_user) + " --set ON_ERROR_STOP=1"
+
+# Live-file candidate scan keyed by (table, size); drives compaction's tier filter
+[group('bootstrap')]
+bootstrap-index-data-file-compaction:
+    @echo ">>> ducklake_data_file_compaction_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
+
+# Covering form of compaction_idx adding begin_snapshot/row_id_start/data_file_id
+[group('bootstrap')]
+bootstrap-index-data-file-compaction-order:
+    @echo ">>> ducklake_data_file_compaction_order_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_order_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes, begin_snapshot, row_id_start, data_file_id) WHERE (end_snapshot IS NULL);"
+
+# Snapshot range read on data files for CDC, time-travel, and ducklake_table_insertions
+[group('bootstrap')]
+bootstrap-index-data-file-snapshot-read:
+    @echo ">>> ducklake_data_file_snapshot_read_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_snapshot_read_idx ON public.ducklake_data_file USING btree (table_id, begin_snapshot, end_snapshot);"
+
+# Snapshot range read on delete files (mirrors data_file_snapshot_read)
+[group('bootstrap')]
+bootstrap-index-delete-file-snapshot-read:
+    @echo ">>> ducklake_delete_file_snapshot_read_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_snapshot_read_idx ON public.ducklake_delete_file USING btree (table_id, begin_snapshot, end_snapshot);"
+
+# Live-delete-file scan, partial on end_snapshot IS NULL
+[group('bootstrap')]
+bootstrap-index-delete-file-table:
+    @echo ">>> ducklake_delete_file_table_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_table_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot) WHERE (end_snapshot IS NULL);"
+
+# File-column-stats join key; drives per-file stat aggregation during compaction
+[group('bootstrap')]
+bootstrap-index-file-column-stats:
+    @echo ">>> ducklake_file_column_stats_file_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_file_idx ON public.ducklake_file_column_stats USING btree (data_file_id);"
+
+# Partition-value join key for per-file lookups
+[group('bootstrap')]
+bootstrap-index-file-partition-value-file:
+    @echo ">>> ducklake_file_partition_value_file_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_file_idx ON public.ducklake_file_partition_value USING btree (data_file_id);"
+
+# Partition-value table scope (bucket-pruning path on SCAN_TABLE)
+[group('bootstrap')]
+bootstrap-index-file-partition-value-table:
+    @echo ">>> ducklake_file_partition_value_table_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_idx ON public.ducklake_file_partition_value USING btree (table_id);"
+
+# Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
+[group('bootstrap')]
+bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-file-column-stats bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table
+
+# ----------------------------------------------------------------------------
 # state-metrics daemon
 # ----------------------------------------------------------------------------
 
