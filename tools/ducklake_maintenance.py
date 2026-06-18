@@ -7,8 +7,19 @@ file cleanup, orphan deletion, checkpoint) from a K8s CronJob or manually.
 Requires the same env vars as the tools/justfile:
   DUCKLAKE_RDS_HOST, DUCKLAKE_RDS_PORT, DUCKLAKE_RDS_DATABASE,
   DUCKLAKE_RDS_USERNAME, DUCKLAKE_RDS_PASSWORD, DUCKLAKE_DATA_PATH,
-  DUCKDB_S3_REGION, DUCKDB_S3_ACCESS_KEY_ID, DUCKDB_S3_SECRET_ACCESS_KEY
+  DUCKDB_S3_REGION
   (plus optional DUCKDB_S3_ENDPOINT, DUCKDB_S3_USE_SSL, DUCKDB_S3_URL_STYLE)
+
+S3 credentials are optional:
+  - Set BOTH DUCKDB_S3_ACCESS_KEY_ID and DUCKDB_S3_SECRET_ACCESS_KEY for the
+    static-keys path (used by megaduck/viaduck where creds come from an IAM
+    user synced via ExternalSecret).
+  - Leave BOTH unset to use DuckDB's credential_chain provider, which picks up
+    creds from the standard AWS chain (IRSA, instance profile, env, shared
+    config). This is the path for per-tenant ducklings, where the pod is
+    associated with a PodIdentityAssociation and no static-key Secret exists.
+  - Setting exactly one of the two is a misconfiguration and refused at
+    startup.
 
 Optional:
   PUSHGATEWAY_URL — Prometheus Pushgateway address (e.g. http://pushgateway:9091).
@@ -76,6 +87,11 @@ METADATA_SCHEMA = f"__ducklake_metadata_{ATTACH_NAME}"
 # Direct Postgres ATTACH name used for `postgres_execute` / `postgres_query`
 # calls; distinct from the DuckLake-catalog ATTACH (ATTACH_NAME).
 PG_ATTACH_NAME = "pg"
+
+# Name of the DuckDB S3 SECRET created at connect() time. Single source of
+# truth so a future multi-region/cross-account scheme can scope additional
+# SECRETs by name without dredging up every literal.
+S3_SECRET_NAME = "s3"
 
 # Postgres schema containing the DuckLake catalog tables. DuckLake 1.5.x on
 # Postgres stores catalog tables in `public` directly (verified on megaduck);
@@ -154,14 +170,45 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     # to spill crashes. /tmp is the writable emptyDir in the cron pod.
     conn.execute("SET temp_directory = '/tmp/duckdb_spill'")
 
-    # S3 config from env vars
-    s3_region = os.environ.get("DUCKDB_S3_REGION", "us-east-1")
+    # Static keys are optional. If both DUCKDB_S3_ACCESS_KEY_ID and
+    # DUCKDB_S3_SECRET_ACCESS_KEY are set, we use PROVIDER config (the
+    # megaduck/viaduck path: an IAM user's static creds synced from Secrets
+    # Manager). If both are absent, we use PROVIDER credential_chain so DuckDB
+    # picks up creds from the standard AWS chain (IRSA, instance profile, env
+    # vars, etc.) — the per-tenant duckling path, where the pod is associated
+    # with a PodIdentityAssociation and there's no static-key Secret to sync.
+    # Refuse a partial config: a single key set by itself is a misconfiguration
+    # operators should hear about immediately, not silently swap to a
+    # different credential source. Note: an empty-string env var (`""`) is
+    # treated as unset, matching the way K8s ExternalSecrets sometimes mount
+    # an empty value when a remote secret key is missing.
+    s3_key = os.environ.get("DUCKDB_S3_ACCESS_KEY_ID")
+    s3_secret = os.environ.get("DUCKDB_S3_SECRET_ACCESS_KEY")
+    if bool(s3_key) != bool(s3_secret):
+        key_state = "set" if s3_key else "unset"
+        secret_state = "set" if s3_secret else "unset"
+        raise RuntimeError(
+            "DUCKDB_S3_ACCESS_KEY_ID and DUCKDB_S3_SECRET_ACCESS_KEY must be set together or both omitted; "
+            f"got DUCKDB_S3_ACCESS_KEY_ID={key_state}, DUCKDB_S3_SECRET_ACCESS_KEY={secret_state}"
+        )
+    use_credential_chain = not s3_key
+
+    # Region: required when on credential_chain. The legacy us-east-1 default
+    # is kept for the static-keys path because megaduck/viaduck both run there
+    # and have run without setting the var explicitly, but silently defaulting
+    # a per-tenant duckling in (say) eu-west-1 to us-east-1 would resolve creds
+    # to a region whose bucket may not exist. Fail loudly instead.
+    if use_credential_chain:
+        s3_region = _require("DUCKDB_S3_REGION")
+    else:
+        s3_region = os.environ.get("DUCKDB_S3_REGION", "us-east-1")
     s3_defaults = {
         "s3_region": s3_region,
         "s3_endpoint": f"s3.{s3_region}.amazonaws.com",
         "s3_use_ssl": "true",
         "s3_url_style": "vhost",
     }
+
     for key in (
         "DUCKDB_S3_ENDPOINT",
         "DUCKDB_S3_ACCESS_KEY_ID",
@@ -191,26 +238,55 @@ def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     retry_count = int(os.environ.get("COMPACTION_MAX_RETRY_COUNT", "200"))
     conn.execute(f"SET ducklake_max_retry_count = {retry_count}")
 
-    # The legacy SET s3_* settings above are honored by the ducklake catalog
-    # driver but not by ad-hoc httpfs ops (`glob('s3://...')`,
-    # `read_parquet('s3://...')`) in DuckDB 1.4 — those go through the SECRET
-    # manager. Mirror the same credentials into a SECRET so every recipe in
-    # this script (and any operator-typed glob) authenticates correctly.
+    # Modern DuckLake (1.5.x, pinned by millpond) reads S3 through the SECRET
+    # manager from both the catalog driver and ad-hoc httpfs ops (`glob`,
+    # `read_parquet`, ATTACH against `ducklake:s3://...`). The legacy
+    # `SET s3_*` block above is kept for httpfs-pre-secret compatibility, but
+    # the SECRET below is what actually authenticates the runtime path on
+    # 1.5.x.
     s3_endpoint_val = os.environ.get("DUCKDB_S3_ENDPOINT", s3_defaults["s3_endpoint"])
     s3_use_ssl_val = os.environ.get("DUCKDB_S3_USE_SSL", s3_defaults["s3_use_ssl"])
     s3_url_style_val = os.environ.get("DUCKDB_S3_URL_STYLE", s3_defaults["s3_url_style"])
-    s3_key = os.environ.get("DUCKDB_S3_ACCESS_KEY_ID", "")
-    s3_secret = os.environ.get("DUCKDB_S3_SECRET_ACCESS_KEY", "")
-    for v in (s3_endpoint_val, s3_use_ssl_val, s3_url_style_val, s3_key, s3_secret, s3_region):
+    for v in (s3_endpoint_val, s3_use_ssl_val, s3_url_style_val, s3_region):
         if v:
             _sanitize_setting_value(v)
-    conn.execute(
-        f"CREATE OR REPLACE SECRET s3 ("
-        f"TYPE s3, PROVIDER config, "
-        f"KEY_ID '{s3_key}', SECRET '{s3_secret}', "
-        f"REGION '{s3_region}', ENDPOINT '{s3_endpoint_val}', "
-        f"URL_STYLE '{s3_url_style_val}', USE_SSL {s3_use_ssl_val})"
-    )
+    if use_credential_chain:
+        # No KEY_ID/SECRET — credential_chain delegates to the AWS SDK chain
+        # (IRSA token at /var/run/secrets/eks.amazonaws.com/..., ECS container
+        # role, EC2 instance profile, env vars, shared config). DuckDB
+        # validates the chain at CREATE time: if no provider resolves, CREATE
+        # itself raises `Secret Validation Failure: ... Credential Chain`, so
+        # an empty IRSA / missing PodIdentityAssociation surfaces here rather
+        # than as an opaque HTTP 403 on the first httpfs op. The resolved
+        # temporary creds (e.g. an STS token from IRSA) are cached on the
+        # SECRET for the connection lifetime and NOT refreshed — fine for the
+        # short-lived compactor CronJob, but long-running daemons need
+        # external refresh (see ducklake_metrics.py's docstring).
+        try:
+            conn.execute(
+                f"CREATE OR REPLACE SECRET {S3_SECRET_NAME} ("
+                f"TYPE s3, PROVIDER credential_chain, "
+                f"REGION '{s3_region}', ENDPOINT '{s3_endpoint_val}', "
+                f"URL_STYLE '{s3_url_style_val}', USE_SSL {s3_use_ssl_val})"
+            )
+        except duckdb.Error as e:
+            raise RuntimeError(
+                "S3 credential_chain resolution failed at CREATE SECRET; verify the pod has a working "
+                "PodIdentityAssociation / IRSA / instance-profile / env-var / shared-config credential chain. "
+                f"Original error: {e}"
+            ) from e
+    else:
+        # Static keys path: validate to keep the f-string injection-safe
+        # alongside the rest of the inputs already validated above.
+        _sanitize_setting_value(s3_key)
+        _sanitize_setting_value(s3_secret)
+        conn.execute(
+            f"CREATE OR REPLACE SECRET {S3_SECRET_NAME} ("
+            f"TYPE s3, PROVIDER config, "
+            f"KEY_ID '{s3_key}', SECRET '{s3_secret}', "
+            f"REGION '{s3_region}', ENDPOINT '{s3_endpoint_val}', "
+            f"URL_STYLE '{s3_url_style_val}', USE_SSL {s3_use_ssl_val})"
+        )
 
     rds_host = _require("DUCKLAKE_RDS_HOST")
     rds_port = os.environ.get("DUCKLAKE_RDS_PORT", "5432")
