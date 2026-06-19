@@ -87,6 +87,78 @@ class TestWriteWithRetry:
         sink.reset_caches.assert_called_once()
 
 
+# DuckLake-contention strings the metric labeler must catch. Locking these
+# in so a future "improve error messages upstream" PR doesn't silently
+# break the alert-able signal.
+_DUCKLAKE_CONTENTION_MESSAGES = [
+    # DuckLake's own retry-budget-exhausted error (the one operators most
+    # often surface via `ducklake_max_retry_count` bumps)
+    "Failed to commit DuckLake transaction.\nExceeded the maximum retry count of 100 ...",
+    # Underlying Postgres unique-violation bubbled up before DuckLake
+    # gives up
+    'duplicate key value violates unique constraint "ducklake_snapshot_pkey"',
+    # Postgres serialization failure under SERIALIZABLE isolation —
+    # unlikely on duckling RDS today but cheap to classify
+    "ERROR: could not serialize access due to concurrent update",
+]
+
+
+class TestWriteWithRetryErrorLabels:
+    """The metric label distinguishes catalog-contention retries from
+    every other write failure. Without this split, an alert on
+    `millpond_errors_total{type="write_retry"}` lumps S3 timeouts in
+    with snapshot-id PK collisions and can't tell you which is which.
+    """
+
+    @pytest.mark.parametrize("msg", _DUCKLAKE_CONTENTION_MESSAGES)
+    def test_contention_message_labels_as_commit_contention(self, msg):
+        sink = _make_sink()
+        sink.write.side_effect = [duckdb.Error(msg), None]
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
+            _write_with_retry(sink, table)
+        # Exactly one increment, labeled ducklake_commit_contention.
+        calls = mock_metrics.errors_total.labels.call_args_list
+        assert len(calls) == 1
+        assert calls[0].kwargs == {"type": "ducklake_commit_contention"}
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            OSError("S3 timeout"),
+            duckdb.Error("schema mismatch"),
+            KafkaException("broker disconnect"),
+            RuntimeError("unexpected"),
+        ],
+    )
+    def test_non_contention_exception_labels_as_write_retry(self, exc):
+        sink = _make_sink()
+        sink.write.side_effect = [exc, None]
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
+            _write_with_retry(sink, table)
+        calls = mock_metrics.errors_total.labels.call_args_list
+        assert len(calls) == 1
+        assert calls[0].kwargs == {"type": "write_retry"}
+
+    def test_mixed_attempts_label_per_attempt(self):
+        """Each retry increments according to the exception that triggered
+        it — a contention failure then an S3 failure produces one of each
+        label, not "whichever exception was last."
+        """
+        sink = _make_sink()
+        sink.write.side_effect = [
+            duckdb.Error("Exceeded the maximum retry count of 100"),
+            OSError("S3 connection reset"),
+            None,
+        ]
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
+            _write_with_retry(sink, table)
+        labels = [c.kwargs["type"] for c in mock_metrics.errors_total.labels.call_args_list]
+        assert labels == ["ducklake_commit_contention", "write_retry"]
+
+
 class TestFlushErrorDistinction:
     """Offset commit failures must be distinguishable from write failures in metrics and logs."""
 
@@ -733,7 +805,6 @@ class TestApplySort:
         result = _apply_sort(table, self._cfg(sort_by=("region",)))
 
         assert result.column("region").to_pylist() == ["eu-central-1", "us-east-1", "us-west-2"]
-
 
 
 class TestFlushCommit:
