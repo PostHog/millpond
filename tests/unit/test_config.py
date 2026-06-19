@@ -126,6 +126,32 @@ class TestLoad:
         with pytest.raises(RuntimeError, match="DUCKLAKE_SCHEMA.*unsafe characters"):
             load()
 
+    def test_ducklake_max_retry_count_default_100(self):
+        # DuckLake's own default is 10; we bump to 100 to absorb
+        # snapshot-id allocation contention from multi-writer deployments
+        # (see PR description). Lock the default so a future env-loader
+        # refactor doesn't silently regress concurrency behaviour.
+        cfg = load()
+        assert cfg.ducklake_max_retry_count == 100
+
+    def test_ducklake_max_retry_count_explicit_value(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_MAX_RETRY_COUNT", "250")
+        cfg = load()
+        assert cfg.ducklake_max_retry_count == 250
+
+    def test_ducklake_max_retry_count_zero_rejected(self, monkeypatch):
+        # 0 disables retries entirely — under multi-writer load it
+        # degenerates straight to the PK-collision failure mode we're
+        # raising the default to avoid. Refuse loudly rather than accept.
+        monkeypatch.setenv("DUCKLAKE_MAX_RETRY_COUNT", "0")
+        with pytest.raises(RuntimeError, match="DUCKLAKE_MAX_RETRY_COUNT.*positive integer"):
+            load()
+
+    def test_ducklake_max_retry_count_negative_rejected(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_MAX_RETRY_COUNT", "-5")
+        with pytest.raises(RuntimeError, match="DUCKLAKE_MAX_RETRY_COUNT.*positive integer"):
+            load()
+
     def test_partition_by_default_none(self):
         cfg = load()
         assert cfg.partition_by is None
