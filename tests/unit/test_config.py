@@ -102,6 +102,30 @@ class TestLoad:
             cfg = load()
             assert cfg.ducklake_table == name
 
+    def test_ducklake_schema_default_main(self):
+        # When DUCKLAKE_SCHEMA is unset, fall back to DuckDB's default
+        # schema so existing deployments keep writing the same path.
+        cfg = load()
+        assert cfg.ducklake_schema == "main"
+
+    def test_ducklake_schema_empty_string_treated_as_main(self, monkeypatch):
+        # Helm-template gotcha: unset values render as "" rather than
+        # being absent. Treat empty/whitespace as fall-back to default
+        # rather than raising — symmetric with DUCKLAKE_PARTITION_BY.
+        monkeypatch.setenv("DUCKLAKE_SCHEMA", "")
+        cfg = load()
+        assert cfg.ducklake_schema == "main"
+
+    def test_ducklake_schema_explicit_value(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_SCHEMA", "posthog")
+        cfg = load()
+        assert cfg.ducklake_schema == "posthog"
+
+    def test_ducklake_schema_unsafe_rejected(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_SCHEMA", "posthog; DROP TABLE x")
+        with pytest.raises(RuntimeError, match="DUCKLAKE_SCHEMA.*unsafe characters"):
+            load()
+
     def test_partition_by_default_none(self):
         cfg = load()
         assert cfg.partition_by is None

@@ -25,6 +25,7 @@ from millpond.ducklake import DuckLakeSink
 
 def _ducklake_cfg(**overrides) -> MagicMock:
     cfg = MagicMock()
+    cfg.ducklake_schema = "main"
     cfg.ducklake_table = "events"
     cfg.ducklake_connection = ":memory:"
     cfg.ducklake_data_path = "s3://bucket/data"
@@ -39,15 +40,16 @@ def _ducklake_cfg(**overrides) -> MagicMock:
     return cfg
 
 
-
 class TestDuckLakeSinkInit:
     def test_constructs_schema_manager_with_right_table(self):
-        with patch("millpond.ducklake.connect") as mock_connect, patch(
-            "millpond.ducklake.schema.SchemaManager"
-        ) as mock_sm:
+        with (
+            patch("millpond.ducklake.connect") as mock_connect,
+            patch("millpond.ducklake.schema.SchemaManager") as mock_sm,
+        ):
             mock_connect.return_value = MagicMock(name="conn")
             sink = DuckLakeSink(_ducklake_cfg())
-            mock_sm.assert_called_once_with(mock_connect.return_value, "events")
+            mock_sm.assert_called_once_with(mock_connect.return_value, "events", "main")
+            assert sink._schema_name == "main"
             assert sink._table_name == "events"
             assert sink._partition_by is None
             assert sink._tables_ensured == set()
@@ -55,6 +57,7 @@ class TestDuckLakeSinkInit:
     @pytest.mark.parametrize(
         "missing_field",
         [
+            "ducklake_schema",
             "ducklake_table",
             "ducklake_connection",
             "ducklake_data_path",
@@ -85,9 +88,10 @@ class TestDuckLakeSinkInit:
 
 class TestDuckLakeSinkResetCaches:
     def test_clears_tables_ensured_and_invalidates_schema_mgr(self):
-        with patch("millpond.ducklake.connect") as mock_connect, patch(
-            "millpond.ducklake.schema.SchemaManager"
-        ) as mock_sm:
+        with (
+            patch("millpond.ducklake.connect") as mock_connect,
+            patch("millpond.ducklake.schema.SchemaManager") as mock_sm,
+        ):
             mock_connect.return_value = MagicMock(name="conn")
             sink = DuckLakeSink(_ducklake_cfg())
             sink._tables_ensured.add("events")
@@ -104,4 +108,3 @@ class TestDuckLakeSinkClose:
             sink = DuckLakeSink(_ducklake_cfg())
             sink.close()
             mock_conn.close.assert_called_once()
-

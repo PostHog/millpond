@@ -130,12 +130,15 @@ def _validate_partition_expr(expr: str) -> str:
     return expr
 
 
-def _table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+def _table_exists(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    schema_name: str = "main",
+) -> bool:
     """Check if a table exists in the DuckLake catalog."""
     result = conn.execute(
-        "SELECT 1 FROM information_schema.tables "
-        "WHERE table_catalog = 'lake' AND table_schema = 'main' AND table_name = ?",
-        [table_name],
+        "SELECT 1 FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = ? AND table_name = ?",
+        [schema_name, table_name],
     ).fetchone()
     return result is not None
 
@@ -146,6 +149,7 @@ def _ensure_table(
     batch: pa.Table,
     tables_ensured: set[str],
     partition_by: str | None = None,
+    schema_name: str = "main",
 ) -> None:
     """Create the DuckLake table if it doesn't exist. Caller-owned cache.
 
@@ -165,37 +169,42 @@ def _ensure_table(
     if table_name in tables_ensured:
         return
 
-    if _table_exists(conn, table_name):
-        log.info("Table %s already exists", table_name)
+    if _table_exists(conn, table_name, schema_name):
+        log.info("Table %s.%s already exists", schema_name, table_name)
         tables_ensured.add(table_name)
         return
 
     conn.register("_schema_batch", batch.slice(0, 0))  # empty batch, just schema
     try:
         conn.execute(
-            f"CREATE TABLE IF NOT EXISTS lake.main.{table_name} AS "
+            f"CREATE TABLE IF NOT EXISTS lake.{schema_name}.{table_name} AS "
             "SELECT *, NOW() AS _inserted_at FROM _schema_batch WHERE false"
         )
     except duckdb.Error as e:
         # Another pod may have created the table concurrently
-        if _table_exists(conn, table_name):
-            log.info("Table %s created by another pod, continuing", table_name)
+        if _table_exists(conn, table_name, schema_name):
+            log.info("Table %s.%s created by another pod, continuing", schema_name, table_name)
         else:
-            raise RuntimeError(f"Failed to create table {table_name}: {e}") from e
+            raise RuntimeError(f"Failed to create table {schema_name}.{table_name}: {e}") from e
     finally:
         conn.unregister("_schema_batch")
 
     if partition_by is not None:
         _validate_partition_expr(partition_by)
         try:
-            conn.execute(f"ALTER TABLE lake.main.{table_name} SET PARTITIONED BY ({partition_by})")
-            log.info("Table %s partitioned by: %s", table_name, partition_by)
+            conn.execute(f"ALTER TABLE lake.{schema_name}.{table_name} SET PARTITIONED BY ({partition_by})")
+            log.info("Table %s.%s partitioned by: %s", schema_name, table_name, partition_by)
         except duckdb.Error as e:
             # Another pod may have already set partitioning — verify table exists and continue
-            if _table_exists(conn, table_name):
-                log.info("Table %s partition may have been set by another pod, continuing: %s", table_name, e)
+            if _table_exists(conn, table_name, schema_name):
+                log.info(
+                    "Table %s.%s partition may have been set by another pod, continuing: %s",
+                    schema_name,
+                    table_name,
+                    e,
+                )
             else:
-                raise RuntimeError(f"Failed to partition table {table_name}: {e}") from e
+                raise RuntimeError(f"Failed to partition table {schema_name}.{table_name}: {e}") from e
 
     tables_ensured.add(table_name)
 
@@ -207,15 +216,18 @@ def write(
     tables_ensured: set[str],
     schema_mgr: schema.SchemaManager | None = None,
     partition_by: str | None = None,
+    schema_name: str = "main",
 ) -> None:
     """Write an Arrow table to DuckLake with _inserted_at timestamp."""
     check_reserved_collision(batch.schema, RESERVED_COLUMNS)
-    _ensure_table(conn, table_name, batch, tables_ensured, partition_by)
+    _ensure_table(conn, table_name, batch, tables_ensured, partition_by, schema_name)
     if schema_mgr is not None:
         schema_mgr.evolve(batch.schema)
     conn.register("_arrow_batch", batch)
     try:
-        conn.execute(f"INSERT INTO lake.main.{table_name} BY NAME (SELECT *, NOW() AS _inserted_at FROM _arrow_batch)")
+        conn.execute(
+            f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT *, NOW() AS _inserted_at FROM _arrow_batch)"
+        )
     finally:
         conn.unregister("_arrow_batch")
 
@@ -243,6 +255,7 @@ class DuckLakeSink:
         # below are read either by connect() building the Postgres
         # connstring or by this constructor.
         for name in (
+            "ducklake_schema",
             "ducklake_table",
             "ducklake_connection",
             "ducklake_data_path",
@@ -256,13 +269,22 @@ class DuckLakeSink:
                 raise RuntimeError(f"DuckLakeSink requires cfg.{name}; config.load() should have enforced this")
         self._cfg = cfg
         self._conn = connect(cfg)
+        self._schema_name = cfg.ducklake_schema
         self._table_name = cfg.ducklake_table
         self._partition_by = cfg.partition_by
         self._tables_ensured: set[str] = set()
-        self._schema_mgr = schema.SchemaManager(self._conn, self._table_name)
+        self._schema_mgr = schema.SchemaManager(self._conn, self._table_name, self._schema_name)
 
     def write(self, batch: pa.Table) -> None:
-        write(self._conn, self._table_name, batch, self._tables_ensured, self._schema_mgr, self._partition_by)
+        write(
+            self._conn,
+            self._table_name,
+            batch,
+            self._tables_ensured,
+            self._schema_mgr,
+            self._partition_by,
+            self._schema_name,
+        )
 
     def reset_caches(self) -> None:
         self._tables_ensured.clear()
