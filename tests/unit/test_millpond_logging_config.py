@@ -51,6 +51,7 @@ def _minimal_config() -> Config:
         rds_username="ducklake",
         rds_password="pass",
         partition_by=None,
+        ducklake_max_retry_count=100,
         flush_size=104857600,
         flush_interval_ms=60000,
         fetch_min_bytes=1048576,

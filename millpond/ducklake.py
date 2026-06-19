@@ -93,6 +93,14 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     # Disabling insertion order allows DuckDB to process partitions sequentially.
     conn.execute("SET preserve_insertion_order = false")
 
+    # DuckLake retries failed commits up to ducklake_max_retry_count
+    # times before surfacing the error. Default is 10, which is too low
+    # for multi-writer deployments — losers of the snapshot-id allocation
+    # race burn 10 retries fast and surface as
+    # `ducklake_snapshot_pkey` duplicate-key violations. Loaded from
+    # DUCKLAKE_MAX_RETRY_COUNT env (default 100).
+    conn.execute(f"SET ducklake_max_retry_count = {int(cfg.ducklake_max_retry_count)}")
+
     # Build a libpq connection string for DuckLake.
     # The 'postgres:' prefix tells DuckLake to use the Postgres extension
     # for metadata storage rather than a local DuckDB file.

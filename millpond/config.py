@@ -34,6 +34,14 @@ class Config:
     rds_password: str
     partition_by: str | None  # e.g. "year(timestamp),month(timestamp),day(timestamp),hour(timestamp)"
 
+    # DuckLake commit-retry budget. DuckLake's default is 10, which is not
+    # enough when many writers commit against the same metadata catalog
+    # concurrently — losers of snapshot-id allocation races burn through
+    # 10 retries quickly and surface as PK collisions on
+    # ducklake_snapshot_pkey. Loaded from DUCKLAKE_MAX_RETRY_COUNT with a
+    # 100 default (the value DuckLake's own error message suggests).
+    ducklake_max_retry_count: int
+
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
     flush_interval_ms: int  # ms since last flush
@@ -255,6 +263,14 @@ def _load_ducklake_fields() -> dict[str, str | None]:
             f"DUCKLAKE_PARTITION_BY {partition_by!r} contains unsafe characters (must match [a-zA-Z0-9_(),\\s]+)"
         )
 
+    # Reject 0 explicitly — DuckLake itself accepts 0 (no retries), but in
+    # this codebase a 0 budget under multi-writer concurrency degenerates
+    # straight to the PK-collision crash the default was raised to avoid.
+    # An operator misrendering an unset env var as "0" should fail loudly.
+    ducklake_max_retry_count = int(os.environ.get("DUCKLAKE_MAX_RETRY_COUNT", "100"))
+    if ducklake_max_retry_count <= 0:
+        raise RuntimeError(f"DUCKLAKE_MAX_RETRY_COUNT={ducklake_max_retry_count!r} must be a positive integer")
+
     return {
         "ducklake_schema": ducklake_schema,
         "ducklake_table": ducklake_table,
@@ -266,6 +282,7 @@ def _load_ducklake_fields() -> dict[str, str | None]:
         "rds_username": os.environ.get("DUCKLAKE_RDS_USERNAME", "ducklake"),
         "rds_password": _require("DUCKLAKE_RDS_PASSWORD"),
         "partition_by": partition_by,
+        "ducklake_max_retry_count": ducklake_max_retry_count,
     }
 
 
