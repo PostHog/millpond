@@ -41,6 +41,7 @@ def _minimal_config() -> Config:
         group_id="millpond-test",
         replica_count=1,
         ordinal=0,
+        ducklake_schema="main",
         ducklake_table="events",
         ducklake_data_path="s3://bucket/data",
         ducklake_connection=":memory:",

@@ -137,6 +137,7 @@ def _make_cfg(**overrides) -> Config:
         group_id="test-group",
         replica_count=4,
         ordinal=1,
+        ducklake_schema="main",
         ducklake_table="events",
         ducklake_data_path="s3://bucket/data",
         ducklake_connection=":memory:",

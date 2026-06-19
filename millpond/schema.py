@@ -82,9 +82,19 @@ def _normalize_duckdb_type(type_name: str) -> str:
 class SchemaManager:
     """Tracks the DuckLake table schema and evolves it as needed."""
 
-    def __init__(self, conn: duckdb.DuckDBPyConnection, table_name: str):
+    def __init__(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        table_name: str,
+        schema_name: str = "main",
+    ):
+        # `schema_name` defaults to "main" so existing callers (and the
+        # in-process tests that hand-construct a SchemaManager) keep
+        # writing into DuckDB's default schema without changes.
+        # Production callers should set it from cfg.ducklake_schema.
         self._conn = conn
         self._table_name = table_name
+        self._schema_name = schema_name
         self._known_columns: dict[str, str] = {}  # column_name -> duckdb_type
         self._initialized = False
 
@@ -93,8 +103,8 @@ class SchemaManager:
         try:
             result = self._conn.execute(
                 "SELECT column_name, data_type FROM information_schema.columns "
-                "WHERE table_catalog = 'lake' AND table_schema = 'main' AND table_name = ?",
-                [self._table_name],
+                "WHERE table_catalog = 'lake' AND table_schema = ? AND table_name = ?",
+                [self._schema_name, self._table_name],
             ).fetchall()
             self._known_columns = {row[0]: _normalize_duckdb_type(row[1]) for row in result}
             self._initialized = True
@@ -130,7 +140,7 @@ class SchemaManager:
                 log.info("Schema evolution: adding column %s (%s)", field.name, duckdb_type)
                 try:
                     self._conn.execute(
-                        f"ALTER TABLE lake.main.{self._table_name} "
+                        f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
                         f'ADD COLUMN IF NOT EXISTS "{field.name}" {duckdb_type}'
                     )
                     self._known_columns[field.name] = duckdb_type
@@ -150,7 +160,7 @@ class SchemaManager:
                 )
                 try:
                     self._conn.execute(
-                        f"ALTER TABLE lake.main.{self._table_name} "
+                        f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
                         f'ALTER COLUMN "{field.name}" SET DATA TYPE {duckdb_type}'
                     )
                     self._known_columns[field.name] = duckdb_type

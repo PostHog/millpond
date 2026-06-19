@@ -23,6 +23,7 @@ class Config:
     ordinal: int
 
     # DuckLake destination
+    ducklake_schema: str
     ducklake_table: str
     ducklake_data_path: str
     ducklake_connection: str
@@ -237,6 +238,17 @@ def _load_ducklake_fields() -> dict[str, str | None]:
             f"DUCKLAKE_TABLE {ducklake_table!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
         )
 
+    # Default `main` preserves the historical DuckDB schema for any
+    # millpond instance that doesn't set DUCKLAKE_SCHEMA. Schema
+    # identifiers follow the same DuckDB SQL-identifier rules as table
+    # names, so we reuse the table-name regex rather than introducing a
+    # second pattern.
+    ducklake_schema = os.environ.get("DUCKLAKE_SCHEMA", "").strip() or "main"
+    if not _SAFE_TABLE_NAME.match(ducklake_schema):
+        raise RuntimeError(
+            f"DUCKLAKE_SCHEMA {ducklake_schema!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+        )
+
     partition_by = os.environ.get("DUCKLAKE_PARTITION_BY", "").strip() or None
     if partition_by and not SAFE_PARTITION_EXPR.match(partition_by):
         raise RuntimeError(
@@ -244,6 +256,7 @@ def _load_ducklake_fields() -> dict[str, str | None]:
         )
 
     return {
+        "ducklake_schema": ducklake_schema,
         "ducklake_table": ducklake_table,
         "ducklake_data_path": _require("DUCKLAKE_DATA_PATH"),
         "ducklake_connection": _require("DUCKLAKE_CONNECTION"),
@@ -340,8 +353,9 @@ def load() -> Config:
     )
 
     log.info(
-        "Config: topic=%s table=%s ordinal=%d/%d group_id=%s",
+        "Config: topic=%s schema=%s table=%s ordinal=%d/%d group_id=%s",
         topic,
+        cfg.ducklake_schema,
         cfg.table_label,
         ordinal,
         replica_count,
