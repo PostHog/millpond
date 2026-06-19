@@ -179,21 +179,45 @@ def _apply_sort(table: pa.Table, cfg: config.Config) -> pa.Table:
     return table.take(indices)
 
 
+def _is_commit_contention(exc: BaseException) -> bool:
+    """Detect DuckLake catalog-write contention from the exception text.
+
+    DuckLake's commit loop retries up to ducklake_max_retry_count times
+    on PK collisions and serialization conflicts; if that budget is
+    exhausted the surfaced exception carries either an explicit
+    "maximum retry count" sentinel (DuckLake-emitted) or the underlying
+    duplicate-key / serialization-failure text bubbled up from
+    Postgres. Anything else (S3 timeout, schema-evolution race,
+    OOM, etc.) is classed as plain write_retry.
+
+    Keep the substrings stable — they label a metric that an alert
+    may key on. Strings are sourced from:
+      - DuckLake: src/storage/ducklake_transaction_state.cpp:1748
+        "Exceeded the maximum retry count of ..."
+      - Postgres (libpq): "duplicate key value violates unique constraint"
+      - Postgres (libpq): "could not serialize access"
+    """
+    msg = str(exc)
+    return "maximum retry count" in msg or "duplicate key value" in msg or "could not serialize access" in msg
+
+
 def _write_with_retry(sink, consolidated):
     """Write to the sink with exponential backoff on transient failures."""
     for attempt in range(_WRITE_MAX_RETRIES):
         try:
             sink.write(consolidated)
             return
-        except Exception:
-            metrics.errors_total.labels(type="write_retry").inc()
+        except Exception as exc:
+            error_type = "ducklake_commit_contention" if _is_commit_contention(exc) else "write_retry"
+            metrics.errors_total.labels(type=error_type).inc()
             if attempt == _WRITE_MAX_RETRIES - 1:
                 raise
             delay = _WRITE_BASE_DELAY_S * (2**attempt)
             log.warning(
-                "Write failed (attempt %d/%d), retrying in %.1fs",
+                "Write failed (attempt %d/%d, type=%s), retrying in %.1fs",
                 attempt + 1,
                 _WRITE_MAX_RETRIES,
+                error_type,
                 delay,
                 exc_info=True,
             )
