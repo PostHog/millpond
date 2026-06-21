@@ -12,9 +12,16 @@ ARG MILLPOND_VERSION=0.0.0.dev0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=$MILLPOND_VERSION
 RUN uv sync --frozen --no-dev --extra msk-iam
 
-# Install DuckDB CLI (pinned to match the Python package version from pyproject.toml)
+# Install DuckDB CLI (pinned to match the Python package version from pyproject.toml).
+# Install to /opt/uv-tools + /usr/local/bin (both world-readable) instead of the
+# uv default of /root/.local — that subtree is mode 700 on python:3.12-slim, so
+# the non-root `millpond` user in the final stage can't traverse it, and the
+# CLI shim fails with "bad interpreter: Permission denied". Pin to the system
+# python so uv doesn't install a managed interpreter into another /root subtree.
 RUN V=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print(next(x.split('==')[1] for x in d if x.startswith('duckdb==')))") \
-    && uv tool install "duckdb-cli==$V"
+    && UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
+       uv tool install --python /usr/local/bin/python3.12 "duckdb-cli==$V" \
+    && chmod -R a+rX /opt/uv-tools
 
 FROM python:3.12-slim
 
@@ -22,7 +29,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends just=1.40.0* &&
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/millpond /app/millpond
-COPY --from=builder /root/.local/bin/duckdb /usr/local/bin/duckdb
+COPY --from=builder /opt/uv-tools /opt/uv-tools
+COPY --from=builder /usr/local/bin/duckdb /usr/local/bin/duckdb
 COPY tools/justfile /justfile
 COPY tools/ducklake_maintenance.py /app/tools/ducklake_maintenance.py
 COPY tools/ducklake_maintenance.sql /app/tools/ducklake_maintenance.sql
