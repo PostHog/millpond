@@ -55,6 +55,12 @@ USER millpond
 # extension's build SHA at runtime so a drift trips in CI rather than in prod.
 RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres')"
 
+# Build-time smoke test for the duckdb CLI as the runtime user. Catches any
+# regression where the CLI is installed somewhere the `millpond` user can't
+# execute it (the failure mode we just patched). Cheap (~ms) and runs in the
+# same layer the regression would land in.
+RUN duckdb -c "SELECT 1;" >/dev/null
+
 # Health check for non-K8s environments (K8s uses liveness/readiness probes in statefulset.yaml).
 EXPOSE 8000
 
