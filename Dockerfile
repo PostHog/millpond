@@ -18,10 +18,19 @@ RUN uv sync --frozen --no-dev --extra msk-iam
 # location (/root/.local, mode 700 on python:3.12-slim) is unreachable by the
 # non-root `millpond` runtime user. Pin the version from pyproject.toml so the
 # CLI tracks the duckdb Python package.
-RUN V=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print(next(x.split('==')[1] for x in d if x.startswith('duckdb==')))") \
+#
+# TARGETARCH is set by buildx for each platform in the build matrix
+# (linux/amd64 → amd64, linux/arm64 → arm64). DuckDB names its release
+# assets with the same suffix, so this drops in directly. -j on unzip
+# extracts only the `duckdb` binary; the release zip also ships a LICENSE
+# we don't want polluting /usr/local/bin.
+ARG TARGETARCH
+RUN test -n "$TARGETARCH" \
+    && case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
+    && V=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print(next(x.split('==')[1] for x in d if x.startswith('duckdb==')))") \
     && apt-get update && apt-get install -y --no-install-recommends curl unzip \
-    && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${V}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb.zip \
-    && unzip -d /usr/local/bin /tmp/duckdb.zip \
+    && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${V}/duckdb_cli-linux-${TARGETARCH}.zip" -o /tmp/duckdb.zip \
+    && unzip -j -d /usr/local/bin /tmp/duckdb.zip duckdb \
     && chmod 0755 /usr/local/bin/duckdb \
     && rm /tmp/duckdb.zip \
     && apt-get remove -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
