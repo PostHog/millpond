@@ -12,16 +12,19 @@ ARG MILLPOND_VERSION=0.0.0.dev0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=$MILLPOND_VERSION
 RUN uv sync --frozen --no-dev --extra msk-iam
 
-# Install DuckDB CLI (pinned to match the Python package version from pyproject.toml).
-# Install to /opt/uv-tools + /usr/local/bin (both world-readable) instead of the
-# uv default of /root/.local — that subtree is mode 700 on python:3.12-slim, so
-# the non-root `millpond` user in the final stage can't traverse it, and the
-# CLI shim fails with "bad interpreter: Permission denied". Pin to the system
-# python so uv doesn't install a managed interpreter into another /root subtree.
+# Install DuckDB CLI from the upstream GitHub release. duckdb-cli is a single
+# static binary, so we avoid `uv tool install` here: that path installs a full
+# Python venv just to PATH a self-contained C++ binary, and its default install
+# location (/root/.local, mode 700 on python:3.12-slim) is unreachable by the
+# non-root `millpond` runtime user. Pin the version from pyproject.toml so the
+# CLI tracks the duckdb Python package.
 RUN V=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print(next(x.split('==')[1] for x in d if x.startswith('duckdb==')))") \
-    && UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
-       uv tool install --python /usr/local/bin/python3.12 "duckdb-cli==$V" \
-    && chmod -R a+rX /opt/uv-tools
+    && apt-get update && apt-get install -y --no-install-recommends curl unzip \
+    && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${V}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb.zip \
+    && unzip -d /usr/local/bin /tmp/duckdb.zip \
+    && chmod 0755 /usr/local/bin/duckdb \
+    && rm /tmp/duckdb.zip \
+    && apt-get remove -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 FROM python:3.12-slim
 
@@ -29,7 +32,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends just=1.40.0* &&
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/millpond /app/millpond
-COPY --from=builder /opt/uv-tools /opt/uv-tools
 COPY --from=builder /usr/local/bin/duckdb /usr/local/bin/duckdb
 COPY tools/justfile /justfile
 COPY tools/ducklake_maintenance.py /app/tools/ducklake_maintenance.py
