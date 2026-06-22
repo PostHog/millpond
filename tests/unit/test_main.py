@@ -294,6 +294,31 @@ def _capture_skip_calls(mock_metrics):
     return skip_calls
 
 
+class TestCoerceTimestamps:
+    """The main.py delegate that gates coercion on cfg.timestamp_columns."""
+
+    def _cfg(self, *, timestamp_columns=None):
+        cfg = MagicMock()
+        cfg.timestamp_columns = timestamp_columns
+        return cfg
+
+    def test_no_op_when_unconfigured(self):
+        from millpond.main import _coerce_timestamps
+
+        table = pa.table({"timestamp": ["2024-01-01 12:00:00.000000"]})
+        result = _coerce_timestamps(table, self._cfg(timestamp_columns=None))
+        # Short-circuit: same object, no coercion.
+        assert result is table
+        assert result.schema.field("timestamp").type == pa.string()
+
+    def test_coerces_when_configured(self):
+        from millpond.main import _coerce_timestamps
+
+        table = pa.table({"timestamp": ["2024-01-01 12:00:00.000000"], "team_id": [1]})
+        result = _coerce_timestamps(table, self._cfg(timestamp_columns=("timestamp",)))
+        assert result.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+
+
 class TestApplyFilter:
     """Hot-path keep-filter behaviour. Mocks the metrics module so the
     skipped-record counter calls are visible without setting up a real

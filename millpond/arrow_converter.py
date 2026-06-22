@@ -155,17 +155,20 @@ def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
     return flattened
 
 
-# Wire format the upstream ClickHouse-events producers emit for DateTime64
-# columns: space-separated, six fractional digits, UTC implied, no zone suffix
-# (e.g. "2024-01-01 12:00:00.000000"). See the rust kafka-deduplicator
-# clickhouse_events pipeline (parser/processor) and ClickHouse's JSONEachRow
-# DateTime64(6, 'UTC') rendering — both produce exactly this shape.
+# Wire format the upstream ClickHouse-events producers emit for DateTime
+# columns: space-separated, UTC implied, no zone suffix, with a variable number
+# of fractional-second digits — the Node ingestion writes 3 digits for
+# timestamp/created_at/captured_at (`yyyy-MM-dd HH:mm:ss.u`) and 0 digits for
+# person_created_at (`yyyy-MM-dd HH:mm:ss`); other producers/fixtures use the
+# DateTime64(6) form with 6 digits (`2024-01-01 12:00:00.000000`). All of these
+# parse via the cast below — see the rust `ClickHouseEvent` struct
+# (`rust/common/types/src/event.rs`) and the Node `castTimestampOrNow` formats.
 #
-# PyArrow can't parse it via `strptime` (the `%f` directive isn't supported in
+# PyArrow can't parse them via `strptime` (the `%f` directive isn't supported in
 # this build) or via a direct cast to a tz-aware timestamp (that demands an
 # explicit zone offset in the string). The working path is two steps: cast the
 # string to a *naive* microsecond timestamp (Arrow's ISO-8601 parser accepts the
-# space separator and fractional seconds), then stamp it UTC with
+# space separator and 0/3/6 fractional digits), then stamp it UTC with
 # `assume_timezone`. The result is `timestamp[us, tz=UTC]`, which
 # schema._arrow_type_to_duckdb maps to TIMESTAMPTZ — matching the typed
 # timestamp columns the duckling backfill writes.
@@ -180,18 +183,24 @@ def coerce_timestamp_columns(table: pa.Table, columns: tuple[str, ...]) -> pa.Ta
     any column whose values arrive as date-time strings. When millpond writes
     into a table whose column is already TIMESTAMPTZ (e.g. the duckling backfill's
     ``posthog.events``), that VARCHAR batch type can't be reconciled — DuckLake
-    only widens, and TIMESTAMPTZ→VARCHAR is a narrowing — so schema evolution
-    fails and flushes wedge. Pinning these columns to a real Arrow timestamp here,
-    before the batch reaches the sink, makes the inferred type match the table so
-    the insert is a typed append with no DDL, and makes freshly-created tables
-    use TIMESTAMPTZ in the first place.
+    only widens, and TIMESTAMPTZ→VARCHAR is a narrowing — so the per-flush
+    schema-evolution ALTER is rejected and the write stalls. Pinning these
+    columns to a real Arrow timestamp here, before the batch reaches the sink,
+    makes the inferred type match the table so the insert is a typed append with
+    no DDL, and makes freshly-created tables use TIMESTAMPTZ in the first place.
 
     Only columns that are (a) present in this batch and (b) string-typed are
     touched; a column already timestamp-typed, or absent from the batch, is left
-    as-is so the function is safe to point at a superset of columns. Parsing is
-    strict: a value that doesn't match the producer's wire format raises rather
-    than being silently nulled — a format drift is a contract break that should
-    surface loudly, not corrupt timestamps in place.
+    as-is so the function is safe to point at a superset of columns.
+
+    Coercion is non-fatal per column: if a value doesn't match the producer's
+    wire format, the cast for that column raises ``ArrowInvalid`` and we leave the
+    column as string for this batch (the write still lands via DuckDB's implicit
+    VARCHAR→TIMESTAMPTZ cast on INSERT), bumping ``errors_total{type="timestamp_
+    coercion"}`` so a format drift is loud via metrics/alerting rather than
+    silently nulling data — and, critically, without raising on the consume path,
+    where an exception would unwind past main.py's offset bookkeeping and risk
+    committing past records that were never written.
     """
     if not columns:
         return table
@@ -203,7 +212,14 @@ def coerce_timestamp_columns(table: pa.Table, columns: tuple[str, ...]) -> pa.Ta
     for i, field in enumerate(table.schema):
         col = table.column(i)
         if field.name in target and (pa.types.is_string(field.type) or pa.types.is_large_string(field.type)):
-            parsed = pc.assume_timezone(col.cast(pa.timestamp(_TIMESTAMP_UNIT)), _TIMESTAMP_TZ)
+            try:
+                parsed = pc.assume_timezone(col.cast(pa.timestamp(_TIMESTAMP_UNIT)), _TIMESTAMP_TZ)
+            except pa.ArrowInvalid as e:
+                log.warning("Timestamp coercion failed for column %s; leaving as string this batch: %s", field.name, e)
+                metrics.errors_total.labels(type="timestamp_coercion").inc()
+                new_columns.append(col)
+                new_fields.append(field)
+                continue
             new_columns.append(parsed)
             new_fields.append(pa.field(field.name, parsed.type, nullable=field.nullable))
             coerced += 1

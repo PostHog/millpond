@@ -19,7 +19,12 @@ from millpond.schema import SchemaManager
 
 @pytest.fixture()
 def conn():
-    """DuckDB connection with an in-memory 'lake' catalog mimicking DuckLake."""
+    """DuckDB connection with an in-memory 'lake' catalog mimicking DuckLake.
+
+    NB: plain DuckDB does NOT enforce DuckLake's widening-only ALTER rule — it
+    permissively allows narrowing casts. Tests that need that semantic install
+    it explicitly (see `_reject_alter_column` in the coercion tests); don't drop
+    that wrapper assuming the fixture provides it."""
     c = duckdb.connect()
     c.execute("ATTACH ':memory:' AS lake")
     yield c
@@ -290,8 +295,17 @@ class TestTimestampCoercionWritePath:
 
     @patch("millpond.schema.metrics")
     def test_uncoerced_string_batch_triggers_failing_alter(self, mock_metrics, conn, cache):
-        """Reproduces the wedge: without coercion, evolve() tries to narrow the
-        TIMESTAMPTZ columns to VARCHAR, which DuckLake rejects → schema error."""
+        """The baseline this change fixes: without coercion, evolve() attempts to
+        narrow each TIMESTAMPTZ column to VARCHAR and gets rejected.
+
+        Caveat — this asserts the *narrowing ALTER is attempted and metricked*,
+        not the full prod wedge. The real stall is DuckLake-specific at INSERT
+        time; plain in-memory DuckDB would permissively auto-cast the VARCHAR
+        rows into the TIMESTAMPTZ column on `INSERT ... BY NAME`, so the harness
+        can't reproduce the stall itself. `_reject_alter_column` supplies the
+        DuckLake widening-only semantic; the failing ALTER is the observable
+        signal (`errors_total{type="schema"}` bumping every flush) that the fix
+        eliminates."""
         self._create_events_table(conn)
         schema_mgr = SchemaManager(conn, "events")
         schema_mgr._load_table_schema()

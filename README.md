@@ -91,17 +91,19 @@ Sort order is left-to-right (`team_id` primary, `timestamp` secondary). Directio
 
 If any sort field is missing from a batch's schema, the sort is skipped (records still flow through, just unsorted), `millpond_sort_skipped_total{reason="field_missing"}` increments by the record count, and a warning logs once per distinct missing-fields pattern (per pod lifetime — prevents log floods under sustained misconfiguration).
 
+Per-flush cost is ~50–200 ms on a 256 MB / 30k-row batch. Peak memory roughly doubles during the sort because `pa.Table.take()` rewrites a fresh copy of every column; budget accordingly relative to the pod's memory limit.
+
 ### Timestamp coercion
 
-JSON has no native timestamp type, so date-time values arrive as strings and schema inference types them `VARCHAR`. That's fine for a table millpond creates itself, but it wedges when writing into a table whose columns are already `TIMESTAMPTZ` — DuckLake only widens types, and `TIMESTAMPTZ`→`VARCHAR` is a narrowing, so schema evolution fails and flushes stall. `MILLPOND_TIMESTAMP_COLUMNS` names the columns to parse from their string form into `TIMESTAMPTZ` (microsecond, UTC) before the write, so the batch type matches the destination and the insert is a typed append with no DDL.
+JSON has no native timestamp type, so date-time values arrive as strings and schema inference types them `VARCHAR`. That's fine for a table millpond creates itself, but it stalls writes into a table whose columns are already `TIMESTAMPTZ` — DuckLake only widens types, and `TIMESTAMPTZ`→`VARCHAR` is a narrowing, so the per-flush `ALTER COLUMN` is rejected (and the insert stalls under DuckLake). `MILLPOND_TIMESTAMP_COLUMNS` names the columns to parse from their string form into `TIMESTAMPTZ` (microsecond, UTC) before the write, so the batch type matches the destination and the insert is a typed append with no DDL.
 
 ```
 MILLPOND_TIMESTAMP_COLUMNS=timestamp,created_at,person_created_at,group0_created_at,group1_created_at,group2_created_at,group3_created_at,group4_created_at
 ```
 
-Use this when pointing a consumer at a pre-existing typed table (e.g. the duckling backfill's `posthog.events`). Each coercion increments `millpond_timestamp_columns_coerced_total`. The expected input format is the ClickHouse-events wire format (`2024-01-01 12:00:00.000000`, UTC implied); a value that doesn't parse raises rather than being silently nulled, so a producer format change surfaces loudly. Columns absent from a batch or already timestamp-typed are left untouched, so the same list is safe across heterogeneous batches.
+Use this when pointing a consumer at a pre-existing typed table (e.g. the duckling backfill's `posthog.events`). Each coerced column increments `millpond_timestamp_columns_coerced_total`. The input is the ClickHouse-events wire format — space-separated, UTC implied, with 0, 3, or 6 fractional digits depending on column/producer (e.g. `2024-01-01 12:00:00.123`); all parse. Coercion is **non-fatal**: a value that doesn't parse leaves that column as string for the batch and bumps `millpond_errors_total{type="timestamp_coercion"}` (so a producer format drift is loud via metrics without crashing the pod or risking offset commits past unwritten records). Columns absent from a batch or already timestamp-typed are left untouched, so the same list is safe across heterogeneous batches.
 
-Per-flush cost is ~50–200 ms on a 256 MB / 30k-row batch. Peak memory roughly doubles during the sort because `pa.Table.take()` rewrites a fresh copy of every column; budget accordingly relative to the pod's memory limit.
+> **Re-pointing at `posthog.events` — known caveat.** Coercion only fixes the timestamp columns. The backfilled `events` table also has `project_id BIGINT`, and `project_id` is the one numeric column the producer serializes as explicit JSON `null` (no `skip_serializing_if`). In a flush batch where *every* record has a null `project_id`, inference falls back to `VARCHAR` and `evolve()` will attempt (and DuckLake will reject) a narrowing `ALTER` every such flush — `errors_total{type="schema"}` noise, though not data loss (rows still land via the implicit insert cast). Steady-state batches almost always contain at least one non-null `project_id`, but pin it (a typed-column map generalising this feature) or accept the caveat before relying on a fully clean re-point.
 
 ## Adaptive Backpressure
 

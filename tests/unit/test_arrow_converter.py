@@ -1,8 +1,8 @@
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import orjson
 import pyarrow as pa
-import pytest
 
 from millpond.arrow_converter import _drop_null_typed_columns, coerce_timestamp_columns, convert
 
@@ -269,12 +269,41 @@ class TestCoerceTimestampColumns:
         out = coerce_timestamp_columns(table, ())
         assert out is table
 
-    def test_unparseable_value_raises(self):
-        # A format drift is a contract break — surface it loudly rather than
-        # silently nulling the column.
-        table = pa.table({"timestamp": ["not-a-timestamp"]})
-        with pytest.raises(pa.lib.ArrowInvalid):
-            coerce_timestamp_columns(table, ("timestamp",))
+    def test_varying_fractional_precision_parses(self):
+        # The real producer emits 0, 3, or 6 fractional digits depending on the
+        # column/source; all must parse to the same Arrow type.
+        cols = {
+            "timestamp": "2024-01-01 12:00:00.123",  # Node: 3 digits
+            "person_created_at": "2024-01-01 12:00:00",  # Node: 0 digits
+            "created_at": "2024-01-01 12:00:00.123456",  # 6 digits
+        }
+        table = pa.table({k: [v] for k, v in cols.items()})
+        out = coerce_timestamp_columns(table, tuple(cols))
+        for c in cols:
+            assert out.schema.field(c).type == pa.timestamp("us", tz="UTC")
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_unparseable_value_is_non_fatal(self, mock_metrics):
+        # A format drift must NOT raise on the consume path (that risks
+        # committing offsets past unwritten records). The column falls back to
+        # string and a dedicated error metric fires so the drift is still loud.
+        table = pa.table({"timestamp": ["not-a-timestamp"], "team_id": [1]})
+        out = coerce_timestamp_columns(table, ("timestamp",))
+        assert out.schema.field("timestamp").type == pa.string()
+        assert out.column("timestamp").to_pylist() == ["not-a-timestamp"]
+        mock_metrics.errors_total.labels.assert_called_with(type="timestamp_coercion")
+        mock_metrics.errors_total.labels(type="timestamp_coercion").inc.assert_called_once()
+        # A good column alongside a bad one still coerces.
+        mock_metrics.timestamp_columns_coerced_total.inc.assert_not_called()
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_partial_failure_coerces_good_columns(self, mock_metrics):
+        table = pa.table({"timestamp": [self.WIRE], "created_at": ["garbage"]})
+        out = coerce_timestamp_columns(table, ("timestamp", "created_at"))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert out.schema.field("created_at").type == pa.string()
+        mock_metrics.timestamp_columns_coerced_total.inc.assert_called_once_with(1)
+        mock_metrics.errors_total.labels(type="timestamp_coercion").inc.assert_called_once()
 
     def test_roundtrips_through_convert(self):
         # The realistic path: JSON → convert() (infers VARCHAR) → coerce.

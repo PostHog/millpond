@@ -111,9 +111,10 @@ _sort_skipped_total = Counter(
 )
 # Columns parsed from JSON date-time strings into TIMESTAMPTZ before the sink
 # (see arrow_converter.coerce_timestamp_columns). Counts column-coercions, not
-# rows. A flatline while writing into a TIMESTAMPTZ-typed table means the
-# coercion isn't configured (MILLPOND_TIMESTAMP_COLUMNS) and schema evolution
-# will wedge on the timestamp columns.
+# rows. A flatline can mean coercion isn't configured (MILLPOND_TIMESTAMP_COLUMNS
+# unset), or that the configured columns are absent from the batch or already
+# arrive timestamp-typed — so read it alongside the config and
+# errors_total{type="timestamp_coercion"} rather than on its own.
 _timestamp_columns_coerced_total = Counter(
     "millpond_timestamp_columns_coerced_total",
     "String columns parsed to TIMESTAMPTZ before write",
