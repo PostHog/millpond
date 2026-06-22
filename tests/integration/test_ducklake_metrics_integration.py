@@ -43,13 +43,21 @@ def _http_get(url: str, timeout: float = 5.0) -> tuple[int, str]:
         return e.code, (e.read() or b"").decode()
 
 
+TENANT = "test"
+
+
 def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
-    """Create the metadata schema and all five tables the built-ins query."""
+    """Create the metadata schema and every table the built-in queries touch."""
     c.execute("CREATE SCHEMA __ducklake_metadata_lake")
     c.execute(
         "CREATE TABLE __ducklake_metadata_lake.ducklake_data_file ("
         "data_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "
-        "path VARCHAR, file_size_bytes BIGINT, partition_id BIGINT)"
+        "path VARCHAR, file_size_bytes BIGINT, partition_id BIGINT, record_count BIGINT)"
+    )
+    c.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_delete_file ("
+        "delete_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "
+        "path VARCHAR, file_size_bytes BIGINT)"
     )
     c.execute(
         "CREATE TABLE __ducklake_metadata_lake.ducklake_file_partition_value ("
@@ -66,12 +74,24 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
         "CREATE TABLE __ducklake_metadata_lake.ducklake_metadata ("
         "key VARCHAR, value VARCHAR, scope VARCHAR, scope_id BIGINT)"
     )
+    c.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_table ("
+        "table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT)"
+    )
+    c.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_inlined_data_tables ("
+        "table_id BIGINT, schema_version BIGINT, table_name VARCHAR)"
+    )
     # Seed: enough rows that every metric has a non-zero value.
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
-        "(1, 1, 0, NULL, 'a', 500000, 100),"
-        "(2, 1, 0, NULL, 'b', 50000000, 100),"
-        "(3, 1, 0, NULL, 'c', 200000000, 200)"
+        "(1, 1, 0, NULL, 'a', 500000, 100, 1000),"
+        "(2, 1, 0, NULL, 'b', 50000000, 100, 50000),"
+        "(3, 1, 0, NULL, 'c', 200000000, 200, 200000)"
+    )
+    c.execute(
+        "INSERT INTO __ducklake_metadata_lake.ducklake_delete_file VALUES "
+        "(1, 1, 0, NULL, 'd1', 1024)"
     )
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_file_partition_value VALUES "
@@ -88,8 +108,20 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
         "VALUES ('s3://b/x'), ('s3://b/x'), ('s3://b/y')"
     )
     c.execute(
-        "INSERT INTO __ducklake_metadata_lake.ducklake_metadata "
-        "VALUES ('version', '0.4', NULL, NULL)"
+        "INSERT INTO __ducklake_metadata_lake.ducklake_metadata VALUES "
+        "('version', '0.4', NULL, NULL),"
+        "('auto_compact', 'true', NULL, NULL),"
+        "('data_inlining_row_limit', '0', NULL, NULL)"
+    )
+    c.execute(
+        "INSERT INTO __ducklake_metadata_lake.ducklake_table VALUES "
+        "(1, 0, NULL),"      # live
+        "(2, 0, 1)"          # dropped
+    )
+    c.execute(
+        "INSERT INTO __ducklake_metadata_lake.ducklake_inlined_data_tables VALUES "
+        "(1, 1, 'ducklake_inlined_data_1_1'),"   # parent live → reachable
+        "(99, 1, 'ducklake_inlined_data_99_1')"  # no parent ducklake_table row → unreachable
     )
 
 
@@ -128,11 +160,11 @@ class TestDaemonHTTP:
             # query at startup, so the first tick completes almost
             # immediately — no need to wait out the 1-minute interval.
             stop = threading.Event()
-            self_metrics.up.set(1)
+            self_metrics.up.labels(TENANT).set(1)
             srv.ready = True  # type: ignore[attr-defined]
             t = threading.Thread(
                 target=dm._scheduler_loop,
-                args=(conn, queries, gauges, self_metrics, stop),
+                args=(conn, queries, gauges, self_metrics, stop, TENANT),
                 name="scheduler",
                 daemon=True,
             )
@@ -168,23 +200,27 @@ class TestDaemonHTTP:
                 status, body = _http_get(f"http://127.0.0.1:{port}/metrics")
                 assert status == 200
                 expected = [
-                    # b4
                     "ducklake_pending_deletes_total",
                     "ducklake_pending_deletes_unique_paths",
                     "ducklake_pending_deletes_dup_rows",
-                    # b2
+                    "ducklake_data_files_files",
+                    "ducklake_data_files_bytes",
+                    "ducklake_data_files_rows",
+                    "ducklake_delete_files_files",
+                    "ducklake_delete_files_bytes",
                     "ducklake_files_per_band_count",
                     "ducklake_files_per_band_bytes",
-                    # b3
-                    "ducklake_compaction_candidates_count",
-                    # b5
                     "ducklake_snapshots_count",
                     "ducklake_snapshots_oldest_seconds_ago",
                     "ducklake_snapshots_newest_seconds_ago",
-                    # b6
+                    "ducklake_snapshots_oldest_id",
+                    "ducklake_snapshots_newest_id",
+                    "ducklake_inlined_data_tables_total",
+                    "ducklake_unreachable_inline_tables_total",
+                    "ducklake_tables_count",
                     "ducklake_files_per_partition_top20_count",
-                    # catalog version
                     "ducklake_catalog_format_version",
+                    "ducklake_config_value",
                     # self-metrics
                     "ducklake_metrics_up",
                     "ducklake_metrics_query_duration_seconds",
@@ -192,7 +228,7 @@ class TestDaemonHTTP:
                 ]
                 for name in expected:
                     assert name in body, f"{name!r} missing from /metrics output"
-                assert "ducklake_metrics_up 1.0" in body
+                assert f'ducklake_metrics_up{{tenant="{TENANT}"}} 1.0' in body
 
                 # 404 path — bare sanity that we didn't open random URLs.
                 status, _ = _http_get(f"http://127.0.0.1:{port}/anything-else")
