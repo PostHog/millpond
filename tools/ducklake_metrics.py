@@ -70,7 +70,13 @@ log = logging.getLogger("ducklake_metrics")
 BUILTIN_YAML = """
 queries:
   - name: ducklake_pending_deletes
-    help: Pending-deletion queue depth and duplicate-row pathology.
+    help: |
+      Pending-deletion queue depth. `total` is the row count
+      (`ducklake_files_scheduled_for_deletion`); each row references one file
+      path. `unique_paths` is the distinct file count (use this for "how many
+      files are queued"). `dup_rows = total - unique_paths` surfaces the
+      duplicate-row pathology that self-poisons the next cleanup
+      (DuckLake upstream bug c5).
     interval_mins: 1
     values: [total, unique_paths, dup_rows]
     sql: |
@@ -80,21 +86,54 @@ queries:
         COUNT(*) - COUNT(DISTINCT path) AS dup_rows
       FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion
 
+  - name: ducklake_data_files
+    help: |
+      Live data-file (parquet) totals. `files` = file count, `bytes` = total
+      on-disk size, `rows` = total records across all live files. "Live" =
+      `end_snapshot IS NULL`. Per-band breakdown lives in
+      `ducklake_files_per_band`; this is the rollup for "how big is the lake."
+    interval_mins: 1
+    values: [files, bytes, rows]
+    sql: |
+      SELECT
+        COUNT(*) AS files,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes,
+        COALESCE(SUM(record_count), 0)    AS rows
+      FROM __ducklake_metadata_lake.ducklake_data_file
+      WHERE end_snapshot IS NULL
+
+  - name: ducklake_delete_files
+    help: |
+      Live delete-vector (puffin/parquet) totals. Same shape as
+      ducklake_data_files but for the delete side. Outsized vs.
+      ducklake_data_files_files = lots of unmerged deletes; ripe for
+      `ducklake_rewrite_data_files` maintenance.
+    interval_mins: 1
+    values: [files, bytes]
+    sql: |
+      SELECT
+        COUNT(*) AS files,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes
+      FROM __ducklake_metadata_lake.ducklake_delete_file
+      WHERE end_snapshot IS NULL
+
   - name: ducklake_files_per_band
-    help: Live data files grouped into byte-size bands.
+    help: |
+      Live data files grouped into compaction-relevant size bands. Tiers
+      match `ducklake_maintenance.py`'s TIERS spec — `tier1` (<1 MiB),
+      `tier2` (1-10 MiB), `tier3` (10-64 MiB) are compaction targets;
+      `large` (>=64 MiB) is past the compaction threshold and is just
+      reported for shape. Sum across bands equals `ducklake_data_files_files`.
     interval_mins: 1
     labels: [band]
     values: [count, bytes]
     sql: |
       SELECT
         CASE
-          WHEN file_size_bytes < 1048576    THEN 'lt1mib'
-          WHEN file_size_bytes < 5242880    THEN '1to5mib'
-          WHEN file_size_bytes < 10485760   THEN '5to10mib'
-          WHEN file_size_bytes < 33554432   THEN '10to32mib'
-          WHEN file_size_bytes < 67108864   THEN '32to64mib'
-          WHEN file_size_bytes < 134217728  THEN '64to128mib'
-          ELSE 'gt128mib'
+          WHEN file_size_bytes < 1048576   THEN 'tier1'
+          WHEN file_size_bytes < 10485760  THEN 'tier2'
+          WHEN file_size_bytes < 67108864  THEN 'tier3'
+          ELSE 'large'
         END AS band,
         COUNT(*) AS count,
         COALESCE(SUM(file_size_bytes), 0) AS bytes
@@ -102,39 +141,82 @@ queries:
       WHERE end_snapshot IS NULL
       GROUP BY band
 
-  - name: ducklake_compaction_candidates
-    help: Live file counts bucketed to match ducklake_maintenance.py's TIERS spec.
-    interval_mins: 1
-    labels: [tier]
-    values: [count]
-    sql: |
-      SELECT tier, COUNT(*) AS count
-      FROM (
-        SELECT CASE
-          WHEN file_size_bytes < 1048576   THEN 'tier1'
-          WHEN file_size_bytes < 10485760  THEN 'tier2'
-          WHEN file_size_bytes < 67108864  THEN 'tier3'
-          ELSE 'large'
-        END AS tier
-        FROM __ducklake_metadata_lake.ducklake_data_file
-        WHERE end_snapshot IS NULL
-      ) t
-      GROUP BY tier
-      UNION ALL
-      SELECT 'total' AS tier, COUNT(*) AS count
-      FROM __ducklake_metadata_lake.ducklake_data_file
-      WHERE end_snapshot IS NULL
-
   - name: ducklake_snapshots
-    help: Snapshot count plus age of oldest/newest snapshot in seconds.
+    help: |
+      Snapshot population, ages (seconds), and id bounds. Expose the raw
+      `oldest_id`/`newest_id` (counter-like, monotonic) so PromQL can
+      derive the commit rate via `deriv(ducklake_snapshots_newest_id[5m])`
+      — no per-sample storage in the daemon.
     interval_mins: 1
-    values: [count, oldest_seconds_ago, newest_seconds_ago]
+    values: [count, oldest_seconds_ago, newest_seconds_ago, oldest_id, newest_id]
     sql: |
       SELECT
         COUNT(*) AS count,
         COALESCE(EXTRACT(EPOCH FROM (now() - MIN(CAST(snapshot_time AS TIMESTAMPTZ)))), 0) AS oldest_seconds_ago,
-        COALESCE(EXTRACT(EPOCH FROM (now() - MAX(CAST(snapshot_time AS TIMESTAMPTZ)))), 0) AS newest_seconds_ago
+        COALESCE(EXTRACT(EPOCH FROM (now() - MAX(CAST(snapshot_time AS TIMESTAMPTZ)))), 0) AS newest_seconds_ago,
+        COALESCE(MIN(snapshot_id), 0) AS oldest_id,
+        COALESCE(MAX(snapshot_id), 0) AS newest_id
       FROM __ducklake_metadata_lake.ducklake_snapshot
+
+  - name: ducklake_inlined_data_tables
+    help: |
+      Count of rows in `ducklake_inlined_data_tables` (the registry of
+      per-table inline-data tables that DuckLake creates when a write goes
+      through the inlining path). Should stay small in steady state;
+      runaway growth indicates `data_inlining_row_limit` isn't being
+      honored by writers, or writers are creating tables faster than
+      maintenance can drop them (see `ducklake_unreachable_inline_tables`).
+    interval_mins: 1
+    values: [total]
+    sql: |
+      SELECT COUNT(*) AS total
+      FROM __ducklake_metadata_lake.ducklake_inlined_data_tables
+
+  - name: ducklake_unreachable_inline_tables
+    help: |
+      Count of `ducklake_inlined_data_tables` entries whose parent
+      `ducklake_table` has no snapshot-reachable row. These are orphans
+      that DuckLake's own GC (DropEmptySupersededInlinedTables) won't
+      reach because it only acts on superseded-and-empty, not
+      parent-dropped. Should be 0 or near-0 after cleanup; growing trend
+      means the data_imports DROP+CREATE pattern is producing orphans.
+      Uses the range-overlap predicate (strict superset of "actually
+      reachable"; safe-conservative — won't false-positive an unreachable
+      table). See INCIDENT.md.
+    interval_mins: 5
+    values: [total]
+    sql: |
+      WITH bounds AS (
+        SELECT MIN(snapshot_id) AS lo, MAX(snapshot_id) AS hi
+        FROM __ducklake_metadata_lake.ducklake_snapshot
+      ),
+      reachable AS (
+        SELECT DISTINCT t.table_id
+        FROM __ducklake_metadata_lake.ducklake_table t, bounds
+        WHERE t.begin_snapshot <= bounds.hi
+          AND (t.end_snapshot IS NULL OR t.end_snapshot > bounds.lo)
+      )
+      SELECT COUNT(*) AS total
+      FROM __ducklake_metadata_lake.ducklake_inlined_data_tables idt
+      WHERE NOT EXISTS (SELECT 1 FROM reachable r WHERE r.table_id = idt.table_id)
+
+  - name: ducklake_tables
+    help: |
+      Count of `ducklake_table` rows split by lifecycle state.
+      `state="live"` = `end_snapshot IS NULL` (currently visible to the
+      latest snapshot). `state="dropped"` = `end_snapshot` set (still
+      readable by historical snapshots until expire+cleanup reaps them).
+      Imbalance — many dropped, few live — indicates DROP+CREATE churn
+      (data_imports anti-pattern).
+    interval_mins: 1
+    labels: [state]
+    values: [count]
+    sql: |
+      SELECT
+        CASE WHEN end_snapshot IS NULL THEN 'live' ELSE 'dropped' END AS state,
+        COUNT(*) AS count
+      FROM __ducklake_metadata_lake.ducklake_table
+      GROUP BY state
 
   - name: ducklake_files_per_partition_top20
     help: Twenty heaviest partitions by live data-file count (composite values joined with '/').
@@ -176,6 +258,35 @@ queries:
         regexp_replace(value, '^[0-9]+(\\.[0-9]+)?', '') AS suffix
       FROM __ducklake_metadata_lake.ducklake_metadata
       WHERE key = 'version' AND scope IS NULL
+
+  - name: ducklake_config
+    help: |
+      Operationally-relevant DuckLake catalog config values from
+      `ducklake_metadata`. Currently tracks `auto_compact` and
+      `data_inlining_row_limit` at every scope (global / schema / table) —
+      `auto_compact != 'true'` silently disables every maintenance
+      function call against the affected table, and a non-zero
+      `data_inlining_row_limit` is what generates the inline-table
+      backlog this daemon watches. Boolean strings ('true'/'false') map
+      to 1/0; numeric strings cast directly; anything else returns NULL
+      and the sample is dropped (error counter still ticks, surfacing
+      the bad value).
+    interval_mins: 5
+    labels: [key, scope, scope_id]
+    values: [value]
+    sql: |
+      SELECT
+        key,
+        COALESCE(scope, '') AS scope,
+        COALESCE(CAST(scope_id AS VARCHAR), '') AS scope_id,
+        CASE
+          WHEN value = 'true'  THEN 1.0
+          WHEN value = 'false' THEN 0.0
+          WHEN regexp_matches(value, '^-?[0-9]+(\\.[0-9]+)?$') THEN CAST(value AS DOUBLE)
+          ELSE NULL
+        END AS value
+      FROM __ducklake_metadata_lake.ducklake_metadata
+      WHERE key IN ('auto_compact', 'data_inlining_row_limit')
 """
 
 # Intervals are specified in whole minutes via the YAML field `interval_mins`
@@ -271,29 +382,37 @@ class SelfMetrics:
 
 
 def _build_self_metrics(registry: CollectorRegistry | None = None) -> SelfMetrics:
+    """Construct the daemon's own health metrics.
+
+    Every metric carries a ``tenant`` label (injected at sample time from
+    the daemon's resolved tenant identity, see main()) so a Prometheus
+    instance scraping many ducklake_metrics deployments can distinguish
+    series by catalog without relying on per-target relabeling.
+    """
     kwargs = {"registry": registry} if registry is not None else {}
     return SelfMetrics(
         duration=Gauge(
             "ducklake_metrics_query_duration_seconds",
             "Wall-clock duration of the most recent run for each query.",
-            ["query"],
+            ["tenant", "query"],
             **kwargs,
         ),
         errors=Counter(
             "ducklake_metrics_query_errors_total",
             "Cumulative count of failed query runs.",
-            ["query"],
+            ["tenant", "query"],
             **kwargs,
         ),
         last_success=Gauge(
             "ducklake_metrics_query_last_success_timestamp",
             "Unix timestamp of the most recent successful run for each query.",
-            ["query"],
+            ["tenant", "query"],
             **kwargs,
         ),
         up=Gauge(
             "ducklake_metrics_up",
             "1 while the daemon has a live catalog connection; 0 during reconnect.",
+            ["tenant"],
             **kwargs,
         ),
     )
@@ -305,16 +424,19 @@ def _build_query_gauges(
 ) -> dict[str, dict[str, Gauge]]:
     """For each query, register one Gauge per value column.
 
-    Metric name is ``<query_name>_<value>``. Labels come from ``query.labels``.
-    Always suffixes (no special-case for single-value queries) so the metric
-    name shape is uniform across the daemon.
+    Metric name is ``<query_name>_<value>``. Labels come from
+    ``["tenant"] + query.labels`` — ``tenant`` is prepended so every
+    series the daemon emits is tenant-scoped, matching PostHog's
+    per-team labeling convention. Always suffixes (no special-case for
+    single-value queries) so the metric name shape is uniform across
+    the daemon.
     """
     kwargs = {"registry": registry} if registry is not None else {}
     out: dict[str, dict[str, Gauge]] = {}
     for q in queries:
         gs: dict[str, Gauge] = {}
         for v in q.values:
-            gs[v] = Gauge(f"{q.name}_{v}", q.help, q.labels, **kwargs)
+            gs[v] = Gauge(f"{q.name}_{v}", q.help, ["tenant", *q.labels], **kwargs)
         out[q.name] = gs
     return out
 
@@ -335,8 +457,15 @@ def _run_query(
     q: Query,
     gauges: dict[str, Gauge],
     self_metrics: SelfMetrics,
+    tenant: str,
 ) -> bool:
     """Execute one query and update its gauges. Returns True on success.
+
+    ``tenant`` is prepended to every gauge sample's label tuple — see
+    _build_query_gauges / _build_self_metrics. The query's SQL itself
+    is tenant-agnostic; the daemon-level tenant identity gets stitched
+    on at emit time so user-supplied YAML doesn't need to know about
+    the multi-tenant deployment model.
 
     On success: clears each value gauge before re-populating so label
     combinations that drop out between runs don't linger as stale series.
@@ -358,30 +487,27 @@ def _run_query(
                 f"query {q.name}: SQL must return columns named in labels+values; "
                 f"got cols={cols} labels={q.labels} values={q.values}"
             ) from e
-        if q.labels:
-            # Only labeled gauges support clear(); for unlabeled the .set()
-            # below is itself the full state update.
-            for g in gauges.values():
-                g.clear()
+        # Always clear since every gauge has at least the tenant label
+        # — clear() drops all (tenant, ...) label combinations registered
+        # so far for this gauge, so per-run label set churn doesn't leak
+        # stale series.
+        for g in gauges.values():
+            g.clear()
         for row in rows:
             label_vals = [str(row[i]) if row[i] is not None else "" for i in label_idx]
             for v_name, v_i in zip(q.values, value_idx):
                 v = row[v_i]
                 if v is None:
                     continue
-                g = gauges[v_name]
-                if q.labels:
-                    g.labels(*label_vals).set(float(v))
-                else:
-                    g.set(float(v))
+                gauges[v_name].labels(tenant, *label_vals).set(float(v))
         elapsed = time.monotonic() - t0
-        self_metrics.duration.labels(q.name).set(elapsed)
-        self_metrics.last_success.labels(q.name).set_to_current_time()
+        self_metrics.duration.labels(tenant, q.name).set(elapsed)
+        self_metrics.last_success.labels(tenant, q.name).set_to_current_time()
         log.debug("query %s: %d rows in %.3fs", q.name, len(rows), elapsed)
         return True
     except Exception:
         log.exception("query %s failed", q.name)
-        self_metrics.errors.labels(q.name).inc()
+        self_metrics.errors.labels(tenant, q.name).inc()
         return False
 
 
@@ -391,6 +517,7 @@ def _scheduler_loop(
     gauges: dict[str, dict[str, Gauge]],
     self_metrics: SelfMetrics,
     stop: threading.Event,
+    tenant: str,
 ) -> None:
     """Run queries on per-query intervals until stop is set.
 
@@ -421,7 +548,7 @@ def _scheduler_loop(
             return
         heapq.heappop(heap)
         q = queries[idx]
-        ok = _run_query(conn, q, gauges[q.name], self_metrics)
+        ok = _run_query(conn, q, gauges[q.name], self_metrics, tenant)
         if ok:
             consecutive_failures = 0
         else:
@@ -489,6 +616,7 @@ _BACKOFF_MAX_SECONDS = 60.0
 def _connect_with_backoff(
     stop: threading.Event,
     self_metrics: SelfMetrics,
+    tenant: str,
 ) -> duckdb.DuckDBPyConnection | None:
     """Call ducklake_maintenance.connect() with exponential backoff until it succeeds or stop is set.
 
@@ -499,7 +627,7 @@ def _connect_with_backoff(
     sleeps that miss the recovery window.
     """
     delay = _BACKOFF_INITIAL_SECONDS
-    self_metrics.up.set(0)
+    self_metrics.up.labels(tenant).set(0)
     while not stop.is_set():
         try:
             conn = ducklake_maintenance.connect()
@@ -541,6 +669,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated query names to skip from built-ins",
     )
     p.add_argument(
+        "--tenant",
+        default=os.environ.get("DUCKLAKE_TENANT"),
+        help=(
+            "Tenant identity stamped onto every emitted metric as the "
+            "`tenant` label. Required for the multi-tenant deployment "
+            "model — one daemon per tenant, distinguished in Prometheus "
+            "via this label. Falls back to DUCKLAKE_TENANT env."
+        ),
+    )
+    p.add_argument(
         "--list-queries",
         action="store_true",
         help="Print resolved query list and exit (validates config without connecting)",
@@ -560,6 +698,14 @@ def main(argv: list[str] | None = None) -> None:
         for q in queries:
             print(f"{q.name}\t{q.interval_seconds}s\t{q.help}")
         return
+
+    if not args.tenant:
+        sys.exit(
+            "tenant identity required: pass --tenant <name> or set DUCKLAKE_TENANT "
+            "env. Stamped onto every emitted metric as the `tenant` label."
+        )
+    tenant: str = args.tenant
+    log.info("Tenant: %s", tenant)
 
     self_metrics = _build_self_metrics()
     gauges = _build_query_gauges(queries)
@@ -583,17 +729,17 @@ def main(argv: list[str] | None = None) -> None:
     # and stays true thereafter — k8s shouldn't yank metrics traffic on
     # transient catalog flap, and there's no real "traffic" anyway.
     while not stop.is_set():
-        conn = _connect_with_backoff(stop, self_metrics)
+        conn = _connect_with_backoff(stop, self_metrics, tenant)
         if conn is None:
             break
-        self_metrics.up.set(1)
+        self_metrics.up.labels(tenant).set(1)
         srv.ready = True  # type: ignore[attr-defined]
         try:
-            _scheduler_loop(conn, queries, gauges, self_metrics, stop)
+            _scheduler_loop(conn, queries, gauges, self_metrics, stop, tenant)
         except _ReconnectNeeded as e:
             log.warning("%s", e)
         finally:
-            self_metrics.up.set(0)
+            self_metrics.up.labels(tenant).set(0)
             with contextlib.suppress(Exception):
                 conn.close()
 

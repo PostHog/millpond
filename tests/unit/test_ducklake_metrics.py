@@ -144,8 +144,20 @@ def registry():
     return CollectorRegistry()
 
 
+# All test invocations stamp the same synthetic tenant identity onto the
+# emitted samples; `_gauge_value` injects it automatically so individual
+# test bodies don't have to repeat the label.
+TENANT = "test"
+
+
+def _run(conn, q, gauges, sm):
+    """Shim around the underlying _run_query so test bodies don't carry the tenant arg."""
+    return dm.__dict__["_run_query"](conn, q, gauges, sm, TENANT)
+
+
 def _gauge_value(reg: CollectorRegistry, metric: str, labels: dict | None = None) -> float | None:
-    return reg.get_sample_value(metric, labels or {})
+    merged = {"tenant": TENANT, **(labels or {})}
+    return reg.get_sample_value(metric, merged)
 
 
 class TestRunQuery:
@@ -167,7 +179,7 @@ class TestRunQuery:
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
 
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "t_pending_total") == 3
         assert _gauge_value(registry, "t_pending_unique_paths") == 2
@@ -197,12 +209,12 @@ class TestRunQuery:
 
         conn.execute("CREATE TABLE bands (band TEXT, n BIGINT)")
         conn.execute("INSERT INTO bands VALUES ('a', 10), ('b', 20)")
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
         assert _gauge_value(registry, "t_per_band_n", {"band": "a"}) == 10
         assert _gauge_value(registry, "t_per_band_n", {"band": "b"}) == 20
 
         conn.execute("DELETE FROM bands WHERE band = 'b'")
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
         assert _gauge_value(registry, "t_per_band_n", {"band": "a"}) == 10
         assert _gauge_value(registry, "t_per_band_n", {"band": "b"}) is None
 
@@ -213,7 +225,7 @@ class TestRunQuery:
         q = dm.Query(name="t_ok", help="t", sql="SELECT n FROM t", interval_seconds=60, labels=[], values=["n"])
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        assert dm._run_query(conn, q, gauges[q.name], sm) is True
+        assert _run(conn, q, gauges[q.name], sm) is True
 
     def test_sql_error_increments_counter(self, conn, registry):
         q = dm.Query(
@@ -228,7 +240,7 @@ class TestRunQuery:
         sm = dm._build_self_metrics(registry=registry)
 
         # Must not raise — daemon stays up across catalog flap.
-        assert dm._run_query(conn, q, gauges[q.name], sm) is False
+        assert _run(conn, q, gauges[q.name], sm) is False
 
         assert _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "t_broken"}) == 1
         # last_success not set on failure.
@@ -251,7 +263,7 @@ class TestRunQuery:
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
 
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "t_mismatch"}) == 1
 
@@ -277,7 +289,7 @@ class TestBuiltinPendingDeletes:
         q = next(q for q in dm.load_queries(None, set()) if q.name == "ducklake_pending_deletes")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_pending_deletes_total") == 4
         assert _gauge_value(registry, "ducklake_pending_deletes_unique_paths") == 3
@@ -320,34 +332,35 @@ def _builtin(name):
 class TestBuiltinFilesPerBand:
     def test_buckets_live_files_only(self, conn, registry):
         _stub_catalog(conn)
-        # Live files (end_snapshot IS NULL) span four bands; one expired
-        # row must be filtered out.
+        # Live files (end_snapshot IS NULL) span all four bands; one expired
+        # row must be filtered out. Bands match ducklake_maintenance.py's
+        # TIERS: tier1 <1MiB, tier2 1-10MiB, tier3 10-64MiB, large >=64MiB.
         conn.execute(
             "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
-            "(1, 1, 0, NULL, 'a', 500000, 100),"        # lt1mib
-            "(2, 1, 0, NULL, 'b', 1500000, 100),"       # 1to5mib
-            "(3, 1, 0, NULL, 'c', 8000000, 200),"       # 5to10mib
-            "(4, 1, 0, NULL, 'd', 50000000, 200),"      # 32to64mib
-            "(5, 1, 0, NULL, 'e', 200000000, 300),"     # gt128mib
+            "(1, 1, 0, NULL, 'a', 500000, 100),"        # tier1 (<1MiB)
+            "(2, 1, 0, NULL, 'b', 1500000, 100),"       # tier2 (1-10MiB)
+            "(3, 1, 0, NULL, 'c', 8000000, 200),"       # tier2 (1-10MiB)
+            "(4, 1, 0, NULL, 'd', 50000000, 200),"      # tier3 (10-64MiB)
+            "(5, 1, 0, NULL, 'e', 200000000, 300),"     # large (>=64MiB)
             "(6, 1, 0, 5,    'f', 100, 300)"            # expired — must NOT be counted
         )
         q = _builtin("ducklake_files_per_band")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
-        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "lt1mib"}) == 1
-        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "1to5mib"}) == 1
-        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "5to10mib"}) == 1
-        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "32to64mib"}) == 1
-        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "gt128mib"}) == 1
-        assert _gauge_value(registry, "ducklake_files_per_band_bytes", {"band": "lt1mib"}) == 500000
-        assert _gauge_value(registry, "ducklake_files_per_band_bytes", {"band": "gt128mib"}) == 200000000
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "tier1"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "tier2"}) == 2
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "tier3"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "large"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_bytes", {"band": "tier1"}) == 500000
+        assert _gauge_value(registry, "ducklake_files_per_band_bytes", {"band": "tier2"}) == 9500000
+        assert _gauge_value(registry, "ducklake_files_per_band_bytes", {"band": "large"}) == 200000000
 
     def test_band_boundaries_inclusive_lower_exclusive_upper(self, conn, registry):
-        # Exactly 1 MiB (1048576) must land in 1to5mib, not lt1mib —
+        # Exactly 1 MiB (1048576) must land in tier2, not tier1 —
         # matches DuckLake's own bin semantics (min inclusive, max
-        # exclusive) so this metric's bands compose with ducklake_maintenance.py's
+        # exclusive) so these bands compose with ducklake_maintenance.py's
         # tiered compaction.
         _stub_catalog(conn)
         conn.execute(
@@ -358,34 +371,10 @@ class TestBuiltinFilesPerBand:
         q = _builtin("ducklake_files_per_band")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
-        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "lt1mib"}) == 1
-        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "1to5mib"}) == 1
-
-
-class TestBuiltinCompactionCandidates:
-    def test_per_tier_plus_total(self, conn, registry):
-        _stub_catalog(conn)
-        conn.execute(
-            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
-            "(1, 1, 0, NULL, 'a', 500000, 100),"        # tier1
-            "(2, 1, 0, NULL, 'b', 1500000, 100),"       # tier2
-            "(3, 1, 0, NULL, 'c', 8000000, 200),"       # tier2
-            "(4, 1, 0, NULL, 'd', 50000000, 200),"      # tier3
-            "(5, 1, 0, NULL, 'e', 200000000, 300),"     # large
-            "(6, 1, 0, 5,    'f', 100, 300)"            # expired
-        )
-        q = _builtin("ducklake_compaction_candidates")
-        gauges = dm._build_query_gauges([q], registry=registry)
-        sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
-
-        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "tier1"}) == 1
-        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "tier2"}) == 2
-        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "tier3"}) == 1
-        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "large"}) == 1
-        assert _gauge_value(registry, "ducklake_compaction_candidates_count", {"tier": "total"}) == 5
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "tier1"}) == 1
+        assert _gauge_value(registry, "ducklake_files_per_band_count", {"band": "tier2"}) == 1
 
 
 class TestBuiltinSnapshots:
@@ -401,24 +390,30 @@ class TestBuiltinSnapshots:
         q = _builtin("ducklake_snapshots")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_snapshots_count") == 2
         oldest = _gauge_value(registry, "ducklake_snapshots_oldest_seconds_ago")
         newest = _gauge_value(registry, "ducklake_snapshots_newest_seconds_ago")
         # oldest >= newest, both positive (now() > snapshot times in the past).
         assert oldest >= newest > 0
+        # newest_id / oldest_id come from MIN/MAX(snapshot_id); test fixture
+        # uses ids 0 and 1 → oldest_id=0, newest_id=1.
+        assert _gauge_value(registry, "ducklake_snapshots_oldest_id") == 0
+        assert _gauge_value(registry, "ducklake_snapshots_newest_id") == 1
 
     def test_empty_table_returns_zeros_not_errors(self, conn, registry):
         _stub_catalog(conn)
         q = _builtin("ducklake_snapshots")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_snapshots_count") == 0
         assert _gauge_value(registry, "ducklake_snapshots_oldest_seconds_ago") == 0
         assert _gauge_value(registry, "ducklake_snapshots_newest_seconds_ago") == 0
+        assert _gauge_value(registry, "ducklake_snapshots_oldest_id") == 0
+        assert _gauge_value(registry, "ducklake_snapshots_newest_id") == 0
 
 
 class TestBuiltinFilesPerPartitionTop20:
@@ -444,7 +439,7 @@ class TestBuiltinFilesPerPartitionTop20:
         q = _builtin("ducklake_files_per_partition_top20")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026-05-01"}) == 2
         assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026-05-02"}) == 2
@@ -468,7 +463,7 @@ class TestBuiltinFilesPerPartitionTop20:
         q = _builtin("ducklake_files_per_partition_top20")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_files_per_partition_top20_count", {"partition": "2026/05-01"}) == 1
 
@@ -508,7 +503,7 @@ class TestBuiltinCatalog:
         q = _builtin("ducklake_catalog")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert (
             _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": expected_suffix})
@@ -524,7 +519,7 @@ class TestBuiltinCatalog:
         q = _builtin("ducklake_catalog")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": ""}) == 0.4
 
@@ -542,7 +537,7 @@ class TestBuiltinCatalog:
         q = _builtin("ducklake_catalog")
         gauges = dm._build_query_gauges([q], registry=registry)
         sm = dm._build_self_metrics(registry=registry)
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
 
         assert (
             _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "ducklake_catalog"}) == 1
@@ -559,7 +554,7 @@ class TestBuiltinCatalog:
         sm = dm._build_self_metrics(registry=registry)
 
         self._seed(conn, "1.0")
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
         assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": ""}) == 1.0
 
         conn.execute("DELETE FROM __ducklake_metadata_lake.ducklake_metadata WHERE key = 'version'")
@@ -567,7 +562,7 @@ class TestBuiltinCatalog:
             "INSERT INTO __ducklake_metadata_lake.ducklake_metadata VALUES "
             "('version', '1.1-dev1', NULL, NULL)"
         )
-        dm._run_query(conn, q, gauges[q.name], sm)
+        _run(conn, q, gauges[q.name], sm)
         assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": "-dev1"}) == 1.1
         assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": ""}) is None
 
@@ -600,7 +595,7 @@ class TestSchedulerReconnect:
         monkeypatch.setattr(dm, "_run_query", lambda *a, **kw: False)
         stop = threading.Event()
         with pytest.raises(dm._ReconnectNeeded):
-            dm._scheduler_loop(None, [q], gauges, sm, stop)
+            dm._scheduler_loop(None, [q], gauges, sm, stop, TENANT)
 
     def test_success_resets_counter(self, registry, monkeypatch):
         # Pattern: repeatedly fail (THRESHOLD-1) times then succeed once;
@@ -625,7 +620,7 @@ class TestSchedulerReconnect:
         monkeypatch.setattr(dm, "_run_query", fake_run)
         # Must not raise: each run of (THRESHOLD-1) failures is followed
         # by a success that resets the counter back to 0.
-        dm._scheduler_loop(None, [q], gauges, sm, stop)
+        dm._scheduler_loop(None, [q], gauges, sm, stop, TENANT)
 
 
 class TestConnectWithBackoff:
@@ -651,7 +646,7 @@ class TestConnectWithBackoff:
         monkeypatch.setattr(dm, "_BACKOFF_MAX_SECONDS", 0.001)
 
         stop = threading.Event()
-        result = dm._connect_with_backoff(stop, sm)
+        result = dm._connect_with_backoff(stop, sm, TENANT)
         assert result is sentinel
         assert attempts["n"] == 3
         # up was held at 0 throughout; the caller flips it to 1 once it
@@ -670,4 +665,4 @@ class TestConnectWithBackoff:
         monkeypatch.setattr(dm.ducklake_maintenance, "connect", fake_connect)
         monkeypatch.setattr(dm, "_BACKOFF_INITIAL_SECONDS", 0.001)
 
-        assert dm._connect_with_backoff(stop, sm) is None
+        assert dm._connect_with_backoff(stop, sm, TENANT) is None
