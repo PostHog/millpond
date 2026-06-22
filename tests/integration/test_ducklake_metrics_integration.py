@@ -67,9 +67,7 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
         "CREATE TABLE __ducklake_metadata_lake.ducklake_snapshot ("
         "snapshot_id BIGINT, snapshot_time VARCHAR, schema_version BIGINT)"
     )
-    c.execute(
-        "CREATE TABLE __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion (path TEXT)"
-    )
+    c.execute("CREATE TABLE __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion (path TEXT)")
     c.execute(
         "CREATE TABLE __ducklake_metadata_lake.ducklake_metadata ("
         "key VARCHAR, value VARCHAR, scope VARCHAR, scope_id BIGINT)"
@@ -89,20 +87,14 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
         "(2, 1, 0, NULL, 'b', 50000000, 100, 50000),"
         "(3, 1, 0, NULL, 'c', 200000000, 200, 200000)"
     )
-    c.execute(
-        "INSERT INTO __ducklake_metadata_lake.ducklake_delete_file VALUES "
-        "(1, 1, 0, NULL, 'd1', 1024)"
-    )
+    c.execute("INSERT INTO __ducklake_metadata_lake.ducklake_delete_file VALUES (1, 1, 0, NULL, 'd1', 1024)")
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_file_partition_value VALUES "
         "(1, 1, 0, '2026-05-01'),"
         "(2, 1, 0, '2026-05-01'),"
         "(3, 1, 0, '2026-05-02')"
     )
-    c.execute(
-        "INSERT INTO __ducklake_metadata_lake.ducklake_snapshot VALUES "
-        "(0, '2026-05-01 12:00:00+00', 0)"
-    )
+    c.execute("INSERT INTO __ducklake_metadata_lake.ducklake_snapshot VALUES (0, '2026-05-01 12:00:00+00', 0)")
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion "
         "VALUES ('s3://b/x'), ('s3://b/x'), ('s3://b/y')"
@@ -115,12 +107,12 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
     )
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_table VALUES "
-        "(1, 0, NULL),"      # live
-        "(2, 0, 1)"          # dropped
+        "(1, 0, NULL),"  # live
+        "(2, 0, 1)"  # dropped
     )
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_inlined_data_tables VALUES "
-        "(1, 1, 'ducklake_inlined_data_1_1'),"   # parent live → reachable
+        "(1, 1, 'ducklake_inlined_data_1_1'),"  # parent live → reachable
         "(99, 1, 'ducklake_inlined_data_99_1')"  # no parent ducklake_table row → unreachable
     )
 
@@ -137,24 +129,31 @@ class TestDaemonHTTP:
         queries = dm.load_queries(None, set())
         gauges = dm._build_query_gauges(queries, registry=registry)
         self_metrics = dm._build_self_metrics(registry=registry)
+        # Liveness holder threaded through `_start_http` AND `_scheduler_loop`
+        # so /-/healthy reflects actual scheduler progress (matching main()'s
+        # wiring). Without this the body would stay "starting" forever and
+        # the post-tick "ok" assertion below couldn't fire.
+        liveness = dm._Liveness(timeout=300.0)
 
         port = _free_port()
         # Bind to 127.0.0.1 in tests: HTTPServer.server_bind calls
         # socket.getfqdn(host) which on some macOS configs takes 5s for the
         # default "" (any-address) — and there's no functional reason for
         # the test to bind public interfaces.
-        srv = dm._start_http(port, registry=registry, host="127.0.0.1")
+        srv = dm._start_http(port, registry=registry, host="127.0.0.1", liveness=liveness)
         try:
             # Before the scheduler runs, /-/ready must report 503: the
             # daemon is alive but not yet serving up-to-date metrics.
             status, _ = _http_get(f"http://127.0.0.1:{port}/-/ready")
             assert status == 503
 
-            # Healthy is independent of scheduler state — it's a liveness
-            # signal only ("the process answers HTTP").
+            # Healthy is permissive pre-scheduler-start so initial connect
+            # backoff doesn't trip the probe. The body carries the structured
+            # reason so an operator hitting the endpoint manually can
+            # immediately see WHICH state the daemon is in.
             status, body = _http_get(f"http://127.0.0.1:{port}/-/healthy")
             assert status == 200
-            assert body.strip() == "ok"
+            assert body.strip() == "starting"
 
             # Run the scheduler in a thread. Initial heap fires every
             # query at startup, so the first tick completes almost
@@ -164,7 +163,7 @@ class TestDaemonHTTP:
             srv.ready = True  # type: ignore[attr-defined]
             t = threading.Thread(
                 target=dm._scheduler_loop,
-                args=(conn, queries, gauges, self_metrics, stop, TENANT),
+                args=(conn, queries, gauges, self_metrics, stop, TENANT, liveness),
                 name="scheduler",
                 daemon=True,
             )
@@ -193,6 +192,14 @@ class TestDaemonHTTP:
                 # /-/ready now flipped to 200.
                 status, _ = _http_get(f"http://127.0.0.1:{port}/-/ready")
                 assert status == 200
+
+                # /-/healthy body transitions from "starting" → "ok" once
+                # the scheduler has ticked. We're well inside the 300s
+                # timeout, so the tick alone is enough to flip the body
+                # (no in-flight query at this moment).
+                status, body = _http_get(f"http://127.0.0.1:{port}/-/healthy")
+                assert status == 200
+                assert body.strip() == "ok"
 
                 # /metrics now returns the full exposition. Validate
                 # presence (not values — those are unit-tested) so we
@@ -225,6 +232,12 @@ class TestDaemonHTTP:
                     "ducklake_metrics_up",
                     "ducklake_metrics_query_duration_seconds",
                     "ducklake_metrics_query_last_success_timestamp",
+                    # `_liveness_failures_total` is created lazily by
+                    # prometheus_client (first .labels(...).inc() call
+                    # registers the series); under steady-state the probe
+                    # never flips so the series is intentionally absent
+                    # here. Its presence is exercised in
+                    # TestLivenessProbeAtHTTPBoundary.
                 ]
                 for name in expected:
                     assert name in body, f"{name!r} missing from /metrics output"
@@ -241,3 +254,96 @@ class TestDaemonHTTP:
             srv.shutdown()
             srv.server_close()
             conn.close()
+
+
+@pytest.mark.integration
+class TestLivenessProbeAtHTTPBoundary:
+    """End-to-end: a stuck query MUST flip /-/healthy from 200 to 503.
+
+    The whole point of the liveness machinery is unverifiable without
+    driving the actual HTTP handler against an actual server with an
+    actual _Liveness holder set to the values the failure case produces.
+    Pure-function tests in tests/unit/test_ducklake_metrics.py cover the
+    decision matrix; this test proves the wiring (handler reads server's
+    liveness attr, _liveness_status returns the right reason, status code
+    is 503, on_unhealthy callback fires, counter increments, body carries
+    the message). If we drop this, a refactor that breaks the wiring
+    while leaving the pure function intact would ship green.
+    """
+
+    def test_hang_flips_healthy_to_503_and_increments_counter(self):
+        registry = CollectorRegistry()
+        # 50ms timeout so we don't have to wait for the production default
+        # (300s) to elapse; the daemon's wiring is invariant under timeout.
+        liveness = dm._Liveness(timeout=0.05)
+        self_metrics = dm._build_self_metrics(registry=registry)
+
+        # Bind the on_unhealthy callback the same way main() does so we
+        # exercise that path too — without it, the counter would stay at
+        # zero even though the handler returned 503.
+        def _on_unhealthy(reason_code, _message):
+            self_metrics.liveness_failures.labels(TENANT, reason_code).inc()
+
+        port = _free_port()
+        srv = dm._start_http(
+            port,
+            registry=registry,
+            host="127.0.0.1",
+            liveness=liveness,
+            on_unhealthy=_on_unhealthy,
+        )
+        try:
+            # Pre-scheduler-start: handler is unconditionally 200 so initial
+            # connect backoff doesn't kill the pod.
+            status, body = _http_get(f"http://127.0.0.1:{port}/-/healthy")
+            assert status == 200
+            assert body.strip() == "starting"
+
+            # Simulate "scheduler ticked once a while ago, then got stuck
+            # mid-query": flip scheduler_started, set current_query_start
+            # well past the timeout, leave last_tick fresh (the in-flight
+            # signal must win over the tick signal — that's the actual
+            # production failure mode for a hung DuckDB execute()).
+            liveness.scheduler_started = True
+            liveness.last_tick = time.monotonic()
+            liveness.current_query_start = time.monotonic() - 5.0  # 100x the timeout
+
+            status, body = _http_get(f"http://127.0.0.1:{port}/-/healthy")
+            assert status == 503, f"expected 503 on in-flight hang, got {status}: {body!r}"
+            assert "current query running" in body
+
+            # Counter incremented with the structured reason — operators
+            # alert on rate(ducklake_metrics_liveness_failures_total{reason="in_flight"}).
+            value = registry.get_sample_value(
+                "ducklake_metrics_liveness_failures_total",
+                {"tenant": TENANT, "reason": dm.LIVENESS_REASON_IN_FLIGHT},
+            )
+            assert value == 1, f"in_flight counter not incremented; got {value}"
+
+            # Now simulate "scheduler thread died silently" — clear the
+            # in-flight signal and stale the tick. The reason code should
+            # change to stale_tick and the counter gain a second series.
+            liveness.current_query_start = 0.0
+            liveness.last_tick = time.monotonic() - 5.0
+
+            status, body = _http_get(f"http://127.0.0.1:{port}/-/healthy")
+            assert status == 503
+            assert "no scheduler tick" in body
+
+            value = registry.get_sample_value(
+                "ducklake_metrics_liveness_failures_total",
+                {"tenant": TENANT, "reason": dm.LIVENESS_REASON_STALE_TICK},
+            )
+            assert value == 1, f"stale_tick counter not incremented; got {value}"
+
+            # Recovery path: a fresh tick brings the probe back to 200.
+            # Kubelet wouldn't see this in production (it would have
+            # restarted the pod) but the handler must support it for the
+            # transient-hiccup case where one slow scrape preceded the next.
+            liveness.last_tick = time.monotonic()
+            status, body = _http_get(f"http://127.0.0.1:{port}/-/healthy")
+            assert status == 200
+            assert body.strip() == "ok"
+        finally:
+            srv.shutdown()
+            srv.server_close()
