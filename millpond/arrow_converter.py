@@ -155,81 +155,105 @@ def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
     return flattened
 
 
-# Wire format the upstream ClickHouse-events producers emit for DateTime
-# columns: space-separated, UTC implied, no zone suffix, with a variable number
-# of fractional-second digits — the Node ingestion writes 3 digits for
-# timestamp/created_at/captured_at (`yyyy-MM-dd HH:mm:ss.u`) and 0 digits for
-# person_created_at (`yyyy-MM-dd HH:mm:ss`); other producers/fixtures use the
-# DateTime64(6) form with 6 digits (`2024-01-01 12:00:00.000000`). All of these
-# parse via the cast below — see the rust `ClickHouseEvent` struct
-# (`rust/common/types/src/event.rs`) and the Node `castTimestampOrNow` formats.
+# Column type-pinning. JSON has no type schema, so `_build_schema` infers a
+# column's type from its values; when those values don't carry enough type
+# information the inference diverges from the destination DuckLake column, and
+# DuckLake's widening-only schema evolution then rejects the narrowing ALTER
+# every flush (the write stalls under DuckLake at INSERT). Two cases on the
+# duckling backfill's `posthog.events`:
+#   - date-times arrive as strings -> inferred VARCHAR, table is TIMESTAMPTZ;
+#   - `project_id` is the one numeric column the producer serializes as explicit
+#     JSON null (no serde skip), so an all-null batch infers VARCHAR not BIGINT.
+# `coerce_typed_columns` pins named columns to a target type before the batch
+# reaches the sink so the inferred type matches the table (typed append, no DDL)
+# and freshly-created tables use the right type from the start.
 #
-# PyArrow can't parse them via `strptime` (the `%f` directive isn't supported in
-# this build) or via a direct cast to a tz-aware timestamp (that demands an
-# explicit zone offset in the string). The working path is two steps: cast the
-# string to a *naive* microsecond timestamp (Arrow's ISO-8601 parser accepts the
-# space separator and 0/3/6 fractional digits), then stamp it UTC with
-# `assume_timezone`. The result is `timestamp[us, tz=UTC]`, which
-# schema._arrow_type_to_duckdb maps to TIMESTAMPTZ — matching the typed
-# timestamp columns the duckling backfill writes.
-_TIMESTAMP_UNIT = "us"
-_TIMESTAMP_TZ = "UTC"
+# Target type registry: name (as used in MILLPOND_TYPED_COLUMNS) -> (the Arrow
+# type that maps to the intended DuckLake column type via
+# schema._arrow_type_to_duckdb, used to skip already-correct columns) and a
+# coercer that turns a (possibly string) column into that Arrow type.
+#
+# timestamptz needs special handling: PyArrow can't parse the wire format via
+# `strptime` (no `%f` in this build) or a direct tz-aware cast (it demands an
+# explicit zone offset). Cast to a *naive* microsecond timestamp first (Arrow's
+# ISO-8601 parser accepts the space separator and 0/3/6 fractional digits the
+# Node/ClickHouse producers emit — see rust `ClickHouseEvent` in
+# `rust/common/types/src/event.rs`), then stamp it UTC with `assume_timezone`.
+_TIMESTAMPTZ = pa.timestamp("us", tz="UTC")
 
 
-def coerce_timestamp_columns(table: pa.Table, columns: tuple[str, ...]) -> pa.Table:
-    """Parse the named string columns into ``timestamp[us, tz=UTC]``.
+def _to_timestamptz(col):
+    return pc.assume_timezone(col.cast(pa.timestamp("us")), "UTC")
 
-    JSON has no native timestamp type, so ``_build_schema`` infers VARCHAR for
-    any column whose values arrive as date-time strings. When millpond writes
-    into a table whose column is already TIMESTAMPTZ (e.g. the duckling backfill's
-    ``posthog.events``), that VARCHAR batch type can't be reconciled — DuckLake
-    only widens, and TIMESTAMPTZ→VARCHAR is a narrowing — so the per-flush
-    schema-evolution ALTER is rejected and the write stalls. Pinning these
-    columns to a real Arrow timestamp here, before the batch reaches the sink,
-    makes the inferred type match the table so the insert is a typed append with
-    no DDL, and makes freshly-created tables use TIMESTAMPTZ in the first place.
 
-    Only columns that are (a) present in this batch and (b) string-typed are
-    touched; a column already timestamp-typed, or absent from the batch, is left
-    as-is so the function is safe to point at a superset of columns.
+_COERCERS: dict[str, tuple[pa.DataType, object]] = {
+    "timestamptz": (_TIMESTAMPTZ, _to_timestamptz),
+    "bigint": (pa.int64(), lambda col: col.cast(pa.int64())),
+    "double": (pa.float64(), lambda col: col.cast(pa.float64())),
+    "boolean": (pa.bool_(), lambda col: col.cast(pa.bool_())),
+    "varchar": (pa.string(), lambda col: col.cast(pa.string())),
+}
 
-    Coercion is non-fatal per column: if a value doesn't match the producer's
-    wire format, the cast for that column raises ``ArrowInvalid`` and we leave the
-    column as string for this batch (the write still lands via DuckDB's implicit
-    VARCHAR→TIMESTAMPTZ cast on INSERT), bumping ``errors_total{type="timestamp_
-    coercion"}`` so a format drift is loud via metrics/alerting rather than
-    silently nulling data — and, critically, without raising on the consume path,
-    where an exception would unwind past main.py's offset bookkeeping and risk
-    committing past records that were never written.
+# Public allowlist for config validation (single source of truth).
+COERCIBLE_TYPES = frozenset(_COERCERS)
+
+
+def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], ...]) -> pa.Table:
+    """Pin named columns to a target type before the batch reaches the sink.
+
+    ``typed_columns`` is a sequence of ``(column_name, type_name)`` pairs where
+    ``type_name`` is one of ``COERCIBLE_TYPES``. A column is coerced only when it
+    is present in the batch and not already the target Arrow type, so the same
+    map is safe to point at a superset of columns and at heterogeneous batches.
+
+    Coercion is non-fatal per column: if a value can't be cast to the target the
+    cast raises ``ArrowInvalid`` and we leave the column unchanged for this batch
+    (the write still lands via DuckDB's implicit cast on INSERT), bumping
+    ``errors_total{type="column_coercion"}`` so a producer format/type drift is
+    loud via metrics/alerting rather than silently nulling data — and, critically,
+    without raising on the consume path, where an exception would unwind past
+    main.py's offset bookkeeping and risk committing past records never written.
     """
-    if not columns:
+    if not typed_columns:
         return table
 
-    target = set(columns)
-    coerced = 0
+    targets = dict(typed_columns)  # name -> type_name
+    changed = False
     new_columns = []
     new_fields = []
     for i, field in enumerate(table.schema):
         col = table.column(i)
-        if field.name in target and (pa.types.is_string(field.type) or pa.types.is_large_string(field.type)):
-            try:
-                parsed = pc.assume_timezone(col.cast(pa.timestamp(_TIMESTAMP_UNIT)), _TIMESTAMP_TZ)
-            except pa.ArrowInvalid as e:
-                log.warning("Timestamp coercion failed for column %s; leaving as string this batch: %s", field.name, e)
-                metrics.errors_total.labels(type="timestamp_coercion").inc()
-                new_columns.append(col)
-                new_fields.append(field)
-                continue
-            new_columns.append(parsed)
-            new_fields.append(pa.field(field.name, parsed.type, nullable=field.nullable))
-            coerced += 1
-        else:
+        type_name = targets.get(field.name)
+        if type_name is None:
             new_columns.append(col)
             new_fields.append(field)
+            continue
 
-    if coerced == 0:
+        arrow_type, coercer = _COERCERS[type_name]
+        if field.type == arrow_type:
+            # Already the intended type (e.g. project_id arrived non-null as int64).
+            new_columns.append(col)
+            new_fields.append(field)
+            continue
+
+        try:
+            coerced_col = coercer(col)
+        except pa.ArrowInvalid as e:
+            log.warning(
+                "Coercion of column %s to %s failed; leaving as-is this batch: %s", field.name, type_name, e
+            )
+            metrics.errors_total.labels(type="column_coercion").inc()
+            new_columns.append(col)
+            new_fields.append(field)
+            continue
+
+        new_columns.append(coerced_col)
+        new_fields.append(pa.field(field.name, coerced_col.type, nullable=field.nullable))
+        metrics.columns_coerced_total.labels(target_type=type_name).inc()
+        changed = True
+
+    if not changed:
         return table
-    metrics.timestamp_columns_coerced_total.inc(coerced)
     return pa.table(dict(zip([f.name for f in new_fields], new_columns)), schema=pa.schema(new_fields))
 
 

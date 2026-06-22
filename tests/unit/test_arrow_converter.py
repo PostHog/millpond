@@ -4,7 +4,7 @@ from unittest.mock import patch
 import orjson
 import pyarrow as pa
 
-from millpond.arrow_converter import _drop_null_typed_columns, coerce_timestamp_columns, convert
+from millpond.arrow_converter import _drop_null_typed_columns, coerce_typed_columns, convert
 
 
 class TestConvert:
@@ -222,14 +222,14 @@ class TestDropNullTypedColumns:
         assert out.column_names == ["string_with_nulls"]
 
 
-class TestCoerceTimestampColumns:
-    # The wire format every ClickHouse-events producer emits for DateTime64
-    # columns: space-separated, six fractional digits, UTC implied.
+class TestCoerceTypedColumns:
+    # The wire format ClickHouse-events producers emit for DateTime columns:
+    # space-separated, UTC implied, variable fractional precision.
     WIRE = "2024-01-01 12:00:00.000000"
 
     def test_parses_wire_format_to_timestamptz(self):
         table = pa.table({"timestamp": [self.WIRE], "team_id": [1]})
-        out = coerce_timestamp_columns(table, ("timestamp",))
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
         assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
         assert out.column("timestamp").to_pylist() == [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)]
         # Untargeted columns are untouched.
@@ -238,14 +238,29 @@ class TestCoerceTimestampColumns:
     def test_coerces_multiple_columns(self):
         cols = ("timestamp", "created_at", "group0_created_at")
         table = pa.table({c: [self.WIRE] for c in cols})
-        out = coerce_timestamp_columns(table, cols)
+        out = coerce_typed_columns(table, tuple((c, "timestamptz") for c in cols))
         for c in cols:
             assert out.schema.field(c).type == pa.timestamp("us", tz="UTC")
+
+    def test_all_null_string_project_id_coerces_to_bigint(self):
+        # project_id serializes as explicit JSON null (no serde skip), so an
+        # all-null batch infers VARCHAR; bigint coercion realigns it to the
+        # events table's project_id BIGINT.
+        table = pa.table({"project_id": pa.array([None, None], pa.string())})
+        out = coerce_typed_columns(table, (("project_id", "bigint"),))
+        assert out.schema.field("project_id").type == pa.int64()
+        assert out.column("project_id").to_pylist() == [None, None]
+
+    def test_already_target_int64_left_alone(self):
+        # When project_id has values it already infers int64 — no rebuild.
+        table = pa.table({"project_id": pa.array([1, 2], pa.int64())})
+        out = coerce_typed_columns(table, (("project_id", "bigint"),))
+        assert out is table
 
     def test_nulls_pass_through(self):
         # Nullable timestamps (e.g. person_created_at) arrive as JSON null.
         table = pa.table({"person_created_at": pa.array([self.WIRE, None], pa.string())})
-        out = coerce_timestamp_columns(table, ("person_created_at",))
+        out = coerce_typed_columns(table, (("person_created_at", "timestamptz"),))
         assert out.column("person_created_at").to_pylist() == [
             datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
             None,
@@ -253,20 +268,20 @@ class TestCoerceTimestampColumns:
 
     def test_missing_column_is_noop(self):
         # A configured column absent from this batch is skipped, not an error,
-        # so the same column list can be pointed at heterogeneous batches.
+        # so the same map can be pointed at heterogeneous batches.
         table = pa.table({"team_id": [1]})
-        out = coerce_timestamp_columns(table, ("timestamp",))
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
         assert out is table
 
     def test_already_timestamp_typed_left_alone(self):
         ts = pa.array([datetime(2024, 1, 1, tzinfo=UTC)], pa.timestamp("us", tz="UTC"))
         table = pa.table({"timestamp": ts})
-        out = coerce_timestamp_columns(table, ("timestamp",))
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
         assert out is table
 
-    def test_empty_columns_is_noop(self):
+    def test_empty_map_is_noop(self):
         table = pa.table({"timestamp": [self.WIRE]})
-        out = coerce_timestamp_columns(table, ())
+        out = coerce_typed_columns(table, ())
         assert out is table
 
     def test_varying_fractional_precision_parses(self):
@@ -278,7 +293,7 @@ class TestCoerceTimestampColumns:
             "created_at": "2024-01-01 12:00:00.123456",  # 6 digits
         }
         table = pa.table({k: [v] for k, v in cols.items()})
-        out = coerce_timestamp_columns(table, tuple(cols))
+        out = coerce_typed_columns(table, tuple((c, "timestamptz") for c in cols))
         for c in cols:
             assert out.schema.field(c).type == pa.timestamp("us", tz="UTC")
 
@@ -288,22 +303,23 @@ class TestCoerceTimestampColumns:
         # committing offsets past unwritten records). The column falls back to
         # string and a dedicated error metric fires so the drift is still loud.
         table = pa.table({"timestamp": ["not-a-timestamp"], "team_id": [1]})
-        out = coerce_timestamp_columns(table, ("timestamp",))
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
         assert out.schema.field("timestamp").type == pa.string()
         assert out.column("timestamp").to_pylist() == ["not-a-timestamp"]
-        mock_metrics.errors_total.labels.assert_called_with(type="timestamp_coercion")
-        mock_metrics.errors_total.labels(type="timestamp_coercion").inc.assert_called_once()
-        # A good column alongside a bad one still coerces.
-        mock_metrics.timestamp_columns_coerced_total.inc.assert_not_called()
+        mock_metrics.errors_total.labels.assert_called_with(type="column_coercion")
+        mock_metrics.errors_total.labels(type="column_coercion").inc.assert_called_once()
+        mock_metrics.columns_coerced_total.labels.assert_not_called()
 
     @patch("millpond.arrow_converter.metrics")
     def test_partial_failure_coerces_good_columns(self, mock_metrics):
+        # One bad column falls back; the good one (a different target type) still
+        # coerces, and its per-type metric fires.
         table = pa.table({"timestamp": [self.WIRE], "created_at": ["garbage"]})
-        out = coerce_timestamp_columns(table, ("timestamp", "created_at"))
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"), ("created_at", "timestamptz")))
         assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
         assert out.schema.field("created_at").type == pa.string()
-        mock_metrics.timestamp_columns_coerced_total.inc.assert_called_once_with(1)
-        mock_metrics.errors_total.labels(type="timestamp_coercion").inc.assert_called_once()
+        mock_metrics.columns_coerced_total.labels.assert_called_once_with(target_type="timestamptz")
+        mock_metrics.errors_total.labels(type="column_coercion").inc.assert_called_once()
 
     def test_roundtrips_through_convert(self):
         # The realistic path: JSON → convert() (infers VARCHAR) → coerce.
@@ -311,5 +327,5 @@ class TestCoerceTimestampColumns:
         table = convert(messages)
         assert table is not None
         assert table.schema.field("timestamp").type == pa.string()
-        out = coerce_timestamp_columns(table, ("timestamp",))
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
         assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")

@@ -294,29 +294,33 @@ def _capture_skip_calls(mock_metrics):
     return skip_calls
 
 
-class TestCoerceTimestamps:
-    """The main.py delegate that gates coercion on cfg.timestamp_columns."""
+class TestCoerceColumns:
+    """The main.py delegate that gates coercion on cfg.typed_columns."""
 
-    def _cfg(self, *, timestamp_columns=None):
+    def _cfg(self, *, typed_columns=None):
         cfg = MagicMock()
-        cfg.timestamp_columns = timestamp_columns
+        cfg.typed_columns = typed_columns
         return cfg
 
     def test_no_op_when_unconfigured(self):
-        from millpond.main import _coerce_timestamps
+        from millpond.main import _coerce_columns
 
         table = pa.table({"timestamp": ["2024-01-01 12:00:00.000000"]})
-        result = _coerce_timestamps(table, self._cfg(timestamp_columns=None))
+        result = _coerce_columns(table, self._cfg(typed_columns=None))
         # Short-circuit: same object, no coercion.
         assert result is table
         assert result.schema.field("timestamp").type == pa.string()
 
     def test_coerces_when_configured(self):
-        from millpond.main import _coerce_timestamps
+        from millpond.main import _coerce_columns
 
-        table = pa.table({"timestamp": ["2024-01-01 12:00:00.000000"], "team_id": [1]})
-        result = _coerce_timestamps(table, self._cfg(timestamp_columns=("timestamp",)))
+        table = pa.table(
+            {"timestamp": ["2024-01-01 12:00:00.000000"], "project_id": pa.array([None], pa.string())}
+        )
+        pairs = (("timestamp", "timestamptz"), ("project_id", "bigint"))
+        result = _coerce_columns(table, self._cfg(typed_columns=pairs))
         assert result.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert result.schema.field("project_id").type == pa.int64()
 
 
 class TestApplyFilter:

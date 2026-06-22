@@ -93,17 +93,19 @@ If any sort field is missing from a batch's schema, the sort is skipped (records
 
 Per-flush cost is ~50–200 ms on a 256 MB / 30k-row batch. Peak memory roughly doubles during the sort because `pa.Table.take()` rewrites a fresh copy of every column; budget accordingly relative to the pod's memory limit.
 
-### Timestamp coercion
+### Column type coercion
 
-JSON has no native timestamp type, so date-time values arrive as strings and schema inference types them `VARCHAR`. That's fine for a table millpond creates itself, but it stalls writes into a table whose columns are already `TIMESTAMPTZ` — DuckLake only widens types, and `TIMESTAMPTZ`→`VARCHAR` is a narrowing, so the per-flush `ALTER COLUMN` is rejected (and the insert stalls under DuckLake). `MILLPOND_TIMESTAMP_COLUMNS` names the columns to parse from their string form into `TIMESTAMPTZ` (microsecond, UTC) before the write, so the batch type matches the destination and the insert is a typed append with no DDL.
+JSON carries no type schema, so millpond infers a column's type from its values. When the values don't carry enough type information the inference diverges from the destination DuckLake column, and DuckLake's widening-only schema evolution then rejects the narrowing `ALTER` every flush (the insert stalls under DuckLake). `MILLPOND_TYPED_COLUMNS` pins named columns to a target type *before* the write, so the batch type matches the destination — the insert is a typed append with no DDL, and freshly-created tables get the right type from the start.
+
+Format is comma-separated `column:type` pairs; supported types are `timestamptz`, `bigint`, `double`, `boolean`, `varchar`. For re-pointing a consumer at the duckling backfill's `posthog.events` (its `events` table has 8 `TIMESTAMPTZ` columns and `project_id BIGINT`):
 
 ```
-MILLPOND_TIMESTAMP_COLUMNS=timestamp,created_at,person_created_at,group0_created_at,group1_created_at,group2_created_at,group3_created_at,group4_created_at
+MILLPOND_TYPED_COLUMNS=timestamp:timestamptz,created_at:timestamptz,person_created_at:timestamptz,group0_created_at:timestamptz,group1_created_at:timestamptz,group2_created_at:timestamptz,group3_created_at:timestamptz,group4_created_at:timestamptz,project_id:bigint
 ```
 
-Use this when pointing a consumer at a pre-existing typed table (e.g. the duckling backfill's `posthog.events`). Each coerced column increments `millpond_timestamp_columns_coerced_total`. The input is the ClickHouse-events wire format — space-separated, UTC implied, with 0, 3, or 6 fractional digits depending on column/producer (e.g. `2024-01-01 12:00:00.123`); all parse. Coercion is **non-fatal**: a value that doesn't parse leaves that column as string for the batch and bumps `millpond_errors_total{type="timestamp_coercion"}` (so a producer format drift is loud via metrics without crashing the pod or risking offset commits past unwritten records). Columns absent from a batch or already timestamp-typed are left untouched, so the same list is safe across heterogeneous batches.
+Why those columns: date-times arrive as strings, so inference types them `VARCHAR` against a `TIMESTAMPTZ` column; and `project_id` is the one numeric column the producer serializes as explicit JSON `null` (no `skip_serializing_if`), so an all-null batch infers `VARCHAR` against `BIGINT`. Pinning both makes the re-point fully clean. (`person_mode`/`historical_migration` need no pin — they serialize as a string and an omitted-or-bool respectively, matching the table.)
 
-> **Re-pointing at `posthog.events` — known caveat.** Coercion only fixes the timestamp columns. The backfilled `events` table also has `project_id BIGINT`, and `project_id` is the one numeric column the producer serializes as explicit JSON `null` (no `skip_serializing_if`). In a flush batch where *every* record has a null `project_id`, inference falls back to `VARCHAR` and `evolve()` will attempt (and DuckLake will reject) a narrowing `ALTER` every such flush — `errors_total{type="schema"}` noise, though not data loss (rows still land via the implicit insert cast). Steady-state batches almost always contain at least one non-null `project_id`, but pin it (a typed-column map generalising this feature) or accept the caveat before relying on a fully clean re-point.
+The timestamp wire format is space-separated, UTC implied, with 0, 3, or 6 fractional digits depending on column/producer (e.g. `2024-01-01 12:00:00.123`); all parse. Each coerced column increments `millpond_columns_coerced_total{target_type=...}`. Coercion is **non-fatal**: a value that can't be cast leaves that column unchanged for the batch and bumps `millpond_errors_total{type="column_coercion"}` (so a producer format/type drift is loud via metrics without crashing the pod or risking offset commits past unwritten records). Columns absent from a batch or already the target type are left untouched, so the same map is safe across heterogeneous batches.
 
 ## Adaptive Backpressure
 
@@ -221,7 +223,7 @@ See [Record Handling](#record-handling) for context. All four variables below ar
 | `MILLPOND_FILTER_DROP_FIELD_NAME` | no | | Reserved for a future denylist filter; setting it today raises at startup. Mutually exclusive with `MILLPOND_FILTER_KEEP_FIELD_NAME`. |
 | `MILLPOND_FILTER_VALUES` | no | | Comma-separated allowed values. Auto-detected as int if every token parses as an integer, string otherwise. Required when either filter field name is set. |
 | `MILLPOND_SORT_BY` | no | | Comma-separated column names; the batch is sorted ascending by these in tuple order before each write. Missing fields cause the sort to be skipped (records still flow). |
-| `MILLPOND_TIMESTAMP_COLUMNS` | no | | Comma-separated column names to parse from JSON date-time strings into `TIMESTAMPTZ` (µs, UTC) before write. Needed when writing into a table whose timestamp columns are already `TIMESTAMPTZ` (otherwise inference types them `VARCHAR` and schema evolution wedges). Validated as safe identifiers. |
+| `MILLPOND_TYPED_COLUMNS` | no | | Comma-separated `column:type` pairs pinning columns to a target type before write (types: `timestamptz`, `bigint`, `double`, `boolean`, `varchar`). Needed when writing into a table whose columns are already typed and JSON inference would diverge (date-times → `VARCHAR` vs `TIMESTAMPTZ`; all-null `project_id` → `VARCHAR` vs `BIGINT`). Column names validated as safe identifiers; types validated against the allowlist. |
 
 ## Releases
 

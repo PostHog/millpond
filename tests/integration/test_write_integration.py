@@ -12,7 +12,7 @@ import orjson
 import pyarrow as pa
 import pytest
 
-from millpond.arrow_converter import coerce_timestamp_columns, convert
+from millpond.arrow_converter import coerce_typed_columns, convert
 from millpond.ducklake import write
 from millpond.schema import SchemaManager
 
@@ -253,6 +253,7 @@ class TestTimestampCoercionWritePath:
         "person_created_at",
         "group0_created_at",
     )
+    TS_PAIRS = tuple((c, "timestamptz") for c in TS_COLS)
     WIRE = "2024-01-01 12:00:00.000000"
 
     def _nrt_batch(self) -> pa.Table:
@@ -325,7 +326,7 @@ class TestTimestampCoercionWritePath:
         schema_mgr._load_table_schema()
         mock_conn = self._reject_alter_column(schema_mgr)
 
-        batch = coerce_timestamp_columns(self._nrt_batch(), self.TS_COLS)
+        batch = coerce_typed_columns(self._nrt_batch(), self.TS_PAIRS)
         # write() goes through the same (ALTER-rejecting) connection.
         write(mock_conn, "events", batch, cache, schema_mgr, schema_name="main")
 
@@ -344,7 +345,7 @@ class TestTimestampCoercionWritePath:
     def test_fresh_table_created_with_timestamptz(self, conn, cache):
         """When millpond owns table creation, a coerced batch yields TIMESTAMPTZ
         columns from the start (vs VARCHAR for an uncoerced string batch)."""
-        batch = coerce_timestamp_columns(self._nrt_batch(), self.TS_COLS)
+        batch = coerce_typed_columns(self._nrt_batch(), self.TS_PAIRS)
         write(conn, "events", batch, cache, SchemaManager(conn, "events"), schema_name="main")
 
         types = dict(

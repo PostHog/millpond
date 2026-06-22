@@ -64,7 +64,7 @@ def _minimal_config() -> Config:
         filter_drop_field=None,
         filter_values=None,
         sort_by=None,
-        timestamp_columns=None,
+        typed_columns=None,
         kafka_config_overrides=(),
     )
 

@@ -463,8 +463,8 @@ class TestSortByConfig:
         assert any("Sort by: team_id, timestamp (ascending)" in m for m in msgs)
 
 
-class TestTimestampColumnsConfig:
-    """MILLPOND_TIMESTAMP_COLUMNS parsing and validation."""
+class TestTypedColumnsConfig:
+    """MILLPOND_TYPED_COLUMNS parsing and validation."""
 
     @pytest.fixture(autouse=True)
     def _env(self, monkeypatch):
@@ -480,46 +480,69 @@ class TestTimestampColumnsConfig:
 
     def test_unset_yields_none(self):
         cfg = load()
-        assert cfg.timestamp_columns is None
+        assert cfg.typed_columns is None
 
-    def test_single_field(self, monkeypatch):
-        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", "timestamp")
+    def test_single_pair(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "timestamp:timestamptz")
         cfg = load()
-        assert cfg.timestamp_columns == ("timestamp",)
+        assert cfg.typed_columns == (("timestamp", "timestamptz"),)
 
-    def test_events_column_set(self, monkeypatch):
-        # The full set of TIMESTAMPTZ columns in the duckling backfill's events table.
-        cols = "timestamp,created_at,person_created_at,group0_created_at,group4_created_at"
-        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", cols)
+    def test_events_column_set_with_project_id(self, monkeypatch):
+        # The full re-point set: 8 TIMESTAMPTZ columns + project_id BIGINT.
+        spec = "timestamp:timestamptz,created_at:timestamptz,project_id:bigint"
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", spec)
         cfg = load()
-        assert cfg.timestamp_columns == (
-            "timestamp",
-            "created_at",
-            "person_created_at",
-            "group0_created_at",
-            "group4_created_at",
+        assert cfg.typed_columns == (
+            ("timestamp", "timestamptz"),
+            ("created_at", "timestamptz"),
+            ("project_id", "bigint"),
         )
 
-    def test_whitespace_trimmed_and_empty_tokens_dropped(self, monkeypatch):
-        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", " timestamp , , created_at ,")
+    def test_type_name_lowercased_and_whitespace_trimmed(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", " timestamp : TIMESTAMPTZ , , project_id:BigInt ,")
         cfg = load()
-        assert cfg.timestamp_columns == ("timestamp", "created_at")
+        assert cfg.typed_columns == (("timestamp", "timestamptz"), ("project_id", "bigint"))
+
+    def test_order_preserved(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "b:bigint,a:timestamptz")
+        cfg = load()
+        assert cfg.typed_columns == (("b", "bigint"), ("a", "timestamptz"))
+
+    def test_duplicate_same_type_deduped(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "timestamp:timestamptz,timestamp:timestamptz")
+        cfg = load()
+        assert cfg.typed_columns == (("timestamp", "timestamptz"),)
+
+    def test_duplicate_conflicting_type_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "x:bigint,x:timestamptz")
+        with pytest.raises(RuntimeError, match="both"):
+            load()
 
     def test_whitespace_only_value_yields_none(self, monkeypatch):
-        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", "   ")
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "   ")
         cfg = load()
-        assert cfg.timestamp_columns is None
+        assert cfg.typed_columns is None
 
-    def test_unsafe_field_name_rejected(self, monkeypatch):
-        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", "timestamp, foo; DROP TABLE x")
+    def test_missing_colon_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "timestamp")
+        with pytest.raises(RuntimeError, match="must be 'column:type'"):
+            load()
+
+    def test_unknown_type_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "timestamp:datetime")
+        with pytest.raises(RuntimeError, match="must be one of"):
+            load()
+
+    def test_unsafe_column_name_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "foo; DROP TABLE x:bigint")
         with pytest.raises(RuntimeError, match="unsafe characters"):
             load()
 
-    def test_log_lists_columns(self, monkeypatch, caplog):
+    def test_log_lists_pairs(self, monkeypatch, caplog):
         import logging
 
-        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", "timestamp,created_at")
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "timestamp:timestamptz,project_id:bigint")
         with caplog.at_level(logging.INFO, logger="millpond.config"):
             load()
         msgs = [r.message for r in caplog.records]
-        assert any("Coerce to TIMESTAMPTZ: timestamp, created_at" in m for m in msgs)
+        assert any("Coerce typed columns: timestamp:timestamptz, project_id:bigint" in m for m in msgs)
