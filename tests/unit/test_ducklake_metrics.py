@@ -150,9 +150,13 @@ def registry():
 TENANT = "test"
 
 
-def _run(conn, q, gauges, sm):
-    """Shim around the underlying _run_query so test bodies don't carry the tenant arg."""
-    return dm.__dict__["_run_query"](conn, q, gauges, sm, TENANT)
+def _run(conn, q, gauges, sm, **kwargs):
+    """Shim around the underlying _run_query so test bodies don't carry the tenant arg.
+
+    Forwards any extra kwargs (e.g. ``liveness=`` for the liveness-state tests)
+    to the wrapped function so we don't need a second shim per signature.
+    """
+    return dm.__dict__["_run_query"](conn, q, gauges, sm, TENANT, **kwargs)
 
 
 def _gauge_value(reg: CollectorRegistry, metric: str, labels: dict | None = None) -> float | None:
@@ -244,9 +248,7 @@ class TestRunQuery:
 
         assert _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "t_broken"}) == 1
         # last_success not set on failure.
-        assert (
-            _gauge_value(registry, "ducklake_metrics_query_last_success_timestamp", {"query": "t_broken"}) is None
-        )
+        assert _gauge_value(registry, "ducklake_metrics_query_last_success_timestamp", {"query": "t_broken"}) is None
 
     def test_column_name_mismatch_raises_through_error_path(self, conn, registry):
         # SQL columns must include every name listed in labels+values.
@@ -278,9 +280,7 @@ class TestBuiltinPendingDeletes:
     def test_against_stub_schema(self, conn, registry):
         # Re-create just enough of __ducklake_metadata_lake to run the query.
         conn.execute("CREATE SCHEMA __ducklake_metadata_lake")
-        conn.execute(
-            "CREATE TABLE __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion (path TEXT)"
-        )
+        conn.execute("CREATE TABLE __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion (path TEXT)")
         conn.execute(
             "INSERT INTO __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion "
             "VALUES ('s3://b/x'), ('s3://b/x'), ('s3://b/y'), ('s3://b/z')"
@@ -337,12 +337,12 @@ class TestBuiltinFilesPerBand:
         # TIERS: tier1 <1MiB, tier2 1-10MiB, tier3 10-64MiB, large >=64MiB.
         conn.execute(
             "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
-            "(1, 1, 0, NULL, 'a', 500000, 100),"        # tier1 (<1MiB)
-            "(2, 1, 0, NULL, 'b', 1500000, 100),"       # tier2 (1-10MiB)
-            "(3, 1, 0, NULL, 'c', 8000000, 200),"       # tier2 (1-10MiB)
-            "(4, 1, 0, NULL, 'd', 50000000, 200),"      # tier3 (10-64MiB)
-            "(5, 1, 0, NULL, 'e', 200000000, 300),"     # large (>=64MiB)
-            "(6, 1, 0, 5,    'f', 100, 300)"            # expired — must NOT be counted
+            "(1, 1, 0, NULL, 'a', 500000, 100),"  # tier1 (<1MiB)
+            "(2, 1, 0, NULL, 'b', 1500000, 100),"  # tier2 (1-10MiB)
+            "(3, 1, 0, NULL, 'c', 8000000, 200),"  # tier2 (1-10MiB)
+            "(4, 1, 0, NULL, 'd', 50000000, 200),"  # tier3 (10-64MiB)
+            "(5, 1, 0, NULL, 'e', 200000000, 300),"  # large (>=64MiB)
+            "(6, 1, 0, 5,    'f', 100, 300)"  # expired — must NOT be counted
         )
         q = _builtin("ducklake_files_per_band")
         gauges = dm._build_query_gauges([q], registry=registry)
@@ -449,10 +449,7 @@ class TestBuiltinFilesPerPartitionTop20:
 
     def test_composite_partition_keys_joined_with_slash(self, conn, registry):
         _stub_catalog(conn)
-        conn.execute(
-            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
-            "(1, 1, 0, NULL, 'a', 100, 100)"
-        )
+        conn.execute("INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES (1, 1, 0, NULL, 'a', 100, 100)")
         # Two-column partition: index 0 = year, index 1 = day. The query
         # joins them in key-index order with '/'.
         conn.execute(
@@ -505,10 +502,7 @@ class TestBuiltinCatalog:
         sm = dm._build_self_metrics(registry=registry)
         _run(conn, q, gauges[q.name], sm)
 
-        assert (
-            _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": expected_suffix})
-            == expected_value
-        )
+        assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": expected_suffix}) == expected_value
 
     def test_ignores_other_metadata_keys(self, conn, registry):
         # The query filters on key='version' AND scope IS NULL. Other keys
@@ -539,9 +533,7 @@ class TestBuiltinCatalog:
         sm = dm._build_self_metrics(registry=registry)
         _run(conn, q, gauges[q.name], sm)
 
-        assert (
-            _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "ducklake_catalog"}) == 1
-        )
+        assert _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "ducklake_catalog"}) == 1
 
     def test_label_clears_on_upgrade(self, conn, registry):
         # When a lake upgrades from a release ('') to a dev tag ('-dev1'),
@@ -559,8 +551,7 @@ class TestBuiltinCatalog:
 
         conn.execute("DELETE FROM __ducklake_metadata_lake.ducklake_metadata WHERE key = 'version'")
         conn.execute(
-            "INSERT INTO __ducklake_metadata_lake.ducklake_metadata VALUES "
-            "('version', '1.1-dev1', NULL, NULL)"
+            "INSERT INTO __ducklake_metadata_lake.ducklake_metadata VALUES ('version', '1.1-dev1', NULL, NULL)"
         )
         _run(conn, q, gauges[q.name], sm)
         assert _gauge_value(registry, "ducklake_catalog_format_version", {"suffix": "-dev1"}) == 1.1
@@ -666,3 +657,200 @@ class TestConnectWithBackoff:
         monkeypatch.setattr(dm, "_BACKOFF_INITIAL_SECONDS", 0.001)
 
         assert dm._connect_with_backoff(stop, sm, TENANT) is None
+
+
+class TestConnectMemoryLimit:
+    """`SET memory_limit` is applied right after connect when configured.
+
+    Critical because DuckDB's default budget is ~75% of detected RAM, which
+    in a cgroup-limited pod resolves to host RAM and OOM-kills the pod
+    before any query runs.
+    """
+
+    def test_memory_limit_applied_when_set(self, registry, monkeypatch):
+        sm = dm._build_self_metrics(registry=registry)
+        executed: list[str] = []
+
+        class FakeConn:
+            def execute(self, sql):
+                executed.append(sql)
+
+        monkeypatch.setattr(dm.ducklake_maintenance, "connect", FakeConn)
+        monkeypatch.setattr(dm, "_BACKOFF_INITIAL_SECONDS", 0.001)
+
+        result = dm._connect_with_backoff(threading.Event(), sm, TENANT, memory_limit="512MB")
+        assert isinstance(result, FakeConn)
+        assert executed == ["SET memory_limit = '512MB'"]
+
+    def test_memory_limit_omitted_when_none(self, registry, monkeypatch):
+        # No SET statement at all when caller doesn't pass a limit — preserves
+        # the previous behaviour for callers that haven't been wired through.
+        sm = dm._build_self_metrics(registry=registry)
+        executed: list[str] = []
+
+        class FakeConn:
+            def execute(self, sql):
+                executed.append(sql)
+
+        monkeypatch.setattr(dm.ducklake_maintenance, "connect", FakeConn)
+        monkeypatch.setattr(dm, "_BACKOFF_INITIAL_SECONDS", 0.001)
+
+        dm._connect_with_backoff(threading.Event(), sm, TENANT, memory_limit=None)
+        assert executed == []
+
+    def test_memory_limit_rejects_injection_at_startup(self, registry, monkeypatch):
+        # Reuses ducklake_maintenance._sanitize_setting_value, which only
+        # allows the alphanumeric + safe-punctuation charset. Validation
+        # happens ONCE up-front (outside the retry loop) so a bad value
+        # raises immediately at daemon startup — if it happened inside
+        # the loop the broad `except Exception:` would swallow it and
+        # retry the bad input forever in a tight 0.001s sleep loop.
+        sm = dm._build_self_metrics(registry=registry)
+
+        def must_not_connect():
+            pytest.fail("connect() must not be reached with an invalid memory_limit value")
+
+        monkeypatch.setattr(dm.ducklake_maintenance, "connect", must_not_connect)
+
+        with pytest.raises(ValueError, match="Illegal character"):
+            dm._connect_with_backoff(threading.Event(), sm, TENANT, memory_limit="512MB'; DROP TABLE x; --")
+
+
+class TestLivenessStatus:
+    """The pure /-/healthy decision function.
+
+    Drives the probe via plain (state, now) inputs so each restart-or-not
+    case is tested without an HTTP round-trip or a scheduler thread.
+    """
+
+    def test_no_liveness_object_is_healthy(self):
+        # Daemon constructed without a liveness holder (pre-wiring callers or
+        # tests) must not flap the probe — return healthy.
+        ok, code, message = dm._liveness_status(None, now=1000.0)
+        assert ok is True
+        assert code == dm.LIVENESS_REASON_STARTING
+        assert message == "starting"
+
+    def test_pre_scheduler_start_is_healthy(self):
+        # Initial connect backoff can take minutes. The liveness probe must
+        # not kill the pod during that window — gate the freshness check on
+        # scheduler_started.
+        lv = dm._Liveness(timeout=300.0)
+        ok, code, _ = dm._liveness_status(lv, now=10_000.0)
+        assert ok is True
+        assert code == dm.LIVENESS_REASON_STARTING
+
+    def test_recent_tick_is_healthy(self):
+        lv = dm._Liveness(timeout=300.0, scheduler_started=True, last_tick=900.0)
+        ok, code, _ = dm._liveness_status(lv, now=1000.0)
+        assert ok is True
+        assert code == dm.LIVENESS_REASON_OK
+
+    def test_stale_tick_trips_503(self):
+        # Last tick is older than the timeout window — scheduler thread is
+        # dead or wedged on something we can't see (e.g. a hung syscall),
+        # restart is the only recovery.
+        lv = dm._Liveness(timeout=300.0, scheduler_started=True, last_tick=100.0)
+        ok, code, message = dm._liveness_status(lv, now=1000.0)
+        assert ok is False
+        assert code == dm.LIVENESS_REASON_STALE_TICK
+        assert "no scheduler tick" in message
+        assert "900s" in message
+
+    def test_current_query_within_timeout_is_healthy(self):
+        # A long-running but not-yet-stuck query: legitimate, not a hang.
+        # Both signals are fresh — query started 200s ago, last tick 200s ago.
+        lv = dm._Liveness(timeout=300.0, scheduler_started=True, current_query_start=800.0, last_tick=800.0)
+        ok, code, _ = dm._liveness_status(lv, now=1000.0)
+        assert ok is True
+        assert code == dm.LIVENESS_REASON_OK
+
+    def test_current_query_past_timeout_trips_503(self):
+        # The reviewer's case: a DuckDB execute() that never returns.
+        # current_query_start was set at query enter and never cleared.
+        lv = dm._Liveness(timeout=300.0, scheduler_started=True, current_query_start=100.0, last_tick=50.0)
+        ok, code, message = dm._liveness_status(lv, now=1000.0)
+        assert ok is False
+        assert code == dm.LIVENESS_REASON_IN_FLIGHT
+        assert "current query running" in message
+        assert "900s" in message
+
+    def test_in_flight_query_takes_precedence_over_stale_tick(self):
+        # If both signals would flip 503, the in-flight reason is more
+        # actionable — surface it.
+        lv = dm._Liveness(timeout=300.0, scheduler_started=True, current_query_start=50.0, last_tick=50.0)
+        ok, code, _ = dm._liveness_status(lv, now=1000.0)
+        assert ok is False
+        assert code == dm.LIVENESS_REASON_IN_FLIGHT
+
+
+class TestRunQueryUpdatesLiveness:
+    """_run_query must stamp the liveness holder so /-/healthy reflects progress."""
+
+    def test_success_clears_in_flight_and_ticks(self, registry):
+        conn = duckdb.connect()
+        q = dm.Query(name="q", help="h", sql="SELECT 1 AS n", interval_seconds=0, labels=[], values=["n"])
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        lv = dm._Liveness(timeout=300.0)
+
+        ok = _run(conn, q, gauges["q"], sm, liveness=lv)
+
+        assert ok is True
+        assert lv.current_query_start == 0.0, "must clear after successful query"
+        assert lv.last_tick > 0.0, "must tick on success"
+
+    def test_failure_still_ticks(self, registry):
+        # The whole point of the liveness signal: failures aren't hangs.
+        # A scheduler that's failing every query is still "alive" from a
+        # restart-needed perspective — let CONSECUTIVE_FAILURE_THRESHOLD
+        # handle reconnect, not the liveness probe.
+        conn = duckdb.connect()
+        q = dm.Query(
+            name="q", help="h", sql="SELECT * FROM does_not_exist", interval_seconds=0, labels=[], values=["x"]
+        )
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        lv = dm._Liveness(timeout=300.0)
+
+        ok = _run(conn, q, gauges["q"], sm, liveness=lv)
+
+        assert ok is False
+        assert lv.current_query_start == 0.0
+        assert lv.last_tick > 0.0, "failure path must still tick — failure isn't a hang"
+
+
+class TestSchedulerStartsLiveness:
+    """The scheduler must flip `scheduler_started` BEFORE the first query runs.
+
+    Without this, a hang on the very first query would never be detected:
+    the pre-scheduler-start short-circuit would keep returning healthy.
+    """
+
+    def test_scheduler_started_flips_before_first_query(self, registry, monkeypatch):
+        q = dm.Query(name="q", help="h", sql="SELECT 1 AS n", interval_seconds=0, labels=[], values=["n"])
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        lv = dm._Liveness(timeout=300.0)
+        assert lv.scheduler_started is False
+
+        observed: list[bool] = []
+        stop = threading.Event()
+
+        def spy_run(*_a, **_kw):
+            # Snapshot the flag the *moment* the first query enters.
+            observed.append(lv.scheduler_started)
+            stop.set()
+            return True
+
+        monkeypatch.setattr(dm, "_run_query", spy_run)
+        dm._scheduler_loop(None, [q], gauges, sm, stop, TENANT, lv)
+
+        assert observed == [True], "scheduler must mark itself started before running the first query"
+
+
+# Note: end-to-end "handler returns 200/503 over real HTTP" coverage lives in
+# tests/integration/test_ducklake_metrics_integration.py (TestLivenessProbeAtHTTPBoundary).
+# Drives the handler against an actual ThreadingHTTPServer with a tiny timeout,
+# so the wiring of _liveness_status → status code → counter → log is exercised
+# end-to-end. The unit tests above stay focused on the pure decision function.

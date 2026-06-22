@@ -61,7 +61,7 @@ The header documents the constraints any new recipe must follow:
 
 Long-running Prometheus-exposition daemon for catalog-side lake-state metrics. Single Python file. Single thread for queries (one DuckDB connection isn't safe for concurrent calls anyway), separate thread for the HTTP server. Reuses `ducklake_maintenance.connect()`.
 
-Endpoints: `/metrics`, `/-/healthy` (k8s liveness — always 200 while the process answers), `/-/ready` (k8s readiness — 200 after the first successful connect; never gated on individual query completion so slow queries can't block rollout).
+Endpoints: `/metrics`, `/-/healthy` (k8s liveness — 200 while the scheduler is making progress, 503 after `--liveness-timeout-seconds` either with a query stuck in flight or with no scheduler tick at all; pre-scheduler-start is unconditionally 200 so initial connect backoff doesn't trip the probe), `/-/ready` (k8s readiness — 200 after the first successful connect; never gated on individual query completion so slow queries can't block rollout).
 
 Queries are described in YAML and parsed through one loader regardless of whether they came from the embedded `BUILTIN_YAML` constant or from a file pointed at by `DUCKLAKE_METRICS_CONFIG`. User YAML extends the built-ins by name (user wins on collision); `DUCKLAKE_METRICS_DISABLE` drops named built-ins.
 
@@ -97,6 +97,7 @@ Self-metrics (always on):
 | `ducklake_metrics_query_duration_seconds` | gauge | `query` | Wall-clock duration of the most recent run |
 | `ducklake_metrics_query_last_success_timestamp` | gauge | `query` | Unix ts of the most recent successful run |
 | `ducklake_metrics_query_errors_total` | counter | `query` | Cumulative failed runs |
+| `ducklake_metrics_liveness_failures_total` | counter | `reason` | Cumulative 503 responses from `/-/healthy`, labeled `in_flight` (a single query exceeded the liveness timeout) or `stale_tick` (no scheduler loop or reconnect retry in that long). Alert on `rate(...) > 0` to catch a wedged daemon BEFORE kubelet restarts the pod |
 
 Reconnect: connect failures retry with exponential backoff (1s → 60s cap). Once connected, transient query failures only increment the per-query error counter and log; the daemon stays up. After `CONSECUTIVE_FAILURE_THRESHOLD` (default 10) runs in a row across all queries fail, the scheduler raises `_ReconnectNeeded` and the outer loop drops the connection and reconnects via the same backoff. Any successful run resets the streak.
 
@@ -107,6 +108,8 @@ Env vars (in addition to the `DUCKLAKE_*` / `DUCKDB_*` set used by `ducklake_mai
 | `DUCKLAKE_METRICS_PORT` | `9100` | HTTP listen port |
 | `DUCKLAKE_METRICS_CONFIG` | unset | Path to user-supplied queries YAML |
 | `DUCKLAKE_METRICS_DISABLE` | unset | Comma-separated names to skip from built-ins |
+| `DUCKLAKE_METRICS_LIVENESS_TIMEOUT` | `300` | Seconds before `/-/healthy` flips 503 on a stuck query or stalled scheduler; size above the slowest legitimate query |
+| `DUCKLAKE_METRICS_MEMORY_LIMIT` | unset (DuckDB default) | DuckDB `memory_limit` applied right after connect (e.g. `1GB`). DuckDB defaults to ~75% of detected RAM, which inside a cgroup-limited pod often resolves to host RAM and the kernel OOM-kills the pod once DuckDB tries to grow into non-existent memory. Set this WELL UNDER `resources.limits.memory` to leave headroom for the Python interpreter, the ducklake extension's in-memory catalog model, and HTTP server buffers (~250-500Mi typical) |
 
 ## justfile
 

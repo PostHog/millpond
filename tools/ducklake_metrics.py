@@ -379,6 +379,7 @@ class SelfMetrics:
     errors: Counter
     last_success: Gauge
     up: Gauge
+    liveness_failures: Counter
 
 
 def _build_self_metrics(registry: CollectorRegistry | None = None) -> SelfMetrics:
@@ -413,6 +414,18 @@ def _build_self_metrics(registry: CollectorRegistry | None = None) -> SelfMetric
             "ducklake_metrics_up",
             "1 while the daemon has a live catalog connection; 0 during reconnect.",
             ["tenant"],
+            **kwargs,
+        ),
+        liveness_failures=Counter(
+            "ducklake_metrics_liveness_failures_total",
+            (
+                "Cumulative count of /-/healthy responses that returned 503, by reason. "
+                "`in_flight` = a single query exceeded the liveness timeout; "
+                "`stale_tick` = no scheduler tick (loop iteration or reconnect retry) "
+                "in that long. Alert on rate(...) > 0 to catch a wedged daemon BEFORE "
+                "kubelet's failureThreshold restarts the pod."
+            ),
+            ["tenant", "reason"],
             **kwargs,
         ),
     )
@@ -452,12 +465,84 @@ class _ReconnectNeeded(Exception):
 CONSECUTIVE_FAILURE_THRESHOLD = 10
 
 
+# Default liveness ceiling. A single catalog query stuck in flight, or a
+# scheduler thread that has stopped ticking entirely, will trip /-/healthy
+# 503 after this many seconds and let k8s restart the pod. Sized well above
+# the slowest realistic catalog query so a genuinely long query (e.g. counting
+# inlined-data tables on a multi-million-row catalog) doesn't flap the probe.
+# Tunable via --liveness-timeout-seconds / DUCKLAKE_METRICS_LIVENESS_TIMEOUT.
+_DEFAULT_LIVENESS_TIMEOUT_SECONDS = 300.0
+
+
+@dataclass
+class _Liveness:
+    """Shared timing state between the scheduler loop and the health handler.
+
+    The scheduler updates ``current_query_start`` / ``last_tick`` from one
+    thread; the HTTP handler reads them from another. Both fields are plain
+    floats, and CPython's bytecode-level atomicity for single-attribute
+    float load/store is enough here — we only need approximate timing for
+    a liveness signal, not strict consistency, and any read that races a
+    write either sees the old or the new value (both bounded by the
+    timeout) so the worst case is one extra grace period before /-/healthy
+    flips. A Lock would just add overhead without changing the outcome.
+
+    ``scheduler_started`` flips True once the scheduler loop has begun
+    iterating. While False, /-/healthy is unconditionally 200 so the
+    startup probe doesn't kill the pod during the initial connect backoff
+    (which can be minutes if the catalog is cold).
+
+    ``timeout`` is per-instance so tests can construct short-deadline
+    instances without monkeypatching the module constant.
+    """
+
+    timeout: float = _DEFAULT_LIVENESS_TIMEOUT_SECONDS
+    scheduler_started: bool = False
+    current_query_start: float = 0.0  # monotonic; 0 means no query in flight
+    last_tick: float = 0.0  # monotonic; 0 means scheduler hasn't ticked yet
+
+
+# Stable reason codes for the /-/healthy decision. Kept as a small enum-ish
+# set rather than ad-hoc strings so the `ducklake_metrics_liveness_failures_total`
+# counter can label by reason without scraping free text. The free-text
+# message returned alongside the code is for humans (probe body, log lines)
+# and may evolve; the code is part of the metrics contract.
+LIVENESS_REASON_STARTING = "starting"
+LIVENESS_REASON_OK = "ok"
+LIVENESS_REASON_IN_FLIGHT = "in_flight"
+LIVENESS_REASON_STALE_TICK = "stale_tick"
+
+
+def _liveness_status(liveness: _Liveness | None, now: float) -> tuple[bool, str, str]:
+    """Return (is_healthy, reason_code, message). Pure function — drives both probes + tests + metrics.
+
+    `reason_code` is one of LIVENESS_REASON_* (stable; safe as a metric label).
+    `message` is human-readable (probe body, log lines; may evolve).
+    """
+    if liveness is None or not liveness.scheduler_started:
+        # Pre-scheduler: process is up, that's enough for liveness. Readiness
+        # is gated separately on the catalog connect.
+        return True, LIVENESS_REASON_STARTING, "starting"
+    cur_start = liveness.current_query_start
+    if cur_start > 0.0 and now - cur_start > liveness.timeout:
+        return (
+            False,
+            LIVENESS_REASON_IN_FLIGHT,
+            f"current query running >{liveness.timeout:.0f}s ({now - cur_start:.0f}s)",
+        )
+    last_tick = liveness.last_tick
+    if last_tick > 0.0 and now - last_tick > liveness.timeout:
+        return False, LIVENESS_REASON_STALE_TICK, f"no scheduler tick in {now - last_tick:.0f}s"
+    return True, LIVENESS_REASON_OK, "ok"
+
+
 def _run_query(
     conn: duckdb.DuckDBPyConnection,
     q: Query,
     gauges: dict[str, Gauge],
     self_metrics: SelfMetrics,
     tenant: str,
+    liveness: _Liveness | None = None,
 ) -> bool:
     """Execute one query and update its gauges. Returns True on success.
 
@@ -475,6 +560,8 @@ def _run_query(
     whether to escalate to a reconnect.
     """
     t0 = time.monotonic()
+    if liveness is not None:
+        liveness.current_query_start = t0
     try:
         cur = conn.execute(q.sql)
         cols = [d[0] for d in cur.description]
@@ -509,6 +596,13 @@ def _run_query(
         log.exception("query %s failed", q.name)
         self_metrics.errors.labels(tenant, q.name).inc()
         return False
+    finally:
+        if liveness is not None:
+            # Tick before clearing current_query_start so a concurrent reader
+            # can never see "no query in flight AND no recent tick" — that
+            # combination should only ever mean "scheduler dead".
+            liveness.last_tick = time.monotonic()
+            liveness.current_query_start = 0.0
 
 
 def _scheduler_loop(
@@ -518,6 +612,7 @@ def _scheduler_loop(
     self_metrics: SelfMetrics,
     stop: threading.Event,
     tenant: str,
+    liveness: _Liveness | None = None,
 ) -> None:
     """Run queries on per-query intervals until stop is set.
 
@@ -540,6 +635,12 @@ def _scheduler_loop(
     now = time.monotonic()
     for idx in range(len(queries)):
         heapq.heappush(heap, (now, next(seq), idx))
+    if liveness is not None:
+        # Flip BEFORE the first query runs so /-/healthy starts gating on
+        # actual scheduler progress immediately. Without this the handler
+        # stays in "starting → 200" mode until the first query completes,
+        # masking a hang on the very first query.
+        liveness.scheduler_started = True
     consecutive_failures = 0
     while not stop.is_set():
         next_ts, _, idx = heap[0]
@@ -548,26 +649,31 @@ def _scheduler_loop(
             return
         heapq.heappop(heap)
         q = queries[idx]
-        ok = _run_query(conn, q, gauges[q.name], self_metrics, tenant)
+        ok = _run_query(conn, q, gauges[q.name], self_metrics, tenant, liveness)
         if ok:
             consecutive_failures = 0
         else:
             consecutive_failures += 1
             if consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD:
-                raise _ReconnectNeeded(
-                    f"{consecutive_failures} consecutive query failures; reconnecting"
-                )
+                raise _ReconnectNeeded(f"{consecutive_failures} consecutive query failures; reconnecting")
         heapq.heappush(heap, (time.monotonic() + q.interval_seconds, next(seq), idx))
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
     """Serve /metrics, /-/healthy, /-/ready.
 
-    Liveness (/-/healthy): 200 as long as the process answers — k8s should
-    not restart on transient catalog flap. Readiness (/-/ready): 200 once
-    the scheduler has started; we deliberately do NOT gate on any
-    individual query completing because some queries can be slow and
-    blocking readiness on them would block rollout.
+    Liveness (/-/healthy): 200 while the scheduler is making progress
+    (either ticking on schedule or currently running a query within the
+    liveness timeout). 503 if a single query has been in flight past the
+    timeout OR no query has ticked in that long — both mean the catalog
+    connection or scheduler thread is wedged and a restart is the only
+    recovery. Pre-scheduler-start the endpoint is unconditionally 200 so
+    the startup probe doesn't kill the pod during initial connect backoff.
+
+    Readiness (/-/ready): 200 once the scheduler has started; we
+    deliberately do NOT gate on any individual query completing because
+    some queries can be slow and blocking readiness on them would block
+    rollout.
     """
 
     server_version = "ducklake-metrics/0"
@@ -588,7 +694,18 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = generate_latest(reg)
             self._send(200, body, CONTENT_TYPE_LATEST)
         elif self.path == "/-/healthy":
-            self._send(200, b"ok\n", "text/plain; charset=utf-8")
+            liveness = getattr(self.server, "liveness", None)
+            alive, reason_code, message = _liveness_status(liveness, time.monotonic())
+            body = f"{message}\n".encode()
+            if not alive:
+                # Fire the counter + the (debounced) log line before sending
+                # the response so the signal goes out even if the kubelet
+                # connection dies mid-write. See _on_unhealthy in main() for
+                # the bound callback.
+                cb = getattr(self.server, "on_unhealthy", None)
+                if cb is not None:
+                    cb(reason_code, message)
+            self._send(200 if alive else 503, body, "text/plain; charset=utf-8")
         elif self.path == "/-/ready":
             ready = getattr(self.server, "ready", False)
             self._send(200 if ready else 503, b"ok\n" if ready else b"not ready\n", "text/plain; charset=utf-8")
@@ -600,10 +717,14 @@ def _start_http(
     port: int,
     registry: CollectorRegistry | None = None,
     host: str = "",
+    liveness: _Liveness | None = None,
+    on_unhealthy: object | None = None,
 ) -> ThreadingHTTPServer:
     srv = ThreadingHTTPServer((host, port), _HealthHandler)
     srv.ready = False  # type: ignore[attr-defined]
     srv.registry = registry if registry is not None else REGISTRY  # type: ignore[attr-defined]
+    srv.liveness = liveness  # type: ignore[attr-defined]
+    srv.on_unhealthy = on_unhealthy  # type: ignore[attr-defined]
     threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()
     log.info("HTTP server listening on %s:%d", host or "*", port)
     return srv
@@ -617,6 +738,8 @@ def _connect_with_backoff(
     stop: threading.Event,
     self_metrics: SelfMetrics,
     tenant: str,
+    liveness: _Liveness | None = None,
+    memory_limit: str | None = None,
 ) -> duckdb.DuckDBPyConnection | None:
     """Call ducklake_maintenance.connect() with exponential backoff until it succeeds or stop is set.
 
@@ -625,13 +748,41 @@ def _connect_with_backoff(
     while we're trying. Backoff starts at 1s and caps at 60s; the cap is
     intentional so that a long catalog outage doesn't grow into 30-minute
     sleeps that miss the recovery window.
+
+    Each retry stamps ``liveness.last_tick`` so the /-/healthy probe doesn't
+    report "no scheduler tick" while we're legitimately waiting on the
+    catalog to come back. Semantically: a daemon retrying connect IS doing
+    useful work, even though no query has run yet. Without this stamp a
+    >5min outage would flip the probe and k8s would restart the pod with a
+    misleading reason that points at the scheduler thread instead of the
+    catalog.
+
+    ``memory_limit`` (when set) is applied via ``SET memory_limit = '<v>'``
+    immediately after connect — DuckDB's default budget is ~75% of detected
+    RAM, which inside a constrained pod (cgroup limit small, host RAM
+    large) means DuckDB tries to grow well past the cgroup and the kernel
+    OOM-kills the pod before the daemon can do anything useful. Setting it
+    explicitly to a number that fits within `resources.limits.memory` (less
+    Python interpreter + extension overhead, ~250-500Mi) keeps DuckDB inside
+    the budget — e.g. '1GB' for a pod limit of 1.5Gi. The value is
+    validated ONCE up-front (outside the retry loop) so a bad value fails
+    fast at daemon startup rather than retrying forever in a tight loop
+    that the broad except-clause below would otherwise swallow.
     """
+    if memory_limit is not None:
+        ducklake_maintenance._sanitize_setting_value(memory_limit)
     delay = _BACKOFF_INITIAL_SECONDS
     self_metrics.up.labels(tenant).set(0)
     while not stop.is_set():
+        if liveness is not None:
+            liveness.last_tick = time.monotonic()
         try:
             conn = ducklake_maintenance.connect()
-            log.info("Connected to DuckLake catalog")
+            if memory_limit is not None:
+                conn.execute(f"SET memory_limit = '{memory_limit}'")
+                log.info("Connected to DuckLake catalog (memory_limit=%s)", memory_limit)
+            else:
+                log.info("Connected to DuckLake catalog (memory_limit=DuckDB default)")
             return conn
         except Exception:
             log.exception("connect to DuckLake failed; retrying in %.0fs", delay)
@@ -679,6 +830,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--liveness-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("DUCKLAKE_METRICS_LIVENESS_TIMEOUT", _DEFAULT_LIVENESS_TIMEOUT_SECONDS)),
+        help=(
+            "Liveness ceiling for /-/healthy: 503 returned when a single query has "
+            "been running, OR no scheduler tick has happened, for this many seconds. "
+            "Sized to allow the slowest legitimate query a comfortable margin. "
+            f"Default {_DEFAULT_LIVENESS_TIMEOUT_SECONDS:.0f}s."
+        ),
+    )
+    p.add_argument(
+        "--duckdb-memory-limit",
+        default=os.environ.get("DUCKLAKE_METRICS_MEMORY_LIMIT"),
+        help=(
+            "DuckDB `memory_limit` applied right after connect (e.g. '512MB', '1GB'). "
+            "DuckDB's default is ~75%% of detected RAM; inside a cgroup-limited pod "
+            "that often resolves to the host RAM rather than the cgroup limit, and "
+            "the kernel OOM-kills the pod once DuckDB tries to grow into "
+            "non-existent memory. Size this WELL UNDER the pod's "
+            "resources.limits.memory (leave headroom for the Python interpreter, "
+            "the ducklake extension's in-memory catalog model, and HTTP server "
+            "buffers — ~150-200Mi typical). Unset = DuckDB default (only safe on "
+            "a host where DuckDB can actually use ~75%% of the reported RAM)."
+        ),
+    )
+    p.add_argument(
         "--list-queries",
         action="store_true",
         help="Print resolved query list and exit (validates config without connecting)",
@@ -719,8 +896,27 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    srv = _start_http(args.port)
-    log.info("Scheduler starting; %d query(ies) registered", len(queries))
+    liveness = _Liveness(timeout=args.liveness_timeout_seconds)
+
+    # Debounce so kubelet's per-N-seconds /-/healthy scrape doesn't spam
+    # the log while the probe stays 503 — log on the first transition into
+    # an unhealthy reason and again only when the reason CHANGES. Counter
+    # increments every time (operators alert off rate(); they don't want
+    # debounce baked into the metric).
+    last_logged_reason: dict[str, str | None] = {"reason": None}
+
+    def _on_unhealthy(reason_code: str, message: str) -> None:
+        self_metrics.liveness_failures.labels(tenant, reason_code).inc()
+        if last_logged_reason["reason"] != reason_code:
+            log.warning("liveness probe 503 (%s): %s", reason_code, message)
+            last_logged_reason["reason"] = reason_code
+
+    srv = _start_http(args.port, liveness=liveness, on_unhealthy=_on_unhealthy)
+    log.info(
+        "Scheduler starting; %d query(ies) registered; liveness timeout %.0fs",
+        len(queries),
+        liveness.timeout,
+    )
 
     # Outer reconnect loop: every iteration establishes a fresh connection
     # (with backoff) and runs the scheduler against it. The scheduler exits
@@ -729,13 +925,13 @@ def main(argv: list[str] | None = None) -> None:
     # and stays true thereafter — k8s shouldn't yank metrics traffic on
     # transient catalog flap, and there's no real "traffic" anyway.
     while not stop.is_set():
-        conn = _connect_with_backoff(stop, self_metrics, tenant)
+        conn = _connect_with_backoff(stop, self_metrics, tenant, liveness, args.duckdb_memory_limit)
         if conn is None:
             break
         self_metrics.up.labels(tenant).set(1)
         srv.ready = True  # type: ignore[attr-defined]
         try:
-            _scheduler_loop(conn, queries, gauges, self_metrics, stop, tenant)
+            _scheduler_loop(conn, queries, gauges, self_metrics, stop, tenant, liveness)
         except _ReconnectNeeded as e:
             log.warning("%s", e)
         finally:
