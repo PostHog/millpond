@@ -80,6 +80,15 @@ class Config:
     # sink.write(). None disables the sort entirely.
     sort_by: tuple[str, ...] | None
 
+    # Optional columns to parse from JSON date-time strings into TIMESTAMPTZ
+    # before write (see arrow_converter.coerce_timestamp_columns). JSON carries
+    # date-times as strings, so inference would type them VARCHAR; that wedges
+    # schema evolution when the destination column is already TIMESTAMPTZ (e.g.
+    # writing NRT events into the duckling backfill's typed `posthog.events`).
+    # None disables coercion (the default — every existing consumer that owns
+    # its own freshly-created table keeps VARCHAR timestamps unchanged).
+    timestamp_columns: tuple[str, ...] | None
+
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
@@ -223,6 +232,32 @@ def _load_sort_by() -> tuple[str, ...] | None:
     return fields
 
 
+def _load_timestamp_columns() -> tuple[str, ...] | None:
+    """Parse MILLPOND_TIMESTAMP_COLUMNS into a tuple of column names.
+
+    Comma-separated; whitespace trimmed; empty tokens dropped. Each name must
+    match the safe-identifier pattern so a misconfiguration surfaces at startup,
+    not at the first flush. Returns None when the env var is absent or
+    whitespace-only. These columns are parsed from their JSON string form into
+    TIMESTAMPTZ before write — name the destination's timestamp columns (e.g.
+    for the events table: timestamp, created_at, person_created_at,
+    group0_created_at … group4_created_at).
+    """
+    raw = os.environ.get("MILLPOND_TIMESTAMP_COLUMNS", "").strip()
+    if not raw:
+        return None
+    fields = tuple(t.strip() for t in raw.split(",") if t.strip())
+    if not fields:
+        return None
+    for field in fields:
+        if not _SAFE_COLUMN_NAME.match(field):
+            raise RuntimeError(
+                f"MILLPOND_TIMESTAMP_COLUMNS field {field!r} contains unsafe characters "
+                "(must match [a-zA-Z_][a-zA-Z0-9_]*)"
+            )
+    return fields
+
+
 _VALID_AUTO_OFFSET_RESET = ("earliest", "latest")
 
 
@@ -334,6 +369,7 @@ def load() -> Config:
 
     filter_keep_field, filter_drop_field, filter_values = _load_filter_fields()
     sort_by = _load_sort_by()
+    timestamp_columns = _load_timestamp_columns()
 
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
@@ -354,6 +390,7 @@ def load() -> Config:
         filter_drop_field=filter_drop_field,
         filter_values=filter_values,
         sort_by=sort_by,
+        timestamp_columns=timestamp_columns,
         kafka_config_overrides=kafka_overrides,
         # No ``MILLPOND_`` prefix on POSTHOG_PROJECT_TOKEN: it's a
         # PostHog-wide secret typically sourced from a shared K8s Secret
@@ -382,4 +419,6 @@ def load() -> Config:
         log.info("Filter (keep): %s in %s", cfg.filter_keep_field, cfg.filter_values)
     if cfg.sort_by is not None:
         log.info("Sort by: %s (ascending)", ", ".join(cfg.sort_by))
+    if cfg.timestamp_columns is not None:
+        log.info("Coerce to TIMESTAMPTZ: %s", ", ".join(cfg.timestamp_columns))
     return cfg

@@ -1,7 +1,10 @@
+from datetime import UTC, datetime
+
 import orjson
 import pyarrow as pa
+import pytest
 
-from millpond.arrow_converter import _drop_null_typed_columns, convert
+from millpond.arrow_converter import _drop_null_typed_columns, coerce_timestamp_columns, convert
 
 
 class TestConvert:
@@ -217,3 +220,67 @@ class TestDropNullTypedColumns:
         )
         out = _drop_null_typed_columns(table)
         assert out.column_names == ["string_with_nulls"]
+
+
+class TestCoerceTimestampColumns:
+    # The wire format every ClickHouse-events producer emits for DateTime64
+    # columns: space-separated, six fractional digits, UTC implied.
+    WIRE = "2024-01-01 12:00:00.000000"
+
+    def test_parses_wire_format_to_timestamptz(self):
+        table = pa.table({"timestamp": [self.WIRE], "team_id": [1]})
+        out = coerce_timestamp_columns(table, ("timestamp",))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert out.column("timestamp").to_pylist() == [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)]
+        # Untargeted columns are untouched.
+        assert out.schema.field("team_id").type == pa.int64()
+
+    def test_coerces_multiple_columns(self):
+        cols = ("timestamp", "created_at", "group0_created_at")
+        table = pa.table({c: [self.WIRE] for c in cols})
+        out = coerce_timestamp_columns(table, cols)
+        for c in cols:
+            assert out.schema.field(c).type == pa.timestamp("us", tz="UTC")
+
+    def test_nulls_pass_through(self):
+        # Nullable timestamps (e.g. person_created_at) arrive as JSON null.
+        table = pa.table({"person_created_at": pa.array([self.WIRE, None], pa.string())})
+        out = coerce_timestamp_columns(table, ("person_created_at",))
+        assert out.column("person_created_at").to_pylist() == [
+            datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
+            None,
+        ]
+
+    def test_missing_column_is_noop(self):
+        # A configured column absent from this batch is skipped, not an error,
+        # so the same column list can be pointed at heterogeneous batches.
+        table = pa.table({"team_id": [1]})
+        out = coerce_timestamp_columns(table, ("timestamp",))
+        assert out is table
+
+    def test_already_timestamp_typed_left_alone(self):
+        ts = pa.array([datetime(2024, 1, 1, tzinfo=UTC)], pa.timestamp("us", tz="UTC"))
+        table = pa.table({"timestamp": ts})
+        out = coerce_timestamp_columns(table, ("timestamp",))
+        assert out is table
+
+    def test_empty_columns_is_noop(self):
+        table = pa.table({"timestamp": [self.WIRE]})
+        out = coerce_timestamp_columns(table, ())
+        assert out is table
+
+    def test_unparseable_value_raises(self):
+        # A format drift is a contract break — surface it loudly rather than
+        # silently nulling the column.
+        table = pa.table({"timestamp": ["not-a-timestamp"]})
+        with pytest.raises(pa.lib.ArrowInvalid):
+            coerce_timestamp_columns(table, ("timestamp",))
+
+    def test_roundtrips_through_convert(self):
+        # The realistic path: JSON → convert() (infers VARCHAR) → coerce.
+        messages = [orjson.dumps({"timestamp": self.WIRE, "event": "$pageview"})]
+        table = convert(messages)
+        assert table is not None
+        assert table.schema.field("timestamp").type == pa.string()
+        out = coerce_timestamp_columns(table, ("timestamp",))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")

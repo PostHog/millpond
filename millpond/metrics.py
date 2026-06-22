@@ -109,6 +109,16 @@ _sort_skipped_total = Counter(
     "Records in a flush whose sort step was skipped",
     ["pipeline", "broker_source", "reason"],
 )
+# Columns parsed from JSON date-time strings into TIMESTAMPTZ before the sink
+# (see arrow_converter.coerce_timestamp_columns). Counts column-coercions, not
+# rows. A flatline while writing into a TIMESTAMPTZ-typed table means the
+# coercion isn't configured (MILLPOND_TIMESTAMP_COLUMNS) and schema evolution
+# will wedge on the timestamp columns.
+_timestamp_columns_coerced_total = Counter(
+    "millpond_timestamp_columns_coerced_total",
+    "String columns parsed to TIMESTAMPTZ before write",
+    ["pipeline", "broker_source"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -156,6 +166,7 @@ last_committed_offset = _last_committed_offset
 schema_columns_added_total = _schema_columns_added_total
 schema_columns_widened_total = _schema_columns_widened_total
 sort_skipped_total = _sort_skipped_total
+timestamp_columns_coerced_total = _timestamp_columns_coerced_total
 rdkafka_replyq = _rdkafka_replyq
 rdkafka_msg_cnt = _rdkafka_msg_cnt
 rdkafka_msg_size = _rdkafka_msg_size
@@ -171,6 +182,7 @@ def init(pipeline: str, broker_source: str = ""):
     global flush_size_bytes, flush_size_records
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
+    global timestamp_columns_coerced_total
     global rdkafka_replyq, rdkafka_msg_cnt, rdkafka_msg_size
     global rdkafka_broker_rtt_avg, rdkafka_broker_rtt_p99
 
@@ -198,6 +210,7 @@ def init(pipeline: str, broker_source: str = ""):
     consume_batch_size_current = _consume_batch_size_current.labels(pipeline=pipeline, broker_source=bs)
     schema_columns_added_total = _schema_columns_added_total.labels(pipeline=pipeline, broker_source=bs)
     schema_columns_widened_total = _schema_columns_widened_total.labels(pipeline=pipeline, broker_source=bs)
+    timestamp_columns_coerced_total = _timestamp_columns_coerced_total.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_size = _rdkafka_msg_size.labels(pipeline=pipeline, broker_source=bs)

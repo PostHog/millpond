@@ -461,3 +461,65 @@ class TestSortByConfig:
             load()
         msgs = [r.message for r in caplog.records]
         assert any("Sort by: team_id, timestamp (ascending)" in m for m in msgs)
+
+
+class TestTimestampColumnsConfig:
+    """MILLPOND_TIMESTAMP_COLUMNS parsing and validation."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "1")
+        monkeypatch.setenv("POD_NAME", "millpond-events-0")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+
+    def test_unset_yields_none(self):
+        cfg = load()
+        assert cfg.timestamp_columns is None
+
+    def test_single_field(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", "timestamp")
+        cfg = load()
+        assert cfg.timestamp_columns == ("timestamp",)
+
+    def test_events_column_set(self, monkeypatch):
+        # The full set of TIMESTAMPTZ columns in the duckling backfill's events table.
+        cols = "timestamp,created_at,person_created_at,group0_created_at,group4_created_at"
+        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", cols)
+        cfg = load()
+        assert cfg.timestamp_columns == (
+            "timestamp",
+            "created_at",
+            "person_created_at",
+            "group0_created_at",
+            "group4_created_at",
+        )
+
+    def test_whitespace_trimmed_and_empty_tokens_dropped(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", " timestamp , , created_at ,")
+        cfg = load()
+        assert cfg.timestamp_columns == ("timestamp", "created_at")
+
+    def test_whitespace_only_value_yields_none(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", "   ")
+        cfg = load()
+        assert cfg.timestamp_columns is None
+
+    def test_unsafe_field_name_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", "timestamp, foo; DROP TABLE x")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+    def test_log_lists_columns(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("MILLPOND_TIMESTAMP_COLUMNS", "timestamp,created_at")
+        with caplog.at_level(logging.INFO, logger="millpond.config"):
+            load()
+        msgs = [r.message for r in caplog.records]
+        assert any("Coerce to TIMESTAMPTZ: timestamp, created_at" in m for m in msgs)

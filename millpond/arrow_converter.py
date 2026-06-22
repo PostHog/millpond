@@ -2,6 +2,9 @@ import logging
 
 import orjson
 import pyarrow as pa
+import pyarrow.compute as pc
+
+from millpond import metrics
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +153,68 @@ def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
                 new[k] = v
         flattened.append(new)
     return flattened
+
+
+# Wire format the upstream ClickHouse-events producers emit for DateTime64
+# columns: space-separated, six fractional digits, UTC implied, no zone suffix
+# (e.g. "2024-01-01 12:00:00.000000"). See the rust kafka-deduplicator
+# clickhouse_events pipeline (parser/processor) and ClickHouse's JSONEachRow
+# DateTime64(6, 'UTC') rendering — both produce exactly this shape.
+#
+# PyArrow can't parse it via `strptime` (the `%f` directive isn't supported in
+# this build) or via a direct cast to a tz-aware timestamp (that demands an
+# explicit zone offset in the string). The working path is two steps: cast the
+# string to a *naive* microsecond timestamp (Arrow's ISO-8601 parser accepts the
+# space separator and fractional seconds), then stamp it UTC with
+# `assume_timezone`. The result is `timestamp[us, tz=UTC]`, which
+# schema._arrow_type_to_duckdb maps to TIMESTAMPTZ — matching the typed
+# timestamp columns the duckling backfill writes.
+_TIMESTAMP_UNIT = "us"
+_TIMESTAMP_TZ = "UTC"
+
+
+def coerce_timestamp_columns(table: pa.Table, columns: tuple[str, ...]) -> pa.Table:
+    """Parse the named string columns into ``timestamp[us, tz=UTC]``.
+
+    JSON has no native timestamp type, so ``_build_schema`` infers VARCHAR for
+    any column whose values arrive as date-time strings. When millpond writes
+    into a table whose column is already TIMESTAMPTZ (e.g. the duckling backfill's
+    ``posthog.events``), that VARCHAR batch type can't be reconciled — DuckLake
+    only widens, and TIMESTAMPTZ→VARCHAR is a narrowing — so schema evolution
+    fails and flushes wedge. Pinning these columns to a real Arrow timestamp here,
+    before the batch reaches the sink, makes the inferred type match the table so
+    the insert is a typed append with no DDL, and makes freshly-created tables
+    use TIMESTAMPTZ in the first place.
+
+    Only columns that are (a) present in this batch and (b) string-typed are
+    touched; a column already timestamp-typed, or absent from the batch, is left
+    as-is so the function is safe to point at a superset of columns. Parsing is
+    strict: a value that doesn't match the producer's wire format raises rather
+    than being silently nulled — a format drift is a contract break that should
+    surface loudly, not corrupt timestamps in place.
+    """
+    if not columns:
+        return table
+
+    target = set(columns)
+    coerced = 0
+    new_columns = []
+    new_fields = []
+    for i, field in enumerate(table.schema):
+        col = table.column(i)
+        if field.name in target and (pa.types.is_string(field.type) or pa.types.is_large_string(field.type)):
+            parsed = pc.assume_timezone(col.cast(pa.timestamp(_TIMESTAMP_UNIT)), _TIMESTAMP_TZ)
+            new_columns.append(parsed)
+            new_fields.append(pa.field(field.name, parsed.type, nullable=field.nullable))
+            coerced += 1
+        else:
+            new_columns.append(col)
+            new_fields.append(field)
+
+    if coerced == 0:
+        return table
+    metrics.timestamp_columns_coerced_total.inc(coerced)
+    return pa.table(dict(zip([f.name for f in new_fields], new_columns)), schema=pa.schema(new_fields))
 
 
 def convert(messages: list[bytes]) -> pa.Table | None:

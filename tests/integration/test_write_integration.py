@@ -8,9 +8,11 @@ Postgres or S3.
 from unittest.mock import MagicMock, patch
 
 import duckdb
+import orjson
 import pyarrow as pa
 import pytest
 
+from millpond.arrow_converter import coerce_timestamp_columns, convert
 from millpond.ducklake import write
 from millpond.schema import SchemaManager
 
@@ -228,6 +230,117 @@ class TestSchemaEvolution:
         mock_metrics.errors_total.labels(type="schema").inc.assert_called_once()
         # Column type should remain BIGINT
         assert schema_mgr._known_columns["x"] == "BIGINT"
+
+
+@pytest.mark.integration
+class TestTimestampCoercionWritePath:
+    """End-to-end: NRT JSON (string timestamps) written into a table whose
+    timestamp columns are already TIMESTAMPTZ — the duckling backfill's
+    `posthog.events` shape. Without coercion this is the prod wedge that
+    PR #12334 hit; coercion makes the batch type match the table so no
+    schema-evolution DDL is needed.
+    """
+
+    # The events table's TIMESTAMPTZ columns, per the backfill DDL.
+    TS_COLS = (
+        "timestamp",
+        "created_at",
+        "person_created_at",
+        "group0_created_at",
+    )
+    WIRE = "2024-01-01 12:00:00.000000"
+
+    def _nrt_batch(self) -> pa.Table:
+        """An NRT batch the way it reaches the sink: JSON → convert() infers
+        VARCHAR for the date-time strings."""
+        msg = {"uuid": "u1", "event": "$pageview", "team_id": 1}
+        for c in self.TS_COLS:
+            msg[c] = self.WIRE
+        table = convert([orjson.dumps(msg)])
+        assert table is not None
+        # Precondition: inference really does type these as strings.
+        for c in self.TS_COLS:
+            assert table.schema.field(c).type == pa.string()
+        return table
+
+    def _create_events_table(self, conn) -> None:
+        cols = ", ".join(f"{c} TIMESTAMPTZ" for c in self.TS_COLS)
+        # _inserted_at mirrors the backfill DDL — write()'s INSERT ... BY NAME
+        # appends NOW() into it.
+        conn.execute(
+            f"CREATE TABLE lake.main.events "
+            f"(uuid VARCHAR, event VARCHAR, team_id BIGINT, {cols}, _inserted_at TIMESTAMPTZ)"
+        )
+
+    def _reject_alter_column(self, schema_mgr) -> None:
+        """Wrap the connection so ALTER COLUMN raises, simulating DuckLake's
+        widening-only enforcement (plain DuckDB would permissively allow the
+        narrowing and hide the bug)."""
+        real_conn = schema_mgr._conn
+        mock_conn = MagicMock(wraps=real_conn)
+        mock_conn.execute = MagicMock(
+            side_effect=lambda sql, *a, **kw: (
+                (_ for _ in ()).throw(duckdb.Error("DuckLake only widens"))
+                if "ALTER COLUMN" in sql
+                else real_conn.execute(sql, *a, **kw)
+            )
+        )
+        schema_mgr._conn = mock_conn
+        return mock_conn
+
+    @patch("millpond.schema.metrics")
+    def test_uncoerced_string_batch_triggers_failing_alter(self, mock_metrics, conn, cache):
+        """Reproduces the wedge: without coercion, evolve() tries to narrow the
+        TIMESTAMPTZ columns to VARCHAR, which DuckLake rejects → schema error."""
+        self._create_events_table(conn)
+        schema_mgr = SchemaManager(conn, "events")
+        schema_mgr._load_table_schema()
+        self._reject_alter_column(schema_mgr)
+
+        schema_mgr.evolve(self._nrt_batch().schema)
+
+        # One ALTER attempt per timestamp column, each rejected and metricked.
+        assert mock_metrics.errors_total.labels(type="schema").inc.call_count == len(self.TS_COLS)
+
+    @patch("millpond.schema.metrics")
+    def test_coerced_batch_writes_with_no_schema_ddl(self, mock_metrics, conn, cache):
+        """The fix: coerced batch matches the table, so evolve() issues no DDL
+        and the rows land with real timestamps — even when ALTER is forbidden."""
+        self._create_events_table(conn)
+        schema_mgr = SchemaManager(conn, "events")
+        schema_mgr._load_table_schema()
+        mock_conn = self._reject_alter_column(schema_mgr)
+
+        batch = coerce_timestamp_columns(self._nrt_batch(), self.TS_COLS)
+        # write() goes through the same (ALTER-rejecting) connection.
+        write(mock_conn, "events", batch, cache, schema_mgr, schema_name="main")
+
+        # No schema error, no widen, no add — types already matched.
+        mock_metrics.errors_total.labels(type="schema").inc.assert_not_called()
+        mock_metrics.schema_columns_widened_total.inc.assert_not_called()
+        mock_metrics.schema_columns_added_total.inc.assert_not_called()
+
+        # Data landed and the stored value is a real timestamp.
+        row = conn.execute(
+            "SELECT event, timestamp FROM lake.main.events WHERE uuid = 'u1'"
+        ).fetchone()
+        assert row[0] == "$pageview"
+        assert str(row[1]).startswith("2024-01-01 12:00:00")
+
+    def test_fresh_table_created_with_timestamptz(self, conn, cache):
+        """When millpond owns table creation, a coerced batch yields TIMESTAMPTZ
+        columns from the start (vs VARCHAR for an uncoerced string batch)."""
+        batch = coerce_timestamp_columns(self._nrt_batch(), self.TS_COLS)
+        write(conn, "events", batch, cache, SchemaManager(conn, "events"), schema_name="main")
+
+        types = dict(
+            conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            ).fetchall()
+        )
+        for c in self.TS_COLS:
+            assert types[c] == "TIMESTAMP WITH TIME ZONE"
 
     @patch("millpond.schema.metrics")
     def test_unsafe_field_name_skipped(self, mock_metrics, conn, cache):

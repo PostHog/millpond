@@ -40,6 +40,20 @@ def _convert_batch(values: list[bytes]) -> pa.Table | None:
     return table
 
 
+def _coerce_timestamps(table: pa.Table, cfg: config.Config) -> pa.Table:
+    """Parse `cfg.timestamp_columns` from JSON strings into TIMESTAMPTZ.
+
+    Returns the input unchanged when no timestamp columns are configured.
+    Applied right after JSON→Arrow conversion and before the keep-filter, so
+    the typed timestamps flow through filtering, sorting, table creation, and
+    schema evolution. See arrow_converter.coerce_timestamp_columns for why this
+    is necessary when writing into a table with TIMESTAMPTZ-typed columns.
+    """
+    if cfg.timestamp_columns is None:
+        return table
+    return arrow_converter.coerce_timestamp_columns(table, cfg.timestamp_columns)
+
+
 def _apply_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
     """Apply the configured keep-filter: drop records whose value in
     `filter_keep_field` is not in `filter_values`.
@@ -400,6 +414,7 @@ def main():
                     table = _convert_batch(values)
                     if table is not None:
                         skipped = len(values) - len(table)
+                        table = _coerce_timestamps(table, cfg)
                         table = _apply_filter(table, cfg)
                         if len(table) > 0:
                             pending.append(table)

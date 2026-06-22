@@ -91,6 +91,16 @@ Sort order is left-to-right (`team_id` primary, `timestamp` secondary). Directio
 
 If any sort field is missing from a batch's schema, the sort is skipped (records still flow through, just unsorted), `millpond_sort_skipped_total{reason="field_missing"}` increments by the record count, and a warning logs once per distinct missing-fields pattern (per pod lifetime — prevents log floods under sustained misconfiguration).
 
+### Timestamp coercion
+
+JSON has no native timestamp type, so date-time values arrive as strings and schema inference types them `VARCHAR`. That's fine for a table millpond creates itself, but it wedges when writing into a table whose columns are already `TIMESTAMPTZ` — DuckLake only widens types, and `TIMESTAMPTZ`→`VARCHAR` is a narrowing, so schema evolution fails and flushes stall. `MILLPOND_TIMESTAMP_COLUMNS` names the columns to parse from their string form into `TIMESTAMPTZ` (microsecond, UTC) before the write, so the batch type matches the destination and the insert is a typed append with no DDL.
+
+```
+MILLPOND_TIMESTAMP_COLUMNS=timestamp,created_at,person_created_at,group0_created_at,group1_created_at,group2_created_at,group3_created_at,group4_created_at
+```
+
+Use this when pointing a consumer at a pre-existing typed table (e.g. the duckling backfill's `posthog.events`). Each coercion increments `millpond_timestamp_columns_coerced_total`. The expected input format is the ClickHouse-events wire format (`2024-01-01 12:00:00.000000`, UTC implied); a value that doesn't parse raises rather than being silently nulled, so a producer format change surfaces loudly. Columns absent from a batch or already timestamp-typed are left untouched, so the same list is safe across heterogeneous batches.
+
 Per-flush cost is ~50–200 ms on a 256 MB / 30k-row batch. Peak memory roughly doubles during the sort because `pa.Table.take()` rewrites a fresh copy of every column; budget accordingly relative to the pod's memory limit.
 
 ## Adaptive Backpressure
@@ -209,6 +219,7 @@ See [Record Handling](#record-handling) for context. All four variables below ar
 | `MILLPOND_FILTER_DROP_FIELD_NAME` | no | | Reserved for a future denylist filter; setting it today raises at startup. Mutually exclusive with `MILLPOND_FILTER_KEEP_FIELD_NAME`. |
 | `MILLPOND_FILTER_VALUES` | no | | Comma-separated allowed values. Auto-detected as int if every token parses as an integer, string otherwise. Required when either filter field name is set. |
 | `MILLPOND_SORT_BY` | no | | Comma-separated column names; the batch is sorted ascending by these in tuple order before each write. Missing fields cause the sort to be skipped (records still flow). |
+| `MILLPOND_TIMESTAMP_COLUMNS` | no | | Comma-separated column names to parse from JSON date-time strings into `TIMESTAMPTZ` (µs, UTC) before write. Needed when writing into a table whose timestamp columns are already `TIMESTAMPTZ` (otherwise inference types them `VARCHAR` and schema evolution wedges). Validated as safe identifiers. |
 
 ## Releases
 
