@@ -77,7 +77,7 @@ queries:
       files are queued"). `dup_rows = total - unique_paths` surfaces the
       duplicate-row pathology that self-poisons the next cleanup
       (DuckLake upstream bug c5).
-    interval_mins: 1
+    interval_mins: 5
     values: [total, unique_paths, dup_rows]
     sql: |
       SELECT
@@ -92,7 +92,7 @@ queries:
       on-disk size, `rows` = total records across all live files. "Live" =
       `end_snapshot IS NULL`. Per-band breakdown lives in
       `ducklake_files_per_band`; this is the rollup for "how big is the lake."
-    interval_mins: 1
+    interval_mins: 5
     values: [files, bytes, rows]
     sql: |
       SELECT
@@ -108,7 +108,7 @@ queries:
       ducklake_data_files but for the delete side. Outsized vs.
       ducklake_data_files_files = lots of unmerged deletes; ripe for
       `ducklake_rewrite_data_files` maintenance.
-    interval_mins: 1
+    interval_mins: 5
     values: [files, bytes]
     sql: |
       SELECT
@@ -124,7 +124,7 @@ queries:
       `tier2` (1-10 MiB), `tier3` (10-64 MiB) are compaction targets;
       `large` (>=64 MiB) is past the compaction threshold and is just
       reported for shape. Sum across bands equals `ducklake_data_files_files`.
-    interval_mins: 1
+    interval_mins: 5
     labels: [band]
     values: [count, bytes]
     sql: |
@@ -147,7 +147,7 @@ queries:
       `oldest_id`/`newest_id` (counter-like, monotonic) so PromQL can
       derive the commit rate via `deriv(ducklake_snapshots_newest_id[5m])`
       — no per-sample storage in the daemon.
-    interval_mins: 1
+    interval_mins: 5
     values: [count, oldest_seconds_ago, newest_seconds_ago, oldest_id, newest_id]
     sql: |
       SELECT
@@ -166,7 +166,7 @@ queries:
       runaway growth indicates `data_inlining_row_limit` isn't being
       honored by writers, or writers are creating tables faster than
       maintenance can drop them (see `ducklake_unreachable_inline_tables`).
-    interval_mins: 1
+    interval_mins: 5
     values: [total]
     sql: |
       SELECT COUNT(*) AS total
@@ -208,7 +208,7 @@ queries:
       readable by historical snapshots until expire+cleanup reaps them).
       Imbalance — many dropped, few live — indicates DROP+CREATE churn
       (data_imports anti-pattern).
-    interval_mins: 1
+    interval_mins: 5
     labels: [state]
     values: [count]
     sql: |
@@ -220,7 +220,7 @@ queries:
 
   - name: ducklake_files_per_partition_top20
     help: Twenty heaviest partitions by live data-file count (composite values joined with '/').
-    interval_mins: 1
+    interval_mins: 5
     labels: [partition]
     values: [count]
     sql: |
