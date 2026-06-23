@@ -198,6 +198,40 @@ _COERCERS: dict[str, tuple[pa.DataType, object]] = {
 COERCIBLE_TYPES = frozenset(_COERCERS)
 
 
+def _coerce_or_null(col, coercer, arrow_type: pa.DataType) -> tuple[object, int]:
+    """Coerce ``col`` to ``arrow_type`` via ``coercer``, nulling values that don't
+    convert. Returns ``(coerced_column, num_failed)``.
+
+    The fast path is one vectorized cast. Arrow's cast is all-or-nothing — a single
+    unconvertible value raises for the whole column — so on failure we fall back to
+    a per-value pass that nulls only the bad values and keeps the good ones.
+
+    Crucially the result is ALWAYS ``arrow_type``, even on total failure: a
+    configured column must end up the *same* type in every batch, or
+    ``pa.concat_tables()`` over the pending buffer raises ``ArrowTypeError`` at
+    flush (outside the write-retry/offset path) the moment a coerced batch and a
+    fallback batch are concatenated. Leaving the column as its source type would
+    move the crash there instead of avoiding it. The per-value pass is a cold path
+    — it runs only for a batch that actually contains an unparseable value.
+    """
+    try:
+        return coercer(col), 0
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+        src_type = col.type
+        out: list = []
+        failed = 0
+        for v in col.to_pylist():
+            if v is None:
+                out.append(None)
+                continue
+            try:
+                out.append(coercer(pa.array([v], type=src_type))[0].as_py())
+            except (pa.ArrowInvalid, pa.ArrowTypeError):
+                out.append(None)
+                failed += 1
+        return pa.array(out, type=arrow_type), failed
+
+
 def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], ...]) -> pa.Table:
     """Pin named columns to a target type before the batch reaches the sink.
 
@@ -206,13 +240,13 @@ def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], 
     is present in the batch and not already the target Arrow type, so the same
     map is safe to point at a superset of columns and at heterogeneous batches.
 
-    Coercion is non-fatal per column: if a value can't be cast to the target the
-    cast raises ``ArrowInvalid`` and we leave the column unchanged for this batch
-    (the write still lands via DuckDB's implicit cast on INSERT), bumping
-    ``errors_total{type="column_coercion"}`` so a producer format/type drift is
-    loud via metrics/alerting rather than silently nulling data — and, critically,
-    without raising on the consume path, where an exception would unwind past
-    main.py's offset bookkeeping and risk committing past records never written.
+    A present, configured column is ALWAYS emitted as the target Arrow type — this
+    keeps the pending buffer schema-consistent so ``pa.concat_tables()`` at flush
+    never raises on a type mismatch. Coercion is non-fatal: values that can't be
+    cast (a producer format/type drift) are nulled, and ``errors_total{type=
+    "column_coercion"}`` is bumped so the drift is loud via metrics/alerting. It
+    never raises on the consume path, where an exception would unwind past main.py's
+    offset bookkeeping and risk committing past records never written.
     """
     if not typed_columns:
         return table
@@ -236,20 +270,19 @@ def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], 
             new_fields.append(field)
             continue
 
-        try:
-            coerced_col = coercer(col)
-        except pa.ArrowInvalid as e:
+        coerced_col, failed = _coerce_or_null(col, coercer, arrow_type)
+        new_columns.append(coerced_col)
+        new_fields.append(pa.field(field.name, arrow_type, nullable=field.nullable))
+        if failed:
             log.warning(
-                "Coercion of column %s to %s failed; leaving as-is this batch: %s", field.name, type_name, e
+                "Coercion of column %s to %s nulled %d unconvertible value(s) this batch",
+                field.name,
+                type_name,
+                failed,
             )
             metrics.errors_total.labels(type="column_coercion").inc()
-            new_columns.append(col)
-            new_fields.append(field)
-            continue
-
-        new_columns.append(coerced_col)
-        new_fields.append(pa.field(field.name, coerced_col.type, nullable=field.nullable))
-        metrics.columns_coerced_total.labels(target_type=type_name).inc()
+        else:
+            metrics.columns_coerced_total.labels(target_type=type_name).inc()
         changed = True
 
     if not changed:

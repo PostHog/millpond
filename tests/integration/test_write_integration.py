@@ -5,6 +5,7 @@ ducklake.write() and schema.SchemaManager code paths without requiring
 Postgres or S3.
 """
 
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import duckdb
@@ -335,12 +336,14 @@ class TestTimestampCoercionWritePath:
         mock_metrics.schema_columns_widened_total.inc.assert_not_called()
         mock_metrics.schema_columns_added_total.inc.assert_not_called()
 
-        # Data landed and the stored value is a real timestamp.
+        # Data landed and the stored value is the right instant. DuckDB renders
+        # TIMESTAMPTZ in the session timezone, so compare the instant (aware
+        # equality is tz-independent) rather than its string form.
         row = conn.execute(
             "SELECT event, timestamp FROM lake.main.events WHERE uuid = 'u1'"
         ).fetchone()
         assert row[0] == "$pageview"
-        assert str(row[1]).startswith("2024-01-01 12:00:00")
+        assert row[1] == datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
 
     def test_fresh_table_created_with_timestamptz(self, conn, cache):
         """When millpond owns table creation, a coerced batch yields TIMESTAMPTZ

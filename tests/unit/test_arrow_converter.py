@@ -298,26 +298,47 @@ class TestCoerceTypedColumns:
             assert out.schema.field(c).type == pa.timestamp("us", tz="UTC")
 
     @patch("millpond.arrow_converter.metrics")
-    def test_unparseable_value_is_non_fatal(self, mock_metrics):
-        # A format drift must NOT raise on the consume path (that risks
-        # committing offsets past unwritten records). The column falls back to
-        # string and a dedicated error metric fires so the drift is still loud.
+    def test_unparseable_value_is_non_fatal_and_typed(self, mock_metrics):
+        # A format drift must NOT raise on the consume path (that risks committing
+        # offsets past unwritten records). The bad value is nulled but the column
+        # is STILL the target type — keeping the pending buffer schema-consistent
+        # so pa.concat_tables at flush can't raise — and the error metric fires.
         table = pa.table({"timestamp": ["not-a-timestamp"], "team_id": [1]})
         out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
-        assert out.schema.field("timestamp").type == pa.string()
-        assert out.column("timestamp").to_pylist() == ["not-a-timestamp"]
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert out.column("timestamp").to_pylist() == [None]
         mock_metrics.errors_total.labels.assert_called_with(type="column_coercion")
         mock_metrics.errors_total.labels(type="column_coercion").inc.assert_called_once()
         mock_metrics.columns_coerced_total.labels.assert_not_called()
 
+    def test_bad_value_nulled_good_values_preserved(self):
+        # Within one column, only the unconvertible value is nulled; good values
+        # survive and the column is the target type.
+        table = pa.table({"timestamp": [self.WIRE, "garbage", None]})
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert out.column("timestamp").to_pylist() == [datetime(2024, 1, 1, 12, 0, tzinfo=UTC), None, None]
+
+    def test_failed_batch_stays_concatenable_with_good_batch(self):
+        # Regression for the cross-batch concat crash: a batch whose coercion
+        # failed must still concat with a fully-coerced batch (both end up the
+        # target type), because the consume loop buffers batches and flushes them
+        # via pa.concat_tables(..., promote_options="default").
+        good = coerce_typed_columns(pa.table({"timestamp": [self.WIRE]}), (("timestamp", "timestamptz"),))
+        bad = coerce_typed_columns(pa.table({"timestamp": ["garbage"]}), (("timestamp", "timestamptz"),))
+        merged = pa.concat_tables([good, bad], promote_options="default")  # must not raise
+        assert merged.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert merged.column("timestamp").to_pylist() == [datetime(2024, 1, 1, 12, 0, tzinfo=UTC), None]
+
     @patch("millpond.arrow_converter.metrics")
     def test_partial_failure_coerces_good_columns(self, mock_metrics):
-        # One bad column falls back; the good one (a different target type) still
-        # coerces, and its per-type metric fires.
+        # One column has a bad value (nulled, error metric); the other coerces
+        # cleanly (per-type success metric). Both end up the target type.
         table = pa.table({"timestamp": [self.WIRE], "created_at": ["garbage"]})
         out = coerce_typed_columns(table, (("timestamp", "timestamptz"), ("created_at", "timestamptz")))
         assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
-        assert out.schema.field("created_at").type == pa.string()
+        assert out.schema.field("created_at").type == pa.timestamp("us", tz="UTC")
+        assert out.column("created_at").to_pylist() == [None]
         mock_metrics.columns_coerced_total.labels.assert_called_once_with(target_type="timestamptz")
         mock_metrics.errors_total.labels(type="column_coercion").inc.assert_called_once()
 
