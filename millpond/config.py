@@ -3,6 +3,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from millpond import arrow_converter
+
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Shared with ducklake._validate_partition_expr — keep in sync or import from here.
@@ -79,6 +81,16 @@ class Config:
     # in tuple order. Applied to the consolidated batch right before
     # sink.write(). None disables the sort entirely.
     sort_by: tuple[str, ...] | None
+
+    # Optional (column_name, target_type) pairs to pin to a target type before
+    # write (see arrow_converter.coerce_typed_columns). JSON carries no type
+    # schema, so inference can diverge from the destination column and wedge
+    # DuckLake's widening-only schema evolution — date-times infer VARCHAR vs a
+    # TIMESTAMPTZ column, and an all-null `project_id` infers VARCHAR vs BIGINT
+    # (writing NRT events into the duckling backfill's typed `posthog.events`).
+    # None disables coercion (the default — every existing consumer that owns its
+    # own freshly-created table is unaffected).
+    typed_columns: tuple[tuple[str, str], ...] | None
 
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
@@ -223,6 +235,57 @@ def _load_sort_by() -> tuple[str, ...] | None:
     return fields
 
 
+def _load_typed_columns() -> tuple[tuple[str, str], ...] | None:
+    """Parse MILLPOND_TYPED_COLUMNS into ordered (column_name, type_name) pairs.
+
+    Format: comma-separated ``column:type`` entries, e.g.
+    ``timestamp:timestamptz,project_id:bigint``. Whitespace trimmed; empty tokens
+    dropped; type names lower-cased. Column names must match the safe-identifier
+    pattern and type names must be in arrow_converter.COERCIBLE_TYPES, so a
+    misconfiguration surfaces at startup not at the first flush. A column listed
+    twice with the same type is de-duplicated; listed twice with conflicting
+    types is a startup error. Returns None when the env var is absent/whitespace.
+
+    For re-pointing a consumer at the duckling backfill's events table, pin the
+    eight TIMESTAMPTZ columns and project_id:
+    timestamp,created_at,person_created_at,group0..4_created_at -> timestamptz;
+    project_id -> bigint.
+    """
+    raw = os.environ.get("MILLPOND_TYPED_COLUMNS", "").strip()
+    if not raw:
+        return None
+
+    seen: dict[str, str] = {}
+    pairs: list[tuple[str, str]] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" not in token:
+            raise RuntimeError(f"MILLPOND_TYPED_COLUMNS entry {token!r} must be 'column:type'")
+        name, _, type_name = token.partition(":")
+        name, type_name = name.strip(), type_name.strip().lower()
+        if not _SAFE_COLUMN_NAME.match(name):
+            raise RuntimeError(
+                f"MILLPOND_TYPED_COLUMNS column {name!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+            )
+        if type_name not in arrow_converter.COERCIBLE_TYPES:
+            raise RuntimeError(
+                f"MILLPOND_TYPED_COLUMNS type {type_name!r} for column {name!r} must be one of "
+                f"{sorted(arrow_converter.COERCIBLE_TYPES)}"
+            )
+        if name in seen:
+            if seen[name] != type_name:
+                raise RuntimeError(f"MILLPOND_TYPED_COLUMNS maps {name!r} to both {seen[name]!r} and {type_name!r}")
+            continue
+        seen[name] = type_name
+        pairs.append((name, type_name))
+
+    if not pairs:
+        return None
+    return tuple(pairs)
+
+
 _VALID_AUTO_OFFSET_RESET = ("earliest", "latest")
 
 
@@ -334,6 +397,7 @@ def load() -> Config:
 
     filter_keep_field, filter_drop_field, filter_values = _load_filter_fields()
     sort_by = _load_sort_by()
+    typed_columns = _load_typed_columns()
 
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
@@ -354,6 +418,7 @@ def load() -> Config:
         filter_drop_field=filter_drop_field,
         filter_values=filter_values,
         sort_by=sort_by,
+        typed_columns=typed_columns,
         kafka_config_overrides=kafka_overrides,
         # No ``MILLPOND_`` prefix on POSTHOG_PROJECT_TOKEN: it's a
         # PostHog-wide secret typically sourced from a shared K8s Secret
@@ -382,4 +447,6 @@ def load() -> Config:
         log.info("Filter (keep): %s in %s", cfg.filter_keep_field, cfg.filter_values)
     if cfg.sort_by is not None:
         log.info("Sort by: %s (ascending)", ", ".join(cfg.sort_by))
+    if cfg.typed_columns is not None:
+        log.info("Coerce typed columns: %s", ", ".join(f"{n}:{t}" for n, t in cfg.typed_columns))
     return cfg

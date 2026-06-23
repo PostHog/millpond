@@ -2,6 +2,9 @@ import logging
 
 import orjson
 import pyarrow as pa
+import pyarrow.compute as pc
+
+from millpond import metrics
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +153,141 @@ def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
                 new[k] = v
         flattened.append(new)
     return flattened
+
+
+# Column type-pinning. JSON has no type schema, so `_build_schema` infers a
+# column's type from its values; when those values don't carry enough type
+# information the inference diverges from the destination DuckLake column, and
+# DuckLake's widening-only schema evolution then rejects the narrowing ALTER
+# every flush (the write stalls under DuckLake at INSERT). Two cases on the
+# duckling backfill's `posthog.events`:
+#   - date-times arrive as strings -> inferred VARCHAR, table is TIMESTAMPTZ;
+#   - `project_id` is the one numeric column the producer serializes as explicit
+#     JSON null (no serde skip), so an all-null batch infers VARCHAR not BIGINT.
+# `coerce_typed_columns` pins named columns to a target type before the batch
+# reaches the sink so the inferred type matches the table (typed append, no DDL)
+# and freshly-created tables use the right type from the start.
+#
+# Target type registry: name (as used in MILLPOND_TYPED_COLUMNS) -> (the Arrow
+# type that maps to the intended DuckLake column type via
+# schema._arrow_type_to_duckdb, used to skip already-correct columns) and a
+# coercer that turns a (possibly string) column into that Arrow type.
+#
+# timestamptz needs special handling: PyArrow can't parse the wire format via
+# `strptime` (no `%f` in this build) or a direct tz-aware cast (it demands an
+# explicit zone offset). Cast to a *naive* microsecond timestamp first (Arrow's
+# ISO-8601 parser accepts the space separator and 0/3/6 fractional digits the
+# Node/ClickHouse producers emit — see rust `ClickHouseEvent` in
+# `rust/common/types/src/event.rs`), then stamp it UTC with `assume_timezone`.
+_TIMESTAMPTZ = pa.timestamp("us", tz="UTC")
+
+
+def _to_timestamptz(col):
+    return pc.assume_timezone(col.cast(pa.timestamp("us")), "UTC")
+
+
+_COERCERS: dict[str, tuple[pa.DataType, object]] = {
+    "timestamptz": (_TIMESTAMPTZ, _to_timestamptz),
+    "bigint": (pa.int64(), lambda col: col.cast(pa.int64())),
+    "double": (pa.float64(), lambda col: col.cast(pa.float64())),
+    "boolean": (pa.bool_(), lambda col: col.cast(pa.bool_())),
+    "varchar": (pa.string(), lambda col: col.cast(pa.string())),
+}
+
+# Public allowlist for config validation (single source of truth).
+COERCIBLE_TYPES = frozenset(_COERCERS)
+
+
+def _coerce_or_null(col, coercer, arrow_type: pa.DataType) -> tuple[object, int]:
+    """Coerce ``col`` to ``arrow_type`` via ``coercer``, nulling values that don't
+    convert. Returns ``(coerced_column, num_failed)``.
+
+    The fast path is one vectorized cast. Arrow's cast is all-or-nothing — a single
+    unconvertible value raises for the whole column — so on failure we fall back to
+    a per-value pass that nulls only the bad values and keeps the good ones.
+
+    Crucially the result is ALWAYS ``arrow_type``, even on total failure: a
+    configured column must end up the *same* type in every batch, or
+    ``pa.concat_tables()`` over the pending buffer raises ``ArrowTypeError`` at
+    flush (outside the write-retry/offset path) the moment a coerced batch and a
+    fallback batch are concatenated. Leaving the column as its source type would
+    move the crash there instead of avoiding it. The per-value pass is a cold path
+    — it runs only for a batch that actually contains an unparseable value.
+    """
+    try:
+        return coercer(col), 0
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+        src_type = col.type
+        out: list = []
+        failed = 0
+        for v in col.to_pylist():
+            if v is None:
+                out.append(None)
+                continue
+            try:
+                out.append(coercer(pa.array([v], type=src_type))[0].as_py())
+            except (pa.ArrowInvalid, pa.ArrowTypeError):
+                out.append(None)
+                failed += 1
+        return pa.array(out, type=arrow_type), failed
+
+
+def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], ...]) -> pa.Table:
+    """Pin named columns to a target type before the batch reaches the sink.
+
+    ``typed_columns`` is a sequence of ``(column_name, type_name)`` pairs where
+    ``type_name`` is one of ``COERCIBLE_TYPES``. A column is coerced only when it
+    is present in the batch and not already the target Arrow type, so the same
+    map is safe to point at a superset of columns and at heterogeneous batches.
+
+    A present, configured column is ALWAYS emitted as the target Arrow type — this
+    keeps the pending buffer schema-consistent so ``pa.concat_tables()`` at flush
+    never raises on a type mismatch. Coercion is non-fatal: values that can't be
+    cast (a producer format/type drift) are nulled, and ``errors_total{type=
+    "column_coercion"}`` is bumped so the drift is loud via metrics/alerting. It
+    never raises on the consume path, where an exception would unwind past main.py's
+    offset bookkeeping and risk committing past records never written.
+    """
+    if not typed_columns:
+        return table
+
+    targets = dict(typed_columns)  # name -> type_name
+    changed = False
+    new_columns = []
+    new_fields = []
+    for i, field in enumerate(table.schema):
+        col = table.column(i)
+        type_name = targets.get(field.name)
+        if type_name is None:
+            new_columns.append(col)
+            new_fields.append(field)
+            continue
+
+        arrow_type, coercer = _COERCERS[type_name]
+        if field.type == arrow_type:
+            # Already the intended type (e.g. project_id arrived non-null as int64).
+            new_columns.append(col)
+            new_fields.append(field)
+            continue
+
+        coerced_col, failed = _coerce_or_null(col, coercer, arrow_type)
+        new_columns.append(coerced_col)
+        new_fields.append(pa.field(field.name, arrow_type, nullable=field.nullable))
+        if failed:
+            log.warning(
+                "Coercion of column %s to %s nulled %d unconvertible value(s) this batch",
+                field.name,
+                type_name,
+                failed,
+            )
+            metrics.errors_total.labels(type="column_coercion").inc()
+        else:
+            metrics.columns_coerced_total.labels(target_type=type_name).inc()
+        changed = True
+
+    if not changed:
+        return table
+    return pa.table(dict(zip([f.name for f in new_fields], new_columns)), schema=pa.schema(new_fields))
 
 
 def convert(messages: list[bytes]) -> pa.Table | None:

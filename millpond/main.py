@@ -40,6 +40,20 @@ def _convert_batch(values: list[bytes]) -> pa.Table | None:
     return table
 
 
+def _coerce_columns(table: pa.Table, cfg: config.Config) -> pa.Table:
+    """Pin `cfg.typed_columns` to their target types after JSON→Arrow conversion.
+
+    Returns the input unchanged when no typed columns are configured. Applied
+    right after conversion and before the keep-filter, so the typed columns flow
+    through filtering, sorting, table creation, and schema evolution. See
+    arrow_converter.coerce_typed_columns for why this is necessary when writing
+    into a table with already-typed columns (TIMESTAMPTZ, BIGINT, …).
+    """
+    if cfg.typed_columns is None:
+        return table
+    return arrow_converter.coerce_typed_columns(table, cfg.typed_columns)
+
+
 def _apply_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
     """Apply the configured keep-filter: drop records whose value in
     `filter_keep_field` is not in `filter_values`.
@@ -400,6 +414,7 @@ def main():
                     table = _convert_batch(values)
                     if table is not None:
                         skipped = len(values) - len(table)
+                        table = _coerce_columns(table, cfg)
                         table = _apply_filter(table, cfg)
                         if len(table) > 0:
                             pending.append(table)

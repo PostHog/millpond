@@ -109,6 +109,17 @@ _sort_skipped_total = Counter(
     "Records in a flush whose sort step was skipped",
     ["pipeline", "broker_source", "reason"],
 )
+# Columns pinned to a target type before the sink (see
+# arrow_converter.coerce_typed_columns), labelled by target_type. Counts
+# column-coercions, not rows. A flatline can mean coercion isn't configured
+# (MILLPOND_TYPED_COLUMNS unset), or that the configured columns are absent from
+# the batch or already arrive correctly typed — so read it alongside the config
+# and errors_total{type="column_coercion"} rather than on its own.
+_columns_coerced_total = Counter(
+    "millpond_columns_coerced_total",
+    "Columns pinned to a target type before write",
+    ["pipeline", "broker_source", "target_type"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -156,6 +167,7 @@ last_committed_offset = _last_committed_offset
 schema_columns_added_total = _schema_columns_added_total
 schema_columns_widened_total = _schema_columns_widened_total
 sort_skipped_total = _sort_skipped_total
+columns_coerced_total = _columns_coerced_total
 rdkafka_replyq = _rdkafka_replyq
 rdkafka_msg_cnt = _rdkafka_msg_cnt
 rdkafka_msg_size = _rdkafka_msg_size
@@ -171,6 +183,7 @@ def init(pipeline: str, broker_source: str = ""):
     global flush_size_bytes, flush_size_records
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
+    global columns_coerced_total
     global rdkafka_replyq, rdkafka_msg_cnt, rdkafka_msg_size
     global rdkafka_broker_rtt_avg, rdkafka_broker_rtt_p99
 
@@ -181,6 +194,7 @@ def init(pipeline: str, broker_source: str = ""):
     batches_flushed_total = _AutoCommonLabels(_batches_flushed_total, pipeline, bs)
     records_skipped_total = _AutoCommonLabels(_records_skipped_total, pipeline, bs)
     sort_skipped_total = _AutoCommonLabels(_sort_skipped_total, pipeline, bs)
+    columns_coerced_total = _AutoCommonLabels(_columns_coerced_total, pipeline, bs)
     errors_total = _AutoCommonLabels(_errors_total, pipeline, bs)
     consumer_lag = _AutoCommonLabels(_consumer_lag, pipeline, bs)
     last_committed_offset = _AutoCommonLabels(_last_committed_offset, pipeline, bs)

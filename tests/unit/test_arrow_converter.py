@@ -1,7 +1,10 @@
+from datetime import UTC, datetime
+from unittest.mock import patch
+
 import orjson
 import pyarrow as pa
 
-from millpond.arrow_converter import _drop_null_typed_columns, convert
+from millpond.arrow_converter import _drop_null_typed_columns, coerce_typed_columns, convert
 
 
 class TestConvert:
@@ -217,3 +220,133 @@ class TestDropNullTypedColumns:
         )
         out = _drop_null_typed_columns(table)
         assert out.column_names == ["string_with_nulls"]
+
+
+class TestCoerceTypedColumns:
+    # The wire format ClickHouse-events producers emit for DateTime columns:
+    # space-separated, UTC implied, variable fractional precision.
+    WIRE = "2024-01-01 12:00:00.000000"
+
+    def test_parses_wire_format_to_timestamptz(self):
+        table = pa.table({"timestamp": [self.WIRE], "team_id": [1]})
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert out.column("timestamp").to_pylist() == [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)]
+        # Untargeted columns are untouched.
+        assert out.schema.field("team_id").type == pa.int64()
+
+    def test_coerces_multiple_columns(self):
+        cols = ("timestamp", "created_at", "group0_created_at")
+        table = pa.table({c: [self.WIRE] for c in cols})
+        out = coerce_typed_columns(table, tuple((c, "timestamptz") for c in cols))
+        for c in cols:
+            assert out.schema.field(c).type == pa.timestamp("us", tz="UTC")
+
+    def test_all_null_string_project_id_coerces_to_bigint(self):
+        # project_id serializes as explicit JSON null (no serde skip), so an
+        # all-null batch infers VARCHAR; bigint coercion realigns it to the
+        # events table's project_id BIGINT.
+        table = pa.table({"project_id": pa.array([None, None], pa.string())})
+        out = coerce_typed_columns(table, (("project_id", "bigint"),))
+        assert out.schema.field("project_id").type == pa.int64()
+        assert out.column("project_id").to_pylist() == [None, None]
+
+    def test_already_target_int64_left_alone(self):
+        # When project_id has values it already infers int64 — no rebuild.
+        table = pa.table({"project_id": pa.array([1, 2], pa.int64())})
+        out = coerce_typed_columns(table, (("project_id", "bigint"),))
+        assert out is table
+
+    def test_nulls_pass_through(self):
+        # Nullable timestamps (e.g. person_created_at) arrive as JSON null.
+        table = pa.table({"person_created_at": pa.array([self.WIRE, None], pa.string())})
+        out = coerce_typed_columns(table, (("person_created_at", "timestamptz"),))
+        assert out.column("person_created_at").to_pylist() == [
+            datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
+            None,
+        ]
+
+    def test_missing_column_is_noop(self):
+        # A configured column absent from this batch is skipped, not an error,
+        # so the same map can be pointed at heterogeneous batches.
+        table = pa.table({"team_id": [1]})
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
+        assert out is table
+
+    def test_already_timestamp_typed_left_alone(self):
+        ts = pa.array([datetime(2024, 1, 1, tzinfo=UTC)], pa.timestamp("us", tz="UTC"))
+        table = pa.table({"timestamp": ts})
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
+        assert out is table
+
+    def test_empty_map_is_noop(self):
+        table = pa.table({"timestamp": [self.WIRE]})
+        out = coerce_typed_columns(table, ())
+        assert out is table
+
+    def test_varying_fractional_precision_parses(self):
+        # The real producer emits 0, 3, or 6 fractional digits depending on the
+        # column/source; all must parse to the same Arrow type.
+        cols = {
+            "timestamp": "2024-01-01 12:00:00.123",  # Node: 3 digits
+            "person_created_at": "2024-01-01 12:00:00",  # Node: 0 digits
+            "created_at": "2024-01-01 12:00:00.123456",  # 6 digits
+        }
+        table = pa.table({k: [v] for k, v in cols.items()})
+        out = coerce_typed_columns(table, tuple((c, "timestamptz") for c in cols))
+        for c in cols:
+            assert out.schema.field(c).type == pa.timestamp("us", tz="UTC")
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_unparseable_value_is_non_fatal_and_typed(self, mock_metrics):
+        # A format drift must NOT raise on the consume path (that risks committing
+        # offsets past unwritten records). The bad value is nulled but the column
+        # is STILL the target type — keeping the pending buffer schema-consistent
+        # so pa.concat_tables at flush can't raise — and the error metric fires.
+        table = pa.table({"timestamp": ["not-a-timestamp"], "team_id": [1]})
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert out.column("timestamp").to_pylist() == [None]
+        mock_metrics.errors_total.labels.assert_called_with(type="column_coercion")
+        mock_metrics.errors_total.labels(type="column_coercion").inc.assert_called_once()
+        mock_metrics.columns_coerced_total.labels.assert_not_called()
+
+    def test_bad_value_nulled_good_values_preserved(self):
+        # Within one column, only the unconvertible value is nulled; good values
+        # survive and the column is the target type.
+        table = pa.table({"timestamp": [self.WIRE, "garbage", None]})
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert out.column("timestamp").to_pylist() == [datetime(2024, 1, 1, 12, 0, tzinfo=UTC), None, None]
+
+    def test_failed_batch_stays_concatenable_with_good_batch(self):
+        # Regression for the cross-batch concat crash: a batch whose coercion
+        # failed must still concat with a fully-coerced batch (both end up the
+        # target type), because the consume loop buffers batches and flushes them
+        # via pa.concat_tables(..., promote_options="default").
+        good = coerce_typed_columns(pa.table({"timestamp": [self.WIRE]}), (("timestamp", "timestamptz"),))
+        bad = coerce_typed_columns(pa.table({"timestamp": ["garbage"]}), (("timestamp", "timestamptz"),))
+        merged = pa.concat_tables([good, bad], promote_options="default")  # must not raise
+        assert merged.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert merged.column("timestamp").to_pylist() == [datetime(2024, 1, 1, 12, 0, tzinfo=UTC), None]
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_partial_failure_coerces_good_columns(self, mock_metrics):
+        # One column has a bad value (nulled, error metric); the other coerces
+        # cleanly (per-type success metric). Both end up the target type.
+        table = pa.table({"timestamp": [self.WIRE], "created_at": ["garbage"]})
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"), ("created_at", "timestamptz")))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert out.schema.field("created_at").type == pa.timestamp("us", tz="UTC")
+        assert out.column("created_at").to_pylist() == [None]
+        mock_metrics.columns_coerced_total.labels.assert_called_once_with(target_type="timestamptz")
+        mock_metrics.errors_total.labels(type="column_coercion").inc.assert_called_once()
+
+    def test_roundtrips_through_convert(self):
+        # The realistic path: JSON → convert() (infers VARCHAR) → coerce.
+        messages = [orjson.dumps({"timestamp": self.WIRE, "event": "$pageview"})]
+        table = convert(messages)
+        assert table is not None
+        assert table.schema.field("timestamp").type == pa.string()
+        out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
+        assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
