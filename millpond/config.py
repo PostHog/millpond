@@ -267,8 +267,7 @@ def _load_typed_columns() -> tuple[tuple[str, str], ...] | None:
         name, type_name = name.strip(), type_name.strip().lower()
         if not _SAFE_COLUMN_NAME.match(name):
             raise RuntimeError(
-                f"MILLPOND_TYPED_COLUMNS column {name!r} contains unsafe characters "
-                "(must match [a-zA-Z_][a-zA-Z0-9_]*)"
+                f"MILLPOND_TYPED_COLUMNS column {name!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
             )
         if type_name not in arrow_converter.COERCIBLE_TYPES:
             raise RuntimeError(
@@ -277,9 +276,7 @@ def _load_typed_columns() -> tuple[tuple[str, str], ...] | None:
             )
         if name in seen:
             if seen[name] != type_name:
-                raise RuntimeError(
-                    f"MILLPOND_TYPED_COLUMNS maps {name!r} to both {seen[name]!r} and {type_name!r}"
-                )
+                raise RuntimeError(f"MILLPOND_TYPED_COLUMNS maps {name!r} to both {seen[name]!r} and {type_name!r}")
             continue
         seen[name] = type_name
         pairs.append((name, type_name))
