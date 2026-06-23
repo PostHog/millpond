@@ -290,6 +290,18 @@ bootstrap-index-delete-file-table:
     @echo ">>> ducklake_delete_file_table_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_table_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot) WHERE (end_snapshot IS NULL);"
 
+# Lake-wide SUM(file_size_bytes) over live delete files (drives the
+# ducklake_metrics ducklake_delete_files_bytes panel). Partial-on-NULL
+# narrows the index to live rows only, so write-amp is bounded — one entry
+# added per live insert, removed on supersession. Mirrors the data_file
+# compaction index's shape on the delete side, where the existing
+# ducklake_delete_file_table_idx omits file_size_bytes and forces a heap
+# fetch for the SUM aggregate.
+[group('bootstrap')]
+bootstrap-index-delete-file-metrics:
+    @echo ">>> ducklake_delete_file_metrics_idx"
+    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_metrics_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
+
 # File-column-stats join key; drives per-file stat aggregation during compaction
 [group('bootstrap')]
 bootstrap-index-file-column-stats:
@@ -310,7 +322,7 @@ bootstrap-index-file-partition-value-table:
 
 # Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
 [group('bootstrap')]
-bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-file-column-stats bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table
+bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table
 
 # ----------------------------------------------------------------------------
 # state-metrics daemon
