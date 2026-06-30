@@ -132,11 +132,13 @@ dedup-deletions-dry-run:
 dedup-deletions:
     python {{ ducklake_maintenance }} dedup-deletions
 
+# REMOVE-WHEN: upstream-ducklake-fix-deployed
 # Preview repair-partition-values (counts only, no DML; one-shot per customer)
 [group('lifecycle')]
 repair-partition-values-dry-run:
     python {{ ducklake_maintenance }} repair-partition-values --dry-run
 
+# REMOVE-WHEN: upstream-ducklake-fix-deployed
 # Repair ducklake_file_partition_value rows wrecked by the ducklake_add_data_files bug
 # (one-shot per customer; remove this recipe with the upstream DuckLake source fix)
 [group('lifecycle')]
