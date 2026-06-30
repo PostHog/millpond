@@ -39,6 +39,7 @@ import time
 from collections import defaultdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Literal
 
 import duckdb
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
@@ -345,9 +346,7 @@ def expire(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
 
 def _pg_query_one(conn: duckdb.DuckDBPyConnection, sql: str) -> tuple:
     """Run a SELECT via the pg ATTACH and return the first row."""
-    return conn.execute(
-        f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(sql)})"
-    ).fetchone()
+    return conn.execute(f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(sql)})").fetchone()
 
 
 def _pg_execute(conn: duckdb.DuckDBPyConnection, sql: str) -> None:
@@ -355,7 +354,9 @@ def _pg_execute(conn: duckdb.DuckDBPyConnection, sql: str) -> None:
     conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(sql)})")
 
 
-def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int, num_batches: int | None, dry_run: bool) -> None:
+def expire_snapshots(
+    conn: duckdb.DuckDBPyConnection, days: int, batch_size: int, num_batches: int | None, dry_run: bool
+) -> None:
     """Postgres-native snapshot expiry that bypasses ducklake_expire_snapshots.
 
     DuckLake's built-in OOMs on large catalogs because it loads all matching
@@ -405,7 +406,9 @@ def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int
         log.info(
             "expire-snapshots dry-run: %d snapshots older than %d days (batch_size=%d); "
             "run without --dry-run to see per-batch dead file counts",
-            row[0], days, batch_size,
+            row[0],
+            days,
+            batch_size,
         )
         return
 
@@ -464,10 +467,13 @@ def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int
         dead_dv_count = _pg_query_one(conn, f"SELECT COUNT(*) FROM ({dead_dv_full_subq}) _d")[0]
 
         log.info(
-            "expire-snapshots: batch %d: snapshot_ids [%d..%d] (%d), "
-            "dead_data_files=%d dead_delete_vectors=%d",
-            batch_num, snapshot_ids[0], snapshot_ids[-1], len(snapshot_ids),
-            dead_data_count, dead_dv_count,
+            "expire-snapshots: batch %d: snapshot_ids [%d..%d] (%d), dead_data_files=%d dead_delete_vectors=%d",
+            batch_num,
+            snapshot_ids[0],
+            snapshot_ids[-1],
+            len(snapshot_ids),
+            dead_data_count,
+            dead_dv_count,
         )
 
         if dead_data_count > 0:
@@ -483,8 +489,12 @@ def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int
                 f")",
             )
             _pg_execute(conn, f"DELETE FROM {s}.ducklake_file_column_stats WHERE data_file_id IN ({dead_data_id_subq})")
-            _pg_execute(conn, f"DELETE FROM {s}.ducklake_file_partition_value WHERE data_file_id IN ({dead_data_id_subq})")
-            _pg_execute(conn, f"DELETE FROM {s}.ducklake_file_variant_stats WHERE data_file_id IN ({dead_data_id_subq})")
+            _pg_execute(
+                conn, f"DELETE FROM {s}.ducklake_file_partition_value WHERE data_file_id IN ({dead_data_id_subq})"
+            )
+            _pg_execute(
+                conn, f"DELETE FROM {s}.ducklake_file_variant_stats WHERE data_file_id IN ({dead_data_id_subq})"
+            )
             _pg_execute(conn, f"DELETE FROM {s}.ducklake_data_file WHERE data_file_id IN ({dead_data_id_subq})")
 
         if dead_dv_count > 0:
@@ -511,7 +521,11 @@ def expire_snapshots(conn: duckdb.DuckDBPyConnection, days: int, batch_size: int
     log.info(
         "expire-snapshots: done: %d snapshots expired, %d dead data files + %d delete vectors "
         "scheduled for deletion (%d batches, batch_size=%d, num_batches=%s); run cleanup-all to delete S3 objects",
-        total_snapshots, total_dead_data_files, total_dead_delete_vectors, batch_num, batch_size,
+        total_snapshots,
+        total_dead_data_files,
+        total_dead_delete_vectors,
+        batch_num,
+        batch_size,
         str(num_batches) if num_batches is not None else "unlimited",
     )
 
@@ -635,6 +649,565 @@ def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     log.info("dedup-deletions: queue now has %d duplicate rows", after)
 
 
+# ---------------------------------------------------------------------------
+# repair-partition-values: recurring catalog cleanup
+# ---------------------------------------------------------------------------
+# Workaround for an upstream DuckLake bug in ducklake_add_data_files(): when a
+# partition spec applies multiple transforms to one source column (events:
+# year/month/day on `timestamp`; persons: year/month on `_timestamp`), every
+# ducklake_file_partition_value row lands at the HIGHEST partition_key_index
+# instead of being spread across the spec's columns. Tier-3 compaction then
+# fails with "Files have different hive partition path", and partition pruning
+# silently misses files.
+#
+# A dagster duckling backfill fix-up reduces new-write bleeding (PostHog repo,
+# posthog/dags/events_backfill_to_duckling.py:_fixup_partition_values_for_added_files),
+# but it's per-batch and may not be deployed everywhere. This subcommand is the
+# catalog-side backstop: wired as the first step of the 15-minute compaction
+# cronjob, it cleans up any rot (historical or freshly-introduced) on every
+# tick. The cheap pre-flight EXISTS query short-circuits when there's nothing
+# to do, so clean catalogs pay near-zero cost.
+#
+# REMOVE this subcommand (and the matching just-recipes) once the upstream
+# DuckLake source fix is deployed across every customer warehouse AND every
+# customer's catalog has had at least one clean pre-flight (no rot detected).
+
+# REMOVE-WHEN: upstream-ducklake-fix-deployed
+# Per-kind partition spec. "events" / "persons" are the logical kinds; the
+# actual catalog table name can carry a per-team suffix (events_<suffix> /
+# persons_<suffix>) per DuckgresServerTeam.table_suffix on the posthog side.
+# The spec is identical across suffix variants since the partition layout
+# doesn't change. Must mirror the live catalog
+# (ducklake_partition_column.transform for the active partition_id). Asserted
+# at runtime before any DML — drift fails loud.
+_REPAIR_PARTITION_VALUE_SPEC: dict[str, tuple[tuple[int, str], ...]] = {
+    "events": ((0, "year"), (1, "month"), (2, "day")),
+    "persons": ((0, "year"), (1, "month")),
+}
+
+# Bounds on the per-table repair statement so a runaway query can't hold the
+# advisory lock forever and block all other maintenance.
+_REPAIR_PARTITION_VALUE_STATEMENT_TIMEOUT = "300s"
+_REPAIR_PARTITION_VALUE_LOCK_TIMEOUT = "30s"
+
+
+def _repair_partition_values_path_shape_predicate(
+    table_kind: Literal["events", "persons"], *, column: str = "path"
+) -> str:
+    """SQL regex that matches the kind's expected hive layout — numeric year/
+    month[/day] segments followed by a single .parquet file name. Tighter than
+    a LIKE chain: it rejects non-numeric segments (e.g. `day=ab`) at the
+    targets stage. Without this, `substring(path from '<col>=([0-9]+)')`
+    silently returns NULL on a non-matching path, which would produce NULL
+    partition_value rows — a third class of catalog rot worse than the bug
+    we're repairing. `column` defaults to bare `path`; pass the aliased form
+    (e.g. `df.path`) when the surrounding SELECT uses a table alias."""
+    if table_kind == "events":
+        return f"({column} ~ '/year=[0-9]+/month=[0-9]+/day=[0-9]+/[^/]+\\.parquet$')"
+    if table_kind == "persons":
+        return f"({column} ~ '/year=[0-9]+/month=[0-9]+/[^/]+\\.parquet$')"
+    raise ValueError(f"unknown table_kind: {table_kind!r}")
+
+
+def _repair_partition_values_discover_tables(conn: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
+    """Find every live posthog.events* / posthog.persons* table in this catalog.
+
+    Returns a list of (kind, table_name), where kind is "events"/"persons" and
+    table_name is the actual catalog name (potentially suffixed). LIKE escapes
+    the underscore because PG treats _ as a single-char wildcard — without the
+    escape, "events" itself would match the "events_%" pattern.
+    """
+    discover_sql = (
+        f"SELECT t.table_name "
+        f"FROM {PG_CATALOG_SCHEMA}.ducklake_table t "
+        f"JOIN {PG_CATALOG_SCHEMA}.ducklake_schema sch "
+        f"  ON sch.schema_id = t.schema_id AND sch.end_snapshot IS NULL "
+        f"WHERE sch.schema_name = 'posthog' "
+        f"  AND t.end_snapshot IS NULL "
+        f"  AND ("
+        f"    t.table_name = 'events' OR t.table_name LIKE 'events\\_%' ESCAPE '\\' "
+        f"    OR t.table_name = 'persons' OR t.table_name LIKE 'persons\\_%' ESCAPE '\\'"
+        f"  ) "
+        f"ORDER BY t.table_name"
+    )
+    rows = conn.execute(
+        f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(discover_sql)})"
+    ).fetchall()
+    discovered: list[tuple[str, str]] = []
+    for (table_name,) in rows:
+        if table_name == "events" or table_name.startswith("events_"):
+            discovered.append(("events", table_name))
+        elif table_name == "persons" or table_name.startswith("persons_"):
+            discovered.append(("persons", table_name))
+    return discovered
+
+
+def _repair_partition_values_pre_flight_any_rot(conn: duckdb.DuckDBPyConnection) -> bool:
+    """Cheap one-shot EXISTS across all in-scope posthog events/persons tables.
+
+    Returns True iff at least one file's fpv state doesn't match expected for
+    its kind: events files must have exactly 3 fpv rows (year/month/day),
+    persons exactly 2 (year/month). Also True if ANY fpv row in scope has a
+    NULL partition_value. EXISTS short-circuits at the first matching row
+    inside the LIMIT 1 subquery — keeps this snappy on clean catalogs.
+
+    Important because this subcommand will run as the first step of the
+    15-minute compaction cronjob: most invocations will be against clean
+    catalogs and should exit before doing N per-table count queries.
+    """
+    pre_flight_sql = (
+        "SELECT EXISTS ( "
+        "  SELECT 1 FROM ( "
+        "    SELECT df.data_file_id, df.table_id, t.table_name, "
+        "           COUNT(fpv.partition_key_index) AS n_fpv, "
+        "           BOOL_OR(fpv.partition_value IS NULL) AS has_null "
+        f"    FROM {PG_CATALOG_SCHEMA}.ducklake_data_file df "
+        f"    JOIN {PG_CATALOG_SCHEMA}.ducklake_table t USING (table_id) "
+        f"    JOIN {PG_CATALOG_SCHEMA}.ducklake_schema sch "
+        "      ON sch.schema_id = t.schema_id AND sch.end_snapshot IS NULL "
+        f"    LEFT JOIN {PG_CATALOG_SCHEMA}.ducklake_file_partition_value fpv "
+        "      ON fpv.data_file_id = df.data_file_id AND fpv.table_id = df.table_id "
+        "    WHERE sch.schema_name = 'posthog' "
+        "      AND t.end_snapshot IS NULL "
+        "      AND df.end_snapshot IS NULL "
+        "      AND df.path NOT LIKE '%/full/%' "
+        "      AND (t.table_name IN ('events','persons') "
+        "           OR t.table_name LIKE 'events\\_%' ESCAPE '\\' "
+        "           OR t.table_name LIKE 'persons\\_%' ESCAPE '\\') "
+        "    GROUP BY df.data_file_id, df.table_id, t.table_name "
+        "    HAVING (t.table_name LIKE 'events%' AND COUNT(fpv.partition_key_index) <> 3) "
+        "        OR (t.table_name LIKE 'persons%' AND COUNT(fpv.partition_key_index) <> 2) "
+        "        OR BOOL_OR(fpv.partition_value IS NULL) "
+        "    LIMIT 1 "
+        "  ) s "
+        ") AS has_rot"
+    )
+    row = conn.execute(
+        f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(pre_flight_sql)})"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("repair-partition-values pre-flight: EXISTS query returned no row")
+    return bool(row[0])
+
+
+def _repair_partition_values_log_outliers(conn: duckdb.DuckDBPyConnection, tables: list[tuple[str, str]]) -> None:
+    # Lake-relative files (`ducklake-{uuid}.parquet` at the lake root) and the
+    # persons /full/ singleton don't fit the hive layout this subcommand
+    # repairs. They're known and intentional; just log counts so the operator
+    # sees they exist (they're skipped by the repair filters).
+    if not tables:
+        return
+    table_names_sql = ", ".join(f"'{tn}'" for _, tn in tables)
+    counts_sql = (
+        f"SELECT t.table_name, "
+        f"  COUNT(*) FILTER (WHERE df.path NOT LIKE 's3://%') AS lake_relative, "
+        f"  COUNT(*) FILTER (WHERE df.path LIKE '%/full/%')   AS full_singleton "
+        f"FROM {PG_CATALOG_SCHEMA}.ducklake_data_file df "
+        f"JOIN {PG_CATALOG_SCHEMA}.ducklake_table t USING (table_id) "
+        f"JOIN {PG_CATALOG_SCHEMA}.ducklake_schema sch "
+        f"  ON sch.schema_id = t.schema_id AND sch.end_snapshot IS NULL "
+        f"WHERE df.end_snapshot IS NULL AND t.end_snapshot IS NULL "
+        f"  AND sch.schema_name = 'posthog' "
+        f"  AND t.table_name IN ({table_names_sql}) "
+        f"GROUP BY t.table_name "
+        f"HAVING COUNT(*) FILTER (WHERE df.path NOT LIKE 's3://%') > 0 "
+        f"    OR COUNT(*) FILTER (WHERE df.path LIKE '%/full/%') > 0"
+    )
+    rows = conn.execute(
+        f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(counts_sql)})"
+    ).fetchall()
+    for table_name, lake_relative, full_singleton in rows:
+        log.warning(
+            "repair-partition-values: %s has %d lake-relative + %d /full/ file(s) "
+            "(skipped — not in scope of this repair)",
+            table_name,
+            lake_relative,
+            full_singleton,
+        )
+
+
+def _repair_partition_values_resolve(
+    conn: duckdb.DuckDBPyConnection, table_kind: Literal["events", "persons"], table_name: str
+) -> tuple[int, int] | None:
+    """Look up (table_id, partition_id) for posthog.<table_name> and verify the
+    live partition_column spec matches _REPAIR_PARTITION_VALUE_SPEC[kind].
+
+    Returns None if the table was discovered earlier but has since gone away
+    (race against ALTER/DROP, or end_snapshot was set between discover and
+    resolve). Raises if the live spec doesn't match what we'd write.
+    """
+    lookup_sql = (
+        f"SELECT t.table_id, pi.partition_id "
+        f"FROM {PG_CATALOG_SCHEMA}.ducklake_table t "
+        f"JOIN {PG_CATALOG_SCHEMA}.ducklake_schema sch "
+        f"  ON sch.schema_id = t.schema_id AND sch.end_snapshot IS NULL "
+        f"JOIN {PG_CATALOG_SCHEMA}.ducklake_partition_info pi "
+        f"  ON pi.table_id = t.table_id AND pi.end_snapshot IS NULL "
+        f"WHERE sch.schema_name = 'posthog' "
+        f"  AND t.table_name = '{table_name}' "
+        f"  AND t.end_snapshot IS NULL"
+    )
+    rows = conn.execute(
+        f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(lookup_sql)})"
+    ).fetchall()
+    if len(rows) == 0:
+        log.warning(
+            "repair-partition-values: posthog.%s was discovered but no live partition_info found — "
+            "table may have been dropped or unpartitioned between discovery and resolve. Skipping.",
+            table_name,
+        )
+        return None
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"repair-partition-values: expected exactly one live partition_info for "
+            f"posthog.{table_name}, got {len(rows)}"
+        )
+    table_id, partition_id = rows[0]
+
+    # Assert live spec matches our hardcoded expectation for this kind.
+    spec_sql = (
+        f"SELECT partition_key_index, transform "
+        f"FROM {PG_CATALOG_SCHEMA}.ducklake_partition_column "
+        f"WHERE partition_id = {int(partition_id)} AND table_id = {int(table_id)} "
+        f"ORDER BY partition_key_index"
+    )
+    spec_rows = conn.execute(
+        f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(spec_sql)})"
+    ).fetchall()
+    actual = tuple((int(idx), str(transform)) for idx, transform in spec_rows)
+    expected = _REPAIR_PARTITION_VALUE_SPEC[table_kind]
+    if actual != expected:
+        raise RuntimeError(
+            f"repair-partition-values: live catalog spec for posthog.{table_name} "
+            f"(kind={table_kind}, partition_id={partition_id}) is {actual}; expected {expected}. "
+            f"Update _REPAIR_PARTITION_VALUE_SPEC and redeploy before re-running. "
+            f"Inspect with: SELECT partition_key_index, transform FROM public.ducklake_partition_column "
+            f"WHERE partition_id = {int(partition_id)} AND table_id = {int(table_id)} ORDER BY partition_key_index;"
+        )
+    return int(table_id), int(partition_id)
+
+
+def _repair_partition_values_count_broken(
+    conn: duckdb.DuckDBPyConnection,
+    table_kind: Literal["events", "persons"],
+    table_id: int,
+    partition_id: int,
+    spec: tuple[tuple[int, str], ...],
+) -> tuple[int, int]:
+    """Return (wrong_indexes, null_values) for files this table needs repaired.
+
+    A file is "wrong_indexes" if its actual fpv partition_key_index set is NOT
+    exactly {0,1,...,len(spec)-1}, OR its partition_id is NULL on a legacy
+    team_id=... path. A file is "null_values" if ANY of its fpv rows has a
+    NULL partition_value — separately reported because that's a third class of
+    rot (e.g. from a hypothetical write that registered a path the substring
+    regex couldn't parse). Lake-relative + /full/ files are deliberately
+    excluded (warned about separately). Scoped by table_id (so per-team
+    suffixed tables don't bleed into each other); the legacy-path filter uses
+    kind because the S3 layout is keyed on the LOGICAL kind, not the suffixed
+    table_name."""
+    expected_index_set = "ARRAY[" + ",".join(str(idx) for idx, _ in spec) + "]"
+    path_shape_predicate = _repair_partition_values_path_shape_predicate(table_kind, column="df.path")
+    count_sql = (
+        f"WITH targets AS ( "
+        f"  SELECT df.data_file_id "
+        f"  FROM {PG_CATALOG_SCHEMA}.ducklake_data_file df "
+        f"  WHERE df.table_id = {table_id} "
+        f"    AND df.end_snapshot IS NULL "
+        f"    AND df.path NOT LIKE '%/full/%' "
+        f"    AND {path_shape_predicate} "
+        f"    AND ( "
+        f"      df.partition_id = {partition_id} "
+        f"      OR (df.partition_id IS NULL "
+        f"          AND df.path LIKE '%/backfill/{table_kind}/team_id=%') "
+        f"    ) "
+        f"), "
+        f"state AS ( "
+        f"  SELECT t.data_file_id, "
+        f"         COALESCE( "
+        f"           array_agg(fpv.partition_key_index ORDER BY fpv.partition_key_index) "
+        f"           FILTER (WHERE fpv.partition_key_index IS NOT NULL), "
+        f"           '{{}}'::bigint[] "
+        f"         ) AS indexes, "
+        f"         BOOL_OR(fpv.partition_value IS NULL) AS has_null "
+        f"  FROM targets t "
+        f"  LEFT JOIN {PG_CATALOG_SCHEMA}.ducklake_file_partition_value fpv "
+        f"    ON fpv.data_file_id = t.data_file_id AND fpv.table_id = {table_id} "
+        f"  GROUP BY t.data_file_id "
+        f") "
+        f"SELECT "
+        f"  COUNT(*) FILTER (WHERE indexes IS DISTINCT FROM {expected_index_set}::bigint[]) AS wrong_indexes, "
+        f"  COUNT(*) FILTER (WHERE has_null) AS null_values "
+        f"FROM state"
+    )
+    row = conn.execute(f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(count_sql)})").fetchone()
+    if row is None:
+        raise RuntimeError(
+            "repair-partition-values: count query returned no row (Postgres protocol invariant violated)"
+        )
+    return int(row[0]), int(row[1])
+
+
+def _repair_partition_values_execute(
+    conn: duckdb.DuckDBPyConnection,
+    table_kind: Literal["events", "persons"],
+    table_id: int,
+    partition_id: int,
+    spec: tuple[tuple[int, str], ...],
+) -> None:
+    """Race-safe per-table repair, executed as ONE postgres_execute call.
+
+    DuckDB's postgres extension wraps every postgres_execute call in
+    ``BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ; ...; COMMIT;``. All
+    statements in this call therefore share one snapshot — concurrent dagster
+    commits that land DURING the call are invisible to every read in this
+    call (including the trailing post-condition), and our own writes are
+    visible to that post-condition. No operator-side freeze of dagster is
+    required.
+
+    Statements (one call, one snapshot):
+      1. SET LOCAL statement_timeout + lock_timeout — bound runaway so the
+         advisory lock can't be held forever.
+      2. CREATE TEMP TABLE _repair_targets ON COMMIT DROP AS SELECT … —
+         materialize Class A (NULL partition_id at legacy team_id= path) +
+         Class B (partition_id set, partial fpv rows) + Era 3 (N fpv rows
+         all at highest index) into a temp table. ON COMMIT DROP means it
+         auto-cleans at the end of this txn, so the next per-table call
+         sees no leftover state.
+      3. wCTE INSERT — relabel UPDATEs partition_id on the Class A subset,
+         deleted DELETEs existing fpv rows for the target set, INSERT
+         re-emits canonical fpv rows parsed from each target's path. All
+         three driven off _repair_targets, scoped consistently with the
+         post-condition. relabel + deleted are unreferenced from INSERT;
+         PG §7.8.2 guarantees data-modifying CTEs in WITH run exactly once
+         "to completion, independently of whether the primary query reads
+         all (or indeed any) of their output." A defensive reference
+         (WHERE EXISTS) would silently filter Class A files whose DELETE
+         returns 0 rows.
+      4. DO block — re-derives fpv state for _repair_targets including
+         our own writes; RAISE EXCEPTION if any row still has wrong indexes
+         or NULL partition_value. The exception surfaces to Python as a
+         duckdb error; the orchestrator catches it and continues to the
+         next table.
+
+    Scoped by table_id; the legacy-path predicate uses kind because the
+    dagster backfill writes to s3://.../backfill/<kind>/<team_id>/...
+    regardless of whether the catalog table carries a suffix. The hive-
+    shape predicate rejects non-conforming paths at the targets stage —
+    without it, ``substring(...)`` would silently return NULL on a non-
+    matching path and we'd insert NULL partition_value rows.
+
+    Silent skip worth knowing: a NULL-partition_id file at a path that does
+    NOT match the legacy ``/backfill/<kind>/team_id=`` layout is excluded
+    from _repair_targets. This tool is scoped to the dagster-bug rot; other
+    NULL-partition_id origins (if any ever appear) are not in scope.
+
+    A dagster commit whose data_file_id was allocated below our visible MAX
+    but committed AFTER our snapshot is invisible to this call and goes
+    unrepaired. A re-run picks it up — convergent."""
+    expected_index_set = "ARRAY[" + ",".join(str(idx) for idx, _ in spec) + "]"
+    targets_path_shape = _repair_partition_values_path_shape_predicate(table_kind, column="df.path")
+    insert_branches = " UNION ALL ".join(
+        f"SELECT t.data_file_id, {table_id}, {idx}, "
+        f"(substring(t.path from '{col_name}=([0-9]+)'))::INT::TEXT "
+        f"FROM _repair_targets t"
+        for idx, col_name in spec
+    )
+    repair_sql = (
+        f"SET LOCAL statement_timeout = '{_REPAIR_PARTITION_VALUE_STATEMENT_TIMEOUT}'; "
+        f"SET LOCAL lock_timeout = '{_REPAIR_PARTITION_VALUE_LOCK_TIMEOUT}'; "
+        f"CREATE TEMP TABLE _repair_targets ON COMMIT DROP AS "
+        f"  SELECT df.data_file_id, df.path "
+        f"  FROM {PG_CATALOG_SCHEMA}.ducklake_data_file df "
+        f"  WHERE df.table_id = {table_id} "
+        f"    AND df.end_snapshot IS NULL "
+        f"    AND df.path NOT LIKE '%/full/%' "
+        f"    AND {targets_path_shape} "
+        f"    AND ( "
+        f"      df.partition_id = {partition_id} "
+        f"      OR (df.partition_id IS NULL "
+        f"          AND df.path LIKE '%/backfill/{table_kind}/team_id=%') "
+        f"    ); "
+        f"WITH relabel AS ( "
+        f"  UPDATE {PG_CATALOG_SCHEMA}.ducklake_data_file "
+        f"  SET partition_id = {partition_id} "
+        f"  WHERE data_file_id IN (SELECT data_file_id FROM _repair_targets) "
+        f"    AND partition_id IS NULL "
+        f"), "
+        f"deleted AS ( "
+        f"  DELETE FROM {PG_CATALOG_SCHEMA}.ducklake_file_partition_value "
+        f"  WHERE table_id = {table_id} "
+        f"    AND data_file_id IN (SELECT data_file_id FROM _repair_targets) "
+        f") "
+        f"INSERT INTO {PG_CATALOG_SCHEMA}.ducklake_file_partition_value "
+        f"  (data_file_id, table_id, partition_key_index, partition_value) "
+        f"{insert_branches}; "
+        f"DO $repair$ "
+        f"DECLARE wrong INT; nulls INT; "
+        f"BEGIN "
+        f"  WITH state AS ( "
+        f"    SELECT t.data_file_id, "
+        f"           COALESCE( "
+        f"             array_agg(fpv.partition_key_index ORDER BY fpv.partition_key_index) "
+        f"             FILTER (WHERE fpv.partition_key_index IS NOT NULL), "
+        f"             '{{}}'::bigint[] "
+        f"           ) AS indexes, "
+        f"           BOOL_OR(fpv.partition_value IS NULL) AS has_null "
+        f"    FROM _repair_targets t "
+        f"    LEFT JOIN {PG_CATALOG_SCHEMA}.ducklake_file_partition_value fpv "
+        f"      ON fpv.data_file_id = t.data_file_id AND fpv.table_id = {table_id} "
+        f"    GROUP BY t.data_file_id "
+        f"  ) "
+        f"  SELECT COUNT(*) FILTER (WHERE indexes IS DISTINCT FROM {expected_index_set}::bigint[]), "
+        f"         COUNT(*) FILTER (WHERE has_null) "
+        f"    INTO wrong, nulls FROM state; "
+        f"  IF wrong > 0 OR nulls > 0 THEN "
+        f"    RAISE EXCEPTION 'repair-partition-values post-condition failed for table_id={table_id}: "
+        f"wrong_indexes=% null_values=%', wrong, nulls; "
+        f"  END IF; "
+        f"END $repair$;"
+    )
+    conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(repair_sql)})")
+
+
+def repair_partition_values(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
+    """Recurring catalog repair for the ducklake_add_data_files partition index bug.
+
+    Designed to run as the first step of the 15-minute compaction cronjob, so
+    every invocation must be cheap on clean catalogs and safe alongside the
+    dagster backfill. See the module-level repair-partition-values block above
+    for full context.
+
+    Order of operations:
+      1. Acquire millpond's session-scoped maintenance advisory lock (unless
+         dry_run) so concurrent millpond maintenance jobs don't race. The lock
+         does NOT serialize against dagster — REPEATABLE READ does that.
+      2. Discover every live posthog.events* / posthog.persons* table in this
+         catalog (covers DuckgresServerTeam.table_suffix variants).
+      3. Cheap pre-flight EXISTS: short-circuit and return clean if no file in
+         scope has wrong fpv shape or NULL partition_value. This is the hot
+         path for cron-driven invocations on already-clean catalogs.
+      4. Per-table plan: resolve (table_id, partition_id), verify the live
+         catalog spec matches our hardcoded expectation, count broken files.
+      5. Per-table repair: one postgres_execute call per table (race-safe via
+         REPEATABLE READ snapshot — see _repair_partition_values_execute).
+
+    Per-table failures (post-condition raise, lock timeout, statement timeout,
+    network blip) are logged and the loop continues — one bad table doesn't
+    block the rest. The orchestrator raises iff every planned table failed
+    (the tool achieved nothing); otherwise warns and returns clean.
+
+    Convergent: safe to re-run on already-repaired catalogs (pre-flight
+    short-circuits) or on catalogs without events/persons tables (exits after
+    discover). A data_file_id that dagster allocates below our snapshot's
+    visible MAX but commits AFTER our snapshot is invisible to this run;
+    the next 15-minute tick picks it up.
+    """
+    log.info("repair-partition-values: starting (dry_run=%s)", dry_run)
+
+    if not dry_run:
+        _acquire_advisory_lock(conn)
+
+    discovered = _repair_partition_values_discover_tables(conn)
+    if not discovered:
+        log.info("repair-partition-values: no posthog.events* / posthog.persons* tables in this catalog, exiting")
+        return
+    log.info(
+        "repair-partition-values: discovered %d table(s): %s",
+        len(discovered),
+        ", ".join(f"{name} ({kind})" for kind, name in discovered),
+    )
+
+    if not _repair_partition_values_pre_flight_any_rot(conn):
+        log.info("repair-partition-values: pre-flight clean (no rot detected in scope), exiting")
+        return
+
+    _repair_partition_values_log_outliers(conn, discovered)
+
+    plan: list[tuple[Literal["events", "persons"], str, int, int, tuple[tuple[int, str], ...], int, int]] = []
+    for table_kind, table_name in discovered:
+        spec = _REPAIR_PARTITION_VALUE_SPEC[table_kind]
+        try:
+            resolved = _repair_partition_values_resolve(conn, table_kind, table_name)
+            if resolved is None:
+                continue
+            table_id, partition_id = resolved
+            wrong_indexes, null_values = _repair_partition_values_count_broken(
+                conn, table_kind, table_id, partition_id, spec
+            )
+        except Exception as exc:
+            log.warning(
+                "repair-partition-values: table=%s kind=%s planning failed; skipping (likely out of scope — "
+                "different partition spec, dropped table, or transient catalog read). error=%s",
+                table_name,
+                table_kind,
+                exc,
+            )
+            continue
+        log.info(
+            "repair-partition-values: table=%s kind=%s table_id=%d partition_id=%d "
+            "pre_wrong_indexes=%d pre_null_values=%d",
+            table_name,
+            table_kind,
+            table_id,
+            partition_id,
+            wrong_indexes,
+            null_values,
+        )
+        if wrong_indexes > 0 or null_values > 0:
+            plan.append((table_kind, table_name, table_id, partition_id, spec, wrong_indexes, null_values))
+
+    if not plan:
+        log.info("repair-partition-values: nothing to repair after planning, exiting")
+        return
+
+    if dry_run:
+        log.info("repair-partition-values: dry_run=True, skipping execute")
+        return
+
+    failed: list[str] = []
+    for table_kind, table_name, table_id, partition_id, spec, pre_wrong, pre_null in plan:
+        try:
+            _repair_partition_values_execute(conn, table_kind, table_id, partition_id, spec)
+            post_wrong, post_null = _repair_partition_values_count_broken(
+                conn, table_kind, table_id, partition_id, spec
+            )
+        except Exception as exc:
+            log.error(
+                "repair-partition-values: table=%s kind=%s table_id=%d partition_id=%d "
+                "execute failed; continuing. error=%s",
+                table_name,
+                table_kind,
+                table_id,
+                partition_id,
+                exc,
+            )
+            failed.append(table_name)
+            continue
+        log.info(
+            "repair-partition-values: table=%s kind=%s table_id=%d partition_id=%d "
+            "pre_wrong_indexes=%d pre_null_values=%d post_wrong_indexes=%d post_null_values=%d",
+            table_name,
+            table_kind,
+            table_id,
+            partition_id,
+            pre_wrong,
+            pre_null,
+            post_wrong,
+            post_null,
+        )
+
+    if failed and len(failed) == len(plan):
+        raise RuntimeError(f"repair-partition-values: all {len(plan)} planned table(s) failed: {', '.join(failed)}")
+    if failed:
+        log.warning(
+            "repair-partition-values: %d/%d table(s) failed: %s (next cron tick will retry)",
+            len(failed),
+            len(plan),
+            ", ".join(failed),
+        )
+
+
 def _heal_orphans_b1_counts(conn: duckdb.DuckDBPyConnection, data_path: str) -> tuple[int, int]:
     """Run heal-orphans's B1 gate counts against an already-populated _orphans.
 
@@ -699,8 +1272,7 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
         _acquire_advisory_lock(conn)
 
     conn.execute(
-        "CREATE OR REPLACE TEMP TABLE _orphans AS "
-        "SELECT data_file_id, path FROM find_catalog_orphans(?)",
+        "CREATE OR REPLACE TEMP TABLE _orphans AS SELECT data_file_id, path FROM find_catalog_orphans(?)",
         [data_path],
     )
     n_orphans = conn.execute("SELECT COUNT(*) FROM _orphans").fetchone()[0]
@@ -751,10 +1323,7 @@ def heal_orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     # atomic at the upstream Postgres layer (per quirk r4).
     paths = [row[0] for row in conn.execute("SELECT path FROM _orphans").fetchall()]
     path_list = ", ".join(_sql_string_literal(p) for p in paths)
-    delete_sql = (
-        f"DELETE FROM {PG_CATALOG_SCHEMA}.ducklake_files_scheduled_for_deletion "
-        f"WHERE path IN ({path_list})"
-    )
+    delete_sql = f"DELETE FROM {PG_CATALOG_SCHEMA}.ducklake_files_scheduled_for_deletion WHERE path IN ({path_list})"
     conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(delete_sql)})")
 
     after = conn.execute(
@@ -789,14 +1358,11 @@ def cleanup_all_safe(conn: duckdb.DuckDBPyConnection, max_iterations: int) -> No
             return
         except duckdb.IOException as e:
             log.warning(
-                "cleanup-all-safe: cleanup-all crashed on attempt %d (%s); "
-                "looping to heal fresh orphans",
+                "cleanup-all-safe: cleanup-all crashed on attempt %d (%s); looping to heal fresh orphans",
                 attempt,
                 e,
             )
-    raise RuntimeError(
-        f"cleanup-all-safe exhausted {max_iterations} iterations without a clean cleanup-all run"
-    )
+    raise RuntimeError(f"cleanup-all-safe exhausted {max_iterations} iterations without a clean cleanup-all run")
 
 
 def fsck(conn: duckdb.DuckDBPyConnection, dry_run: bool, max_iterations: int) -> None:
@@ -1126,20 +1692,29 @@ def compact(
     # into one log line per table rather than one line per group.
     totals: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0])
     for schema, tbl, inputs, outputs in result:
-        totals[(schema, tbl)][0] += 1        # groups
-        totals[(schema, tbl)][1] += inputs   # input files
+        totals[(schema, tbl)][0] += 1  # groups
+        totals[(schema, tbl)][1] += inputs  # input files
         totals[(schema, tbl)][2] += outputs  # output files
     for (schema, tbl), (groups, inputs, outputs) in totals.items():
         log.info(
             "compact tier-%d: %s.%s: %d groups, %d files → %d output files",
-            tier, schema, tbl, groups, inputs, outputs,
+            tier,
+            schema,
+            tbl,
+            groups,
+            inputs,
+            outputs,
         )
     total_groups = sum(v[0] for v in totals.values())
     total_inputs = sum(v[1] for v in totals.values())
     total_outputs = sum(v[2] for v in totals.values())
     log.info(
         "compact tier-%d: %d groups total, %d files → %d output files, duration=%.1fs",
-        tier, total_groups, total_inputs, total_outputs, elapsed,
+        tier,
+        total_groups,
+        total_inputs,
+        total_outputs,
+        elapsed,
     )
 
 
@@ -1212,6 +1787,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "dedup-deletions",
         help="Drop duplicate rows from ducklake_files_scheduled_for_deletion (workaround for DuckLake bug c5)",
+    )
+    p.add_argument("--dry-run", action="store_true")
+
+    # REMOVE-WHEN: upstream-ducklake-fix-deployed
+    # repair-partition-values (one-shot per customer; remove with the upstream DuckLake source fix)
+    p = sub.add_parser(
+        "repair-partition-values",
+        help="Repair ducklake_file_partition_value rows wrecked by the ducklake_add_data_files bug",
     )
     p.add_argument("--dry-run", action="store_true")
 
@@ -1351,6 +1934,8 @@ def main(argv: list[str] | None = None) -> None:
                 cleanup_all(conn, args.dry_run)
             case "dedup-deletions":
                 dedup_deletions(conn, args.dry_run)
+            case "repair-partition-values":  # REMOVE-WHEN: upstream-ducklake-fix-deployed
+                repair_partition_values(conn, args.dry_run)
             case "find-orphans":
                 find_orphans(conn)
             case "heal-orphans":
