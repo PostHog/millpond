@@ -755,6 +755,22 @@ def _repair_partition_values_pre_flight_any_rot(conn: duckdb.DuckDBPyConnection)
     15-minute compaction cronjob: most invocations will be against clean
     catalogs and should exit before doing N per-table count queries.
     """
+    # Restrict to files a real _execute run would actually touch:
+    #   - Table must be PARTITIONED (has a live ducklake_partition_info row) —
+    #     otherwise events_nrt / other unpartitioned events*/persons* variants
+    #     produce COUNT(fpv)=0 and trip the HAVING <> 3 branch forever.
+    #   - Path must be S3-absolute — lake-relative files (ducklake-{uuid}.parquet
+    #     at the lake root) don't fit the hive layout the repair targets.
+    #   - Path must match the kind-specific hive layout _execute expects
+    #     (events: year/month/day; persons: year/month) — some persons files
+    #     were written under a legacy `/year=/month=/day=/…` path that this
+    #     tool can't currently parse (persons has no `day` partition column),
+    #     so they're out of _execute's scope and shouldn't fire pre-flight.
+    # Without these filters this always returns TRUE on any catalog with
+    # unpartitioned variants, lake-relative files, or those legacy paths,
+    # defeating the cron short-circuit.
+    events_path_shape = _repair_partition_values_path_shape_predicate("events", column="df.path")
+    persons_path_shape = _repair_partition_values_path_shape_predicate("persons", column="df.path")
     pre_flight_sql = (
         "SELECT EXISTS ( "
         "  SELECT 1 FROM ( "
@@ -765,15 +781,21 @@ def _repair_partition_values_pre_flight_any_rot(conn: duckdb.DuckDBPyConnection)
         f"    JOIN {PG_CATALOG_SCHEMA}.ducklake_table t USING (table_id) "
         f"    JOIN {PG_CATALOG_SCHEMA}.ducklake_schema sch "
         "      ON sch.schema_id = t.schema_id AND sch.end_snapshot IS NULL "
+        f"    JOIN {PG_CATALOG_SCHEMA}.ducklake_partition_info pi "
+        "      ON pi.table_id = t.table_id AND pi.end_snapshot IS NULL "
         f"    LEFT JOIN {PG_CATALOG_SCHEMA}.ducklake_file_partition_value fpv "
         "      ON fpv.data_file_id = df.data_file_id AND fpv.table_id = df.table_id "
         "    WHERE sch.schema_name = 'posthog' "
         "      AND t.end_snapshot IS NULL "
         "      AND df.end_snapshot IS NULL "
+        "      AND df.path LIKE 's3://%' "
         "      AND df.path NOT LIKE '%/full/%' "
-        "      AND (t.table_name IN ('events','persons') "
-        "           OR t.table_name LIKE 'events\\_%' ESCAPE '\\' "
-        "           OR t.table_name LIKE 'persons\\_%' ESCAPE '\\') "
+        "      AND ( "
+        f"        ((t.table_name = 'events' OR t.table_name LIKE 'events\\_%' ESCAPE '\\') "
+        f"          AND {events_path_shape}) "
+        f"        OR ((t.table_name = 'persons' OR t.table_name LIKE 'persons\\_%' ESCAPE '\\') "
+        f"          AND {persons_path_shape}) "
+        "      ) "
         "    GROUP BY df.data_file_id, df.table_id, t.table_name "
         "    HAVING (t.table_name LIKE 'events%' AND COUNT(fpv.partition_key_index) <> 3) "
         "        OR (t.table_name LIKE 'persons%' AND COUNT(fpv.partition_key_index) <> 2) "
