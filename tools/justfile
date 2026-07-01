@@ -17,6 +17,10 @@ s3_url_style := env("DUCKDB_S3_URL_STYLE", "vhost")
 s3_use_ssl := env("DUCKDB_S3_USE_SSL", "true")
 data_path := env("DUCKLAKE_DATA_PATH", "")
 
+# Default compaction knobs — exported so child python processes inherit.
+# Override at the shell for one-off runs: COMPACTION_MAX_FILES=500 just compact-to-tier-3
+export COMPACTION_MAX_FILES := env("COMPACTION_MAX_FILES", "80")
+
 # DUCKDB_S3_USE_SSL must be a literal SQL boolean — it's interpolated into
 # both `SET s3_use_ssl = '<value>'` (a SQL string literal) and into
 # `CREATE OR REPLACE SECRET ... USE_SSL <value>` (an UNQUOTED bool, where
