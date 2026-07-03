@@ -47,6 +47,14 @@ COPY tools/ducklake_maintenance.py /app/tools/ducklake_maintenance.py
 COPY tools/ducklake_maintenance.sql /app/tools/ducklake_maintenance.sql
 COPY tools/ducklake_metrics.py /app/tools/ducklake_metrics.py
 
+# Shell banner: interactive shells (kubectl exec) print which DuckLake
+# catalog the container targets, derived from DUCKLAKE_* env (override the
+# label with MILLPOND_SHELL_LABEL). Debian bash reads /etc/bash.bashrc for
+# interactive non-login shells; appended at build because the runtime
+# rootfs is read-only.
+COPY tools/shell-banner.bashrc /tmp/shell-banner.bashrc
+RUN cat /tmp/shell-banner.bashrc >> /etc/bash.bashrc && rm /tmp/shell-banner.bashrc
+
 ENV PATH="/app/.venv/bin:$PATH"
 
 RUN useradd --create-home --shell /bin/false millpond
