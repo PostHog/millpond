@@ -120,6 +120,15 @@ class TestArgparse:
         args = self.parser.parse_args(["dedup-deletions"])
         assert args.dry_run is False
 
+    def test_purge_orphan_stats_dry_run(self):
+        args = self.parser.parse_args(["purge-orphan-stats", "--dry-run"])
+        assert args.command == "purge-orphan-stats"
+        assert args.dry_run is True
+
+    def test_purge_orphan_stats_real(self):
+        args = self.parser.parse_args(["purge-orphan-stats"])
+        assert args.dry_run is False
+
     def test_find_orphans(self):
         args = self.parser.parse_args(["find-orphans"])
         assert args.command == "find-orphans"
@@ -291,6 +300,102 @@ class TestExpireSnapshots:
 # ---------------------------------------------------------------------------
 # Tier B — orchestrators with mocked sub-calls
 # ---------------------------------------------------------------------------
+
+
+class TestPurgeOrphanStats:
+    """Verify purge_orphan_stats predicate shape, dry-run gating, and ordering."""
+
+    def _make_conn(self, before=(5, 120), after=(0, 0), lock_acquired=True):
+        """Mock conn: counts query returns `before` first, `after` afterwards."""
+        conn = MagicMock()
+        counts = iter([before, after, after])
+        executed = []
+
+        def fake_execute(sql, *args, **kwargs):
+            result = MagicMock()
+            if "postgres_query" in sql and "table_rows" in sql:
+                result.fetchone.return_value = next(counts)
+            elif "postgres_query" in sql and "pg_try_advisory_lock" in sql:
+                result.fetchone.return_value = (lock_acquired,)
+            elif "postgres_execute" in sql:
+                executed.append(sql)
+            return result
+
+        conn.execute.side_effect = fake_execute
+        conn._executed = executed
+        return conn
+
+    def test_dry_run_reports_without_deleting(self, caplog):
+        conn = self._make_conn(before=(5, 120))
+        with caplog.at_level(logging.INFO):
+            ducklake_maintenance.purge_orphan_stats(conn, dry_run=True)
+        assert conn._executed == []
+        assert "5 orphaned table-stats rows, 120 orphaned column-stats rows" in caplog.text
+
+    def test_zero_orphans_skips_lock_and_delete(self):
+        conn = self._make_conn(before=(0, 0))
+        ducklake_maintenance.purge_orphan_stats(conn, dry_run=False)
+        assert conn._executed == []
+        # advisory lock must not be taken when there is nothing to do
+        assert not any(
+            "pg_try_advisory_lock" in str(c) for c in conn.execute.call_args_list
+        )
+
+    def test_real_run_single_txn_table_stats_first(self, caplog):
+        """Both DELETEs must ship in ONE postgres_execute call (one REPEATABLE
+        READ transaction) with table_stats first. Two separate transactions
+        would expose a "table_stats present, column_stats gone" state that
+        crashes the commit path's conflict read (unguarded GetValue on the
+        NULL column_id the LEFT JOIN produces)."""
+        conn = self._make_conn(before=(5, 120), after=(0, 0))
+        with caplog.at_level(logging.INFO):
+            ducklake_maintenance.purge_orphan_stats(conn, dry_run=False)
+        assert len(conn._executed) == 1
+        sql = conn._executed[0]
+        assert "SET LOCAL statement_timeout" in sql
+        assert "SET LOCAL lock_timeout" in sql
+        ts_pos = sql.index("DELETE FROM public.ducklake_table_stats")
+        cs_pos = sql.index("DELETE FROM public.ducklake_table_column_stats")
+        assert ts_pos < cs_pos
+        assert "deleted ~5 table-stats and ~120 column-stats rows" in caplog.text
+
+    def test_lock_failure_aborts_before_any_delete(self):
+        conn = self._make_conn(before=(5, 120), lock_acquired=False)
+        with pytest.raises(RuntimeError, match="advisory lock"):
+            ducklake_maintenance.purge_orphan_stats(conn, dry_run=False)
+        assert conn._executed == []
+
+    def test_churn_during_run_clamps_deleted_at_zero(self, caplog):
+        """More orphans after than before (pathological churn) must not log
+        negative deleted counts."""
+        conn = self._make_conn(before=(5, 120), after=(7, 150))
+        with caplog.at_level(logging.INFO):
+            ducklake_maintenance.purge_orphan_stats(conn, dry_run=False)
+        assert "deleted ~0 table-stats and ~0 column-stats rows" in caplog.text
+        assert "7/150 orphans remain" in caplog.text
+
+    def test_predicate_uses_not_exists_never_not_in(self):
+        """NOT IN goes three-valued on NULL table_ids: it skips NULL-key rows
+        (metric/purge divergence) and deletes NOTHING if the live set ever
+        contained a NULL. The predicate must be NOT EXISTS."""
+        conn = self._make_conn(before=(1, 1), after=(0, 0))
+        ducklake_maintenance.purge_orphan_stats(conn, dry_run=False)
+        for sql in conn._executed:
+            assert "NOT EXISTS" in sql
+            assert "NOT IN" not in sql
+            assert "end_snapshot IS NULL" in sql
+
+    def test_large_purge_logs_vacuum_hint(self, caplog):
+        conn = self._make_conn(before=(1_000, 200_000), after=(0, 0))
+        with caplog.at_level(logging.INFO):
+            ducklake_maintenance.purge_orphan_stats(conn, dry_run=False)
+        assert "VACUUM (ANALYZE)" in caplog.text
+
+    def test_small_purge_no_vacuum_hint(self, caplog):
+        conn = self._make_conn(before=(5, 120), after=(0, 0))
+        with caplog.at_level(logging.INFO):
+            ducklake_maintenance.purge_orphan_stats(conn, dry_run=False)
+        assert "VACUUM" not in caplog.text
 
 
 class TestCleanupAllSafe:

@@ -649,6 +649,127 @@ def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     log.info("dedup-deletions: queue now has %d duplicate rows", after)
 
 
+# Bounds on the purge deletes so a blocked or runaway statement can't hold
+# the maintenance advisory lock forever. Same pattern as the
+# repair-partition-values timeout constants.
+_PURGE_ORPHAN_STATS_STATEMENT_TIMEOUT = "300s"
+_PURGE_ORPHAN_STATS_LOCK_TIMEOUT = "30s"
+
+
+def _orphan_stats_predicate(alias: str) -> str:
+    """WHERE fragment selecting stats rows whose table has no live version.
+
+    NOT EXISTS, never NOT IN: stats-table `table_id` is nullable and the
+    stats tables have no PK. NOT IN goes three-valued on NULLs — it skips
+    NULL-key rows (leaving permanent residue the monitoring counts as
+    orphaned), and if the live set ever contained a NULL table_id it would
+    silently delete NOTHING. NOT EXISTS treats NULL-key rows as orphaned,
+    which is correct: they are unreadable and pure commit-path weight.
+
+    Kept in lockstep with the `ducklake_stats_rows_orphaned` metric in
+    ducklake-metrics-daemon — metric and purge must count the same rows.
+    """
+    return (
+        f"NOT EXISTS ("
+        f"SELECT 1 FROM {PG_CATALOG_SCHEMA}.ducklake_table t "
+        f"WHERE t.table_id = {alias}.table_id AND t.end_snapshot IS NULL"
+        f")"
+    )
+
+
+def purge_orphan_stats(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
+    """Delete global-stats rows left behind by dropped tables.
+
+    DROP TABLE only end-snapshots the `ducklake_table` row; the table's rows
+    in `ducklake_table_stats` / `ducklake_table_column_stats` linger until
+    snapshot expiry deletes the last table version. The commit path reads
+    BOTH stats tables in full on every commit attempt, so on catalogs with
+    heavy DROP+CREATE churn the orphans directly inflate every writer's
+    commit latency (observed: a catalog at 99.3% orphaned column-stats rows
+    committed 30-50x slower until purged).
+
+    Safe to run at any time, concurrently with writers:
+      - Orphanhood is permanent — table_ids are allocated monotonically and
+        never reused, there is no undrop, and post-drop writes are rejected
+        at commit. Nothing can un-orphan a row.
+      - BOTH deletes run in ONE postgres_execute call = ONE REPEATABLE READ
+        transaction. This is load-bearing, not style: the commit path's
+        conflict read (GetSnapshotAndStatsAndChanges) does
+        `ducklake_table_stats LEFT JOIN ducklake_table_column_stats` with a
+        WHERE that only filters table_stats columns, and
+        TransformGlobalStatsRow does an UNGUARDED GetValue on column_id — a
+        reader-visible state of "table_stats row present, column_stats rows
+        gone" turns every contended commit into an InternalException. One
+        transaction means readers see either both tables purged or neither.
+        Within it, table_stats is deleted first to match the DeleteSnapshots
+        cascade order (same cross-table lock order → no lock-order-inversion
+        deadlock with concurrent expiry); the intermediate no-parent
+        column_stats state is invisible anyway (single txn) and harmless to
+        the LEFT JOIN even if it weren't.
+      - Live tables' stats rows are never touched, so concurrent stats
+        UPDATEs from committing writers don't contend with the deletes.
+      - A concurrent ducklake_expire_snapshots cascade (which does NOT take
+        our advisory lock) deleting the same rows can surface as a
+        serialization error or deadlock; the tool raises and a re-run is
+        fully convergent (rows already gone, predicate re-evaluates).
+
+    Column-stats rows are matched on table_id only: a row with NULL
+    column_id (observed in the wild) is still dead weight once its table is
+    gone. VACUUM cannot run here (postgres_execute wraps every call in a
+    transaction block), so after a large purge the commit path keeps
+    scanning dead pages until autovacuum catches up — for multi-100k purges
+    run `VACUUM (ANALYZE)` on both stats tables manually to realize the
+    full win immediately.
+    """
+    s = PG_CATALOG_SCHEMA
+    counts_sql = (
+        f"SELECT "
+        f"(SELECT COUNT(*) FROM {s}.ducklake_table_stats ts "
+        f" WHERE {_orphan_stats_predicate('ts')}) AS table_rows, "
+        f"(SELECT COUNT(*) FROM {s}.ducklake_table_column_stats cs "
+        f" WHERE {_orphan_stats_predicate('cs')}) AS column_rows"
+    )
+    table_rows, column_rows = _pg_query_one(conn, counts_sql)
+    log.info(
+        "purge-orphan-stats: %d orphaned table-stats rows, %d orphaned column-stats rows (dry_run=%s)",
+        table_rows,
+        column_rows,
+        dry_run,
+    )
+    if dry_run or (table_rows == 0 and column_rows == 0):
+        return
+
+    _acquire_advisory_lock(conn)
+    # One call = one transaction (see docstring); SET LOCAL bounds a blocked
+    # or runaway delete so the advisory lock can't be held forever — same
+    # pattern as repair-partition-values.
+    _pg_execute(
+        conn,
+        f"SET LOCAL statement_timeout = '{_PURGE_ORPHAN_STATS_STATEMENT_TIMEOUT}'; "
+        f"SET LOCAL lock_timeout = '{_PURGE_ORPHAN_STATS_LOCK_TIMEOUT}'; "
+        f"DELETE FROM {s}.ducklake_table_stats ts WHERE {_orphan_stats_predicate('ts')}; "
+        f"DELETE FROM {s}.ducklake_table_column_stats cs WHERE {_orphan_stats_predicate('cs')}",
+    )
+
+    after_table, after_column = _pg_query_one(conn, counts_sql)
+    log.info(
+        "purge-orphan-stats: deleted ~%d table-stats and ~%d column-stats rows "
+        "(%d/%d orphans remain from churn during the run)",
+        max(0, table_rows - after_table),
+        max(0, column_rows - after_column),
+        after_table,
+        after_column,
+    )
+    if table_rows + column_rows >= 100_000:
+        log.info(
+            "purge-orphan-stats: large purge — run VACUUM (ANALYZE) on "
+            "%s.ducklake_table_stats and %s.ducklake_table_column_stats to reclaim "
+            "dead pages now instead of waiting for autovacuum",
+            s,
+            s,
+        )
+
+
 # ---------------------------------------------------------------------------
 # repair-partition-values: recurring catalog cleanup
 # ---------------------------------------------------------------------------
@@ -1812,6 +1933,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dry-run", action="store_true")
 
+    # purge-orphan-stats
+    p = sub.add_parser(
+        "purge-orphan-stats",
+        help="Delete global-stats rows for dropped tables (commit-path tax; see ducklake_stats_rows_orphaned metric)",
+    )
+    p.add_argument("--dry-run", action="store_true")
+
     # REMOVE-WHEN: upstream-ducklake-fix-deployed
     # repair-partition-values (one-shot per customer; remove with the upstream DuckLake source fix)
     p = sub.add_parser(
@@ -1956,6 +2084,8 @@ def main(argv: list[str] | None = None) -> None:
                 cleanup_all(conn, args.dry_run)
             case "dedup-deletions":
                 dedup_deletions(conn, args.dry_run)
+            case "purge-orphan-stats":
+                purge_orphan_stats(conn, args.dry_run)
             case "repair-partition-values":  # REMOVE-WHEN: upstream-ducklake-fix-deployed
                 repair_partition_values(conn, args.dry_run)
             case "find-orphans":
