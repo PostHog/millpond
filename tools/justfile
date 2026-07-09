@@ -136,6 +136,16 @@ dedup-deletions-dry-run:
 dedup-deletions:
     python {{ ducklake_maintenance }} dedup-deletions
 
+# Report orphaned global-stats rows (dropped tables' leftovers) without deleting
+[group('lifecycle')]
+purge-orphan-stats-dry-run:
+    python {{ ducklake_maintenance }} purge-orphan-stats --dry-run
+
+# Purge orphaned global-stats rows (dropped tables' leftovers tax every commit)
+[group('lifecycle')]
+purge-orphan-stats:
+    python {{ ducklake_maintenance }} purge-orphan-stats
+
 # REMOVE-WHEN: upstream-ducklake-fix-deployed
 # Preview repair-partition-values (counts only, no DML; one-shot per customer)
 [group('lifecycle')]
