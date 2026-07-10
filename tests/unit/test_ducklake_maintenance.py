@@ -407,6 +407,115 @@ class TestExpireSnapshotsSafety:
         assert not any("pg_try_advisory_lock" in str(c.args[0]) for c in conn.execute.call_args_list)
 
 
+class TestCleanupFamilyAdvisoryLock:
+    """Every mutating cleanup-family entry point must take the maintenance
+    advisory lock; dry-run paths must not."""
+
+    def _conn(self):
+        conn = MagicMock()
+
+        def fake_execute(sql, *args, **kwargs):
+            result = MagicMock()
+            if "pg_try_advisory_lock" in sql:
+                result.fetchone.return_value = (True,)
+            elif "COUNT(*)" in sql:
+                result.fetchone.return_value = (0,)
+            else:
+                result.fetchall.return_value = []
+            return result
+
+        conn.execute.side_effect = fake_execute
+        return conn
+
+    def _locked(self, conn):
+        return any("pg_try_advisory_lock" in str(c.args[0]) for c in conn.execute.call_args_list)
+
+    def test_cleanup_locks(self):
+        conn = self._conn()
+        ducklake_maintenance.cleanup(conn, days=1, dry_run=False)
+        assert self._locked(conn)
+
+    def test_cleanup_dry_run_skips_lock(self):
+        conn = self._conn()
+        ducklake_maintenance.cleanup(conn, days=1, dry_run=True)
+        assert not self._locked(conn)
+
+    def test_cleanup_all_locks(self):
+        conn = self._conn()
+        ducklake_maintenance.cleanup_all(conn)
+        assert self._locked(conn)
+
+    def test_orphans_locks_and_dry_run_skips(self):
+        conn = self._conn()
+        ducklake_maintenance.orphans(conn, dry_run=False)
+        assert self._locked(conn)
+        conn2 = self._conn()
+        ducklake_maintenance.orphans(conn2, dry_run=True)
+        assert not self._locked(conn2)
+
+    def test_checkpoint_locks(self):
+        conn = self._conn()
+        ducklake_maintenance.checkpoint(conn)
+        assert self._locked(conn)
+
+
+class TestRepairDiscoveryNameGate:
+    """Catalog-derived table names outside the strict identifier shape must
+    be skipped loudly, never interpolated into SQL."""
+
+    def _conn(self, names):
+        conn = MagicMock()
+        result = MagicMock()
+        result.fetchall.return_value = [(n,) for n in names]
+        conn.execute.return_value = result
+        return conn
+
+    def test_hostile_name_skipped_with_warning(self, caplog):
+        hostile = "events_x' UNION SELECT 1,2 --"
+        conn = self._conn(["events", hostile, "persons_2024"])
+        with caplog.at_level(logging.WARNING):
+            out = ducklake_maintenance._repair_partition_values_discover_tables(conn)
+        assert ("events", "events") in out
+        assert ("persons", "persons_2024") in out
+        assert all(hostile != name for _, name in out)
+        assert "refusing to interpolate" in caplog.text
+
+    def test_plain_names_pass(self):
+        conn = self._conn(["events", "events_nrt", "persons", "persons_v2"])
+        out = ducklake_maintenance._repair_partition_values_discover_tables(conn)
+        assert len(out) == 4
+
+
+class TestRepairSqlEscaping:
+    """Pin that the two catalog-name interpolation sites route through
+    _sql_string_literal. The discovery gate keeps quote-bearing names out of
+    the composed flow, but resolve/log_outliers are independently callable
+    belts -- a revert to plain f-string quoting here must fail a test, not
+    pass silently. Names are fed directly, bypassing the gate."""
+
+    # A name with one embedded single quote. _sql_string_literal doubles it
+    # for the inner literal, then postgres_query's outer wrapper doubles
+    # again, so the fully-composed SQL contains a 4-quote run around it.
+    NAME = "events_o" + "'" + "brien"
+    ESCAPED = "events_o" + "'" * 4 + "brien"
+    UNESCAPED = "'events_o" + "'" + "brien'"
+
+    def test_log_outliers_escapes_table_names(self):
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = []
+        ducklake_maintenance._repair_partition_values_log_outliers(conn, [("events", self.NAME)])
+        sql = conn.execute.call_args[0][0]
+        assert self.ESCAPED in sql
+        assert self.UNESCAPED not in sql
+
+    def test_resolve_escapes_table_name(self):
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = []
+        ducklake_maintenance._repair_partition_values_resolve(conn, "events", self.NAME)
+        sql = conn.execute.call_args[0][0]
+        assert ("t.table_name = " + "'" * 2 + "events_o" + "'" * 4 + "brien" + "'" * 2) in sql
+
+
 class TestPurgeOrphanStats:
     """Verify purge_orphan_stats predicate shape, dry-run gating, and ordering."""
 

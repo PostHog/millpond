@@ -490,13 +490,19 @@ def expire_snapshots(
 
         # --- Dead data files ---
         dead_data_where = _dead_where("df")
-        dead_data_full_subq = f"SELECT df.data_file_id, df.path, df.path_is_relative FROM {s}.ducklake_data_file df WHERE {dead_data_where}"
+        dead_data_full_subq = (
+            f"SELECT df.data_file_id, df.path, df.path_is_relative "
+            f"FROM {s}.ducklake_data_file df WHERE {dead_data_where}"
+        )
 
         dead_data_count = _pg_query_one(conn, f"SELECT COUNT(*) FROM ({dead_data_full_subq}) _d")[0]
 
         # --- Dead delete vectors (positional delete files) ---
         dead_dv_where = _dead_where("dv")
-        dead_dv_full_subq = f"SELECT dv.delete_file_id AS data_file_id, dv.path, dv.path_is_relative FROM {s}.ducklake_delete_file dv WHERE {dead_dv_where}"
+        dead_dv_full_subq = (
+            f"SELECT dv.delete_file_id AS data_file_id, dv.path, dv.path_is_relative "
+            f"FROM {s}.ducklake_delete_file dv WHERE {dead_dv_where}"
+        )
 
         dead_dv_count = _pg_query_one(conn, f"SELECT COUNT(*) FROM ({dead_dv_full_subq}) _d")[0]
 
@@ -606,6 +612,13 @@ def _log_cleanup_throughput(
 
 def cleanup(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
     """Delete files scheduled for deletion older than N days."""
+    if not dry_run:
+        # Mutating path: mutex against other maintenance invocations (the
+        # extension-side maintenance in ingest pods does NOT take this lock;
+        # see _acquire_advisory_lock docstring). Same-session re-acquisition
+        # by nested callers (maintain -> expire/cleanup, fsck -> cleanup_all_safe)
+        # is fine: pg advisory locks are reentrant per session.
+        _acquire_advisory_lock(conn)
     log.info("Cleaning up files older than %d days (dry_run=%s)", days, dry_run)
     t0 = time.monotonic()
     result = conn.execute(
@@ -634,6 +647,7 @@ def cleanup_all(conn: duckdb.DuckDBPyConnection) -> None:
     rejects --dry-run outright; age-gated previews exist as cleanup-dry-run
     and the full pipeline preview as fsck-dry-run.
     """
+    _acquire_advisory_lock(conn)
     log.info("Cleaning up all files scheduled for deletion")
     t0 = time.monotonic()
     result = conn.execute(f"CALL ducklake_cleanup_old_files('{ATTACH_NAME}', cleanup_all => true)").fetchall()
@@ -864,6 +878,12 @@ _REPAIR_PARTITION_VALUE_SPEC: dict[str, tuple[tuple[int, str], ...]] = {
     "persons": ((0, "year"), (1, "month")),
 }
 
+# Catalog-derived table names must be plain identifiers before they are ever
+# interpolated into SQL (defense-in-depth: interpolation sites ALSO escape
+# via _sql_string_literal, but a quote-bearing name has no business in this
+# repair pipeline at all).
+_CATALOG_TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
 # Bounds on the per-table repair statement so a runaway query can't hold the
 # advisory lock forever and block all other maintenance.
 _REPAIR_PARTITION_VALUE_STATEMENT_TIMEOUT = "300s"
@@ -914,6 +934,19 @@ def _repair_partition_values_discover_tables(conn: duckdb.DuckDBPyConnection) ->
     ).fetchall()
     discovered: list[tuple[str, str]] = []
     for (table_name,) in rows:
+        # Catalog-derived names are attacker/typo-controlled via ordinary
+        # DDL and get interpolated into later postgres_query/postgres_execute
+        # statements. A name outside the strict identifier shape (e.g.
+        # containing a quote) is by definition not a millpond-written
+        # events_*/persons_* table, so it is skipped LOUDLY rather than
+        # repaired — never interpolated.
+        if not _CATALOG_TABLE_NAME_RE.fullmatch(table_name):
+            log.warning(
+                "repair-partition-values: skipping table with non-identifier name %r "
+                "(not millpond-written; refusing to interpolate it into SQL)",
+                table_name,
+            )
+            continue
         if table_name == "events" or table_name.startswith("events_"):
             discovered.append(("events", table_name))
         elif table_name == "persons" or table_name.startswith("persons_"):
@@ -967,6 +1000,11 @@ def _repair_partition_values_pre_flight_any_rot(conn: duckdb.DuckDBPyConnection)
         "    WHERE sch.schema_name = 'posthog' "
         "      AND t.end_snapshot IS NULL "
         "      AND df.end_snapshot IS NULL "
+        # Match the discovery gate (_CATALOG_TABLE_NAME_RE): a table whose
+        # name isn't a plain identifier is skipped by the repair, so it must
+        # not make pre-flight report rot the plan will never touch (else the
+        # cron alternates has_rot=true / repaired-nothing forever).
+        "      AND t.table_name ~ '^[A-Za-z0-9_]+$' "
         "      AND df.path LIKE 's3://%' "
         "      AND df.path NOT LIKE '%/full/%' "
         "      AND ( "
@@ -998,7 +1036,7 @@ def _repair_partition_values_log_outliers(conn: duckdb.DuckDBPyConnection, table
     # sees they exist (they're skipped by the repair filters).
     if not tables:
         return
-    table_names_sql = ", ".join(f"'{tn}'" for _, tn in tables)
+    table_names_sql = ", ".join(_sql_string_literal(tn) for _, tn in tables)
     counts_sql = (
         f"SELECT t.table_name, "
         f"  COUNT(*) FILTER (WHERE df.path NOT LIKE 's3://%') AS lake_relative, "
@@ -1045,7 +1083,7 @@ def _repair_partition_values_resolve(
         f"JOIN {PG_CATALOG_SCHEMA}.ducklake_partition_info pi "
         f"  ON pi.table_id = t.table_id AND pi.end_snapshot IS NULL "
         f"WHERE sch.schema_name = 'posthog' "
-        f"  AND t.table_name = '{table_name}' "
+        f"  AND t.table_name = {_sql_string_literal(table_name)} "
         f"  AND t.end_snapshot IS NULL"
     )
     rows = conn.execute(
@@ -1610,6 +1648,13 @@ def find_orphans(conn: duckdb.DuckDBPyConnection) -> None:
 
 def orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
     """Find and delete orphaned S3 files."""
+    if not dry_run:
+        # Mutating path: mutex against other maintenance invocations (the
+        # extension-side maintenance in ingest pods does NOT take this lock;
+        # see _acquire_advisory_lock docstring). Same-session re-acquisition
+        # by nested callers (maintain -> expire/cleanup, fsck -> cleanup_all_safe)
+        # is fine: pg advisory locks are reentrant per session.
+        _acquire_advisory_lock(conn)
     log.info("Deleting orphaned files (dry_run=%s)", dry_run)
     result = conn.execute(
         f"CALL ducklake_delete_orphaned_files('{ATTACH_NAME}', dry_run => {str(dry_run).lower()})"
@@ -1620,13 +1665,19 @@ def orphans(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
 
 def checkpoint(conn: duckdb.DuckDBPyConnection) -> None:
     """Run CHECKPOINT (integrated merge + expire + cleanup)."""
+    # Always mutating (no dry-run form exists for CHECKPOINT).
+    _acquire_advisory_lock(conn)
     log.info("Running CHECKPOINT")
     conn.execute(f"CHECKPOINT {ATTACH_NAME}")
     log.info("CHECKPOINT complete")
 
 
 def maintain(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
-    """Full maintenance: expire snapshots then cleanup files."""
+    """Full maintenance: expire snapshots then cleanup files.
+
+    No direct DML of its own; the advisory lock is taken (reentrantly, same
+    session) inside expire() and cleanup().
+    """
     expire(conn, days, dry_run)
     cleanup(conn, days, dry_run)
 

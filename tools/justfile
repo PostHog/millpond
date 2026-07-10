@@ -266,34 +266,34 @@ checkpoint: _confirm-target
 # Probe: merge up to a few adjacent files in one table (no target_file_size change)
 [group('compaction')]
 compact-probe table="events" max_compacted_files="2": _confirm-target
-    python {{ ducklake_maintenance }} compact-probe --table "{{ table }}" --max-compacted-files {{ max_compacted_files }}
+    python {{ ducklake_maintenance }} compact-probe --table {{ quote(table) }} --max-compacted-files {{ max_compacted_files }}
 
 # Tier 0 -> Tier 1: merge files < 1 MiB into ~5 MiB files
 [group('compaction')]
 compact-to-tier-1 table="": _confirm-target
-    python {{ ducklake_maintenance }} compact --tier 1 --table "{{ table }}"
+    python {{ ducklake_maintenance }} compact --tier 1 --table {{ quote(table) }}
 
 [group('compaction')]
 compact-to-tier-1-dry-run table="":
-    python {{ ducklake_maintenance }} compact --tier 1 --table "{{ table }}" --dry-run
+    python {{ ducklake_maintenance }} compact --tier 1 --table {{ quote(table) }} --dry-run
 
 # Tier 1 -> Tier 2: merge files in [1 MiB, 10 MiB) into ~32 MiB files
 [group('compaction')]
 compact-to-tier-2 table="": _confirm-target
-    python {{ ducklake_maintenance }} compact --tier 2 --table "{{ table }}"
+    python {{ ducklake_maintenance }} compact --tier 2 --table {{ quote(table) }}
 
 [group('compaction')]
 compact-to-tier-2-dry-run table="":
-    python {{ ducklake_maintenance }} compact --tier 2 --table "{{ table }}" --dry-run
+    python {{ ducklake_maintenance }} compact --tier 2 --table {{ quote(table) }} --dry-run
 
 # Tier 2 -> Tier 3: merge files in [10 MiB, 64 MiB) into ~128 MiB files
 [group('compaction')]
 compact-to-tier-3 table="": _confirm-target
-    python {{ ducklake_maintenance }} compact --tier 3 --table "{{ table }}"
+    python {{ ducklake_maintenance }} compact --tier 3 --table {{ quote(table) }}
 
 [group('compaction')]
 compact-to-tier-3-dry-run table="":
-    python {{ ducklake_maintenance }} compact --tier 3 --table "{{ table }}" --dry-run
+    python {{ ducklake_maintenance }} compact --tier 3 --table {{ quote(table) }} --dry-run
 
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3)
 [group('compaction')]
