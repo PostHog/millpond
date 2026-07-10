@@ -302,6 +302,99 @@ class TestExpireSnapshots:
 # ---------------------------------------------------------------------------
 
 
+class TestExpireSnapshotsSafety:
+    """Pin the three safety properties of expire_snapshots: head guard,
+    structural bridging predicate, and per-batch atomicity."""
+
+    def _run(self, batch_rows, dry_run=False):
+        conn = TestExpireSnapshots()._make_conn(batch_rows)
+        ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=dry_run)
+        return [str(c.args[0]) for c in conn.execute.call_args_list]
+
+    def test_head_guard_in_batch_select(self):
+        """The newest snapshot must NEVER be expired — DuckLake resolves all
+        state from MAX(snapshot_id); expiring it bricks the catalog (fork
+        built-in has the same guard)."""
+        calls = self._run([[(1,), (2,)]])
+        batch_selects = [c for c in calls if "ORDER BY snapshot_id LIMIT" in c]
+        assert batch_selects, "no batch SELECT issued"
+        for c in batch_selects:
+            assert "MAX(snapshot_id)" in c and "snapshot_id !=" in c
+
+    def test_head_guard_in_dry_run_count(self):
+        calls = self._run([], dry_run=True)
+        counts = [c for c in calls if "COUNT(*)" in c and "ducklake_snapshot" in c]
+        assert counts and all("MAX(snapshot_id)" in c for c in counts)
+
+    def test_dead_predicate_is_structural_not_time_based(self):
+        """Bridging must be 'no surviving snapshot in [begin, end)' — a
+        snapshot_time comparison can classify a file dead while a later-batch
+        or head-retained snapshot still references it."""
+        calls = self._run([[(1,), (2,)]])
+        dml = [c for c in calls if "postgres_execute" in c and "ducklake_data_file" in c]
+        assert dml, "no batch DML issued"
+        for c in dml:
+            assert "live.snapshot_id NOT IN" in c
+            assert "live.snapshot_time" not in c
+
+    def test_batch_is_single_transaction(self):
+        """Queue INSERTs, file cascade, and snapshot DELETEs must ship in ONE
+        postgres_execute call (one txn): a crash between separate calls
+        leaves surviving snapshot rows whose data-file rows are gone."""
+        calls = self._run([[(1,), (2,)]])
+        dml = [c for c in calls if "postgres_execute" in c]
+        # exactly one DML call for the single batch
+        assert len(dml) == 1, f"expected 1 batch txn, got {len(dml)}"
+        sql = dml[0]
+        assert "SET LOCAL statement_timeout" in sql and "SET LOCAL lock_timeout" in sql
+        # schedule-before-drop and snapshots-last invariants
+        q_ins = sql.index("ducklake_files_scheduled_for_deletion")
+        d_file = sql.index("DELETE FROM public.ducklake_data_file ")
+        d_snap = sql.rindex("DELETE FROM public.ducklake_snapshot WHERE")
+        assert q_ins < d_file < d_snap
+
+    def test_empty_catalog_issues_no_dml(self):
+        calls = self._run([])
+        assert not any("postgres_execute" in c for c in calls)
+
+    def test_dml_failure_propagates_and_stops(self):
+        """A failed batch txn (lock_timeout, network, anything) must raise and
+        stop the loop — never swallow and re-select the same ids (spin) or
+        continue to later batches on top of an unapplied one."""
+        conn = TestExpireSnapshots()._make_conn([[(1,), (2,)], [(3,), (4,)]])
+        inner = conn.execute.side_effect
+
+        def failing_execute(sql, *args, **kwargs):
+            if "postgres_execute" in sql:
+                raise RuntimeError("lock_timeout")
+            return inner(sql, *args, **kwargs)
+
+        conn.execute.side_effect = failing_execute
+        with pytest.raises(RuntimeError, match="lock_timeout"):
+            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=False)
+        selects = [c for c in conn.execute.call_args_list if "ORDER BY snapshot_id LIMIT" in str(c.args[0])]
+        assert len(selects) == 1, "loop must stop at the failed batch, not continue"
+
+    def test_batch_size_cap_rejected_at_parse(self):
+        parser = ducklake_maintenance.build_parser()
+        args = parser.parse_args(["expire-snapshots", "--batch-size", "20000"])
+        assert args.batch_size == 20000  # argparse allows; main() rejects
+        with pytest.raises(SystemExit):
+            ducklake_maintenance.main(["expire-snapshots", "--batch-size", "20000", "--dry-run"])
+
+    def test_expire_builtin_takes_advisory_lock(self):
+        conn = MagicMock()
+        ducklake_maintenance.expire(conn, days=7, dry_run=False)
+        assert any("pg_try_advisory_lock" in str(c.args[0]) for c in conn.execute.call_args_list), (
+            "expire() must mutex against expire-snapshots/cleanup"
+        )
+
+    def test_expire_builtin_dry_run_skips_lock(self):
+        conn = MagicMock()
+        ducklake_maintenance.expire(conn, days=7, dry_run=True)
+        assert not any("pg_try_advisory_lock" in str(c.args[0]) for c in conn.execute.call_args_list)
+
+
 class TestPurgeOrphanStats:
     """Verify purge_orphan_stats predicate shape, dry-run gating, and ordering."""
 
@@ -337,9 +430,7 @@ class TestPurgeOrphanStats:
         ducklake_maintenance.purge_orphan_stats(conn, dry_run=False)
         assert conn._executed == []
         # advisory lock must not be taken when there is nothing to do
-        assert not any(
-            "pg_try_advisory_lock" in str(c) for c in conn.execute.call_args_list
-        )
+        assert not any("pg_try_advisory_lock" in str(c) for c in conn.execute.call_args_list)
 
     def test_real_run_single_txn_table_stats_first(self, caplog):
         """Both DELETEs must ship in ONE postgres_execute call (one REPEATABLE
@@ -863,9 +954,7 @@ class TestConnectSecretDdlAgainstRealDuckdb:
                 "REGION 'us-east-1', ENDPOINT 's3.us-east-1.amazonaws.com', "
                 "URL_STYLE 'vhost', USE_SSL true)"
             )
-            rows = conn.execute(
-                "SELECT name, type, provider FROM duckdb_secrets() WHERE name = 's3'"
-            ).fetchall()
+            rows = conn.execute("SELECT name, type, provider FROM duckdb_secrets() WHERE name = 's3'").fetchall()
             assert rows, "real DuckDB did not register the static-keys SECRET"
             name, type_, provider = rows[0]
             assert name == "s3"
@@ -904,9 +993,7 @@ class TestConnectSecretDdlAgainstRealDuckdb:
                     f"likely a SECRET-grammar regression: {msg}"
                 )
                 return  # acceptable on no-creds runner; provider keyword is valid
-            rows = conn.execute(
-                "SELECT name, type, provider FROM duckdb_secrets() WHERE name = 's3'"
-            ).fetchall()
+            rows = conn.execute("SELECT name, type, provider FROM duckdb_secrets() WHERE name = 's3'").fetchall()
             assert rows, "real DuckDB did not register the credential_chain SECRET"
             name, type_, provider = rows[0]
             assert name == "s3"
