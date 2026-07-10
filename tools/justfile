@@ -71,6 +71,11 @@ _s3_url_style_sql := replace(s3_url_style, "'", "''")
 
 _setup := "INSTALL httpfs; INSTALL ducklake; INSTALL postgres; LOAD httpfs; LOAD ducklake; LOAD postgres; SET temp_directory = '/tmp/duckdb_spill'; SET enable_http_logging = false; SET pg_debug_show_queries = false; SET s3_region = '" + _s3_region_sql + "'; SET s3_endpoint = '" + _s3_endpoint_sql + "'; SET s3_access_key_id = '" + _s3_key_sql + "'; SET s3_secret_access_key = '" + _s3_secret_sql + "'; SET s3_use_ssl = " + _s3_use_ssl_validated + "; SET s3_url_style = '" + _s3_url_style_sql + "'; CREATE OR REPLACE SECRET s3 (TYPE s3, PROVIDER config, KEY_ID '" + _s3_key_sql + "', SECRET '" + _s3_secret_sql + "', REGION '" + _s3_region_sql + "', ENDPOINT '" + _s3_endpoint_sql + "', URL_STYLE '" + _s3_url_style_sql + "', USE_SSL " + _s3_use_ssl_validated + "); ATTACH 'postgres:" + _pg_connstr_sql + "' AS lake (TYPE ducklake, DATA_PATH '" + _data_path_sql + "'); ATTACH '" + _pg_connstr_sql + "' AS pg (TYPE postgres); USE lake;"
 
+# See _confirm-target: identity env passed explicitly so CLI overrides
+# (`just rds_host=X ...`) retarget the python process instead of silently
+# no-opping. Non-secret only; password/S3 keys stay in ambient env.
+_target_env := "DUCKLAKE_RDS_HOST=" + quote(rds_host) + " DUCKLAKE_RDS_PORT=" + quote(rds_port) + " DUCKLAKE_RDS_DATABASE=" + quote(rds_db) + " DUCKLAKE_RDS_USERNAME=" + quote(rds_user) + " DUCKLAKE_DATA_PATH=" + quote(data_path)
+
 ducklake_maintenance := env("DUCKLAKE_MAINTENANCE_SCRIPT", "/app/tools/ducklake_maintenance.py")
 ducklake_maintenance_sql := env("DUCKLAKE_MAINTENANCE_SQL", "/app/tools/ducklake_maintenance.sql")
 ducklake_metrics := env("DUCKLAKE_METRICS_SCRIPT", "/app/tools/ducklake_metrics.py")
@@ -87,31 +92,29 @@ default:
 # banner into the pod log and proceed unchanged. Born from a real incident:
 # a shell pod with stale env vars expired snapshots on the wrong catalog.
 #
-# The banner reads AMBIENT env (not the justfile variables above) on
-# purpose: the python tool reads os.environ, so a `just rds_host=...` CLI
-# override — which does NOT retarget python-backed recipes — is correctly
-# not reflected here. `db` shows the silent 'ducklake' fallback explicitly
-# so a half-loaded environment is visible instead of invisible. Fallbacks
-# use bash ${VAR-...} (no colon) to mirror python's os.environ.get(): a
-# set-but-EMPTY var renders empty here exactly as python passes "" along.
+# Every recipe that mutates the catalog or deletes S3 objects depends on
+# this. It prints the target catalog and, ONLY when stdin is a TTY, demands
+# an explicit yes; non-interactive invocations (cron pods, CI) print the
+# banner into the pod log and proceed unchanged. Born from a real incident:
+# a shell pod with stale env vars expired snapshots on the wrong catalog.
+#
+# Reads the JUSTFILE variables (host/port/db/user/data_path), passed as
+# positional args so nothing interpolates inside the quoted script. These
+# ARE the values every recipe now targets: python/metrics recipes get them
+# via _target_env, bootstrap recipes via _psql, `shell` via _setup — so a
+# `just rds_host=X ...` override is reflected here AND actually applied,
+# with no ambient-vs-override split. `db`/`user` show the shared 'ducklake'
+# default (matches the python side) rather than <UNSET> so a half-loaded
+# environment is visible.
 #
 # Deliberately NOT just's native [confirm] attribute: [confirm] reads
-# stdin unconditionally, which would hang/abort the non-TTY cron pods.
-# Consequently `just --yes` does NOT bypass this prompt — the scripted
-# bypass is `</dev/null` (i.e. explicitly taking the non-interactive
-# path). Editing notes: dedup-to-one-prompt relies on this recipe staying
-# PARAMETERLESS (just dedups deps per distinct argument list), and the
-# bash script must stay free of single quotes or the outer sh -cu parse
-# breaks.
+# stdin unconditionally and would hang/abort the non-TTY cron pods.
+# Consequently `just --yes` does NOT bypass this prompt; the scripted
+# bypass is `</dev/null`. Editing notes: dedup-to-one-prompt relies on
+# this recipe staying PARAMETERLESS, and the bash script must stay free of
+# single quotes or the outer sh -cu parse breaks.
 _confirm-target:
-    @bash -c 'echo "TARGET CATALOG: host=${DUCKLAKE_RDS_HOST-<UNSET>} port=${DUCKLAKE_RDS_PORT-5432} db=${DUCKLAKE_RDS_DATABASE-ducklake (fallback default)} data_path=${DUCKLAKE_DATA_PATH-<UNSET>}" >&2; if [ -t 0 ]; then read -r -p "Proceed against this catalog? [y/N] " a; [ "$a" = "y" ] || { echo "aborted" >&2; exit 1; }; fi'
-
-# Same guard for the psql-backed bootstrap recipes, which target via the
-# JUSTFILE variables (these DO honor `just rds_host=...` overrides), so
-# the ambient-env banner above would lie for them. Values are passed as
-# positional args so nothing is interpolated inside the quoted script.
-_confirm-psql-target:
-    @bash -c 'echo "TARGET RDS (psql): host=$0 port=$1 db=$2 user=$3" >&2; if [ -t 0 ]; then read -r -p "Proceed against this RDS? [y/N] " a; [ "$a" = "y" ] || { echo "aborted" >&2; exit 1; }; fi' {{ quote(rds_host) }} {{ quote(rds_port) }} {{ quote(rds_db) }} {{ quote(rds_user) }}
+    @bash -c 'echo "TARGET CATALOG: host=$0 port=$1 db=$2 user=$3 data_path=$4" >&2; if [ -t 0 ]; then read -r -p "Proceed against this catalog? [y/N] " a; [ "$a" = "y" ] || { echo "aborted" >&2; exit 1; }; fi' {{ quote(rds_host) }} {{ quote(rds_port) }} {{ quote(rds_db) }} {{ quote(rds_user) }} {{ quote(data_path) }}
 
 # ----------------------------------------------------------------------------
 # interactive
@@ -130,105 +133,105 @@ shell:
 # Expire snapshots (dry run)
 [group('lifecycle')]
 expire-dry-run days="7":
-    python {{ ducklake_maintenance }} expire --days {{ days }} --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} expire --days {{ quote(days) }} --dry-run
 
 # Expire snapshots
 [group('lifecycle')]
 expire days="7": _confirm-target
-    python {{ ducklake_maintenance }} expire --days {{ days }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} expire --days {{ quote(days) }}
 
 # Postgres-native snapshot expiry (dry run)
 [group('lifecycle')]
 expire-snapshots-dry-run days="7" batch_size="1000":
-    python {{ ducklake_maintenance }} expire-snapshots --days {{ days }} --batch-size {{ batch_size }} --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} expire-snapshots --days {{ quote(days) }} --batch-size {{ quote(batch_size) }} --dry-run
 
 # Postgres-native snapshot expiry — runs at most num_batches batches per invocation
 [group('lifecycle')]
 expire-snapshots days="7" batch_size="1000" num_batches="": _confirm-target
-    python {{ ducklake_maintenance }} expire-snapshots --days {{ days }} --batch-size {{ batch_size }} {{ if num_batches != "" { "--num-batches " + num_batches } else { "" } }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} expire-snapshots --days {{ quote(days) }} --batch-size {{ quote(batch_size) }} {{ if num_batches != "" { "--num-batches " + quote(num_batches) } else { "" } }}
 
 # Preview files scheduled for deletion
 [group('lifecycle')]
 cleanup-dry-run days="1":
-    python {{ ducklake_maintenance }} cleanup --days {{ days }} --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} cleanup --days {{ quote(days) }} --dry-run
 
 # Delete files scheduled for deletion
 [group('lifecycle')]
 cleanup days="1": _confirm-target
-    python {{ ducklake_maintenance }} cleanup --days {{ days }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} cleanup --days {{ quote(days) }}
 
 # Delete all files scheduled for deletion regardless of age
 [group('lifecycle')]
 cleanup-all: _confirm-target
-    python {{ ducklake_maintenance }} cleanup-all
+    env {{ _target_env }} python {{ ducklake_maintenance }} cleanup-all
 
 # Preview duplicate rows in the pending-deletion queue (workaround for DuckLake bug c5)
 [group('lifecycle')]
 dedup-deletions-dry-run:
-    python {{ ducklake_maintenance }} dedup-deletions --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} dedup-deletions --dry-run
 
 # Drop duplicate rows from the pending-deletion queue (workaround for DuckLake bug c5)
 [group('lifecycle')]
 dedup-deletions: _confirm-target
-    python {{ ducklake_maintenance }} dedup-deletions
+    env {{ _target_env }} python {{ ducklake_maintenance }} dedup-deletions
 
 # Report orphaned global-stats rows (dropped tables' leftovers) without deleting
 [group('lifecycle')]
 purge-orphan-stats-dry-run:
-    python {{ ducklake_maintenance }} purge-orphan-stats --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} purge-orphan-stats --dry-run
 
 # Purge orphaned global-stats rows (dropped tables' leftovers tax every commit)
 [group('lifecycle')]
 purge-orphan-stats: _confirm-target
-    python {{ ducklake_maintenance }} purge-orphan-stats
+    env {{ _target_env }} python {{ ducklake_maintenance }} purge-orphan-stats
 
 # REMOVE-WHEN: upstream-ducklake-fix-deployed
 # Preview repair-partition-values (counts only, no DML; one-shot per customer)
 [group('lifecycle')]
 repair-partition-values-dry-run:
-    python {{ ducklake_maintenance }} repair-partition-values --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} repair-partition-values --dry-run
 
 # REMOVE-WHEN: upstream-ducklake-fix-deployed
 # Repair ducklake_file_partition_value rows wrecked by the ducklake_add_data_files bug
 # (one-shot per customer; remove this recipe with the upstream DuckLake source fix)
 [group('lifecycle')]
 repair-partition-values: _confirm-target
-    python {{ ducklake_maintenance }} repair-partition-values
+    env {{ _target_env }} python {{ ducklake_maintenance }} repair-partition-values
 
 # List catalog rows whose S3 key no longer exists (catalog-side orphans)
 [group('lifecycle')]
 find-orphans:
-    python {{ ducklake_maintenance }} find-orphans
+    env {{ _target_env }} python {{ ducklake_maintenance }} find-orphans
 
 # Preview heal-orphans (run safety gates, skip the DELETE)
 [group('lifecycle')]
 heal-orphans-dry-run:
-    python {{ ducklake_maintenance }} heal-orphans --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} heal-orphans --dry-run
 
 # Delete catalog rows whose S3 key no longer exists (gated B1/B3 safety checks)
 [group('lifecycle')]
 heal-orphans: _confirm-target
-    python {{ ducklake_maintenance }} heal-orphans
+    env {{ _target_env }} python {{ ducklake_maintenance }} heal-orphans
 
 # Loop dedup + heal-orphans + cleanup-all until cleanup-all exits clean
 [group('lifecycle')]
 cleanup-all-safe max_iterations="10": _confirm-target
-    python {{ ducklake_maintenance }} cleanup-all-safe --max-iterations {{ max_iterations }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} cleanup-all-safe --max-iterations {{ quote(max_iterations) }}
 
 # Preview fsck (cleanup-all-safe + S3-orphan sweep, dry-run)
 [group('lifecycle')]
 fsck-dry-run:
-    python {{ ducklake_maintenance }} fsck --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} fsck --dry-run
 
 # Bring the lake catalog to a known-good state end-to-end
 [group('lifecycle')]
 fsck max_iterations="10": _confirm-target
-    python {{ ducklake_maintenance }} fsck --max-iterations {{ max_iterations }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} fsck --max-iterations {{ quote(max_iterations) }}
 
 # Preview S3 objects that ducklake_delete_orphaned_files would delete
 [group('lifecycle')]
 delete-orphaned-files-dry-run:
-    python {{ ducklake_maintenance }} orphans --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} orphans --dry-run
 
 # DELETE every S3 object under DATA_PATH not referenced by the attached
 # catalog. Renamed from `orphans`: the noun name read as a listing (the
@@ -242,22 +245,22 @@ delete-orphaned-files-dry-run:
 [doc("DELETE every S3 object under DATA_PATH not referenced by the catalog (python subcommand: orphans)")]
 [group('lifecycle')]
 delete-orphaned-files: _confirm-target
-    python {{ ducklake_maintenance }} orphans
+    env {{ _target_env }} python {{ ducklake_maintenance }} orphans
 
 # Full maintenance: expire snapshots + cleanup files
 [group('lifecycle')]
 maintain days="7": _confirm-target
-    python {{ ducklake_maintenance }} maintain --days {{ days }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} maintain --days {{ quote(days) }}
 
 # Full maintenance dry run
 [group('lifecycle')]
 maintain-dry-run days="7":
-    python {{ ducklake_maintenance }} maintain --days {{ days }} --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} maintain --days {{ quote(days) }} --dry-run
 
 # Run CHECKPOINT (integrated merge + expire + cleanup)
 [group('lifecycle')]
 checkpoint: _confirm-target
-    python {{ ducklake_maintenance }} checkpoint
+    env {{ _target_env }} python {{ ducklake_maintenance }} checkpoint
 
 # ----------------------------------------------------------------------------
 # tiered compaction
@@ -266,34 +269,34 @@ checkpoint: _confirm-target
 # Probe: merge up to a few adjacent files in one table (no target_file_size change)
 [group('compaction')]
 compact-probe table="events" max_compacted_files="2": _confirm-target
-    python {{ ducklake_maintenance }} compact-probe --table {{ quote(table) }} --max-compacted-files {{ max_compacted_files }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} compact-probe --table {{ quote(table) }} --max-compacted-files {{ quote(max_compacted_files) }}
 
 # Tier 0 -> Tier 1: merge files < 1 MiB into ~5 MiB files
 [group('compaction')]
 compact-to-tier-1 table="": _confirm-target
-    python {{ ducklake_maintenance }} compact --tier 1 --table {{ quote(table) }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} compact --tier 1 --table {{ quote(table) }}
 
 [group('compaction')]
 compact-to-tier-1-dry-run table="":
-    python {{ ducklake_maintenance }} compact --tier 1 --table {{ quote(table) }} --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} compact --tier 1 --table {{ quote(table) }} --dry-run
 
 # Tier 1 -> Tier 2: merge files in [1 MiB, 10 MiB) into ~32 MiB files
 [group('compaction')]
 compact-to-tier-2 table="": _confirm-target
-    python {{ ducklake_maintenance }} compact --tier 2 --table {{ quote(table) }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} compact --tier 2 --table {{ quote(table) }}
 
 [group('compaction')]
 compact-to-tier-2-dry-run table="":
-    python {{ ducklake_maintenance }} compact --tier 2 --table {{ quote(table) }} --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} compact --tier 2 --table {{ quote(table) }} --dry-run
 
 # Tier 2 -> Tier 3: merge files in [10 MiB, 64 MiB) into ~128 MiB files
 [group('compaction')]
 compact-to-tier-3 table="": _confirm-target
-    python {{ ducklake_maintenance }} compact --tier 3 --table {{ quote(table) }}
+    env {{ _target_env }} python {{ ducklake_maintenance }} compact --tier 3 --table {{ quote(table) }}
 
 [group('compaction')]
 compact-to-tier-3-dry-run table="":
-    python {{ ducklake_maintenance }} compact --tier 3 --table {{ quote(table) }} --dry-run
+    env {{ _target_env }} python {{ ducklake_maintenance }} compact --tier 3 --table {{ quote(table) }} --dry-run
 
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3)
 [group('compaction')]
@@ -339,31 +342,31 @@ _psql := "PGPASSWORD=" + quote(rds_password) + " psql --host=" + quote(rds_host)
 
 # Live-file candidate scan keyed by (table, size); drives compaction's tier filter
 [group('bootstrap')]
-bootstrap-index-data-file-compaction: _confirm-psql-target
+bootstrap-index-data-file-compaction: _confirm-target
     @echo ">>> ducklake_data_file_compaction_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
 
 # Covering form of compaction_idx adding begin_snapshot/row_id_start/data_file_id
 [group('bootstrap')]
-bootstrap-index-data-file-compaction-order: _confirm-psql-target
+bootstrap-index-data-file-compaction-order: _confirm-target
     @echo ">>> ducklake_data_file_compaction_order_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_order_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes, begin_snapshot, row_id_start, data_file_id) WHERE (end_snapshot IS NULL);"
 
 # Snapshot range read on data files for CDC, time-travel, and ducklake_table_insertions
 [group('bootstrap')]
-bootstrap-index-data-file-snapshot-read: _confirm-psql-target
+bootstrap-index-data-file-snapshot-read: _confirm-target
     @echo ">>> ducklake_data_file_snapshot_read_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_snapshot_read_idx ON public.ducklake_data_file USING btree (table_id, begin_snapshot, end_snapshot);"
 
 # Snapshot range read on delete files (mirrors data_file_snapshot_read)
 [group('bootstrap')]
-bootstrap-index-delete-file-snapshot-read: _confirm-psql-target
+bootstrap-index-delete-file-snapshot-read: _confirm-target
     @echo ">>> ducklake_delete_file_snapshot_read_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_snapshot_read_idx ON public.ducklake_delete_file USING btree (table_id, begin_snapshot, end_snapshot);"
 
 # Live-delete-file scan, partial on end_snapshot IS NULL
 [group('bootstrap')]
-bootstrap-index-delete-file-table: _confirm-psql-target
+bootstrap-index-delete-file-table: _confirm-target
     @echo ">>> ducklake_delete_file_table_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_table_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot) WHERE (end_snapshot IS NULL);"
 
@@ -375,25 +378,25 @@ bootstrap-index-delete-file-table: _confirm-psql-target
 # ducklake_delete_file_table_idx omits file_size_bytes and forces a heap
 # fetch for the SUM aggregate.
 [group('bootstrap')]
-bootstrap-index-delete-file-metrics: _confirm-psql-target
+bootstrap-index-delete-file-metrics: _confirm-target
     @echo ">>> ducklake_delete_file_metrics_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_metrics_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
 
 # File-column-stats join key; drives per-file stat aggregation during compaction
 [group('bootstrap')]
-bootstrap-index-file-column-stats: _confirm-psql-target
+bootstrap-index-file-column-stats: _confirm-target
     @echo ">>> ducklake_file_column_stats_file_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_file_idx ON public.ducklake_file_column_stats USING btree (data_file_id);"
 
 # Partition-value join key for per-file lookups
 [group('bootstrap')]
-bootstrap-index-file-partition-value-file: _confirm-psql-target
+bootstrap-index-file-partition-value-file: _confirm-target
     @echo ">>> ducklake_file_partition_value_file_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_file_idx ON public.ducklake_file_partition_value USING btree (data_file_id);"
 
 # Partition-value table scope (bucket-pruning path on SCAN_TABLE)
 [group('bootstrap')]
-bootstrap-index-file-partition-value-table: _confirm-psql-target
+bootstrap-index-file-partition-value-table: _confirm-target
     @echo ">>> ducklake_file_partition_value_table_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_idx ON public.ducklake_file_partition_value USING btree (table_id);"
 
@@ -408,14 +411,14 @@ bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-fil
 # Run the ducklake-metrics daemon (Prometheus exposition on :$port)
 [group('metrics')]
 ducklake-metrics port="9100":
-    python {{ ducklake_metrics }} --port {{ port }}
+    env {{ _target_env }} python {{ ducklake_metrics }} --port {{ quote(port) }}
 
 # Run the daemon with a user-supplied queries YAML extending the built-ins
 [group('metrics')]
 ducklake-metrics-with-config config port="9100":
-    python {{ ducklake_metrics }} --port {{ port }} --config "{{ config }}"
+    env {{ _target_env }} python {{ ducklake_metrics }} --port {{ quote(port) }} --config {{ quote(config) }}
 
 # Print the resolved query list (built-ins + user config) and exit; validates config without connecting
 [group('metrics')]
 ducklake-metrics-list config="":
-    python {{ ducklake_metrics }} --list-queries {{ if config != "" { "--config " + config } else { "" } }}
+    env {{ _target_env }} python {{ ducklake_metrics }} --list-queries {{ if config != "" { "--config " + quote(config) } else { "" } }}
