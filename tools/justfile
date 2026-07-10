@@ -79,12 +79,48 @@ default:
     @just --list
 
 # ----------------------------------------------------------------------------
+# target-identity guard
+# ----------------------------------------------------------------------------
+# Every recipe that mutates the catalog or deletes S3 objects depends on
+# this. It prints the target catalog and, ONLY when stdin is a TTY, demands
+# an explicit yes; non-interactive invocations (cron pods, CI) print the
+# banner into the pod log and proceed unchanged. Born from a real incident:
+# a shell pod with stale env vars expired snapshots on the wrong catalog.
+#
+# The banner reads AMBIENT env (not the justfile variables above) on
+# purpose: the python tool reads os.environ, so a `just rds_host=...` CLI
+# override — which does NOT retarget python-backed recipes — is correctly
+# not reflected here. `db` shows the silent 'ducklake' fallback explicitly
+# so a half-loaded environment is visible instead of invisible. Fallbacks
+# use bash ${VAR-...} (no colon) to mirror python's os.environ.get(): a
+# set-but-EMPTY var renders empty here exactly as python passes "" along.
+#
+# Deliberately NOT just's native [confirm] attribute: [confirm] reads
+# stdin unconditionally, which would hang/abort the non-TTY cron pods.
+# Consequently `just --yes` does NOT bypass this prompt — the scripted
+# bypass is `</dev/null` (i.e. explicitly taking the non-interactive
+# path). Editing notes: dedup-to-one-prompt relies on this recipe staying
+# PARAMETERLESS (just dedups deps per distinct argument list), and the
+# bash script must stay free of single quotes or the outer sh -cu parse
+# breaks.
+_confirm-target:
+    @bash -c 'echo "TARGET CATALOG: host=${DUCKLAKE_RDS_HOST-<UNSET>} port=${DUCKLAKE_RDS_PORT-5432} db=${DUCKLAKE_RDS_DATABASE-ducklake (fallback default)} data_path=${DUCKLAKE_DATA_PATH-<UNSET>}" >&2; if [ -t 0 ]; then read -r -p "Proceed against this catalog? [y/N] " a; [ "$a" = "y" ] || { echo "aborted" >&2; exit 1; }; fi'
+
+# Same guard for the psql-backed bootstrap recipes, which target via the
+# JUSTFILE variables (these DO honor `just rds_host=...` overrides), so
+# the ambient-env banner above would lie for them. Values are passed as
+# positional args so nothing is interpolated inside the quoted script.
+_confirm-psql-target:
+    @bash -c 'echo "TARGET RDS (psql): host=$0 port=$1 db=$2 user=$3" >&2; if [ -t 0 ]; then read -r -p "Proceed against this RDS? [y/N] " a; [ "$a" = "y" ] || { echo "aborted" >&2; exit 1; }; fi' {{ quote(rds_host) }} {{ quote(rds_port) }} {{ quote(rds_db) }} {{ quote(rds_user) }}
+
+# ----------------------------------------------------------------------------
 # interactive
 # ----------------------------------------------------------------------------
 
 # Open an interactive DuckDB shell connected to the DuckLake
 [group('interactive')]
 shell:
+    @bash -c 'echo "TARGET CATALOG (duckdb shell): host=$0 port=$1 db=$2 data_path=$3" >&2' {{ quote(rds_host) }} {{ quote(rds_port) }} {{ quote(rds_db) }} {{ quote(data_path) }}
     {{ duckdb }} -cmd "{{ _setup }}" -cmd ".read {{ ducklake_maintenance_sql }}"
 
 # ----------------------------------------------------------------------------
@@ -98,7 +134,7 @@ expire-dry-run days="7":
 
 # Expire snapshots
 [group('lifecycle')]
-expire days="7":
+expire days="7": _confirm-target
     python {{ ducklake_maintenance }} expire --days {{ days }}
 
 # Postgres-native snapshot expiry (dry run)
@@ -108,7 +144,7 @@ expire-snapshots-dry-run days="7" batch_size="1000":
 
 # Postgres-native snapshot expiry — runs at most num_batches batches per invocation
 [group('lifecycle')]
-expire-snapshots days="7" batch_size="1000" num_batches="":
+expire-snapshots days="7" batch_size="1000" num_batches="": _confirm-target
     python {{ ducklake_maintenance }} expire-snapshots --days {{ days }} --batch-size {{ batch_size }} {{ if num_batches != "" { "--num-batches " + num_batches } else { "" } }}
 
 # Preview files scheduled for deletion
@@ -118,12 +154,12 @@ cleanup-dry-run days="1":
 
 # Delete files scheduled for deletion
 [group('lifecycle')]
-cleanup days="1":
+cleanup days="1": _confirm-target
     python {{ ducklake_maintenance }} cleanup --days {{ days }}
 
 # Delete all files scheduled for deletion regardless of age
 [group('lifecycle')]
-cleanup-all:
+cleanup-all: _confirm-target
     python {{ ducklake_maintenance }} cleanup-all
 
 # Preview duplicate rows in the pending-deletion queue (workaround for DuckLake bug c5)
@@ -133,7 +169,7 @@ dedup-deletions-dry-run:
 
 # Drop duplicate rows from the pending-deletion queue (workaround for DuckLake bug c5)
 [group('lifecycle')]
-dedup-deletions:
+dedup-deletions: _confirm-target
     python {{ ducklake_maintenance }} dedup-deletions
 
 # Report orphaned global-stats rows (dropped tables' leftovers) without deleting
@@ -143,7 +179,7 @@ purge-orphan-stats-dry-run:
 
 # Purge orphaned global-stats rows (dropped tables' leftovers tax every commit)
 [group('lifecycle')]
-purge-orphan-stats:
+purge-orphan-stats: _confirm-target
     python {{ ducklake_maintenance }} purge-orphan-stats
 
 # REMOVE-WHEN: upstream-ducklake-fix-deployed
@@ -156,7 +192,7 @@ repair-partition-values-dry-run:
 # Repair ducklake_file_partition_value rows wrecked by the ducklake_add_data_files bug
 # (one-shot per customer; remove this recipe with the upstream DuckLake source fix)
 [group('lifecycle')]
-repair-partition-values:
+repair-partition-values: _confirm-target
     python {{ ducklake_maintenance }} repair-partition-values
 
 # List catalog rows whose S3 key no longer exists (catalog-side orphans)
@@ -171,12 +207,12 @@ heal-orphans-dry-run:
 
 # Delete catalog rows whose S3 key no longer exists (gated B1/B3 safety checks)
 [group('lifecycle')]
-heal-orphans:
+heal-orphans: _confirm-target
     python {{ ducklake_maintenance }} heal-orphans
 
 # Loop dedup + heal-orphans + cleanup-all until cleanup-all exits clean
 [group('lifecycle')]
-cleanup-all-safe max_iterations="10":
+cleanup-all-safe max_iterations="10": _confirm-target
     python {{ ducklake_maintenance }} cleanup-all-safe --max-iterations {{ max_iterations }}
 
 # Preview fsck (cleanup-all-safe + S3-orphan sweep, dry-run)
@@ -186,7 +222,7 @@ fsck-dry-run:
 
 # Bring the lake catalog to a known-good state end-to-end
 [group('lifecycle')]
-fsck max_iterations="10":
+fsck max_iterations="10": _confirm-target
     python {{ ducklake_maintenance }} fsck --max-iterations {{ max_iterations }}
 
 # Preview orphaned files
@@ -196,12 +232,12 @@ orphans-dry-run:
 
 # Delete orphaned files
 [group('lifecycle')]
-orphans:
+orphans: _confirm-target
     python {{ ducklake_maintenance }} orphans
 
 # Full maintenance: expire snapshots + cleanup files
 [group('lifecycle')]
-maintain days="7":
+maintain days="7": _confirm-target
     python {{ ducklake_maintenance }} maintain --days {{ days }}
 
 # Full maintenance dry run
@@ -211,7 +247,7 @@ maintain-dry-run days="7":
 
 # Run CHECKPOINT (integrated merge + expire + cleanup)
 [group('lifecycle')]
-checkpoint:
+checkpoint: _confirm-target
     python {{ ducklake_maintenance }} checkpoint
 
 # ----------------------------------------------------------------------------
@@ -220,12 +256,12 @@ checkpoint:
 
 # Probe: merge up to a few adjacent files in one table (no target_file_size change)
 [group('compaction')]
-compact-probe table="events" max_compacted_files="2":
+compact-probe table="events" max_compacted_files="2": _confirm-target
     python {{ ducklake_maintenance }} compact-probe --table "{{ table }}" --max-compacted-files {{ max_compacted_files }}
 
 # Tier 0 -> Tier 1: merge files < 1 MiB into ~5 MiB files
 [group('compaction')]
-compact-to-tier-1 table="":
+compact-to-tier-1 table="": _confirm-target
     python {{ ducklake_maintenance }} compact --tier 1 --table "{{ table }}"
 
 [group('compaction')]
@@ -234,7 +270,7 @@ compact-to-tier-1-dry-run table="":
 
 # Tier 1 -> Tier 2: merge files in [1 MiB, 10 MiB) into ~32 MiB files
 [group('compaction')]
-compact-to-tier-2 table="":
+compact-to-tier-2 table="": _confirm-target
     python {{ ducklake_maintenance }} compact --tier 2 --table "{{ table }}"
 
 [group('compaction')]
@@ -243,7 +279,7 @@ compact-to-tier-2-dry-run table="":
 
 # Tier 2 -> Tier 3: merge files in [10 MiB, 64 MiB) into ~128 MiB files
 [group('compaction')]
-compact-to-tier-3 table="":
+compact-to-tier-3 table="": _confirm-target
     python {{ ducklake_maintenance }} compact --tier 3 --table "{{ table }}"
 
 [group('compaction')]
@@ -289,31 +325,31 @@ _psql := "PGPASSWORD=" + quote(rds_password) + " psql --host=" + quote(rds_host)
 
 # Live-file candidate scan keyed by (table, size); drives compaction's tier filter
 [group('bootstrap')]
-bootstrap-index-data-file-compaction:
+bootstrap-index-data-file-compaction: _confirm-psql-target
     @echo ">>> ducklake_data_file_compaction_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
 
 # Covering form of compaction_idx adding begin_snapshot/row_id_start/data_file_id
 [group('bootstrap')]
-bootstrap-index-data-file-compaction-order:
+bootstrap-index-data-file-compaction-order: _confirm-psql-target
     @echo ">>> ducklake_data_file_compaction_order_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_order_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes, begin_snapshot, row_id_start, data_file_id) WHERE (end_snapshot IS NULL);"
 
 # Snapshot range read on data files for CDC, time-travel, and ducklake_table_insertions
 [group('bootstrap')]
-bootstrap-index-data-file-snapshot-read:
+bootstrap-index-data-file-snapshot-read: _confirm-psql-target
     @echo ">>> ducklake_data_file_snapshot_read_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_snapshot_read_idx ON public.ducklake_data_file USING btree (table_id, begin_snapshot, end_snapshot);"
 
 # Snapshot range read on delete files (mirrors data_file_snapshot_read)
 [group('bootstrap')]
-bootstrap-index-delete-file-snapshot-read:
+bootstrap-index-delete-file-snapshot-read: _confirm-psql-target
     @echo ">>> ducklake_delete_file_snapshot_read_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_snapshot_read_idx ON public.ducklake_delete_file USING btree (table_id, begin_snapshot, end_snapshot);"
 
 # Live-delete-file scan, partial on end_snapshot IS NULL
 [group('bootstrap')]
-bootstrap-index-delete-file-table:
+bootstrap-index-delete-file-table: _confirm-psql-target
     @echo ">>> ducklake_delete_file_table_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_table_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot) WHERE (end_snapshot IS NULL);"
 
@@ -325,25 +361,25 @@ bootstrap-index-delete-file-table:
 # ducklake_delete_file_table_idx omits file_size_bytes and forces a heap
 # fetch for the SUM aggregate.
 [group('bootstrap')]
-bootstrap-index-delete-file-metrics:
+bootstrap-index-delete-file-metrics: _confirm-psql-target
     @echo ">>> ducklake_delete_file_metrics_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_metrics_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
 
 # File-column-stats join key; drives per-file stat aggregation during compaction
 [group('bootstrap')]
-bootstrap-index-file-column-stats:
+bootstrap-index-file-column-stats: _confirm-psql-target
     @echo ">>> ducklake_file_column_stats_file_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_file_idx ON public.ducklake_file_column_stats USING btree (data_file_id);"
 
 # Partition-value join key for per-file lookups
 [group('bootstrap')]
-bootstrap-index-file-partition-value-file:
+bootstrap-index-file-partition-value-file: _confirm-psql-target
     @echo ">>> ducklake_file_partition_value_file_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_file_idx ON public.ducklake_file_partition_value USING btree (data_file_id);"
 
 # Partition-value table scope (bucket-pruning path on SCAN_TABLE)
 [group('bootstrap')]
-bootstrap-index-file-partition-value-table:
+bootstrap-index-file-partition-value-table: _confirm-psql-target
     @echo ">>> ducklake_file_partition_value_table_idx"
     {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_idx ON public.ducklake_file_partition_value USING btree (table_id);"
 
