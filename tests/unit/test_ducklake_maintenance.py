@@ -129,6 +129,12 @@ class TestArgparse:
         args = self.parser.parse_args(["purge-orphan-stats"])
         assert args.dry_run is False
 
+    def test_cleanup_all_rejects_dry_run(self):
+        """--dry-run used to be accepted and silently no-op — operators
+        believed they had previewed something. Must now fail loudly."""
+        with pytest.raises(SystemExit):
+            self.parser.parse_args(["cleanup-all", "--dry-run"])
+
     def test_find_orphans(self):
         args = self.parser.parse_args(["find-orphans"])
         assert args.command == "find-orphans"
@@ -166,11 +172,17 @@ class TestArgparse:
         assert args.dry_run is False
         assert args.max_iterations == 5
 
-    def test_compact_threads_memory_defaults(self):
-        args = self.parser.parse_args(["compact", "--tier", "1"])
+    def test_compact_threads_memory_defaults(self, monkeypatch):
+        # argparse defaults read COMPACTION_* env at parser-build time, so a
+        # lingering shell override (the justfile exports COMPACTION_MAX_FILES)
+        # would make this test flaky — isolate and rebuild the parser.
+        for var in ("COMPACTION_THREADS", "COMPACTION_MEMORY_LIMIT", "COMPACTION_MAX_FILES"):
+            monkeypatch.delenv(var, raising=False)
+        parser = ducklake_maintenance.build_parser()
+        args = parser.parse_args(["compact", "--tier", "1"])
         assert args.threads == 2
         assert args.memory_limit == "4GB"
-        assert args.max_compacted_files == 100000
+        assert args.max_compacted_files == 80  # fallback aligned with justfile export
 
     def test_compact_threads_memory_override(self):
         args = self.parser.parse_args(

@@ -39,7 +39,7 @@ Self-contained CLI for DuckLake catalog and storage maintenance. Designed to run
 
 All destructive subcommands take `pg_try_advisory_lock(hashtext('millpond-ducklake-maintenance')::bigint)` on the `pg` ATTACH; concurrent invocations bail rather than racing each other's DELETEs. The lock provides mutual exclusion *between maintenance invocations* — it does not serialize against arbitrary catalog writers (e.g. ingest pods).
 
-Every `cleanup` / `cleanup-all` (skipped on `--dry-run`) logs a single structured throughput line: `cleanup throughput: files_processed=N elapsed_s=T rate_obj_s=R queue_depth_after=A`. `--debug` flips DuckDB's HTTP logging and the postgres extension's `pg_debug_show_queries` back on for short-lived debugging; both are off by default because they add per-call overhead that compounds across tens of thousands of S3 deletes.
+Every `cleanup` (skipped on `--dry-run`) and `cleanup-all` (which has no dry-run form — the CLI rejects `--dry-run`; preview with `cleanup-dry-run` for the age-gated subset or `fsck-dry-run` for the full pipeline) logs a single structured throughput line: `cleanup throughput: files_processed=N elapsed_s=T rate_obj_s=R queue_depth_after=A`. `--debug` flips DuckDB's HTTP logging and the postgres extension's `pg_debug_show_queries` back on for short-lived debugging; both are off by default because they add per-call overhead that compounds across tens of thousands of S3 deletes.
 
 If `PUSHGATEWAY_URL` is set, the script pushes `maintenance_start_time{operation}` (on start) and `maintenance_duration_seconds{operation, status}` (on completion) to a Prometheus Pushgateway, enabling Grafana annotation queries for maintenance windows.
 
@@ -118,7 +118,7 @@ Recipe wrapper for both maintenance and metrics. Copied to `/justfile` in the im
 Groups visible in `just --list`:
 
 - `[interactive]` — `shell` opens a DuckDB session with `lake` and `pg` ATTACHed, S3 SECRET configured, `ducklake_maintenance.sql` macros loaded
-- `[lifecycle]` — every snapshot/file maintenance subcommand of `ducklake_maintenance.py`, both `*` and `*-dry-run` variants
+- `[lifecycle]` — every snapshot/file maintenance subcommand of `ducklake_maintenance.py`, both `*` and `*-dry-run` variants. Recipe names mirror subcommand names with one exception: the `orphans` subcommand is exposed as `delete-orphaned-files{,-dry-run}` — the noun name read as a listing while actually deleting every unreferenced S3 object under DATA_PATH
 - `[compaction]` — tiered compaction recipes plus `compact-probe`
 - `[bootstrap]` — `bootstrap-index-*` per-index recipes (idempotent `CREATE INDEX CONCURRENTLY IF NOT EXISTS` against the DuckLake catalog schema) and `bootstrap-indexes` umbrella; one-shot use against a freshly instantiated DuckLake
 - `[metrics]` — `ducklake-metrics`, `ducklake-metrics-with-config`, `ducklake-metrics-list`

@@ -624,11 +624,16 @@ def cleanup(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
         _log_cleanup_throughput("cleanup", len(result), elapsed, _scheduled_for_deletion_count(conn))
 
 
-def cleanup_all(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
-    """Delete all files scheduled for deletion regardless of age."""
-    if dry_run:
-        log.info("cleanup-all has no dry-run mode; skipping")
-        return
+def cleanup_all(conn: duckdb.DuckDBPyConnection) -> None:
+    """Delete all files scheduled for deletion regardless of age.
+
+    Deliberately no dry_run parameter: ducklake_cleanup_old_files with
+    cleanup_all => true has no preview form, and the previous "accept
+    --dry-run, log 'skipping', do nothing" behavior taught operators they
+    had previewed something when they had previewed nothing. The CLI now
+    rejects --dry-run outright; age-gated previews exist as cleanup-dry-run
+    and the full pipeline preview as fsck-dry-run.
+    """
     log.info("Cleaning up all files scheduled for deletion")
     t0 = time.monotonic()
     result = conn.execute(f"CALL ducklake_cleanup_old_files('{ATTACH_NAME}', cleanup_all => true)").fetchall()
@@ -1549,7 +1554,7 @@ def cleanup_all_safe(conn: duckdb.DuckDBPyConnection, max_iterations: int) -> No
         dedup_deletions(conn, dry_run=False)
         heal_orphans(conn, dry_run=False)
         try:
-            cleanup_all(conn, dry_run=False)
+            cleanup_all(conn)
             log.info("cleanup-all-safe: cleanup-all succeeded on attempt %d", attempt)
             return
         except duckdb.IOException as e:
@@ -1976,8 +1981,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
 
     # cleanup-all
-    p = sub.add_parser("cleanup-all", help="Delete all scheduled files")
-    p.add_argument("--dry-run", action="store_true")
+    # No --dry-run on purpose: there is no preview form of cleanup_all =>
+    # true, and silently accepting the flag (old behavior) made operators
+    # believe they had previewed something. Use cleanup-dry-run (age-gated
+    # subset) or fsck-dry-run instead.
+    sub.add_parser(
+        "cleanup-all",
+        help="Delete all scheduled files (no dry-run; see cleanup-dry-run / fsck-dry-run)",
+        description=(
+            "Delete ALL files scheduled for deletion regardless of age. There is no dry-run "
+            "mode: ducklake_cleanup_old_files with cleanup_all => true has no preview form. "
+            "Preview the age-gated subset with `cleanup --dry-run`, or the full maintenance "
+            "pipeline with `fsck --dry-run`."
+        ),
+    )
 
     # dedup-deletions
     p = sub.add_parser(
@@ -2073,8 +2090,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-compacted-files",
         type=_positive_int,
-        default=_positive_int(os.environ.get("COMPACTION_MAX_FILES", "100000")),
-        help="Cap on files merged per run (default $COMPACTION_MAX_FILES or 100000)",
+        # Fallback matches the justfile's exported default: a direct python
+        # invocation must not be 1250x more aggressive than `just compact-*`.
+        default=_positive_int(os.environ.get("COMPACTION_MAX_FILES", "80")),
+        help="Cap on files merged per run (default $COMPACTION_MAX_FILES or 80)",
     )
 
     # compact-probe
@@ -2139,7 +2158,7 @@ def main(argv: list[str] | None = None) -> None:
             case "cleanup":
                 cleanup(conn, args.days, args.dry_run)
             case "cleanup-all":
-                cleanup_all(conn, args.dry_run)
+                cleanup_all(conn)
             case "dedup-deletions":
                 dedup_deletions(conn, args.dry_run)
             case "purge-orphan-stats":

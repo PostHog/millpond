@@ -121,7 +121,7 @@ _confirm-psql-target:
 [group('interactive')]
 shell:
     @bash -c 'echo "TARGET CATALOG (duckdb shell): host=$0 port=$1 db=$2 data_path=$3" >&2' {{ quote(rds_host) }} {{ quote(rds_port) }} {{ quote(rds_db) }} {{ quote(data_path) }}
-    {{ duckdb }} -cmd "{{ _setup }}" -cmd ".read {{ ducklake_maintenance_sql }}"
+    @{{ duckdb }} -cmd "{{ _setup }}" -cmd ".read {{ ducklake_maintenance_sql }}"
 
 # ----------------------------------------------------------------------------
 # snapshot + file lifecycle
@@ -225,14 +225,23 @@ fsck-dry-run:
 fsck max_iterations="10": _confirm-target
     python {{ ducklake_maintenance }} fsck --max-iterations {{ max_iterations }}
 
-# Preview orphaned files
+# Preview S3 objects that ducklake_delete_orphaned_files would delete
 [group('lifecycle')]
-orphans-dry-run:
+delete-orphaned-files-dry-run:
     python {{ ducklake_maintenance }} orphans --dry-run
 
-# Delete orphaned files
+# DELETE every S3 object under DATA_PATH not referenced by the attached
+# catalog. Renamed from `orphans`: the noun name read as a listing (the
+# listing recipe is find-orphans, which shows a different thing — queue
+# rows with missing S3 keys) and was one tab-complete from running the
+# single most destructive recipe in this file. With a stale
+# DUCKLAKE_DATA_PATH this deletes ANOTHER lake's live data.
+# NOTE: cron logs and pushgateway metrics still label this
+# operation=orphans — that is the python SUBCOMMAND name, which did not
+# change; only this recipe name did.
+[doc("DELETE every S3 object under DATA_PATH not referenced by the catalog (python subcommand: orphans)")]
 [group('lifecycle')]
-orphans: _confirm-target
+delete-orphaned-files: _confirm-target
     python {{ ducklake_maintenance }} orphans
 
 # Full maintenance: expire snapshots + cleanup files
@@ -288,15 +297,15 @@ compact-to-tier-3-dry-run table="":
 
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3)
 [group('compaction')]
-compact-all-tiers table="": compact-to-tier-1 compact-to-tier-2 compact-to-tier-3
+compact-all-tiers table="": (compact-to-tier-1 table) (compact-to-tier-2 table) (compact-to-tier-3 table)
 
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3) then delete scheduled S3 files
 [group('compaction')]
-compact-all-tiers-and-clean table="": compact-to-tier-1 compact-to-tier-2 compact-to-tier-3 cleanup-all
+compact-all-tiers-and-clean table="": (compact-to-tier-1 table) (compact-to-tier-2 table) (compact-to-tier-3 table) cleanup-all
 
 # Dry-run all tiered compactions sequentially (tier 1 -> 2 -> 3)
 [group('compaction')]
-compact-all-tiers-dry-run table="": compact-to-tier-1-dry-run compact-to-tier-2-dry-run compact-to-tier-3-dry-run
+compact-all-tiers-dry-run table="": (compact-to-tier-1-dry-run table) (compact-to-tier-2-dry-run table) (compact-to-tier-3-dry-run table)
 
 # Compact tier 1 then immediately clean up eligible S3 files
 [group('compaction')]
@@ -321,37 +330,42 @@ compact-to-tier-1-and-clean table="": (compact-to-tier-1 table) cleanup-all
 
 # psql command with credentials bound. PGPASSWORD goes via env so the
 # password doesn't leak into `ps`; `quote()` shell-escapes each value.
+# Every recipe line using this MUST be @-prefixed: just echoes the fully
+# interpolated command line otherwise, printing the live password into
+# terminal scrollback / session recordings / CI logs (still leaked by
+# `just -n` and `just --evaluate`, which is unavoidable — don't paste
+# their output for any recipe or variable touching credentials).
 _psql := "PGPASSWORD=" + quote(rds_password) + " psql --host=" + quote(rds_host) + " --port=" + quote(rds_port) + " --dbname=" + quote(rds_db) + " --username=" + quote(rds_user) + " --set ON_ERROR_STOP=1"
 
 # Live-file candidate scan keyed by (table, size); drives compaction's tier filter
 [group('bootstrap')]
 bootstrap-index-data-file-compaction: _confirm-psql-target
     @echo ">>> ducklake_data_file_compaction_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
 
 # Covering form of compaction_idx adding begin_snapshot/row_id_start/data_file_id
 [group('bootstrap')]
 bootstrap-index-data-file-compaction-order: _confirm-psql-target
     @echo ">>> ducklake_data_file_compaction_order_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_order_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes, begin_snapshot, row_id_start, data_file_id) WHERE (end_snapshot IS NULL);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_compaction_order_idx ON public.ducklake_data_file USING btree (table_id, end_snapshot, file_size_bytes, begin_snapshot, row_id_start, data_file_id) WHERE (end_snapshot IS NULL);"
 
 # Snapshot range read on data files for CDC, time-travel, and ducklake_table_insertions
 [group('bootstrap')]
 bootstrap-index-data-file-snapshot-read: _confirm-psql-target
     @echo ">>> ducklake_data_file_snapshot_read_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_snapshot_read_idx ON public.ducklake_data_file USING btree (table_id, begin_snapshot, end_snapshot);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_data_file_snapshot_read_idx ON public.ducklake_data_file USING btree (table_id, begin_snapshot, end_snapshot);"
 
 # Snapshot range read on delete files (mirrors data_file_snapshot_read)
 [group('bootstrap')]
 bootstrap-index-delete-file-snapshot-read: _confirm-psql-target
     @echo ">>> ducklake_delete_file_snapshot_read_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_snapshot_read_idx ON public.ducklake_delete_file USING btree (table_id, begin_snapshot, end_snapshot);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_snapshot_read_idx ON public.ducklake_delete_file USING btree (table_id, begin_snapshot, end_snapshot);"
 
 # Live-delete-file scan, partial on end_snapshot IS NULL
 [group('bootstrap')]
 bootstrap-index-delete-file-table: _confirm-psql-target
     @echo ">>> ducklake_delete_file_table_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_table_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot) WHERE (end_snapshot IS NULL);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_table_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot) WHERE (end_snapshot IS NULL);"
 
 # Lake-wide SUM(file_size_bytes) over live delete files (drives the
 # ducklake_metrics ducklake_delete_files_bytes panel). Partial-on-NULL
@@ -363,25 +377,25 @@ bootstrap-index-delete-file-table: _confirm-psql-target
 [group('bootstrap')]
 bootstrap-index-delete-file-metrics: _confirm-psql-target
     @echo ">>> ducklake_delete_file_metrics_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_metrics_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_delete_file_metrics_idx ON public.ducklake_delete_file USING btree (table_id, end_snapshot, file_size_bytes) WHERE (end_snapshot IS NULL);"
 
 # File-column-stats join key; drives per-file stat aggregation during compaction
 [group('bootstrap')]
 bootstrap-index-file-column-stats: _confirm-psql-target
     @echo ">>> ducklake_file_column_stats_file_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_file_idx ON public.ducklake_file_column_stats USING btree (data_file_id);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_file_idx ON public.ducklake_file_column_stats USING btree (data_file_id);"
 
 # Partition-value join key for per-file lookups
 [group('bootstrap')]
 bootstrap-index-file-partition-value-file: _confirm-psql-target
     @echo ">>> ducklake_file_partition_value_file_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_file_idx ON public.ducklake_file_partition_value USING btree (data_file_id);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_file_idx ON public.ducklake_file_partition_value USING btree (data_file_id);"
 
 # Partition-value table scope (bucket-pruning path on SCAN_TABLE)
 [group('bootstrap')]
 bootstrap-index-file-partition-value-table: _confirm-psql-target
     @echo ">>> ducklake_file_partition_value_table_idx"
-    {{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_idx ON public.ducklake_file_partition_value USING btree (table_id);"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_idx ON public.ducklake_file_partition_value USING btree (table_id);"
 
 # Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
 [group('bootstrap')]
