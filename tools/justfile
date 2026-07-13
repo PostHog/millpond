@@ -400,9 +400,18 @@ bootstrap-index-file-partition-value-table: _confirm-target
     @echo ">>> ducklake_file_partition_value_table_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_idx ON public.ducklake_file_partition_value USING btree (table_id);"
 
+# Covering index for the fpv-corruption integrity scan (ducklake-metrics-daemon's
+# ducklake_partition_value_corruption metric): a GROUP BY data_file_id
+# aggregation over (partition_key_index, partition_value). All three columns in
+# the index -> index-only scan, no heap fetches on this large table.
+[group('bootstrap')]
+bootstrap-index-file-partition-value-cover: _confirm-target
+    @echo ">>> ducklake_file_partition_value_cover_idx"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_cover_idx ON public.ducklake_file_partition_value USING btree (data_file_id, partition_key_index, partition_value);"
+
 # Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
 [group('bootstrap')]
-bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table
+bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-cover
 
 # ----------------------------------------------------------------------------
 # state-metrics daemon
