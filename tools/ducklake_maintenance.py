@@ -957,20 +957,26 @@ def _repair_partition_values_discover_tables(conn: duckdb.DuckDBPyConnection) ->
 def _repair_partition_values_pre_flight_any_rot(conn: duckdb.DuckDBPyConnection) -> bool:
     """Cheap one-shot EXISTS across all in-scope posthog events/persons tables.
 
-    Returns True iff at least one file's fpv state doesn't match expected for
-    its kind: events files must have exactly 3 fpv rows (year/month/day),
-    persons exactly 2 (year/month). Also True if ANY fpv row in scope has a
-    NULL partition_value. EXISTS short-circuits at the first matching row
-    inside the LIMIT 1 subquery — keeps this snappy on clean catalogs.
+    Returns True iff at least one file's fpv INDEX SET is not exactly
+    {0..N-1} for its kind (events {0,1,2}, persons {0,1}), or ANY fpv row in
+    scope has a NULL partition_value. The array-set check mirrors
+    _count_broken / _execute's post-condition and catches BOTH missing rows
+    AND the collapsed-index shape (N rows all stacked on the top index —
+    ducklake_add_data_files rot with the RIGHT row count at the WRONG
+    indexes). A bare row-count check passed that shape, so the pre-flight
+    short-circuited "clean" over real rot and _execute never ran — exactly
+    the corruption the partition-value-corruption dashboard metric flags.
+    EXISTS short-circuits at the first matching row inside the LIMIT 1
+    subquery — keeps this snappy on clean catalogs.
 
-    Important because this subcommand will run as the first step of the
+    Important because this subcommand runs as the first step of the
     15-minute compaction cronjob: most invocations will be against clean
     catalogs and should exit before doing N per-table count queries.
     """
     # Restrict to files a real _execute run would actually touch:
     #   - Table must be PARTITIONED (has a live ducklake_partition_info row) —
     #     otherwise events_nrt / other unpartitioned events*/persons* variants
-    #     produce COUNT(fpv)=0 and trip the HAVING <> 3 branch forever.
+    #     produce an empty fpv index set and trip the HAVING branch forever.
     #   - Path must be S3-absolute — lake-relative files (ducklake-{uuid}.parquet
     #     at the lake root) don't fit the hive layout the repair targets.
     #   - Path must match the kind-specific hive layout _execute expects
@@ -983,11 +989,23 @@ def _repair_partition_values_pre_flight_any_rot(conn: duckdb.DuckDBPyConnection)
     # defeating the cron short-circuit.
     events_path_shape = _repair_partition_values_path_shape_predicate("events", column="df.path")
     persons_path_shape = _repair_partition_values_path_shape_predicate("persons", column="df.path")
+    # Same index-set aggregate + expected arrays as _count_broken and
+    # _execute's post-condition — all three MUST agree, or the pre-flight
+    # short-circuits over rot the repair would fix (or the reverse: fires
+    # forever over files the repair won't touch).
+    index_set_agg = (
+        "COALESCE(array_agg(fpv.partition_key_index ORDER BY fpv.partition_key_index) "
+        "FILTER (WHERE fpv.partition_key_index IS NOT NULL), '{}'::bigint[])"
+    )
+    expected = {
+        kind: "ARRAY[" + ",".join(str(idx) for idx, _ in spec) + "]::bigint[]"
+        for kind, spec in _REPAIR_PARTITION_VALUE_SPEC.items()
+    }
     pre_flight_sql = (
         "SELECT EXISTS ( "
         "  SELECT 1 FROM ( "
         "    SELECT df.data_file_id, df.table_id, t.table_name, "
-        "           COUNT(fpv.partition_key_index) AS n_fpv, "
+        f"           {index_set_agg} AS index_set, "
         "           BOOL_OR(fpv.partition_value IS NULL) AS has_null "
         f"    FROM {PG_CATALOG_SCHEMA}.ducklake_data_file df "
         f"    JOIN {PG_CATALOG_SCHEMA}.ducklake_table t USING (table_id) "
@@ -1014,8 +1032,11 @@ def _repair_partition_values_pre_flight_any_rot(conn: duckdb.DuckDBPyConnection)
         f"          AND {persons_path_shape}) "
         "      ) "
         "    GROUP BY df.data_file_id, df.table_id, t.table_name "
-        "    HAVING (t.table_name LIKE 'events%' AND COUNT(fpv.partition_key_index) <> 3) "
-        "        OR (t.table_name LIKE 'persons%' AND COUNT(fpv.partition_key_index) <> 2) "
+        # Index-SET comparison, not row count: the collapsed shape (3 rows all
+        # at index 2) has the right count at the wrong indexes, and the
+        # non-DISTINCT array_agg also catches duplicated rows per index.
+        f"    HAVING (t.table_name LIKE 'events%' AND {index_set_agg} IS DISTINCT FROM {expected['events']}) "
+        f"        OR (t.table_name LIKE 'persons%' AND {index_set_agg} IS DISTINCT FROM {expected['persons']}) "
         "        OR BOOL_OR(fpv.partition_value IS NULL) "
         "    LIMIT 1 "
         "  ) s "
@@ -1867,6 +1888,47 @@ def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: fl
     return stop
 
 
+def _enumerate_compaction_tables(conn: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
+    """Live BASE TABLEs in the attached lake as (schema, table_name) pairs.
+
+    Catalog-derived names are ordinary-DDL-controlled and get interpolated
+    into the per-table CALL statements below, so anything outside the
+    conservative identifier shape is skipped LOUDLY rather than quoted
+    heroically (same defense as repair-partition-values discovery).
+    """
+    rows = conn.execute(
+        "SELECT table_schema, table_name FROM information_schema.tables "
+        f"WHERE table_catalog = '{ATTACH_NAME}' AND table_type = 'BASE TABLE' "
+        "ORDER BY table_schema, table_name"
+    ).fetchall()
+    tables: list[tuple[str, str]] = []
+    for schema_name, table_name in rows:
+        # _CATALOG_TABLE_NAME_RE (strict [A-Za-z0-9_]+, fullmatch): these names
+        # are interpolated into single-quoted CALL args, and a millpond-written
+        # table is always a plain identifier — anything else is skipped, never
+        # quoted heroically.
+        if not _CATALOG_TABLE_NAME_RE.fullmatch(schema_name) or not _CATALOG_TABLE_NAME_RE.fullmatch(table_name):
+            log.warning(
+                "compact: skipping table with non-identifier name %r.%r (not millpond-written)",
+                schema_name,
+                table_name,
+            )
+            continue
+        tables.append((schema_name, table_name))
+    return tables
+
+
+def _merge_adjacent_call(schema_name: str | None, table_name: str, args: list[str], file_budget: int) -> str:
+    """Build the per-table ducklake_merge_adjacent_files CALL."""
+    call_args = [*args, f"max_compacted_files => {file_budget}"]
+    if schema_name is None:
+        return f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', '{table_name}', {', '.join(call_args)})"
+    return (
+        f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', '{table_name}', "
+        f"schema => '{schema_name}', {', '.join(call_args)})"
+    )
+
+
 def compact(
     conn: duckdb.DuckDBPyConnection,
     tier: int,
@@ -1875,8 +1937,15 @@ def compact(
     threads: int,
     memory_limit: str,
     max_compacted_files: int,
-) -> None:
-    """Compact files in tier N (1, 2, or 3) for the catalog or one table."""
+) -> int:
+    """Compact files in tier N (1, 2, or 3) for the catalog or one table.
+
+    Returns the number of tables whose per-table merge FAILED (0 when
+    everything succeeded, and always 0 for the single-table form, which
+    propagates its error raw instead). main() exports this as the
+    maintenance_compact_tables_failed gauge so a permanently-poisoned
+    table is alertable even though partial failure deliberately exits 0.
+    """
     spec = TIERS[tier]
     min_b, max_b, target = spec["min"], spec["max"], spec["target"]
     scope = f"table '{table}'" if table else "catalog-wide"
@@ -1912,32 +1981,112 @@ def compact(
     )
 
     if dry_run:
-        return
+        return 0
     if candidate_count == 0:
         log.info("compact tier-%d: nothing to do, skipping merge", tier)
-        return
+        return 0
 
     # Bound each run: the prod backlog (600k+ tier-1 candidates) is far too
     # large for one merge transaction — it would blow the cron pod's
     # activeDeadlineSeconds and produce one giant catalog commit. A capped
     # run finishes in bounded time and the cron schedule grinds the backlog
     # down incrementally.
-    args = [f"max_file_size => {max_b}", f"max_compacted_files => {max_compacted_files}"]
+    args = [f"max_file_size => {max_b}"]
     if min_b is not None:
         args.append(f"min_file_size => {min_b}")
-    if table:
-        sql = f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', '{table}', {', '.join(args)})"
-    else:
-        sql = f"CALL ducklake_merge_adjacent_files('{ATTACH_NAME}', {', '.join(args)})"
 
     _set_compaction_tuning(conn, threads, memory_limit)
-    heartbeat = _start_heartbeat(conn, f"compact tier-{tier} merge")
     t0 = time.monotonic()
-    try:
+    result: list[tuple] = []
+    failed: list[str] = []
+    table_total = 1
+
+    if table:
+        # Single-table invocation: unchanged one-CALL semantics; an error
+        # propagates raw, exactly as before.
+        sql = _merge_adjacent_call(None, table, args, max_compacted_files)
+        heartbeat = _start_heartbeat(conn, f"compact tier-{tier} merge")
+        try:
+            with _scoped_target_file_size(conn, target):
+                result = conn.execute(sql).fetchall()
+        finally:
+            heartbeat.set()
+    else:
+        # Catalog-wide compaction, one CALL PER TABLE. The catalog-scope form
+        # of ducklake_merge_adjacent_files aborts the ENTIRE run when any one
+        # table can't compact — e.g. a merge group mixing hive-path
+        # conventions after an add_data_files backfill registered foreign
+        # paths into a live table (seen in production on `events`: the
+        # compactor groups by logical partition_values, then asserts all
+        # files share one hive directory string), or the orphaned
+        # inlined-data/schema-version classes. Per-table calls isolate the
+        # failure: every healthy table still compacts and the broken one is
+        # reported. Mirrors the battle-tested standalone posthog maintenance
+        # script, which loops tables for exactly this reason.
+        tables = _enumerate_compaction_tables(conn)
+        table_total = len(tables)
+        log.info("compact tier-%d: %d live table(s), per-table merge", tier, table_total)
+        if not tables and candidate_count > 0:
+            # Candidates exist but no table passed the identifier gate — the
+            # per-table WARNs above explain which; escalate so this can't be
+            # a silent perpetual no-op.
+            log.warning(
+                "compact tier-%d: %d candidate file(s) but no compactable tables — check skipped-name warnings",
+                tier,
+                candidate_count,
+            )
         with _scoped_target_file_size(conn, target):
-            result = conn.execute(sql).fetchall()
-    finally:
-        heartbeat.set()
+            # max_compacted_files stays a GLOBAL budget across the run — the
+            # same bound as the old catalog-scope call — so run duration
+            # stays predictable. Each table gets what's left; leftovers wait
+            # for the next cron tick.
+            remaining = max_compacted_files
+            for schema_name, table_name in tables:
+                if remaining <= 0:
+                    log.info(
+                        "compact tier-%d: file budget exhausted; remaining tables wait for the next run",
+                        tier,
+                    )
+                    break
+                sql = _merge_adjacent_call(schema_name, table_name, args, remaining)
+                heartbeat = _start_heartbeat(conn, f"compact tier-{tier} {schema_name}.{table_name}")
+                try:
+                    rows = conn.execute(sql).fetchall()
+                    # Validate shape BEFORE mutating shared state: if a fork/
+                    # version drift changes the CALL's result schema, this
+                    # table's accounting fails loudly but the run-wide
+                    # aggregation below never sees malformed rows.
+                    if any(len(r) < 4 for r in rows):
+                        raise ValueError(f"unexpected merge result shape: {rows[:2]!r}")
+                    consumed = sum(r[2] for r in rows)
+                    result.extend(rows)
+                    remaining -= consumed
+                except duckdb.CatalogException:
+                    # Table vanished between enumeration and the CALL (dropped
+                    # mid-run) — benign, don't count it as a failure.
+                    log.warning(
+                        "compact tier-%d: %s.%s disappeared before merge (dropped?); skipping",
+                        tier,
+                        schema_name,
+                        table_name,
+                    )
+                except Exception:
+                    # Continue-on-error relies on the connection SURVIVING the
+                    # failed CALL (verified on duckdb 1.5.2 even for
+                    # InternalException, and pinned end-to-end by
+                    # test_compaction_isolation_integration). If a future
+                    # duckdb bump invalidates the instance on INTERNAL errors,
+                    # every subsequent CALL fails and the run hard-fails via
+                    # the all-failed policy below — noisy, not silent.
+                    failed.append(f"{schema_name}.{table_name}")
+                    log.exception(
+                        "compact tier-%d: %s.%s failed; continuing with remaining tables",
+                        tier,
+                        schema_name,
+                        table_name,
+                    )
+                finally:
+                    heartbeat.set()
     elapsed = time.monotonic() - t0
 
     # Aggregate result rows (one per output group: schema, table, input_files, output_files)
@@ -1968,6 +2117,29 @@ def compact(
         total_outputs,
         elapsed,
     )
+    if failed:
+        log.warning(
+            "compact tier-%d: %d/%d table(s) failed: %s",
+            tier,
+            len(failed),
+            table_total,
+            ", ".join(failed),
+        )
+        if table_total >= 2 and len(failed) == table_total:
+            # Every table failed — that's systemic (catalog down, bad creds,
+            # broken extension), not one poisoned table. Surface as a run
+            # failure so the Job/backoff machinery reacts. A PARTIAL failure
+            # exits 0 on purpose: the just-recipe chain must proceed to the
+            # later tiers and cleanup-all (deletion-queue drain) for the
+            # healthy tables instead of wedging the whole schedule on one
+            # broken table. A SINGLE-table catalog is exempt for the same
+            # reason — 1/1 failed would re-wedge cleanup forever; the
+            # maintenance_compact_tables_failed gauge carries the alert
+            # instead. (Best-effort heuristic: a systemic failure where one
+            # trivially-empty table "succeeds" also lands on the gauge, not
+            # the raise.)
+            raise RuntimeError(f"compact tier-{tier}: all {table_total} table(s) failed")
+    return len(failed)
 
 
 def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_files: int) -> None:
@@ -2183,6 +2355,15 @@ def main(argv: list[str] | None = None) -> None:
         ["operation", "status"],
         registry=registry,
     )
+    # Partial compaction failures deliberately exit 0 (the recipe chain must
+    # still run later tiers + cleanup-all), so a permanently-poisoned table
+    # would otherwise be invisible to metrics. Alert on sustained nonzero.
+    compact_tables_failed = Gauge(
+        "maintenance_compact_tables_failed",
+        "Tables whose per-table merge failed in the last compact run",
+        ["tier"],
+        registry=registry,
+    )
     operation = args.command
     if hasattr(args, "days") and args.days < 1:
         parser.error("--days must be >= 1")
@@ -2231,7 +2412,7 @@ def main(argv: list[str] | None = None) -> None:
             case "checkpoint":
                 checkpoint(conn)
             case "compact":
-                compact(
+                n_failed = compact(
                     conn,
                     args.tier,
                     args.table or None,
@@ -2240,6 +2421,7 @@ def main(argv: list[str] | None = None) -> None:
                     args.memory_limit,
                     args.max_compacted_files,
                 )
+                compact_tables_failed.labels(tier=str(args.tier)).set(n_failed)
             case "compact-probe":
                 compact_probe(conn, args.table, args.max_compacted_files)
     except Exception:
