@@ -828,7 +828,8 @@ class TestHeartbeat:
 def _compact_conn(tables, merge_rows=None, fail_tables=(), candidates=(100, 1000)):
     """A duckdb-conn-shaped MagicMock driving the per-table compact() flow.
 
-    tables: (schema, table) pairs the information_schema read returns.
+    tables: (schema, table) pairs the candidate-driven enumeration returns
+    (the mock returns them verbatim — production orders by backlog DESC).
     merge_rows: {table_name: result rows} for its merge CALL (default []).
     fail_tables: table names whose merge CALL raises.
     """
@@ -839,7 +840,8 @@ def _compact_conn(tables, merge_rows=None, fail_tables=(), candidates=(100, 1000
 
     def _execute(sql, *a, **k):
         res = MagicMock()
-        if "information_schema.tables" in sql:
+        if "HAVING COUNT(*) >= 2" in sql:
+            # candidate-driven table enumeration
             res.fetchall.return_value = list(tables)
         elif "ducklake_merge_adjacent_files" in sql:
             m = call_re.search(sql)
@@ -1056,7 +1058,34 @@ class TestCompactPerTable:
         ducklake_maintenance.compact(
             conn, tier=1, table=None, dry_run=True, threads=2, memory_limit="16GB", max_compacted_files=10
         )
+        assert not any("HAVING COUNT(*) >= 2" in c.args[0] for c in conn.execute.call_args_list)
+
+    def test_enumeration_is_candidate_driven_backlog_first(self):
+        """The table list must come from the tier's candidate files — sized to
+        the tier band, >= 2 files per table (singletons can't merge), most
+        backlogged first — NOT information_schema. Alphabetical enumeration
+        over all live tables let 2-file cosmetic merges starve the real
+        backlog out of the budget (observed: 3,074 tables, budget gone on
+        five billing tables, the 15k-candidate events table never reached)."""
+        conn = _compact_conn([("posthog", "events")])
+        ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        enum_calls = [c.args[0] for c in conn.execute.call_args_list if "HAVING COUNT(*) >= 2" in c.args[0]]
+        assert len(enum_calls) == 1
+        sql = enum_calls[0]
+        assert "ducklake_data_file" in sql and "ducklake_table" in sql and "ducklake_schema" in sql
+        assert "ORDER BY COUNT(*) DESC" in sql, "most backlogged table must be served first"
+        assert "file_size_bytes < 1048576" in sql, "enumeration must be scoped to the tier's size band"
         assert not any("information_schema" in c.args[0] for c in conn.execute.call_args_list)
+
+    def test_enumeration_band_includes_min_for_upper_tiers(self):
+        conn = _compact_conn([("posthog", "events")])
+        ducklake_maintenance.compact(
+            conn, tier=2, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        sql = next(c.args[0] for c in conn.execute.call_args_list if "HAVING COUNT(*) >= 2" in c.args[0])
+        assert "file_size_bytes >= 1048576" in sql and "file_size_bytes < 10485760" in sql
 
 
 class TestScopedTargetFileSize:

@@ -1888,18 +1888,45 @@ def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: fl
     return stop
 
 
-def _enumerate_compaction_tables(conn: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
-    """Live BASE TABLEs in the attached lake as (schema, table_name) pairs.
+def _enumerate_compaction_tables(
+    conn: duckdb.DuckDBPyConnection, min_b: int | None, max_b: int
+) -> list[tuple[str, str]]:
+    """Tables with >= 2 live files in the tier's size band, biggest backlog first.
+
+    Candidate-driven (from ducklake_data_file), NOT information_schema: a
+    catalog can carry thousands of live tables (dlt/Fivetran staging) with
+    zero tier candidates — enumerating all of them costs a bind-time
+    candidate scan per table per tier against a PG catalog with a history
+    of read-tax problems, and alphabetical order let trivially-small
+    early-alphabet tables (2-file cosmetic merges) eat the global file
+    budget every run while the real backlog starved. Observed in prod:
+    3,074 live tables, the budget exhausted on five 2-file billing tables,
+    and the 15k-candidate events table never reached. Candidate-count DESC
+    serves the most backlogged table first; ties break by name for
+    determinism. Single-candidate tables can't merge and are excluded.
 
     Catalog-derived names are ordinary-DDL-controlled and get interpolated
     into the per-table CALL statements below, so anything outside the
     conservative identifier shape is skipped LOUDLY rather than quoted
     heroically (same defense as repair-partition-values discovery).
     """
+    where = [
+        "df.end_snapshot IS NULL",
+        "t.end_snapshot IS NULL",
+        "sch.end_snapshot IS NULL",
+        f"df.file_size_bytes < {max_b}",
+    ]
+    if min_b is not None:
+        where.append(f"df.file_size_bytes >= {min_b}")
     rows = conn.execute(
-        "SELECT table_schema, table_name FROM information_schema.tables "
-        f"WHERE table_catalog = '{ATTACH_NAME}' AND table_type = 'BASE TABLE' "
-        "ORDER BY table_schema, table_name"
+        "SELECT sch.schema_name, t.table_name "
+        f"FROM {METADATA_SCHEMA}.ducklake_data_file df "
+        f"JOIN {METADATA_SCHEMA}.ducklake_table t USING (table_id) "
+        f"JOIN {METADATA_SCHEMA}.ducklake_schema sch ON sch.schema_id = t.schema_id "
+        f"WHERE {' AND '.join(where)} "
+        "GROUP BY sch.schema_name, t.table_name "
+        "HAVING COUNT(*) >= 2 "
+        "ORDER BY COUNT(*) DESC, sch.schema_name, t.table_name"
     ).fetchall()
     tables: list[tuple[str, str]] = []
     for schema_name, table_name in rows:
@@ -2023,15 +2050,20 @@ def compact(
         # failure: every healthy table still compacts and the broken one is
         # reported. Mirrors the battle-tested standalone posthog maintenance
         # script, which loops tables for exactly this reason.
-        tables = _enumerate_compaction_tables(conn)
+        tables = _enumerate_compaction_tables(conn, min_b, max_b)
         table_total = len(tables)
-        log.info("compact tier-%d: %d live table(s), per-table merge", tier, table_total)
+        log.info(
+            "compact tier-%d: %d table(s) with >= 2 tier candidates, biggest backlog first",
+            tier,
+            table_total,
+        )
         if not tables and candidate_count > 0:
-            # Candidates exist but no table passed the identifier gate — the
-            # per-table WARNs above explain which; escalate so this can't be
-            # a silent perpetual no-op.
-            log.warning(
-                "compact tier-%d: %d candidate file(s) but no compactable tables — check skipped-name warnings",
+            # Candidates exist but no table qualified: every candidate is a
+            # per-table singleton (nothing to merge with — benign), or the
+            # holders were skipped by the identifier gate (per-table WARNs
+            # above say which). INFO, not a failure.
+            log.info(
+                "compact tier-%d: %d candidate file(s) but no table has >= 2 — nothing mergeable this run",
                 tier,
                 candidate_count,
             )
