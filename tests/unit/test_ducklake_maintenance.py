@@ -9,6 +9,7 @@ in-process duckdb with stubbed schemas or the docker-compose stack.
 """
 
 import logging
+import re
 from unittest.mock import MagicMock, patch
 
 import duckdb
@@ -516,6 +517,48 @@ class TestRepairSqlEscaping:
         assert ("t.table_name = " + "'" * 2 + "events_o" + "'" * 4 + "brien" + "'" * 2) in sql
 
 
+class TestRepairPreFlightPredicate:
+    """The pre-flight must gate on the fpv INDEX SET, not the row count.
+
+    The collapsed shape (N rows all stacked on the top partition_key_index —
+    ducklake_add_data_files rot) has the RIGHT row count at the WRONG indexes.
+    A bare COUNT(...) <> N check passed it, so the pre-flight short-circuited
+    "clean" over real rot and _execute never ran, while the dashboard's
+    partition-value-corruption metric (distinct-index-set based) kept
+    flagging the same files. The predicate must mirror _count_broken /
+    _execute's post-condition."""
+
+    def _sql(self):
+        conn = MagicMock()
+        result = MagicMock()
+        result.fetchone.return_value = (True,)
+        conn.execute.return_value = result
+        assert ducklake_maintenance._repair_partition_values_pre_flight_any_rot(conn) is True
+        return conn.execute.call_args[0][0]
+
+    def test_gates_on_index_set_not_row_count(self):
+        sql = self._sql()
+        assert "IS DISTINCT FROM ARRAY[0,1,2]::bigint[]" in sql, "events must compare the index SET"
+        assert "IS DISTINCT FROM ARRAY[0,1]::bigint[]" in sql, "persons must compare the index SET"
+        assert "COUNT(fpv.partition_key_index) <> " not in sql, "row-count check passes the collapsed shape"
+
+    def test_aggregate_matches_count_broken(self):
+        # Non-DISTINCT array_agg (catches duplicated rows per index) with the
+        # NULL-filtered COALESCE-to-empty shape used by _count_broken.
+        sql = self._sql()
+        assert "array_agg(fpv.partition_key_index ORDER BY fpv.partition_key_index)" in sql
+        assert "FILTER (WHERE fpv.partition_key_index IS NOT NULL)" in sql
+
+    def test_expected_arrays_derive_from_spec(self):
+        # Single source of truth: the arrays come from
+        # _REPAIR_PARTITION_VALUE_SPEC, so a spec change can't desync the
+        # pre-flight from the repair.
+        sql = self._sql()
+        for kind, spec in ducklake_maintenance._REPAIR_PARTITION_VALUE_SPEC.items():
+            expected = "ARRAY[" + ",".join(str(idx) for idx, _ in spec) + "]::bigint[]"
+            assert expected in sql, f"{kind} expected-index array missing"
+
+
 class TestPurgeOrphanStats:
     """Verify purge_orphan_stats predicate shape, dry-run gating, and ordering."""
 
@@ -782,29 +825,62 @@ class TestHeartbeat:
         assert net is None or (isinstance(net, tuple) and len(net) == 2 and all(v >= 0 for v in net))
 
 
+def _compact_conn(tables, merge_rows=None, fail_tables=(), candidates=(100, 1000)):
+    """A duckdb-conn-shaped MagicMock driving the per-table compact() flow.
+
+    tables: (schema, table) pairs the information_schema read returns.
+    merge_rows: {table_name: result rows} for its merge CALL (default []).
+    fail_tables: table names whose merge CALL raises.
+    """
+    conn = MagicMock()
+    # The CALL's table name is its second positional arg — parse it instead of
+    # substring-matching, so a mock defect can't masquerade as a table failure.
+    call_re = re.compile(r"ducklake_merge_adjacent_files\('[^']*', '([^']*)'")
+
+    def _execute(sql, *a, **k):
+        res = MagicMock()
+        if "information_schema.tables" in sql:
+            res.fetchall.return_value = list(tables)
+        elif "ducklake_merge_adjacent_files" in sql:
+            m = call_re.search(sql)
+            assert m, f"unparseable merge CALL: {sql}"
+            name = m.group(1)
+            if name in fail_tables:
+                raise RuntimeError("DuckLakeCompactor: Files have different hive partition path")
+            res.fetchall.return_value = (merge_rows or {}).get(name, [])
+        elif "ducklake_options" in sql:
+            res.fetchone.return_value = ("134217728",)  # 128MiB, restore path
+        elif "ducklake_data_file" in sql:
+            res.fetchone.return_value = candidates
+        return res
+
+    conn.execute.side_effect = _execute
+    return conn
+
+
+def _merge_calls(conn):
+    return [c.args[0] for c in conn.execute.call_args_list if "ducklake_merge_adjacent_files" in c.args[0]]
+
+
 class TestCompactSql:
-    """compact() must pass the per-run file cap through to the merge CALL."""
+    """compact() must pass the per-run file cap through to the merge CALL(s)."""
 
     def test_merge_runs_under_heartbeat(self, monkeypatch):
-        """The heartbeat must wrap the merge call and be stopped afterwards."""
+        """The heartbeat must wrap each per-table merge and be stopped afterwards."""
         hb = MagicMock()
         start = MagicMock(return_value=hb)
         monkeypatch.setattr(ducklake_maintenance, "_start_heartbeat", start)
 
-        conn = MagicMock()
-        result = MagicMock()
-        result.fetchone.side_effect = [(100, 1000), ("128MiB",)]
-        result.fetchall.return_value = []
-        conn.execute.return_value = result
-
+        conn = _compact_conn([("posthog", "events")])
         ducklake_maintenance.compact(
             conn, tier=1, table=None, dry_run=False, threads=1, memory_limit="16GB", max_compacted_files=25000
         )
 
-        start.assert_called_once_with(conn, "compact tier-1 merge")
+        start.assert_called_once_with(conn, "compact tier-1 posthog.events")
         hb.set.assert_called_once()
 
-    def test_merge_call_includes_max_compacted_files(self):
+    def test_single_table_call_includes_max_compacted_files(self):
+        """--table invocation keeps the direct one-CALL form (no schema arg)."""
         conn = MagicMock()
         result = MagicMock()
         # candidate-count read, then ducklake_options read for target_file_size restore
@@ -813,11 +889,13 @@ class TestCompactSql:
         conn.execute.return_value = result
 
         ducklake_maintenance.compact(
-            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=100000
+            conn, tier=1, table="events", dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=100000
         )
 
-        merge_calls = [c.args[0] for c in conn.execute.call_args_list if "ducklake_merge_adjacent_files" in c.args[0]]
+        merge_calls = _merge_calls(conn)
         assert len(merge_calls) == 1
+        assert "'events'" in merge_calls[0]
+        assert "schema =>" not in merge_calls[0]
         assert "max_compacted_files => 100000" in merge_calls[0]
         assert "max_file_size =>" in merge_calls[0]
 
@@ -831,8 +909,154 @@ class TestCompactSql:
             conn, tier=1, table=None, dry_run=True, threads=2, memory_limit="16GB", max_compacted_files=100000
         )
 
-        merge_calls = [c.args[0] for c in conn.execute.call_args_list if "ducklake_merge_adjacent_files" in c.args[0]]
-        assert not merge_calls
+        assert not _merge_calls(conn)
+
+
+class TestCompactPerTable:
+    """Catalog-wide compaction is one CALL per live table: a poisoned table
+    (e.g. mixed hive-path conventions from an add_data_files backfill — the
+    production `events` incident) must not abort the other tables' compaction."""
+
+    def test_catalog_wide_iterates_tables_with_schema(self):
+        conn = _compact_conn([("posthog", "events"), ("posthog", "persons")])
+        ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        calls = _merge_calls(conn)
+        assert len(calls) == 2
+        assert "schema => 'posthog'" in calls[0] and "'events'" in calls[0]
+        assert "schema => 'posthog'" in calls[1] and "'persons'" in calls[1]
+        assert all("max_compacted_files => 10" in c for c in calls)
+
+    def test_poisoned_table_does_not_abort_run(self, caplog, monkeypatch):
+        hb = MagicMock()
+        start = MagicMock(return_value=hb)
+        monkeypatch.setattr(ducklake_maintenance, "_start_heartbeat", start)
+        conn = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            merge_rows={"persons": [("posthog", "persons", 4, 1)]},
+            fail_tables=("events",),
+        )
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            n_failed = ducklake_maintenance.compact(
+                conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+            )
+        calls = _merge_calls(conn)
+        assert len(calls) == 2, "persons must still be compacted after events fails"
+        assert n_failed == 1
+        assert "1/2 table(s) failed" in caplog.text
+        assert "posthog.events" in caplog.text
+        # Heartbeat stopped on BOTH paths, including the failed table.
+        assert start.call_count == 2
+        assert hb.set.call_count == 2
+        # target_file_size restored despite the partial failure.
+        assert any("ducklake_set_option" in c.args[0] and "128MiB" in c.args[0] for c in conn.execute.call_args_list)
+
+    def test_all_tables_failed_raises(self):
+        conn = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            fail_tables=("events", "persons"),
+        )
+        with pytest.raises(RuntimeError, match="all 2 table"):
+            ducklake_maintenance.compact(
+                conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+            )
+
+    def test_single_table_catalog_poisoned_does_not_raise(self):
+        """1/1 failed must NOT raise: raising would re-wedge the recipe chain
+        (later tiers + cleanup-all) forever — the exact incident mode this
+        change fixes. The failure surfaces via the returned count/gauge."""
+        conn = _compact_conn([("posthog", "events")], fail_tables=("events",))
+        n_failed = ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        assert n_failed == 1
+
+    def test_failure_budget_and_skip_interplay_does_not_raise(self):
+        """fail + budget-exhaust + never-reached must not trip the all-failed
+        policy: failed(1) < total(3)."""
+        conn = _compact_conn(
+            [("posthog", "aaa"), ("posthog", "bbb"), ("posthog", "ccc")],
+            merge_rows={"bbb": [("posthog", "bbb", 10, 1)]},
+            fail_tables=("aaa",),
+        )
+        n_failed = ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        calls = _merge_calls(conn)
+        assert len(calls) == 2, "ccc must be deferred once bbb exhausts the budget"
+        assert n_failed == 1
+
+    def test_malformed_result_rows_fail_the_table_not_the_run(self, caplog):
+        """A fork/version drift in the CALL's result schema must fail that
+        table's accounting loudly, not poison the run-wide aggregation."""
+        conn = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            merge_rows={"events": [("posthog", "events", 3)], "persons": [("posthog", "persons", 4, 1)]},
+        )
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            n_failed = ducklake_maintenance.compact(
+                conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+            )
+        assert n_failed == 1
+        assert "unexpected merge result shape" in caplog.text
+        assert len(_merge_calls(conn)) == 2, "persons still compacts after events' malformed rows"
+
+    def test_budget_is_global_across_tables(self):
+        """A table that consumes the whole file budget stops the loop; later
+        tables wait for the next run (preserves the old catalog-scope bound)."""
+        conn = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            merge_rows={"events": [("posthog", "events", 10, 1)]},
+        )
+        ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        calls = _merge_calls(conn)
+        assert len(calls) == 1 and "'events'" in calls[0]
+
+    def test_remaining_budget_passed_to_next_table(self):
+        conn = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            merge_rows={"events": [("posthog", "events", 3, 1)]},
+        )
+        ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        calls = _merge_calls(conn)
+        assert len(calls) == 2
+        assert "max_compacted_files => 10" in calls[0]
+        assert "max_compacted_files => 7" in calls[1]
+
+    def test_skips_non_identifier_table_names(self, caplog):
+        conn = _compact_conn([("posthog", "events"), ("posthog", "bad'name")])
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            ducklake_maintenance.compact(
+                conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+            )
+        calls = _merge_calls(conn)
+        assert len(calls) == 1 and "'events'" in calls[0]
+        assert "non-identifier" in caplog.text
+
+    def test_empty_catalog_is_a_noop(self):
+        conn = _compact_conn([])
+        n_failed = ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        assert not _merge_calls(conn)
+        assert n_failed == 0
+
+    def test_dry_run_does_not_enumerate_tables(self):
+        """Dry-run must stay cheap against a wedged catalog: no enumeration,
+        no merge CALLs, just the candidate count."""
+        conn = MagicMock()
+        result = MagicMock()
+        result.fetchone.return_value = (100, 1000)
+        conn.execute.return_value = result
+        ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=True, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        assert not any("information_schema" in c.args[0] for c in conn.execute.call_args_list)
 
 
 class TestScopedTargetFileSize:
