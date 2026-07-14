@@ -928,7 +928,9 @@ class TestCompactPerTable:
         assert len(calls) == 2
         assert "schema => 'posthog'" in calls[0] and "'events'" in calls[0]
         assert "schema => 'posthog'" in calls[1] and "'persons'" in calls[1]
-        assert all("max_compacted_files => 10" in c for c in calls)
+        # Multi-table runs cap each table's grant at half the budget so the
+        # first (biggest-backlog) table can't monopolize every run.
+        assert all("max_compacted_files => 5" in c for c in calls)
 
     def test_poisoned_table_does_not_abort_run(self, caplog, monkeypatch):
         hb = MagicMock()
@@ -954,15 +956,24 @@ class TestCompactPerTable:
         # target_file_size restored despite the partial failure.
         assert any("ducklake_set_option" in c.args[0] and "128MiB" in c.args[0] for c in conn.execute.call_args_list)
 
-    def test_all_tables_failed_raises(self):
+    def test_all_tables_failed_does_not_raise(self, caplog):
+        """Per-table failures NEVER raise — the poison-set attractor: with
+        candidate-driven enumeration, healthy tables drain OUT of the table
+        list once compacted while poisoned ones never do, so
+        failed == table_total is the steady state under any persistent
+        poison. An all-failed raise would wedge the recipe chain (later
+        tiers + cleanup-all) every tick, forever — the incident mode this
+        loop exists to prevent. The WARN + gauge carry the alert."""
         conn = _compact_conn(
             [("posthog", "events"), ("posthog", "persons")],
             fail_tables=("events", "persons"),
         )
-        with pytest.raises(RuntimeError, match="all 2 table"):
-            ducklake_maintenance.compact(
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            n_failed = ducklake_maintenance.compact(
                 conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
             )
+        assert n_failed == 2
+        assert "2/2 table(s) failed" in caplog.text
 
     def test_single_table_catalog_poisoned_does_not_raise(self):
         """1/1 failed must NOT raise: raising would re-wedge the recipe chain
@@ -1017,7 +1028,10 @@ class TestCompactPerTable:
         calls = _merge_calls(conn)
         assert len(calls) == 1 and "'events'" in calls[0]
 
-    def test_remaining_budget_passed_to_next_table(self):
+    def test_grant_cap_prevents_whale_monopoly(self):
+        """Multi-table runs grant each table at most half the budget per CALL
+        (biggest backlog gets the biggest cut, never the whole pie); the
+        single-table form keeps the full budget."""
         conn = _compact_conn(
             [("posthog", "events"), ("posthog", "persons")],
             merge_rows={"events": [("posthog", "events", 3, 1)]},
@@ -1027,8 +1041,15 @@ class TestCompactPerTable:
         )
         calls = _merge_calls(conn)
         assert len(calls) == 2
-        assert "max_compacted_files => 10" in calls[0]
-        assert "max_compacted_files => 7" in calls[1]
+        assert "max_compacted_files => 5" in calls[0], "first table capped at budget//2"
+        assert "max_compacted_files => 5" in calls[1], "second grant = min(remaining=7, cap=5)"
+
+        # Single-table catalog: no cap — the whole budget goes to the one table.
+        conn1 = _compact_conn([("posthog", "events")])
+        ducklake_maintenance.compact(
+            conn1, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        assert "max_compacted_files => 10" in _merge_calls(conn1)[0]
 
     def test_skips_non_identifier_table_names(self, caplog):
         conn = _compact_conn([("posthog", "events"), ("posthog", "bad'name")])
@@ -1077,6 +1098,13 @@ class TestCompactPerTable:
         assert "ducklake_data_file" in sql and "ducklake_table" in sql and "ducklake_schema" in sql
         assert "ORDER BY COUNT(*) DESC" in sql, "most backlogged table must be served first"
         assert "file_size_bytes < 1048576" in sql, "enumeration must be scoped to the tier's size band"
+        # Liveness on ALL FOUR relations: file, table, schema, and the
+        # delete-file anti-join. Dropping the table one silently enumerates
+        # renamed tables under stale names (perpetual CatalogException noise);
+        # dropping the delete-file one lets unmergeable delete-laden whales
+        # rank first and no-op forever.
+        assert sql.count("end_snapshot IS NULL") == 4
+        assert "NOT EXISTS" in sql and "ducklake_delete_file" in sql
         assert not any("information_schema" in c.args[0] for c in conn.execute.call_args_list)
 
     def test_enumeration_band_includes_min_for_upper_tiers(self):
@@ -1086,6 +1114,20 @@ class TestCompactPerTable:
         )
         sql = next(c.args[0] for c in conn.execute.call_args_list if "HAVING COUNT(*) >= 2" in c.args[0])
         assert "file_size_bytes >= 1048576" in sql and "file_size_bytes < 10485760" in sql
+
+    def test_all_singleton_candidates_logs_info_not_warning(self, caplog):
+        """Candidates exist but no table qualifies (all per-table singletons,
+        or delete-laden files excluded): benign INFO, zero merge CALLs, no
+        raise — NOT a warning-level anomaly."""
+        conn = _compact_conn([], candidates=(5, 1000))
+        with caplog.at_level(logging.INFO, logger="maintenance"):
+            n_failed = ducklake_maintenance.compact(
+                conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+            )
+        assert n_failed == 0
+        assert not _merge_calls(conn)
+        rec = next(r for r in caplog.records if "nothing mergeable" in r.message)
+        assert rec.levelno == logging.INFO
 
 
 class TestScopedTargetFileSize:
