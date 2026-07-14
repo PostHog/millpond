@@ -1888,18 +1888,58 @@ def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: fl
     return stop
 
 
-def _enumerate_compaction_tables(conn: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
-    """Live BASE TABLEs in the attached lake as (schema, table_name) pairs.
+def _enumerate_compaction_tables(
+    conn: duckdb.DuckDBPyConnection, min_b: int | None, max_b: int
+) -> list[tuple[str, str]]:
+    """Tables with >= 2 live files in the tier's size band, biggest backlog first.
+
+    Candidate-driven (from ducklake_data_file), NOT information_schema: a
+    catalog can carry thousands of live tables (dlt/Fivetran staging) with
+    zero tier candidates — enumerating all of them costs a bind-time
+    candidate scan per table per tier against a PG catalog with a history
+    of read-tax problems, and alphabetical order let trivially-small
+    early-alphabet tables (2-file cosmetic merges) eat the global file
+    budget every run while the real backlog starved. Observed in prod:
+    3,074 live tables, the budget exhausted on five 2-file billing tables,
+    and the 15k-candidate events table never reached. Candidate-count DESC
+    serves the most backlogged table first; ties break by name for
+    determinism. Single-candidate tables can't merge and are excluded.
 
     Catalog-derived names are ordinary-DDL-controlled and get interpolated
     into the per-table CALL statements below, so anything outside the
     conservative identifier shape is skipped LOUDLY rather than quoted
     heroically (same defense as repair-partition-values discovery).
     """
+    where = [
+        "df.end_snapshot IS NULL",
+        "t.end_snapshot IS NULL",
+        "sch.end_snapshot IS NULL",
+        f"df.file_size_bytes < {max_b}",
+        # Mirror the compactor's own selection: merge_adjacent skips any file
+        # carrying live delete files, so counting them here would let an
+        # unmergeable-but-huge table rank first and no-op at the top of every
+        # run (rank inflated by files the extension refuses to touch).
+        (
+            f"NOT EXISTS (SELECT 1 FROM {METADATA_SCHEMA}.ducklake_delete_file dl "
+            "WHERE dl.data_file_id = df.data_file_id AND dl.end_snapshot IS NULL)"
+        ),
+    ]
+    if min_b is not None:
+        where.append(f"df.file_size_bytes >= {min_b}")
+    # NOTE: COUNT(*) >= 2 is per-TABLE; the extension merges per
+    # (partition_id, partition_values) group, so 2 candidates in different
+    # partitions still yield a zero-group no-op CALL. That's a wasted bind
+    # scan, not a correctness issue — do not read >= 2 as a mergeability
+    # guarantee. Zero-group CALLs are counted and logged by the caller.
     rows = conn.execute(
-        "SELECT table_schema, table_name FROM information_schema.tables "
-        f"WHERE table_catalog = '{ATTACH_NAME}' AND table_type = 'BASE TABLE' "
-        "ORDER BY table_schema, table_name"
+        "SELECT sch.schema_name, t.table_name "
+        f"FROM {METADATA_SCHEMA}.ducklake_data_file df "
+        f"JOIN {METADATA_SCHEMA}.ducklake_table t USING (table_id) "
+        f"JOIN {METADATA_SCHEMA}.ducklake_schema sch ON sch.schema_id = t.schema_id "
+        f"WHERE {' AND '.join(where)} "
+        "GROUP BY sch.schema_name, t.table_name "
+        "HAVING COUNT(*) >= 2 "
+        "ORDER BY COUNT(*) DESC, sch.schema_name, t.table_name"
     ).fetchall()
     tables: list[tuple[str, str]] = []
     for schema_name, table_name in rows:
@@ -2000,6 +2040,7 @@ def compact(
     result: list[tuple] = []
     failed: list[str] = []
     table_total = 1
+    noop_tables = 0
 
     if table:
         # Single-table invocation: unchanged one-CALL semantics; an error
@@ -2023,23 +2064,35 @@ def compact(
         # failure: every healthy table still compacts and the broken one is
         # reported. Mirrors the battle-tested standalone posthog maintenance
         # script, which loops tables for exactly this reason.
-        tables = _enumerate_compaction_tables(conn)
+        tables = _enumerate_compaction_tables(conn, min_b, max_b)
         table_total = len(tables)
-        log.info("compact tier-%d: %d live table(s), per-table merge", tier, table_total)
+        log.info(
+            "compact tier-%d: %d table(s) with >= 2 tier candidates, biggest backlog first",
+            tier,
+            table_total,
+        )
         if not tables and candidate_count > 0:
-            # Candidates exist but no table passed the identifier gate — the
-            # per-table WARNs above explain which; escalate so this can't be
-            # a silent perpetual no-op.
-            log.warning(
-                "compact tier-%d: %d candidate file(s) but no compactable tables — check skipped-name warnings",
+            # Candidates exist but no table qualified: every candidate is a
+            # per-table singleton (nothing to merge with — benign), or the
+            # holders were skipped by the identifier gate (per-table WARNs
+            # above say which). INFO, not a failure.
+            log.info(
+                "compact tier-%d: %d candidate file(s) but no table has >= 2 — nothing mergeable this run",
                 tier,
                 candidate_count,
             )
         with _scoped_target_file_size(conn, target):
             # max_compacted_files stays a GLOBAL budget across the run — the
             # same bound as the old catalog-scope call — so run duration
-            # stays predictable. Each table gets what's left; leftovers wait
-            # for the next cron tick.
+            # stays predictable. Leftover tables wait for the next cron tick.
+            #
+            # Per-table GRANT cap: on multi-table runs no single table may
+            # claim more than half the budget in one CALL. Backlog-DESC
+            # ordering without the cap re-created starvation in mirror image —
+            # a whale whose ingest outpaces the drain rate would consume the
+            # entire budget every tick and tables #2..N would never be
+            # served. Biggest backlog still gets the biggest cut; it just
+            # can't take the whole pie.
             remaining = max_compacted_files
             for schema_name, table_name in tables:
                 if remaining <= 0:
@@ -2048,7 +2101,8 @@ def compact(
                         tier,
                     )
                     break
-                sql = _merge_adjacent_call(schema_name, table_name, args, remaining)
+                grant = remaining if table_total == 1 else min(remaining, max(1, max_compacted_files // 2))
+                sql = _merge_adjacent_call(schema_name, table_name, args, grant)
                 heartbeat = _start_heartbeat(conn, f"compact tier-{tier} {schema_name}.{table_name}")
                 try:
                     rows = conn.execute(sql).fetchall()
@@ -2058,6 +2112,12 @@ def compact(
                     # aggregation below never sees malformed rows.
                     if any(len(r) < 4 for r in rows):
                         raise ValueError(f"unexpected merge result shape: {rows[:2]!r}")
+                    if not rows:
+                        # >= 2 in-band files but zero merge groups: candidates
+                        # are per-partition singletons, row-id-non-contiguous,
+                        # or otherwise unmergeable. Counted so a catalog full
+                        # of these is visible, not a silent perpetual no-op.
+                        noop_tables += 1
                     consumed = sum(r[2] for r in rows)
                     result.extend(rows)
                     remaining -= consumed
@@ -2076,8 +2136,9 @@ def compact(
                     # InternalException, and pinned end-to-end by
                     # test_compaction_isolation_integration). If a future
                     # duckdb bump invalidates the instance on INTERNAL errors,
-                    # every subsequent CALL fails and the run hard-fails via
-                    # the all-failed policy below — noisy, not silent.
+                    # every table fails, the failure summary + gauge spike,
+                    # and the target_file_size restore raises — noisy, not
+                    # silent.
                     failed.append(f"{schema_name}.{table_name}")
                     log.exception(
                         "compact tier-%d: %s.%s failed; continuing with remaining tables",
@@ -2117,7 +2178,27 @@ def compact(
         total_outputs,
         elapsed,
     )
+    if noop_tables:
+        log.info(
+            "compact tier-%d: %d/%d table(s) had >= 2 in-band files but zero merge groups "
+            "(per-partition singletons / non-contiguous row-ids)",
+            tier,
+            noop_tables,
+            table_total,
+        )
     if failed:
+        # Per-table failures NEVER raise, no matter how many. An
+        # all-failed raise sounds like a systemic-failure detector, but
+        # candidate-driven enumeration converges on exactly the failed set:
+        # healthy tables drain out of the enumeration once compacted while
+        # poisoned tables never do, so failed == table_total is this
+        # system's steady state under any persistent poison — and raising
+        # would wedge the recipe chain (later tiers + cleanup-all) forever,
+        # the exact incident this loop exists to prevent. The WARN + the
+        # maintenance_compact_tables_failed gauge carry the alert; genuinely
+        # systemic failures still fail the run elsewhere (a dead catalog
+        # fails the candidate query above; dead object storage fails
+        # cleanup-all right after).
         log.warning(
             "compact tier-%d: %d/%d table(s) failed: %s",
             tier,
@@ -2125,20 +2206,6 @@ def compact(
             table_total,
             ", ".join(failed),
         )
-        if table_total >= 2 and len(failed) == table_total:
-            # Every table failed — that's systemic (catalog down, bad creds,
-            # broken extension), not one poisoned table. Surface as a run
-            # failure so the Job/backoff machinery reacts. A PARTIAL failure
-            # exits 0 on purpose: the just-recipe chain must proceed to the
-            # later tiers and cleanup-all (deletion-queue drain) for the
-            # healthy tables instead of wedging the whole schedule on one
-            # broken table. A SINGLE-table catalog is exempt for the same
-            # reason — 1/1 failed would re-wedge cleanup forever; the
-            # maintenance_compact_tables_failed gauge carries the alert
-            # instead. (Best-effort heuristic: a systemic failure where one
-            # trivially-empty table "succeeds" also lands on the gauge, not
-            # the raise.)
-            raise RuntimeError(f"compact tier-{tier}: all {table_total} table(s) failed")
     return len(failed)
 
 

@@ -133,13 +133,46 @@ def test_poisoned_table_does_not_abort_catalog_compaction(lake, caplog):
     assert "Files have different hive partition path" in caplog.text
 
 
-def test_all_tables_poisoned_raises(lake):
-    """Every table failing is systemic and must surface as a run failure —
-    pinned against the real extension error, not a mock."""
+def test_all_tables_poisoned_does_not_wedge(lake, caplog):
+    """Even ALL tables failing must not raise — the poison-set attractor:
+    candidate-driven enumeration converges on the failed set (healthy tables
+    drain out once compacted; poisoned ones never do), so all-failed is the
+    steady state under persistent poison. Raising would wedge the recipe
+    chain (later tiers + cleanup-all) every tick — the incident mode this
+    loop exists to prevent. Pinned against the real extension error."""
     conn, attach = lake
     for t in ("bad1", "bad2"):
         _seed_partitioned_table(conn, t)
     _poison_tables(conn, attach, ("bad1", "bad2"))
 
-    with pytest.raises(RuntimeError, match="all 2 table"):
-        _compact_tier1(conn)
+    with caplog.at_level(logging.WARNING, logger="maintenance"):
+        n_failed = _compact_tier1(conn)
+
+    assert n_failed == 2
+    assert _live_file_count(conn, "bad1") == 4
+    assert _live_file_count(conn, "bad2") == 4
+    assert "2/2 table(s) failed" in caplog.text
+
+
+def test_biggest_backlog_served_first_within_budget(lake):
+    """Behavioral pin of the whole fix: with an alphabetically-first small
+    table and an alphabetically-last big one, the big one must be served
+    first (ORDER BY candidate count DESC flowing through the loop), and the
+    budget must stop the run before the small one — no alphabetical
+    starvation of the backlog."""
+    conn, _attach = lake
+    _seed_partitioned_table(conn, "aaa_small", n_files=2)
+    _seed_partitioned_table(conn, "zzz_big", n_files=6)
+
+    ducklake_maintenance.compact(
+        conn,
+        tier=1,
+        table=None,
+        dry_run=False,
+        threads=2,
+        memory_limit="1GB",
+        max_compacted_files=6,
+    )
+
+    assert _live_file_count(conn, "zzz_big") < 6, "biggest backlog must be served first"
+    assert _live_file_count(conn, "aaa_small") == 2, "budget must exhaust before the small table"
