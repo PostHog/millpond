@@ -232,6 +232,19 @@ Cast direction is values → column (the small array to the big one's type), not
 
 `MILLPOND_FILTER_DROP_FIELD_NAME` is reserved at the config layer (mutex with keep, both empty or exactly one set) and explicitly rejected at startup. The denylist implementation lives in a future commit; the namespace is locked today so that change doesn't require operator env-var churn.
 
+**Include-values source** (`include_values.py`) supplies the allowlist `_apply_filter` reads — the values are now an explicit third argument, fetched per batch via `include_source.current()`, not read off cfg. `build(cfg)` returns exactly ONE object (`StaticIncludeValues` | `ShadowIncludeValues` | `HttpIncludeValues`, distinguished by `.mode`); main starts/stops it around the consume loop and `metrics.include_values_mode{mode}` reports which one actually runs (fleet queries must not pass vacuously on replicas that never got the URL).
+
+Design spine is the consequence asymmetry: erroneous addition = surplus rows downstream ignores; erroneous removal = silent unrecoverable drop. The invariants, all tested in `tests/unit/test_include_values.py`:
+
+- Additions apply on first sight; removals need `removal_confirm_polls` consecutive successful ACCEPTED polls absent. Failed polls and refused polls advance nothing — refusal must never pre-charge the countdown (N refused-empty polls + one junk value would otherwise mass-remove instantly).
+- Refusal guards (whole poll rejected, `include_values_refused_total{reason}`): `empty` (an empty array is never removal evidence and never an acceptable first state), `bulk_removal` (> half of a multi-value set confirmed at once — world-replacement goes through static config, not an unattended poll), `type_flip` (int↔str: one junk element flips `_normalize` to strings and the filter's values→column cast then fails, dropping ENTIRE batches as `filter_field_missing` with offsets still committed — the worst silent-loss path in the module).
+- Authoritative `start()` BLOCKS until the first successful poll and raises on timeout — no proceed-on-bootstrap. The damping state is in-memory; a restart that silently ran on a stale static bootstrap would perform de-facto removals with zero polls of evidence. Halting is recoverable from Kafka; a silent drop is not.
+- Shadow mode: `current()` serves the static set; the prober is a private attribute precisely so reading the polled set as authority requires reaching into `_private`, not a one-line mistake.
+- Thread-safety: `current()` reads an immutable tuple swapped by attribute assignment (single writer = the poll thread); everything else is poll-thread-only. No locks.
+- `_fetch` refuses redirects (urllib re-sends the auth header cross-host otherwise), caps the response at 4 MB, and jitters the poll ±10% so replica fleets don't herd.
+
+Config validation (`_load_include_values_config` in `config.py`) refuses at startup: URL without keep-filter, MODE/auth without URL (an intended dynamic source silently degrading to static is a removal-by-omission), lone auth halves, non-numeric knobs. The URL⇒keep-field⇒non-empty-static-values chain is what makes the no-bootstrap path unreachable through config — `test_keep_filter_chain_guarantees_bootstrap` pins it.
+
 **Sort** (`_apply_sort` in `main.py`) runs inside `_flush()` after `pa.concat_tables` but before `sink.write()`. The sink sees pre-sorted data; sink-side partition columns (year/month/day/hour, computed by the ducklake extension) are not in scope by design — operators specify sort keys against the source schema.
 
 Missing-field handling: if any `cfg.sort_by` field is absent from the batch, the whole sort is skipped (rather than partially sorting on available keys, which would silently differ from intent). Records still flow through unsorted. The metric is `sort_skipped_total{reason="field_missing"}`, deliberately distinct from `records_skipped_total` because no data is being dropped — only the layout improvement is.

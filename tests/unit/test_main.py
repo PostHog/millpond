@@ -314,9 +314,7 @@ class TestCoerceColumns:
     def test_coerces_when_configured(self):
         from millpond.main import _coerce_columns
 
-        table = pa.table(
-            {"timestamp": ["2024-01-01 12:00:00.000000"], "project_id": pa.array([None], pa.string())}
-        )
+        table = pa.table({"timestamp": ["2024-01-01 12:00:00.000000"], "project_id": pa.array([None], pa.string())})
         pairs = (("timestamp", "timestamptz"), ("project_id", "bigint"))
         result = _coerce_columns(table, self._cfg(typed_columns=pairs))
         assert result.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
@@ -329,17 +327,18 @@ class TestApplyFilter:
     Prometheus registry. Each test constructs a Config-shaped object only
     with the fields _apply_filter reads."""
 
-    def _cfg(self, *, keep=None, values=None):
+    def _cfg(self, *, keep=None):
+        # values now flow as _apply_filter's third arg (the include-values
+        # source's current set), not via config.
         cfg = MagicMock()
         cfg.filter_keep_field = keep
-        cfg.filter_values = values
         return cfg
 
     def test_no_op_when_filter_unconfigured(self):
         from millpond.main import _apply_filter
 
         table = pa.table({"team_id": [1, 2, 3]})
-        result = _apply_filter(table, self._cfg())
+        result = _apply_filter(table, self._cfg(), None)
         # Same object: no slicing or filtering — short-circuit at the top.
         assert result is table
 
@@ -349,7 +348,7 @@ class TestApplyFilter:
 
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"team_id": [1, 2, 3, 4, 5], "event": ["a", "b", "c", "d", "e"]})
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(2, 4)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (2, 4))
 
         assert result.num_rows == 2
         assert result.column("team_id").to_pylist() == [2, 4]
@@ -364,7 +363,7 @@ class TestApplyFilter:
 
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"region": ["us-east-1", "us-west-2", "eu-central-1"]})
-        result = _apply_filter(table, self._cfg(keep="region", values=("us-east-1", "eu-central-1")))
+        result = _apply_filter(table, self._cfg(keep="region"), ("us-east-1", "eu-central-1"))
 
         assert result.column("region").to_pylist() == ["us-east-1", "eu-central-1"]
         assert skip_calls == [("filter_excluded", 1)]
@@ -383,7 +382,7 @@ class TestApplyFilter:
 
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"team_id": ["1", "2", "3"]})
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(2,)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (2,))
 
         assert result.num_rows == 1
         assert result.column("team_id").to_pylist() == ["2"]
@@ -399,7 +398,7 @@ class TestApplyFilter:
 
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"team_id": ["02", "2", "003"]})
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(2,)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (2,))
 
         # Only the unambiguous "2" matches; the leading-zero strings don't.
         assert result.column("team_id").to_pylist() == ["2"]
@@ -411,7 +410,7 @@ class TestApplyFilter:
 
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"event": ["a", "b", "c"]})
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (1, 2))
 
         # Column not in schema → whole batch lands in filter_field_missing.
         assert result.num_rows == 0
@@ -427,7 +426,7 @@ class TestApplyFilter:
 
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"team_id": pa.array([1, None, 2, None, 3], type=pa.int64())})
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (1, 2))
 
         assert result.num_rows == 2
         assert result.column("team_id").to_pylist() == [1, 2]
@@ -440,7 +439,7 @@ class TestApplyFilter:
 
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"team_id": [1, 2, 1]})
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (1, 2))
 
         assert result.num_rows == 3
         assert skip_calls == []
@@ -451,7 +450,7 @@ class TestApplyFilter:
 
         _capture_skip_calls(mock_metrics)
         table = pa.table({"team_id": [9, 10, 11], "event": ["a", "b", "c"]})
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (1, 2))
 
         assert result.num_rows == 0
         # Schema is preserved — important so a downstream concat doesn't trip
@@ -464,7 +463,7 @@ class TestApplyFilter:
 
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"team_id": pa.array([], type=pa.int64())})
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (1, 2))
 
         assert result.num_rows == 0
         assert skip_calls == []
@@ -486,7 +485,7 @@ class TestApplyFilter:
         events = pa.chunked_array([["a", "b"], ["c", "d", "e"], ["f"]])
         table = pa.table({"team_id": team_ids, "event": events})
 
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(2,)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (2,))
 
         # Two rows match (the two 2s spread across chunks 0 and 2).
         assert result.column("team_id").to_pylist() == [2, 2]
@@ -513,7 +512,7 @@ class TestApplyFilter:
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"flag": pa.array([True, False, True, False], type=pa.bool_())})
 
-        result = _apply_filter(table, self._cfg(keep="flag", values=(1,)))
+        result = _apply_filter(table, self._cfg(keep="flag"), (1,))
 
         assert result.num_rows == 0
         assert skip_calls == [("filter_field_missing", 4)]
@@ -528,7 +527,7 @@ class TestApplyFilter:
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"score": pa.array([1.0, 2.0, 3.0], type=pa.float64())})
 
-        result = _apply_filter(table, self._cfg(keep="score", values=(2,)))
+        result = _apply_filter(table, self._cfg(keep="score"), (2,))
 
         assert result.num_rows == 0
         assert skip_calls == [("filter_field_missing", 3)]
@@ -543,7 +542,7 @@ class TestApplyFilter:
         ts_col = pa.array([1700000000_000000, 1700000001_000000], type=pa.timestamp("us"))
         table = pa.table({"ts": ts_col})
 
-        result = _apply_filter(table, self._cfg(keep="ts", values=(1700000000_000000,)))
+        result = _apply_filter(table, self._cfg(keep="ts"), (1700000000_000000,))
 
         assert result.num_rows == 0
         assert skip_calls == [("filter_field_missing", 2)]
@@ -562,7 +561,7 @@ class TestApplyFilter:
         )
         table = pa.table({"team_id": struct_col})
 
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (1, 2))
 
         assert result.num_rows == 0
         assert skip_calls == [("filter_field_missing", 3)]
@@ -575,7 +574,7 @@ class TestApplyFilter:
         list_col = pa.array([[1, 2], [3], [4, 5, 6]], type=pa.list_(pa.int64()))
         table = pa.table({"team_id": list_col})
 
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(1, 2)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (1, 2))
 
         assert result.num_rows == 0
         assert skip_calls == [("filter_field_missing", 3)]
@@ -591,7 +590,7 @@ class TestApplyFilter:
         skip_calls = _capture_skip_calls(mock_metrics)
         table = pa.table({"team_id": pa.array([1, 2, 3], type=pa.int32())})
         # 2**40 is well outside int32 range.
-        result = _apply_filter(table, self._cfg(keep="team_id", values=(2**40,)))
+        result = _apply_filter(table, self._cfg(keep="team_id"), (2**40,))
 
         assert result.num_rows == 0
         assert skip_calls == [("filter_field_missing", 3)]

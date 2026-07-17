@@ -546,3 +546,101 @@ class TestTypedColumnsConfig:
             load()
         msgs = [r.message for r in caplog.records]
         assert any("Coerce typed columns: timestamp:timestamptz, project_id:bigint" in m for m in msgs)
+
+
+class TestIncludeValuesConfig:
+    """MILLPOND_INCLUDE_VALUES_* — the dynamic include-set source knobs and
+    their validation against the static filter config."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "1")
+        monkeypatch.setenv("POD_NAME", "millpond-events-0")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "2,50689")
+
+    def test_unset_url_yields_static_only_defaults(self):
+        cfg = load()
+        assert cfg.include_values_url is None
+        assert cfg.include_values_mode == "static"
+
+    def test_mode_without_url_rejected(self, monkeypatch):
+        # A set MODE means a dynamic source was intended; a typo'd/missing
+        # URL must not silently degrade to static-only.
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_MODE", "authoritative")
+        with pytest.raises(RuntimeError, match="MODE is set but"):
+            load()
+
+    def test_timeout_knobs(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_REQUEST_TIMEOUT_S", "5")
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_STARTUP_TIMEOUT_S", "120")
+        cfg = load()
+        assert cfg.include_values_request_timeout_s == 5.0
+        assert cfg.include_values_startup_timeout_s == 120.0
+
+    def test_non_numeric_knob_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_POLL_INTERVAL_S", "soon")
+        with pytest.raises(RuntimeError, match="must be a number"):
+            load()
+
+    def test_keep_filter_chain_guarantees_bootstrap(self, monkeypatch):
+        # The include-values source's no-bootstrap path must stay
+        # unreachable through config: URL requires the keep field, and the
+        # keep field requires non-empty static values. If this chain is
+        # ever loosened, the empty-seed refusal in include_values.py
+        # becomes the only guard — see that module's docstring.
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        cfg = load()
+        assert cfg.filter_values, "static filter_values must be non-empty whenever a URL is configured"
+
+    def test_url_with_defaults(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        cfg = load()
+        assert cfg.include_values_url == "http://cp/values"
+        assert cfg.include_values_mode == "shadow"
+        assert cfg.include_values_poll_interval_s == 60.0
+        assert cfg.include_values_removal_polls == 5
+
+    def test_authoritative_mode(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_MODE", "authoritative")
+        assert load().include_values_mode == "authoritative"
+
+    def test_bad_mode_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_MODE", "yolo")
+        with pytest.raises(RuntimeError, match="MODE"):
+            load()
+
+    def test_url_requires_keep_filter(self, monkeypatch):
+        monkeypatch.delenv("MILLPOND_FILTER_KEEP_FIELD_NAME")
+        monkeypatch.delenv("MILLPOND_FILTER_VALUES")
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        with pytest.raises(RuntimeError, match="FILTER_KEEP_FIELD_NAME"):
+            load()
+
+    def test_auth_header_requires_both_parts(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_AUTH_HEADER_NAME", "X-Secret")
+        with pytest.raises(RuntimeError, match="set together"):
+            load()
+
+    def test_auth_without_url_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_AUTH_TOKEN", "tok")
+        with pytest.raises(RuntimeError, match="requires MILLPOND_INCLUDE_VALUES_URL"):
+            load()
+
+    def test_nonpositive_interval_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_URL", "http://cp/values")
+        monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_POLL_INTERVAL_S", "0")
+        with pytest.raises(RuntimeError, match="must be positive"):
+            load()

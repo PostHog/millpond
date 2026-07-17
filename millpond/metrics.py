@@ -64,6 +64,55 @@ _flush_size_records = Histogram(
     buckets=[100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000],
 )
 
+# --- Include-values source (see include_values.py for semantics) ---
+
+_include_values_size = Gauge(
+    "millpond_include_values_size",
+    "Current number of values in the keep-filter include set",
+    ["pipeline", "broker_source"],
+)
+_include_values_last_success_timestamp_seconds = Gauge(
+    "millpond_include_values_last_success_timestamp_seconds",
+    "Unix time of the last successful include-values poll (alert on age)",
+    ["pipeline", "broker_source"],
+)
+_include_values_pending_removals = Gauge(
+    "millpond_include_values_pending_removals",
+    "Values in the removal-confirmation countdown (absent but not yet removed)",
+    ["pipeline", "broker_source"],
+)
+_include_values_poll_failures_total = Counter(
+    "millpond_include_values_poll_failures_total",
+    "Failed include-values polls (the set is kept as-is on failure)",
+    ["pipeline", "broker_source"],
+)
+_include_values_refused_total = Counter(
+    "millpond_include_values_refused_total",
+    "Successful polls refused by a safety guard (reason: empty|bulk_removal|type_flip)",
+    ["pipeline", "broker_source", "reason"],
+)
+_include_values_mode = Gauge(
+    "millpond_include_values_mode",
+    "1 for the include-values mode this replica actually runs (static|shadow|authoritative)",
+    ["pipeline", "broker_source", "mode"],
+)
+_include_values_changes_total = Counter(
+    "millpond_include_values_changes_total",
+    "Applied include-set changes by action (add|remove)",
+    ["pipeline", "broker_source", "action"],
+)
+_include_values_shadow_only_static = Gauge(
+    "millpond_include_values_shadow_only_static",
+    "Shadow mode: values in the static set but not the polled set",
+    ["pipeline", "broker_source"],
+)
+_include_values_shadow_only_remote = Gauge(
+    "millpond_include_values_shadow_only_remote",
+    "Shadow mode: values in the polled set but not the static set",
+    ["pipeline", "broker_source"],
+)
+
+
 _pending_bytes = Gauge(
     "millpond_pending_bytes",
     "Current pending Arrow bytes awaiting flush",
@@ -168,6 +217,15 @@ schema_columns_added_total = _schema_columns_added_total
 schema_columns_widened_total = _schema_columns_widened_total
 sort_skipped_total = _sort_skipped_total
 columns_coerced_total = _columns_coerced_total
+include_values_size = _include_values_size
+include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds
+include_values_pending_removals = _include_values_pending_removals
+include_values_poll_failures_total = _include_values_poll_failures_total
+include_values_refused_total = _include_values_refused_total
+include_values_mode = _include_values_mode
+include_values_changes_total = _include_values_changes_total
+include_values_shadow_only_static = _include_values_shadow_only_static
+include_values_shadow_only_remote = _include_values_shadow_only_remote
 rdkafka_replyq = _rdkafka_replyq
 rdkafka_msg_cnt = _rdkafka_msg_cnt
 rdkafka_msg_size = _rdkafka_msg_size
@@ -184,6 +242,10 @@ def init(pipeline: str, broker_source: str = ""):
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total
+    global include_values_size, include_values_last_success_timestamp_seconds
+    global include_values_pending_removals, include_values_poll_failures_total
+    global include_values_refused_total, include_values_changes_total, include_values_mode
+    global include_values_shadow_only_static, include_values_shadow_only_remote
     global rdkafka_replyq, rdkafka_msg_cnt, rdkafka_msg_size
     global rdkafka_broker_rtt_avg, rdkafka_broker_rtt_p99
 
@@ -195,6 +257,9 @@ def init(pipeline: str, broker_source: str = ""):
     records_skipped_total = _AutoCommonLabels(_records_skipped_total, pipeline, bs)
     sort_skipped_total = _AutoCommonLabels(_sort_skipped_total, pipeline, bs)
     columns_coerced_total = _AutoCommonLabels(_columns_coerced_total, pipeline, bs)
+    include_values_changes_total = _AutoCommonLabels(_include_values_changes_total, pipeline, bs)
+    include_values_refused_total = _AutoCommonLabels(_include_values_refused_total, pipeline, bs)
+    include_values_mode = _AutoCommonLabels(_include_values_mode, pipeline, bs)
     errors_total = _AutoCommonLabels(_errors_total, pipeline, bs)
     consumer_lag = _AutoCommonLabels(_consumer_lag, pipeline, bs)
     last_committed_offset = _AutoCommonLabels(_last_committed_offset, pipeline, bs)
@@ -207,6 +272,14 @@ def init(pipeline: str, broker_source: str = ""):
     arrow_conversion_seconds = _arrow_conversion_seconds.labels(pipeline=pipeline, broker_source=bs)
     flush_size_bytes = _flush_size_bytes.labels(pipeline=pipeline, broker_source=bs)
     flush_size_records = _flush_size_records.labels(pipeline=pipeline, broker_source=bs)
+    include_values_size = _include_values_size.labels(pipeline=pipeline, broker_source=bs)
+    include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds.labels(
+        pipeline=pipeline, broker_source=bs
+    )
+    include_values_pending_removals = _include_values_pending_removals.labels(pipeline=pipeline, broker_source=bs)
+    include_values_poll_failures_total = _include_values_poll_failures_total.labels(pipeline=pipeline, broker_source=bs)
+    include_values_shadow_only_static = _include_values_shadow_only_static.labels(pipeline=pipeline, broker_source=bs)
+    include_values_shadow_only_remote = _include_values_shadow_only_remote.labels(pipeline=pipeline, broker_source=bs)
     pending_bytes = _pending_bytes.labels(pipeline=pipeline, broker_source=bs)
     buffer_fullness = _buffer_fullness.labels(pipeline=pipeline, broker_source=bs)
     consume_batch_size_current = _consume_batch_size_current.labels(pipeline=pipeline, broker_source=bs)

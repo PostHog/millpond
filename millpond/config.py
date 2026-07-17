@@ -77,6 +77,22 @@ class Config:
     filter_drop_field: str | None
     filter_values: tuple[int, ...] | tuple[str, ...] | None
 
+    # Optional dynamic source for the keep-filter's include set (see
+    # include_values.py). URL unset = today's static behavior. Mode
+    # "shadow" (default) polls and reports diff metrics while the static
+    # list stays authoritative; "authoritative" makes the polled set the
+    # live filter, with the static list as the bootstrap/fallback seed.
+    # The auth header is generic (name + token) — nothing here knows what
+    # the endpoint is.
+    include_values_url: str | None
+    include_values_mode: str
+    include_values_poll_interval_s: float
+    include_values_removal_polls: int
+    include_values_request_timeout_s: float
+    include_values_startup_timeout_s: float
+    include_values_auth_header_name: str | None
+    include_values_auth_token: str | None
+
     # Optional pre-write sort. Tuple of column names; sort is ascending
     # in tuple order. Applied to the consolidated batch right before
     # sink.write(). None disables the sort entirely.
@@ -211,6 +227,91 @@ def _load_filter_fields() -> tuple[str | None, str | None, tuple[int, ...] | tup
         raise RuntimeError("MILLPOND_FILTER_DROP_FIELD_NAME is reserved for a future release; not implemented yet")
 
     return keep, None, _parse_filter_values(values_raw)
+
+
+def _load_include_values_config(
+    filter_keep_field: str | None,
+    filter_values: tuple[int, ...] | tuple[str, ...] | None,
+) -> dict:
+    """Read the MILLPOND_INCLUDE_VALUES_* group and validate it against the
+    static filter config. Startup-refusal beats runtime surprise:
+
+    - a URL without an active keep-filter has nothing to feed;
+    - MODE (or auth) without a URL means the operator INTENDED a dynamic
+      source and a typo'd/missing URL would silently degrade to static —
+      refuse rather than run on the wrong set;
+    - shadow mode without static values has nothing to diff against;
+    - a lone auth header name or token is always a misconfiguration.
+    """
+    url = os.environ.get("MILLPOND_INCLUDE_VALUES_URL", "").strip() or None
+    mode_raw = os.environ.get("MILLPOND_INCLUDE_VALUES_MODE", "").strip().lower()
+    mode = mode_raw or "shadow"
+    header_name = os.environ.get("MILLPOND_INCLUDE_VALUES_AUTH_HEADER_NAME", "").strip() or None
+    token = os.environ.get("MILLPOND_INCLUDE_VALUES_AUTH_TOKEN", "").strip() or None
+
+    if url is None:
+        if mode_raw:
+            raise RuntimeError(
+                "MILLPOND_INCLUDE_VALUES_MODE is set but MILLPOND_INCLUDE_VALUES_URL is not — "
+                "a dynamic source was intended; refusing to silently run static-only"
+            )
+        if header_name or token:
+            raise RuntimeError("MILLPOND_INCLUDE_VALUES_AUTH_* requires MILLPOND_INCLUDE_VALUES_URL")
+        return dict(
+            include_values_url=None,
+            include_values_mode="static",
+            include_values_poll_interval_s=60.0,
+            include_values_removal_polls=5,
+            include_values_request_timeout_s=10.0,
+            include_values_startup_timeout_s=60.0,
+            include_values_auth_header_name=None,
+            include_values_auth_token=None,
+        )
+
+    if mode not in ("shadow", "authoritative"):
+        raise RuntimeError(f"MILLPOND_INCLUDE_VALUES_MODE must be 'shadow' or 'authoritative', got {mode!r}")
+    if filter_keep_field is None:
+        raise RuntimeError("MILLPOND_INCLUDE_VALUES_URL requires MILLPOND_FILTER_KEEP_FIELD_NAME to be set")
+    if mode == "shadow" and filter_values is None:
+        raise RuntimeError("MILLPOND_INCLUDE_VALUES_MODE=shadow requires static MILLPOND_FILTER_VALUES to diff against")
+    if bool(header_name) != bool(token):
+        raise RuntimeError(
+            "MILLPOND_INCLUDE_VALUES_AUTH_HEADER_NAME and MILLPOND_INCLUDE_VALUES_AUTH_TOKEN must be set together"
+        )
+
+    def _parse_number(env_name: str, default: str, cast):
+        raw = os.environ.get(env_name, default)
+        try:
+            return cast(raw)
+        except ValueError:
+            raise RuntimeError(f"{env_name} must be a number, got {raw!r}") from None
+
+    poll_interval = _parse_number("MILLPOND_INCLUDE_VALUES_POLL_INTERVAL_S", "60", float)
+    removal_polls = _parse_number("MILLPOND_INCLUDE_VALUES_REMOVAL_POLLS", "5", int)
+    request_timeout = _parse_number("MILLPOND_INCLUDE_VALUES_REQUEST_TIMEOUT_S", "10", float)
+    startup_timeout = _parse_number("MILLPOND_INCLUDE_VALUES_STARTUP_TIMEOUT_S", "60", float)
+    if poll_interval <= 0:
+        raise RuntimeError("MILLPOND_INCLUDE_VALUES_POLL_INTERVAL_S must be positive")
+    if removal_polls < 1:
+        raise RuntimeError("MILLPOND_INCLUDE_VALUES_REMOVAL_POLLS must be >= 1")
+    if removal_polls == 1:
+        log.warning(
+            "MILLPOND_INCLUDE_VALUES_REMOVAL_POLLS=1 disables removal damping — a single poll "
+            "omitting a value removes it immediately"
+        )
+    if request_timeout <= 0 or startup_timeout <= 0:
+        raise RuntimeError("MILLPOND_INCLUDE_VALUES_*_TIMEOUT_S must be positive")
+
+    return dict(
+        include_values_url=url,
+        include_values_mode=mode,
+        include_values_poll_interval_s=poll_interval,
+        include_values_removal_polls=removal_polls,
+        include_values_request_timeout_s=request_timeout,
+        include_values_startup_timeout_s=startup_timeout,
+        include_values_auth_header_name=header_name,
+        include_values_auth_token=token,
+    )
 
 
 def _load_sort_by() -> tuple[str, ...] | None:
@@ -417,6 +518,7 @@ def load() -> Config:
         filter_keep_field=filter_keep_field,
         filter_drop_field=filter_drop_field,
         filter_values=filter_values,
+        **_load_include_values_config(filter_keep_field, filter_values),
         sort_by=sort_by,
         typed_columns=typed_columns,
         kafka_config_overrides=kafka_overrides,
