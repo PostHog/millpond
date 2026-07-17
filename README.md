@@ -79,6 +79,30 @@ Two skip reasons are tracked on `millpond_records_skipped_total`:
 
 `MILLPOND_FILTER_DROP_FIELD_NAME` is reserved at the config layer (mutex with keep) and currently rejected at startup. It will become a denylist filter in a future release without env-var churn.
 
+### Dynamic allowlist source
+
+The allowlist can be sourced at runtime from an HTTP endpoint instead of being fixed at startup: `MILLPOND_INCLUDE_VALUES_URL` names a URL returning a JSON array of scalars (ints or strings, matching the static list's type), polled on a background thread (default every 60s, ±10% jitter). Millpond knows nothing about the endpoint's meaning — the URL and an optional auth header (`MILLPOND_INCLUDE_VALUES_AUTH_HEADER_NAME` + `_AUTH_TOKEN`) are plain config.
+
+How the static list and the polled set interact:
+
+| `MILLPOND_FILTER_VALUES` (static) | `MILLPOND_INCLUDE_VALUES_URL` | `MILLPOND_INCLUDE_VALUES_MODE` | Effective allowlist | Endpoint's role |
+|---|---|---|---|---|
+| set | unset | unset | the static list | none — today's behavior, unchanged |
+| set | set | `shadow` (default) | the static list | observability only: polled each interval, exports diff-vs-static gauges and staleness; its values are never applied |
+| set | set | `authoritative` | the polled set | live: the static list seeds the initial held set; startup **blocks** until the first successful poll (no proceed-on-stale-bootstrap) |
+| unset | unset | unset | no filter — all records kept | — |
+| unset | set | any | **startup error** | the URL requires an active keep-filter, which requires static values |
+| any | unset | set (or auth vars set) | **startup error** | MODE/auth without a URL means a dynamic source was intended; refusing beats silently running static-only |
+
+In `authoritative` mode the polled set changes under safety rules shaped by a consequence asymmetry — an erroneous addition writes surplus rows, an erroneous removal silently drops records with no recovery:
+
+- **Additions** apply on the first successful poll that shows them.
+- **Removals** require `MILLPOND_INCLUDE_VALUES_REMOVAL_POLLS` (default 5) *consecutive successful* polls with the value absent. Failed polls freeze the countdown; a reappearing value resets it.
+- **Poll failures** keep the last-known-good set indefinitely; staleness is observable via `millpond_include_values_last_success_timestamp_seconds`.
+- **Refused polls** (counted on `millpond_include_values_refused_total{reason}`) keep the set and advance nothing: empty arrays (`empty` — never removal evidence, never an acceptable first state), removals of more than half of a multi-value set at once (`bulk_removal`), and int↔str type changes (`type_flip` — a type-flipped set would fail the filter's cast against the column and drop whole batches).
+
+Rollout is designed to be shadow-first: run `shadow`, alert on `millpond_include_values_shadow_only_static` / `_shadow_only_remote` staying nonzero, and flip to `authoritative` once the symmetric difference holds at zero. `millpond_include_values_mode` reports which mode each replica actually runs, so a fleet-level flip gate can't pass vacuously on a replica that never got the URL.
+
 ### Pre-write sort
 
 Sorts the consolidated batch by one or more columns ascending, right before `sink.write()`. The sink sees pre-sorted data, which improves Parquet compression (especially for low-cardinality keys like `team_id`) and downstream reader predicate pushdown.
@@ -222,6 +246,14 @@ See [Record Handling](#record-handling) for context. All four variables below ar
 | `MILLPOND_FILTER_KEEP_FIELD_NAME` | no | | Column name to check against the allowlist. Must be set with `MILLPOND_FILTER_VALUES`. Validated as a safe identifier. |
 | `MILLPOND_FILTER_DROP_FIELD_NAME` | no | | Reserved for a future denylist filter; setting it today raises at startup. Mutually exclusive with `MILLPOND_FILTER_KEEP_FIELD_NAME`. |
 | `MILLPOND_FILTER_VALUES` | no | | Comma-separated allowed values. Auto-detected as int if every token parses as an integer, string otherwise. Required when either filter field name is set. |
+| `MILLPOND_INCLUDE_VALUES_URL` | no | | HTTP endpoint returning a JSON array of allowlist values (see [Dynamic allowlist source](#dynamic-allowlist-source)). Requires the keep-filter to be configured. |
+| `MILLPOND_INCLUDE_VALUES_MODE` | no | `shadow` | `shadow` (static authoritative, endpoint observed for diff metrics) or `authoritative` (polled set live). Only valid with the URL set. |
+| `MILLPOND_INCLUDE_VALUES_POLL_INTERVAL_S` | no | `60` | Poll cadence, jittered ±10%. |
+| `MILLPOND_INCLUDE_VALUES_REMOVAL_POLLS` | no | `5` | Consecutive successful polls a value must be absent before removal. `1` disables damping (warned at startup). |
+| `MILLPOND_INCLUDE_VALUES_REQUEST_TIMEOUT_S` | no | `10` | Per-request HTTP timeout. |
+| `MILLPOND_INCLUDE_VALUES_STARTUP_TIMEOUT_S` | no | `60` | Authoritative mode: how long startup blocks for the first successful poll before failing the pod. |
+| `MILLPOND_INCLUDE_VALUES_AUTH_HEADER_NAME` | no | | Header name sent with each poll (e.g. an internal-secret header). Must be set together with the token. Redirects are refused so the header can't leak cross-host. |
+| `MILLPOND_INCLUDE_VALUES_AUTH_TOKEN` | no | | Header value. Must be set together with the header name. |
 | `MILLPOND_SORT_BY` | no | | Comma-separated column names; the batch is sorted ascending by these in tuple order before each write. Missing fields cause the sort to be skipped (records still flow). |
 | `MILLPOND_TYPED_COLUMNS` | no | | Comma-separated `column:type` pairs pinning columns to a target type before write (types: `timestamptz`, `bigint`, `double`, `boolean`, `varchar`). Needed when writing into a table whose columns are already typed and JSON inference would diverge (date-times → `VARCHAR` vs `TIMESTAMPTZ`; all-null `project_id` → `VARCHAR` vs `BIGINT`). Column names validated as safe identifiers; types validated against the allowlist. |
 

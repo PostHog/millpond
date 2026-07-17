@@ -8,7 +8,17 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from confluent_kafka import TopicPartition
 
-from millpond import arrow_converter, backpressure, config, consumer, ducklake, logging_config, metrics, server
+from millpond import (
+    arrow_converter,
+    backpressure,
+    config,
+    consumer,
+    ducklake,
+    include_values,
+    logging_config,
+    metrics,
+    server,
+)
 
 log = logging.getLogger(__name__)
 
@@ -54,9 +64,12 @@ def _coerce_columns(table: pa.Table, cfg: config.Config) -> pa.Table:
     return arrow_converter.coerce_typed_columns(table, cfg.typed_columns)
 
 
-def _apply_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
+def _apply_filter(table: pa.Table, cfg: config.Config, values: tuple[int, ...] | tuple[str, ...] | None) -> pa.Table:
     """Apply the configured keep-filter: drop records whose value in
-    `filter_keep_field` is not in `filter_values`.
+    `filter_keep_field` is not in `values` (the CURRENT include set from
+    the configured IncludeValuesSource — static or polled; passing it
+    explicitly per batch is what makes the dynamic source take effect
+    without any state on the config object).
 
     Two reason labels on `records_skipped_total`:
       - `filter_field_missing`: the configured field is absent from this
@@ -87,7 +100,7 @@ def _apply_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
     reserved at the config layer but not implemented here yet — config
     rejects it explicitly at startup.
     """
-    if cfg.filter_keep_field is None or cfg.filter_values is None:
+    if cfg.filter_keep_field is None or values is None:
         return table
 
     field = cfg.filter_keep_field
@@ -122,11 +135,11 @@ def _apply_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
         # a config-vs-schema mismatch (e.g. int values exceeding an int32
         # column's range, or non-numeric strings against an int column)
         # from crashing the pod.
-        value_array = pa.array(cfg.filter_values).cast(column.type)
+        value_array = pa.array(values).cast(column.type)
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as e:
         log.warning(
             "Filter values %r incompatible with column %r type %s (%s); treating batch as field-missing",
-            cfg.filter_values,
+            values,
             field,
             column.type,
             e,
@@ -331,6 +344,7 @@ def main():
     sink = None
     kafka = None
     logger_provider = None
+    include_source = None
 
     cfg = config.load()
     # metrics.init() FIRST so a failure in OTLP setup (DNS lookup at
@@ -365,6 +379,21 @@ def main():
         kafka = consumer.create(cfg)
         log.info("Kafka consumer created, partitions assigned")
         backpressure.init(cfg.consume_batch_size)
+
+        # Include-values source: what the filter reads each batch. In
+        # authoritative mode start() BLOCKS until the first successful
+        # poll (a halt is recoverable from Kafka; running on a stale
+        # bootstrap silently drops records). The mode gauge is what lets
+        # fleet-level queries (shadow-flip gate, staleness alerts) tell
+        # which replicas actually run which source.
+        include_source = include_values.build(cfg)
+        metrics.include_values_mode.labels(mode=include_source.mode).set(1)
+        include_source.start()
+        log.info(
+            "Include-values source started (mode=%s, url=%s)",
+            include_source.mode,
+            cfg.include_values_url,
+        )
 
         shutdown = False
 
@@ -415,7 +444,7 @@ def main():
                     if table is not None:
                         skipped = len(values) - len(table)
                         table = _coerce_columns(table, cfg)
-                        table = _apply_filter(table, cfg)
+                        table = _apply_filter(table, cfg, include_source.current())
                         if len(table) > 0:
                             pending.append(table)
                             pending_bytes += table.nbytes
@@ -468,6 +497,12 @@ def main():
         log.exception("Fatal error in main loop")
         raise
     finally:
+        # Stop the include-values poll thread first — it's daemonized so
+        # this is cosmetic on crash paths, but a clean shutdown shouldn't
+        # leave it racing the final flush.
+        if include_source is not None:
+            include_source.stop()
+
         # Final flush only makes sense if both sink and kafka were created;
         # if startup failed earlier, there's no consumed data to flush.
         if pending_records > 0 and sink is not None and kafka is not None:
