@@ -111,6 +111,16 @@ _include_values_shadow_only_remote = Gauge(
     "Shadow mode: values in the polled set but not the static set",
     ["pipeline", "broker_source"],
 )
+_include_values_pinned = Gauge(
+    "millpond_include_values_pinned",
+    "Statically-pinned values (permanent floor the endpoint cannot remove)",
+    ["pipeline", "broker_source"],
+)
+_include_values_pinned_only = Gauge(
+    "millpond_include_values_pinned_only",
+    "Pinned values the endpoint does not currently serve (kept via the pin floor)",
+    ["pipeline", "broker_source"],
+)
 
 
 _pending_bytes = Gauge(
@@ -226,6 +236,8 @@ include_values_mode = _include_values_mode
 include_values_changes_total = _include_values_changes_total
 include_values_shadow_only_static = _include_values_shadow_only_static
 include_values_shadow_only_remote = _include_values_shadow_only_remote
+include_values_pinned = _include_values_pinned
+include_values_pinned_only = _include_values_pinned_only
 rdkafka_replyq = _rdkafka_replyq
 rdkafka_msg_cnt = _rdkafka_msg_cnt
 rdkafka_msg_size = _rdkafka_msg_size
@@ -246,6 +258,7 @@ def init(pipeline: str, broker_source: str = ""):
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
     global include_values_shadow_only_static, include_values_shadow_only_remote
+    global include_values_pinned, include_values_pinned_only
     global rdkafka_replyq, rdkafka_msg_cnt, rdkafka_msg_size
     global rdkafka_broker_rtt_avg, rdkafka_broker_rtt_p99
 
@@ -280,6 +293,8 @@ def init(pipeline: str, broker_source: str = ""):
     include_values_poll_failures_total = _include_values_poll_failures_total.labels(pipeline=pipeline, broker_source=bs)
     include_values_shadow_only_static = _include_values_shadow_only_static.labels(pipeline=pipeline, broker_source=bs)
     include_values_shadow_only_remote = _include_values_shadow_only_remote.labels(pipeline=pipeline, broker_source=bs)
+    include_values_pinned = _include_values_pinned.labels(pipeline=pipeline, broker_source=bs)
+    include_values_pinned_only = _include_values_pinned_only.labels(pipeline=pipeline, broker_source=bs)
     pending_bytes = _pending_bytes.labels(pipeline=pipeline, broker_source=bs)
     buffer_fullness = _buffer_fullness.labels(pipeline=pipeline, broker_source=bs)
     consume_batch_size_current = _consume_batch_size_current.labels(pipeline=pipeline, broker_source=bs)

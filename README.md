@@ -89,7 +89,7 @@ How the static list and the polled set interact:
 |---|---|---|---|---|
 | set | unset | unset | the static list | none — today's behavior, unchanged |
 | set | set | `shadow` (default) | the static list | observability only: polled each interval, exports diff-vs-static gauges and staleness; its values are never applied |
-| set | set | `authoritative` | the polled set | live: the static list seeds the initial held set; startup **blocks** until the first successful poll (no proceed-on-stale-bootstrap) |
+| set | set | `authoritative` | the polled set **∪ the static list** | live: the endpoint governs everything it serves; the static list is a permanent manual floor ("pins") — values the endpoint has never heard of (legacy/grandfathered) stay included and can only be removed by a config deploy. Startup **blocks** until the first successful poll (no proceed-on-stale-bootstrap) |
 | unset | unset | unset | no filter — all records kept | — |
 | unset | set | any | **startup error** | the URL requires an active keep-filter, which requires static values |
 | any | unset | set (or auth vars set) | **startup error** | MODE/auth without a URL means a dynamic source was intended; refusing beats silently running static-only |
@@ -97,11 +97,13 @@ How the static list and the polled set interact:
 In `authoritative` mode the polled set changes under safety rules shaped by a consequence asymmetry — an erroneous addition writes surplus rows, an erroneous removal silently drops records with no recovery:
 
 - **Additions** apply on the first successful poll that shows them.
-- **Removals** require `MILLPOND_INCLUDE_VALUES_REMOVAL_POLLS` (default 5) *consecutive successful* polls with the value absent. Failed polls freeze the countdown; a reappearing value resets it.
+- **Removals** require `MILLPOND_INCLUDE_VALUES_REMOVAL_POLLS` (default 5) *consecutive successful* polls with the value absent. Failed polls freeze the countdown; a reappearing value resets it. Statically-pinned values are exempt regardless of endpoint state — a pin stays served even if the endpoint once served it and later dropped it; removing a pin is a config deploy.
 - **Poll failures** keep the last-known-good set indefinitely; staleness is observable via `millpond_include_values_last_success_timestamp_seconds`.
-- **Refused polls** (counted on `millpond_include_values_refused_total{reason}`) keep the set and advance nothing: empty arrays (`empty` — never removal evidence, never an acceptable first state), removals of more than half of a multi-value set at once (`bulk_removal`), and int↔str type changes (`type_flip` — a type-flipped set would fail the filter's cast against the column and drop whole batches).
+- **Refused polls** (counted on `millpond_include_values_refused_total{reason}`) keep the set and advance nothing: empty arrays (`empty` — never removal evidence when endpoint-managed values are held; a pins-only set accepts an empty endpoint as a legitimate steady state), removals of more than half of the *endpoint-managed slice* at once (`bulk_removal` — measured against current minus endpoint-invisible pins; the refused poll's **additions still apply**, additions being the safe direction), and int↔str type changes (`type_flip` — a type-flipped set would fail the filter's cast against the column and drop whole batches).
 
-Rollout is designed to be shadow-first: run `shadow`, alert on `millpond_include_values_shadow_only_static` / `_shadow_only_remote` staying nonzero, and flip to `authoritative` once the symmetric difference holds at zero. `millpond_include_values_mode` reports which mode each replica actually runs, so a fleet-level flip gate can't pass vacuously on a replica that never got the URL.
+Rollout is designed to be shadow-first: run `shadow`, watch `millpond_include_values_shadow_only_static` / `_shadow_only_remote`, and flip to `authoritative` once `shadow_only_static` equals the intentional pin *count* (`millpond_include_values_pinned_only` — the pins are logged at startup so membership is checkable) and `shadow_only_remote` matches the expected dynamic expansion. The shadow prober carries the same pins as authoritative mode, so its size/pending-removal gauges predict exactly the set the flip would serve. `millpond_include_values_pinned` / `_pinned_only` survive the flip (the shadow gauges don't), keeping pin/endpoint divergence observable in authoritative mode.
+
+**Prune the static list to the intentional pins before flipping.** Every static value is a permanent pin: a static list that fully mirrors the endpoint at flip time leaves the endpoint with nothing it can ever remove — the damping machinery goes dead with `pending_removals` reading a healthy-looking 0. `pinned_only` at its expected count (vs `pinned` ≈ the whole set) is the tell. `millpond_include_values_mode` reports which mode each replica actually runs, so a fleet-level flip gate can't pass vacuously on a replica that never got the URL.
 
 ### Pre-write sort
 

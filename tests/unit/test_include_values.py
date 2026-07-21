@@ -151,17 +151,23 @@ class TestPollSemantics:
         assert all(n == 1 for n in src._absent_polls.values())
 
     def test_bulk_removal_refused(self, _mock_metrics):
-        # Confirming removal of > half of a multi-value set in one poll is
-        # refused (endpoint replacing the world != routine churn).
+        # Confirming removal of > half of the endpoint-managed slice in
+        # one poll is refused (endpoint replacing the world != routine
+        # churn). The poll's ADDITIONS still apply — additions are the
+        # safe direction, and starving a new team behind a disputed
+        # removal drops its records silently with offsets committed.
         src = _http(bootstrap=(1, 2, 3, 4), removal_confirm_polls=1)
         self._poll(src, [9])
-        # The WHOLE poll is refused — additions too. A world-replacement
-        # response is an endpoint bug or a migration; either goes through
-        # static config, not an unattended poll.
-        assert src.current() == (1, 2, 3, 4)
+        assert src.current() == (1, 2, 3, 4, 9)
         assert "bulk_removal" in _refusal_reasons(_mock_metrics)
         # And nothing was committed to the countdown.
         assert src._absent_polls == {}
+        # A world-replacement response does NOT eventually win: the junk
+        # addition grows the managed slice, but the disputed removals stay
+        # a majority of it, so the refusal is stable poll after poll.
+        self._poll(src, [9])
+        assert src.current() == (1, 2, 3, 4, 9)
+        assert _refusal_reasons(_mock_metrics) == ["bulk_removal", "bulk_removal"]
 
     def test_removing_one_of_two_is_allowed(self):
         src = _http(bootstrap=(1, 2), removal_confirm_polls=1)
@@ -224,6 +230,121 @@ class TestPollSemantics:
         _mock_metrics.include_values_pending_removals.set.assert_called_with(1)
 
 
+class TestPinnedFloor:
+    """Pinned (static) values are a permanent manual floor: always
+    served, never in the removal countdown, removable only by config."""
+
+    def _poll(self, src, remote):
+        with patch.object(src, "_fetch", return_value=remote):
+            src._poll_once()
+
+    def test_pinned_survives_indefinite_endpoint_absence(self):
+        src = _http(bootstrap=(1, 2, 3), pinned=(3,), removal_confirm_polls=2)
+        for _ in range(10):  # far past the confirm threshold
+            self._poll(src, [1, 2])
+        assert src.current() == (1, 2, 3)
+        assert 3 not in src._absent_polls  # never even counts down
+
+    def test_served_set_is_union_of_remote_and_pins(self):
+        src = _http(bootstrap=(3,), pinned=(3,))
+        self._poll(src, [1, 2])
+        assert src.current() == (1, 2, 3)
+
+    def test_unpinned_removal_still_works_alongside_pins(self):
+        src = _http(bootstrap=(1, 2, 3), pinned=(3,), removal_confirm_polls=2)
+        self._poll(src, [1])  # 2 absent (1/2)
+        self._poll(src, [1])  # 2 absent (2/2) -> removed; 3 pinned, stays
+        assert src.current() == (1, 3)
+
+    def test_pin_also_served_by_endpoint_is_fine_and_sticky(self):
+        src = _http(bootstrap=(1, 3), pinned=(3,), removal_confirm_polls=1)
+        self._poll(src, [1, 3])
+        assert src.current() == (1, 3)
+        self._poll(src, [1])  # endpoint drops the pin -> no effect
+        assert src.current() == (1, 3)
+
+    def test_bulk_removal_guard_measured_on_managed_slice(self, _mock_metrics):
+        # 3 pins + 3 endpoint-managed. Confirming removal of 2 of the 3
+        # managed values is >half the MANAGED slice and must refuse, even
+        # though it is well under half of the full 6-value set (the old
+        # whole-set guard would have let it through).
+        src = _http(bootstrap=(1, 2, 3, 101, 102, 103), pinned=(101, 102, 103), removal_confirm_polls=1)
+        self._poll(src, [3])
+        assert "bulk_removal" in _refusal_reasons(_mock_metrics)
+        assert src.current() == (1, 2, 3, 101, 102, 103)
+
+    def test_pins_never_refused_as_bulk_removal(self, _mock_metrics):
+        # All pins absent from the endpoint is the NORMAL state (the
+        # endpoint has never heard of them) — it must not trip any guard.
+        src = _http(bootstrap=(1, 101, 102, 103), pinned=(101, 102, 103), removal_confirm_polls=1)
+        self._poll(src, [1, 2])
+        assert _refusal_reasons(_mock_metrics) == []
+        assert src.current() == (1, 2, 101, 102, 103)
+
+    def test_endpoint_served_pins_count_in_bulk_denominator(self, _mock_metrics):
+        # SWE review: the endpoint serves the pins too (a legacy team the
+        # CP later adopted). Dropping 2 of its 12 values is routine churn
+        # measured against everything it governs — subtracting ALL pins
+        # would read it as 2-of-2 and refuse forever.
+        pins = tuple(range(1, 11))
+        src = _http(bootstrap=tuple(range(1, 13)), pinned=pins, removal_confirm_polls=1)
+        self._poll(src, list(range(1, 11)))  # endpoint drops 11 and 12
+        assert _refusal_reasons(_mock_metrics) == []
+        assert src.current() == pins
+
+    def test_additions_apply_even_when_bulk_removal_refused(self, _mock_metrics):
+        # Refusing a disputed removal must not starve additions: a new
+        # team unable to enter the set means its records drop silently
+        # with offsets committed — worse than any surplus row.
+        src = _http(bootstrap=(1, 2, 3, 101, 102), pinned=(101, 102), removal_confirm_polls=1)
+        self._poll(src, [3, 4])  # removal of {1,2} disputed; 4 is new
+        assert _refusal_reasons(_mock_metrics) == ["bulk_removal"]
+        assert src.current() == (1, 2, 3, 4, 101, 102)  # 4 in, 1/2 kept
+        assert src._absent_polls == {}  # refusal committed no countdown
+        # The addition grew the managed slice, so re-polling the same
+        # remote now clears the dispute instead of livelocking.
+        self._poll(src, [3, 4])
+        assert src.current() == (3, 4, 101, 102)
+
+    def test_empty_endpoint_accepted_when_only_pins_held(self, _mock_metrics):
+        # The motivating deployment's degenerate form: every team is
+        # legacy, the endpoint legitimately serves nothing. Must sync
+        # (not refuse), or authoritative start() crash-loops on timeout.
+        src = _http(bootstrap=(101, 102), pinned=(101, 102))
+        self._poll(src, [])
+        assert _refusal_reasons(_mock_metrics) == []
+        assert src.current() == (101, 102)
+        assert src._synced.is_set()
+
+    def test_empty_endpoint_still_refused_with_managed_values(self, _mock_metrics):
+        src = _http(bootstrap=(1, 101), pinned=(101,))
+        for _ in range(3):
+            self._poll(src, [])
+        assert _refusal_reasons(_mock_metrics) == ["empty"] * 3
+        assert src.current() == (1, 101)
+        assert src._absent_polls == {}  # refusals never charge countdown
+
+    def test_type_flip_refused_keeps_pins(self, _mock_metrics):
+        src = _http(bootstrap=(1, 2, 3), pinned=(3,))
+        self._poll(src, ["a", "b"])
+        assert _refusal_reasons(_mock_metrics) == ["type_flip"]
+        assert src.current() == (1, 2, 3)
+
+    def test_one_of_one_managed_removal_allowed_alongside_pins(self, _mock_metrics):
+        src = _http(bootstrap=(1, 101, 102), pinned=(101, 102), removal_confirm_polls=1)
+        self._poll(src, [2])  # managed slice is {1}: guard is len>1-gated
+        assert _refusal_reasons(_mock_metrics) == []
+        assert src.current() == (2, 101, 102)
+
+    def test_constructor_rejects_pins_outside_bootstrap(self):
+        # A pin the held set never contained would bypass the type-flip
+        # guard on first sight and get string-coerced by _normalize.
+        with pytest.raises(ValueError, match="subset of the bootstrap"):
+            _http(bootstrap=None, pinned=(101,))
+        with pytest.raises(ValueError, match="subset of the bootstrap"):
+            _http(bootstrap=(1, 2), pinned=(101,))
+
+
 class TestStartStop:
     def test_start_blocks_and_raises_without_sync_even_with_bootstrap(self):
         # REGRESSION (review finding): restart amnesia. Proceeding on the
@@ -281,6 +402,13 @@ class TestBuild:
         assert src.mode == "authoritative"
         assert src.current() == (1, 2)  # bootstrap until first sync
         assert src._shadow_reference is None
+        assert src._pinned == {1, 2}  # static config is the permanent floor
+
+    def test_shadow_prober_is_pinned_like_authoritative(self):
+        # The shadow prober must simulate the set the flip would serve,
+        # so it carries the same pins as authoritative mode would.
+        src = build(self._cfg(include_values_url="http://x/v"))
+        assert src._prober._pinned == {1, 2}
 
     def test_auth_header_threaded(self):
         src = build(
