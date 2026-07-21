@@ -11,9 +11,13 @@
   reading it as authority in shadow mode should require reaching into
   private attributes, not a one-line mistake.
 - authoritative (URL + mode=authoritative): `current()` serves the
-  polled set, seeded from the static values; startup BLOCKS until the
-  first successful poll (see `start()` — a halt is recoverable from
-  Kafka, a silent drop is not).
+  UNION of the polled set and the static values; startup BLOCKS until
+  the first successful poll (see `start()` — a halt is recoverable from
+  Kafka, a silent drop is not). The static values are a permanent
+  manual floor ("pins"): teams the endpoint's backing store has never
+  heard of (legacy/grandfathered) stay included forever, never enter
+  the removal countdown, and can only be removed by a config deploy.
+  The endpoint governs everything it serves; config governs the rest.
 
 The consequence asymmetry drives every safety choice: an erroneous
 ADDITION writes surplus rows a downstream reader ignores; an erroneous
@@ -21,17 +25,24 @@ REMOVAL silently drops records on the floor with no recovery. Hence:
 
 - additions apply on the first successful poll that shows them;
 - removals require `removal_confirm_polls` CONSECUTIVE successful polls
-  with the value absent; failed polls advance nothing;
+  with the value absent; failed polls advance nothing; pinned (static)
+  values are exempt REGARDLESS of endpoint state — a pin stays served
+  even if the endpoint once served it and later dropped it; removing a
+  pin is a config deploy, never an endpoint change;
 - a REFUSED poll (below) advances nothing either — refusal must not
   pre-charge the removal countdown;
 - a poll failure keeps the last-known-good set, with staleness
   observable via `millpond_include_values_last_success_timestamp_seconds`;
 - a successful poll is REFUSED (set kept, `millpond_include_values_
-  refused_total{reason}`) when it would (a) empty a non-empty set,
-  (b) seed an EMPTY initial set, (c) confirm removal of more than half
-  of a multi-value set at once, or (d) flip the set's scalar type
-  (int↔str) — a type flip would silently exclude every record at the
-  filter's cast site, which is a mass drop wearing a different hat;
+  refused_total{reason}`) when it would (a) empty a non-empty set —
+  except when the held set is pins-only, where an empty endpoint is a
+  legitimate steady state, not removal evidence, (b) seed an EMPTY
+  initial set, (c) confirm removal of more than half of the endpoint-
+  MANAGED slice (current minus endpoint-invisible pins) at once — that
+  poll's additions still apply, additions being the safe direction —
+  or (d) flip the set's scalar type (int↔str) — a type flip would
+  silently exclude every record at the filter's cast site, which is a
+  mass drop wearing a different hat;
 - the damping state and last-known-good set are IN-MEMORY: a restart
   falls back to the static bootstrap, which is why authoritative mode
   refuses to start unsynced rather than running on a possibly-stale
@@ -131,6 +142,7 @@ class HttpIncludeValues:
         removal_confirm_polls: int,
         auth_header: tuple[str, str] | None = None,
         bootstrap: Values | None = None,
+        pinned: Values | None = None,
         shadow_reference: Values | None = None,
         request_timeout_s: float = 10.0,
         startup_timeout_s: float = 60.0,
@@ -139,6 +151,24 @@ class HttpIncludeValues:
         self._poll_interval_s = poll_interval_s
         self._removal_confirm_polls = removal_confirm_polls
         self._auth_header = auth_header
+        # Permanent floor: pinned values are always in the served set and
+        # never enter the removal countdown. `build()` passes the static
+        # config here, so "it's in the config" is a durable guarantee even
+        # when the endpoint's backing store has never heard of the value.
+        self._pinned: set = set(pinned or ())
+        if self._pinned and not self._pinned <= set(bootstrap or ()):
+            # A pin outside the bootstrap would bypass the type-flip guard
+            # on first sight (held_type is None) and get string-coerced by
+            # _normalize into a value the filter's column cast rejects.
+            # build() always passes bootstrap == pinned; direct construction
+            # must keep the invariant too.
+            raise ValueError("pinned values must be a subset of the bootstrap set")
+        if self._pinned:
+            log.info(
+                "include-values: %d pinned value(s) — permanent floor, removable only by config deploy: %s",
+                len(self._pinned),
+                sorted(self._pinned, key=str)[:_LOG_CHANGES_INDIVIDUALLY_MAX],
+            )
         self._shadow_reference = shadow_reference
         self._request_timeout_s = request_timeout_s
         self._startup_timeout_s = startup_timeout_s
@@ -242,11 +272,22 @@ class HttpIncludeValues:
         # include set and drop every record. Legitimately shrinking to
         # zero values is an operator action through static config.
         if not remote_set:
-            if current_set or self._values is None:
+            if current_set - self._pinned:
+                self._refuse("empty", "endpoint served an empty array")
+                self._record_success_metrics(remote_set)
+                return
+            if not self._pinned and (current_set or self._values is None):
                 self._refuse("empty", "endpoint served an empty array")
                 if current_set:
                     self._record_success_metrics(remote_set)
                 return
+            # Pins-only held set (the all-legacy deployment: every team is
+            # grandfathered, the endpoint legitimately serves nothing).
+            # There is nothing endpoint-managed to remove, so an empty
+            # array is not removal evidence against anything — fall
+            # through to the accept path (candidate = pins) so
+            # authoritative start() syncs instead of crash-looping on
+            # startup_timeout for a valid config.
 
         additions = remote_set - current_set
 
@@ -256,26 +297,53 @@ class HttpIncludeValues:
         # by one junk value would otherwise mass-remove instantly).
         tentative_counts: dict[int | str, int] = {}
         confirmed_removals: set = set()
-        for v in current_set - remote_set:
+        # Pinned values are exempt from the countdown entirely: the
+        # endpoint has no authority over them, so its silence about them
+        # is not removal evidence.
+        for v in current_set - remote_set - self._pinned:
             tentative_counts[v] = self._absent_polls.get(v, 0) + 1
             if tentative_counts[v] >= self._removal_confirm_polls:
                 confirmed_removals.add(v)
 
-        candidate = (current_set | additions) - confirmed_removals
+        candidate = (current_set | additions | self._pinned) - confirmed_removals
 
         if not candidate and current_set:
+            # Unreachable when pins are configured (candidate ⊇ pinned, and
+            # build() guarantees non-empty pins whenever a URL is set) —
+            # kept as a backstop for pin-less direct construction. The
+            # load-bearing empty guard is the unconditional one above.
             self._refuse("empty", f"result would empty a non-empty set ({len(current_set)} values)")
             self._record_success_metrics(remote_set)
             return
         # Bulk-removal refusal: confirming removal of more than half of a
         # multi-value set in one poll is a fleet-wide config wipe, not
         # routine churn. (Removing 1 of 2 is allowed; the guard is against
-        # the endpoint replacing the world.)
-        if len(current_set) > 1 and len(confirmed_removals) > max(1, len(current_set) // 2):
+        # the endpoint replacing the world.) Measured against the slice
+        # the endpoint actually GOVERNS: current minus the endpoint-
+        # INVISIBLE pins. Subtracting all pins would undercount when the
+        # endpoint also serves pinned values (dropping 2 of its 12 would
+        # read as 2-of-2 and refuse forever); counting them all would let
+        # a large pin set mask a full wipe of the managed values.
+        managed = current_set - (self._pinned - remote_set)
+        if len(managed) > 1 and len(confirmed_removals) > max(1, len(managed) // 2):
             self._refuse(
                 "bulk_removal",
-                f"would remove {len(confirmed_removals)} of {len(current_set)} values in one poll",
+                f"would remove {len(confirmed_removals)} of {len(managed)} endpoint-managed values in one poll",
             )
+            # Additions still apply on this refusal: they are the safe
+            # direction (surplus rows vs silent drop), and starving them
+            # behind a disputed removal would drop NEW teams' records with
+            # offsets committed — the loss class this module exists to
+            # prevent. The countdown state is NOT committed (a refusal
+            # never pre-charges removals), so the dispute itself stays
+            # frozen. Applying additions also grows the managed slice,
+            # which lets a livelocked dispute clear once enough new values
+            # arrive to make the removals a minority again.
+            if additions:
+                self._log_changes(additions, set())
+                for _ in additions:
+                    metrics.include_values_changes_total.labels(action="add").inc()
+                self._values = _normalize(list(current_set | additions | self._pinned))
             self._record_success_metrics(remote_set)
             return
 
@@ -318,6 +386,11 @@ class HttpIncludeValues:
         metrics.include_values_size.set(len(self._values or ()))
         metrics.include_values_pending_removals.set(len(self._absent_polls))
         metrics.include_values_last_success_timestamp_seconds.set(time.time())
+        # Pin observability survives the authoritative flip (unlike the
+        # shadow gauges): pinned_only > 0 is the standing count of values
+        # kept purely by the config floor.
+        metrics.include_values_pinned.set(len(self._pinned))
+        metrics.include_values_pinned_only.set(len(self._pinned - remote_set))
         if self._shadow_reference is not None:
             ref = set(self._shadow_reference)
             metrics.include_values_shadow_only_static.set(len(ref - remote_set))
@@ -371,6 +444,11 @@ def build(cfg) -> StaticIncludeValues | ShadowIncludeValues | HttpIncludeValues:
         removal_confirm_polls=cfg.include_values_removal_polls,
         auth_header=auth,
         bootstrap=cfg.filter_values,
+        # Pinned in shadow mode too, so the prober's internal set (and its
+        # size/pending_removals gauges) simulates exactly what the
+        # authoritative flip would serve — a shadow that predicts a
+        # different set than the flip delivers is worse than no shadow.
+        pinned=cfg.filter_values,
         shadow_reference=cfg.filter_values if cfg.include_values_mode == "shadow" else None,
         request_timeout_s=cfg.include_values_request_timeout_s,
         startup_timeout_s=cfg.include_values_startup_timeout_s,
