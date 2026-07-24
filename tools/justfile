@@ -302,6 +302,23 @@ compact-to-tier-3-dry-run table="":
 [group('compaction')]
 compact-all-tiers table="": (compact-to-tier-1 table) (compact-to-tier-2 table) (compact-to-tier-3 table)
 
+# Chain-safe no-arg wrappers for the tenant maintenance CronJob. In a
+# multi-recipe invocation (`just a b c`) a recipe with a positional param
+# EATS the next recipe name as its argument — `just compact-all-tiers
+# expire ...` runs compaction against table="expire". These wrappers pin
+# the defaults so the composition-stamped cron can run one flat chain:
+#   just -f /justfile bootstrap-indexes compact-all-tiers-default \
+#     expire-7d purge-orphan-stats cleanup-all
+# The SEQUENCE deliberately lives in the cron definition (crossplane
+# composition), not an umbrella recipe here — changing the steps must not
+# require a millpond release.
+
+# compact-all-tiers with the default (all tables), chain-safe
+compact-all-tiers-default: (compact-all-tiers)
+
+# snapshot expiry at the 7-day fleet default, chain-safe
+expire-7d: (expire "7")
+
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3) then delete scheduled S3 files
 [group('compaction')]
 compact-all-tiers-and-clean table="": (compact-to-tier-1 table) (compact-to-tier-2 table) (compact-to-tier-3 table) cleanup-all
