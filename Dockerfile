@@ -73,7 +73,10 @@ USER millpond
 # returns 404). The DuckDB Python pin (1.5.2 in pyproject.toml) locks the
 # DuckLake major line, and tests/unit/test_ducklake_pin.py asserts the loaded
 # extension's build SHA at runtime so a drift trips in CI rather than in prod.
-RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres')"
+# aws: required by CREATE SECRET (TYPE s3, PROVIDER credential_chain) — the
+# Pod-Identity path the tenant maintenance crons use. Without it DuckDB
+# auto-installs at runtime, which dies on a read-only root filesystem.
+RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres'); c.execute('INSTALL aws')"
 
 # Build-time smoke test for the duckdb CLI as the runtime user. Catches any
 # regression where the CLI is installed somewhere the `millpond` user can't
