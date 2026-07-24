@@ -37,7 +37,10 @@ RUN test -n "$TARGETARCH" \
 
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends just=1.40.0* && rm -rf /var/lib/apt/lists/*
+# postgresql-client: the justfile's bootstrap-index-* recipes shell out to
+# psql for CREATE INDEX CONCURRENTLY (cannot run inside a transaction, so
+# the python/duckdb connection path is not a substitute).
+RUN apt-get update && apt-get install -y --no-install-recommends just=1.40.0* postgresql-client && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/millpond /app/millpond
