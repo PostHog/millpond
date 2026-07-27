@@ -448,3 +448,12 @@ ducklake-metrics-with-config config port="9100":
 [group('metrics')]
 ducklake-metrics-list config="":
     env {{ _target_env }} python {{ ducklake_metrics }} --list-queries {{ if config != "" { "--config " + quote(config) } else { "" } }}
+
+# One-shot: run every query once and push exposition to
+# $DUCKLAKE_METRICS_PUSH_URL (VictoriaMetrics import endpoint).
+# Chain-safe (no positional params) — the per-tenant metrics CronJob's
+# recipe; tenant identity via $DUCKLAKE_TENANT, catalog target via the
+# same _target_env contract the maintenance recipes use.
+[group('metrics')]
+metrics-once:
+    env {{ _target_env }} python {{ ducklake_metrics }} --once

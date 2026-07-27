@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
-"""DuckLake state-metrics daemon.
+"""DuckLake state-metrics daemon / one-shot exporter.
 
-Long-running process that periodically runs a fixed set of catalog-side
+Two modes over the same query set:
+
+- Daemon (default): long-running scheduler + /metrics HTTP server, one
+  process per tenant (the legacy deployment model).
+- ``--once``: run every query once and POST the exposition payload to a
+  Prometheus-import endpoint (``--push-url``, e.g. VictoriaMetrics
+  vmagent ``/api/v1/import/prometheus``) — the per-tenant metrics
+  CronJob's mode, mirroring the maintenance cron's scoped-lifecycle
+  model. Metric names and the ``tenant`` label are identical across
+  modes, so dashboards don't care which produced the samples.
+
+Periodically (or once) runs a fixed set of catalog-side
 queries against a DuckLake and exposes the results as Prometheus gauges.
 Built-in queries cover lake-shape signals (size-band distribution,
 compaction-tier candidate counts, pending-deletion queue depth, snapshot
@@ -41,6 +52,9 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -792,6 +806,103 @@ def _connect_with_backoff(
     return None
 
 
+def _connect_once(memory_limit: str | None) -> duckdb.DuckDBPyConnection:
+    """Single connect attempt for --once mode: no backoff — the CronJob's
+    next tick IS the retry, and a loud fast failure is the signal we want
+    (kube_job_status_failed is the alert surface, same as the maintenance
+    cron)."""
+    if memory_limit is not None:
+        ducklake_maintenance._sanitize_setting_value(memory_limit)
+    conn = ducklake_maintenance.connect()
+    if memory_limit is not None:
+        conn.execute(f"SET memory_limit = '{memory_limit}'")
+    log.info(
+        "Connected to DuckLake catalog (memory_limit=%s)",
+        memory_limit if memory_limit is not None else "DuckDB default",
+    )
+    return conn
+
+
+def _push_metrics(url: str, registry: CollectorRegistry) -> None:
+    """POST the registry in exposition format to a Prometheus-import
+    endpoint (VictoriaMetrics vmagent/vminsert `/api/v1/import/prometheus`).
+
+    Plain exposition text over HTTP — the payload is byte-identical to what
+    a scrape of the daemon would have produced, which is what keeps every
+    existing dashboard selector working. urllib raises on >=400; VM answers
+    204 on success.
+
+    Scheme is validated to http(s) before opening: urllib also accepts
+    file:// (the semgrep dynamic-urllib finding), and a misconfigured
+    push URL must fail loudly rather than "succeed" against the local
+    filesystem. The URL itself is operator-supplied deploy config (helm
+    value → env), never request data."""
+    scheme = urllib.parse.urlsplit(url).scheme
+    if scheme not in ("http", "https"):
+        raise ValueError(f"push-url must be http(s), got scheme {scheme!r}")
+    body = generate_latest(registry)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": CONTENT_TYPE_LATEST},
+    )
+    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - scheme-validated operator config
+        log.info("Pushed %d bytes to %s (HTTP %d)", len(body), url, resp.status)
+
+
+def _run_once(
+    queries: list[Query],
+    tenant: str,
+    push_url: str,
+    memory_limit: str | None,
+) -> int:
+    """One-shot mode: connect, run every query once, push, exit.
+
+    Per-query failures do NOT fail the run — they are themselves pushed
+    (ducklake_metrics_query_errors_total) and therefore visible where the
+    dashboards already look. The run exits nonzero only when nothing useful
+    could be produced or delivered: connect failure, zero successful
+    queries, or push failure.
+
+    A DEDICATED registry, never the global default: the default registry
+    carries the untenanted python_*/process_* collectors, and pushing
+    those through an import endpoint (no scrape instance label) would make
+    every tenant's job fight over the same series. The push must contain
+    exactly the tenant-labeled metrics and nothing else.
+    """
+    registry = CollectorRegistry()
+    self_metrics = _build_self_metrics(registry)
+    gauges = _build_query_gauges(queries, registry)
+
+    try:
+        conn = _connect_once(memory_limit)
+    except Exception:
+        log.exception("connect to DuckLake failed")
+        return 1
+    try:
+        self_metrics.up.labels(tenant).set(1)
+        succeeded = 0
+        for q in queries:
+            if _run_query(conn, q, gauges[q.name], self_metrics, tenant):
+                succeeded += 1
+        log.info("Ran %d/%d queries successfully", succeeded, len(queries))
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+    if succeeded == 0:
+        log.error("no query succeeded; not pushing a metrics payload of pure errors")
+        return 1
+    try:
+        _push_metrics(push_url, registry)
+    except Exception:
+        log.exception("metrics push failed")
+        return 1
+    return 0
+
+
 def _setup_logging() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -860,6 +971,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print resolved query list and exit (validates config without connecting)",
     )
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help=(
+            "One-shot mode for the per-tenant metrics CronJob: connect, run "
+            "every query once, POST the exposition-format payload to "
+            "--push-url, exit. No HTTP server, no scheduler, no backoff — "
+            "the cron's next tick is the retry and a failed Job is the "
+            "alert surface. Requires --push-url."
+        ),
+    )
+    p.add_argument(
+        "--push-url",
+        default=os.environ.get("DUCKLAKE_METRICS_PUSH_URL"),
+        help=(
+            "Prometheus-import endpoint for --once mode, e.g. a "
+            "VictoriaMetrics vmagent's /api/v1/import/prometheus. Falls "
+            "back to DUCKLAKE_METRICS_PUSH_URL env."
+        ),
+    )
     return p
 
 
@@ -883,6 +1014,11 @@ def main(argv: list[str] | None = None) -> None:
         )
     tenant: str = args.tenant
     log.info("Tenant: %s", tenant)
+
+    if args.once:
+        if not args.push_url:
+            sys.exit("--once requires --push-url (or DUCKLAKE_METRICS_PUSH_URL env)")
+        sys.exit(_run_once(queries, tenant, args.push_url, args.duckdb_memory_limit))
 
     self_metrics = _build_self_metrics()
     gauges = _build_query_gauges(queries)
