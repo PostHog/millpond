@@ -53,6 +53,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -829,7 +830,16 @@ def _push_metrics(url: str, registry: CollectorRegistry) -> None:
     Plain exposition text over HTTP — the payload is byte-identical to what
     a scrape of the daemon would have produced, which is what keeps every
     existing dashboard selector working. urllib raises on >=400; VM answers
-    204 on success."""
+    204 on success.
+
+    Scheme is validated to http(s) before opening: urllib also accepts
+    file:// (the semgrep dynamic-urllib finding), and a misconfigured
+    push URL must fail loudly rather than "succeed" against the local
+    filesystem. The URL itself is operator-supplied deploy config (helm
+    value → env), never request data."""
+    scheme = urllib.parse.urlsplit(url).scheme
+    if scheme not in ("http", "https"):
+        raise ValueError(f"push-url must be http(s), got scheme {scheme!r}")
     body = generate_latest(registry)
     req = urllib.request.Request(
         url,
@@ -837,7 +847,8 @@ def _push_metrics(url: str, registry: CollectorRegistry) -> None:
         method="POST",
         headers={"Content-Type": CONTENT_TYPE_LATEST},
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - operator-supplied cluster URL
+    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - scheme-validated operator config
         log.info("Pushed %d bytes to %s (HTTP %d)", len(body), url, resp.status)
 
 

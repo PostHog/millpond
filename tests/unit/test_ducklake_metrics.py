@@ -961,3 +961,9 @@ class TestRunOnce:
 
         monkeypatch.setattr(dm, "_connect_once", boom)
         assert dm._run_once([_once_query()], TENANT, "http://127.0.0.1:1/nope", None) == 1
+
+    def test_non_http_push_url_rejected(self, conn, monkeypatch):
+        # file:// (or any non-http scheme) must fail loudly, never touch
+        # the filesystem — the semgrep dynamic-urllib hardening.
+        monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
+        assert dm._run_once([_once_query()], TENANT, "file:///etc/passwd", None) == 1
