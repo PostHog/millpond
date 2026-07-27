@@ -854,3 +854,110 @@ class TestSchedulerStartsLiveness:
 # Drives the handler against an actual ThreadingHTTPServer with a tiny timeout,
 # so the wiring of _liveness_status → status code → counter → log is exercised
 # end-to-end. The unit tests above stay focused on the pure decision function.
+
+
+# ---------------------------------------------------------------------------
+# --once mode: _run_once / _push_metrics against a real local HTTP sink
+# ---------------------------------------------------------------------------
+
+
+class _CaptureSink:
+    """Local HTTP server standing in for the VictoriaMetrics import
+    endpoint: captures POST bodies, answers a configurable status."""
+
+    def __init__(self, status: int = 204):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        sink = self
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - stdlib signature
+                length = int(self.headers.get("Content-Length", "0"))
+                sink.bodies.append(self.rfile.read(length))
+                sink.content_types.append(self.headers.get("Content-Type", ""))
+                self.send_response(sink.status)
+                self.end_headers()
+
+            def log_message(self, *args):  # noqa: A002
+                pass
+
+        self.status = status
+        self.bodies: list[bytes] = []
+        self.content_types: list[str] = []
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.srv.server_address[1]}/api/v1/import/prometheus"
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def _once_query(name="t_once", sql="SELECT 7 AS n"):
+    return dm.Query(name=name, help="t", sql=sql, interval_seconds=60, labels=[], values=["n"])
+
+
+class TestRunOnce:
+    def test_success_pushes_only_tenant_scoped_metrics(self, conn, monkeypatch):
+        monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once([_once_query()], TENANT, sink.url, None)
+        finally:
+            sink.close()
+        assert rc == 0
+        assert len(sink.bodies) == 1
+        body = sink.bodies[0].decode()
+        assert 't_once_n{tenant="test"} 7.0' in body
+        assert 'ducklake_metrics_up{tenant="test"} 1.0' in body
+        # Dedicated registry: the untenanted default-registry collectors
+        # must never reach the shared import endpoint.
+        assert "python_info" not in body
+        assert "process_" not in body
+        assert sink.content_types[0].startswith("text/plain")
+
+    def test_all_queries_failing_exits_nonzero_without_push(self, conn, monkeypatch):
+        monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once([_once_query(sql="SELECT n FROM missing_table")], TENANT, sink.url, None)
+        finally:
+            sink.close()
+        assert rc == 1
+        assert sink.bodies == []
+
+    def test_partial_failure_still_pushes_with_error_counter(self, conn, monkeypatch):
+        monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once(
+                [_once_query(), _once_query(name="t_bad", sql="SELECT n FROM missing_table")],
+                TENANT,
+                sink.url,
+                None,
+            )
+        finally:
+            sink.close()
+        assert rc == 0
+        body = sink.bodies[0].decode()
+        assert 't_once_n{tenant="test"} 7.0' in body
+        assert 'ducklake_metrics_query_errors_total{query="t_bad",tenant="test"} 1.0' in body
+
+    def test_push_failure_exits_nonzero(self, conn, monkeypatch):
+        monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
+        sink = _CaptureSink(status=500)
+        try:
+            rc = dm._run_once([_once_query()], TENANT, sink.url, None)
+        finally:
+            sink.close()
+        assert rc == 1
+
+    def test_connect_failure_exits_nonzero(self, monkeypatch):
+        def boom(_ml):
+            raise RuntimeError("no catalog")
+
+        monkeypatch.setattr(dm, "_connect_once", boom)
+        assert dm._run_once([_once_query()], TENANT, "http://127.0.0.1:1/nope", None) == 1
