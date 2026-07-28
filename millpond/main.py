@@ -160,6 +160,12 @@ def _apply_filter(table: pa.Table, cfg: config.Config, values: tuple[int, ...] |
         metrics.records_skipped_total.labels(reason="filter_field_missing").inc(null_count)
     if n_excluded > 0:
         metrics.records_skipped_total.labels(reason="filter_excluded").inc(n_excluded)
+    if len(filtered) > 0:
+        # Per-value match counts on the KEPT rows only (bounded by the
+        # include set). value_counts on the filtered column is one pass
+        # over the minority the filter retained.
+        for chunk in pc.value_counts(filtered[field]).to_pylist():
+            metrics.filter_matched_total.labels(value=str(chunk["values"])).inc(chunk["counts"])
     return filtered
 
 

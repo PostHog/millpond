@@ -369,6 +369,37 @@ class TestApplyFilter:
         assert skip_calls == [("filter_excluded", 1)]
 
     @patch("millpond.main.metrics")
+    def test_matched_counts_per_value(self, mock_metrics):
+        # filter_matched_total gets one increment per DISTINCT kept value
+        # with the per-value row count — the stacked-proportion panel's
+        # data. Excluded values must not appear.
+        from millpond.main import _apply_filter
+
+        match_calls: list[tuple[str, int]] = []
+
+        def _counter_for(value):
+            counter = MagicMock()
+            counter.inc.side_effect = lambda n, v=value: match_calls.append((v, n))
+            return counter
+
+        mock_metrics.filter_matched_total.labels.side_effect = _counter_for
+        table = pa.table({"team_id": [2, 2, 2, 47074, 47074, 999]})
+        result = _apply_filter(table, self._cfg(keep="team_id"), (2, 47074))
+
+        assert result.num_rows == 5
+        assert sorted(match_calls) == [("2", 3), ("47074", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_matched_counts_skipped_on_empty_result(self, mock_metrics):
+        # Nothing kept -> no filter_matched_total activity at all.
+        from millpond.main import _apply_filter
+
+        table = pa.table({"team_id": [7, 8, 9]})
+        result = _apply_filter(table, self._cfg(keep="team_id"), (2,))
+        assert result.num_rows == 0
+        mock_metrics.filter_matched_total.labels.assert_not_called()
+
+    @patch("millpond.main.metrics")
     def test_int_values_coerce_to_string_column(self, mock_metrics):
         # When the column is string-typed and values parsed as int, the
         # values get cast to their canonical string form ("2") and matched

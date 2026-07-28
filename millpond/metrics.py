@@ -35,6 +35,12 @@ _records_skipped_total = Counter(
     "Records skipped",
     ["pipeline", "broker_source", "reason"],
 )
+_filter_matched_total = Counter(
+    "millpond_filter_matched_total",
+    "Records kept by the include filter, by matched filter value (team id). "
+    "Cardinality is bounded by the include set (static pins + CP discovery).",
+    ["pipeline", "broker_source", "value"],
+)
 _errors_total = Counter(
     "millpond_errors_total",
     "Errors by type",
@@ -213,6 +219,7 @@ records_consumed_total = _records_consumed_total
 records_written_total = _records_written_total
 batches_flushed_total = _batches_flushed_total
 records_skipped_total = _records_skipped_total
+filter_matched_total = _filter_matched_total
 errors_total = _errors_total
 flush_duration_seconds = _flush_duration_seconds
 arrow_conversion_seconds = _arrow_conversion_seconds
@@ -257,6 +264,7 @@ def init(pipeline: str, broker_source: str = ""):
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
+    global filter_matched_total
     global include_values_shadow_only_static, include_values_shadow_only_remote
     global include_values_pinned, include_values_pinned_only
     global rdkafka_replyq, rdkafka_msg_cnt, rdkafka_msg_size
@@ -268,6 +276,7 @@ def init(pipeline: str, broker_source: str = ""):
     records_consumed_total = _AutoCommonLabels(_records_consumed_total, pipeline, bs)
     batches_flushed_total = _AutoCommonLabels(_batches_flushed_total, pipeline, bs)
     records_skipped_total = _AutoCommonLabels(_records_skipped_total, pipeline, bs)
+    filter_matched_total = _AutoCommonLabels(_filter_matched_total, pipeline, bs)
     sort_skipped_total = _AutoCommonLabels(_sort_skipped_total, pipeline, bs)
     columns_coerced_total = _AutoCommonLabels(_columns_coerced_total, pipeline, bs)
     include_values_changes_total = _AutoCommonLabels(_include_values_changes_total, pipeline, bs)
