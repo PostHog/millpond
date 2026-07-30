@@ -62,20 +62,25 @@ class Config:
     # Broker source label for metrics (e.g. "msk", "warpstream")
     broker_source: str
 
-    # Optional record filter. Exactly one of `filter_keep_field` /
-    # `filter_drop_field` may be set; whichever is set names the column to
-    # check against `filter_values`. Keep = allowlist (keep records whose
-    # value is in filter_values, drop the rest). Drop = denylist (drop
-    # records whose value is in filter_values, keep the rest). Only the
-    # keep direction is implemented today; the drop slot reserves the
-    # namespace and the mutual-exclusion contract for a future add.
-    # `filter_values` is parsed at load time and is homogeneous — either a
-    # tuple of ints (if all comma-separated tokens parsed as int) or a tuple
-    # of strings (otherwise). main.py applies this after JSON→Arrow but
-    # before the pending buffer.
+    # Optional record filters. Keep = allowlist (keep records whose value
+    # in `filter_keep_field` is in `filter_values`, drop the rest). Drop =
+    # denylist (drop records whose value in `filter_drop_field` is in
+    # `filter_drop_values`, keep the rest). The directions COMPOSE: keep
+    # runs first, drop refines the survivors — that's the point (the keep
+    # side may be the CP-driven dynamic include set, while drop is a
+    # static operator blacklist, e.g. muting one tenant's firehose share
+    # during an incident). Each direction has its own values var so they
+    # never share a list. Values are parsed at load time and homogeneous —
+    # tuple of ints (if every comma-separated token parses as int) or of
+    # strings (otherwise). main.py applies both after JSON→Arrow but
+    # before the pending buffer. Failure semantics differ by direction
+    # (see main.py): an unevaluable ALLOWLIST drops the batch (fail
+    # closed); an unevaluable DENYLIST keeps it (fail open — a blacklist
+    # that can't evaluate must not turn schema drift into data loss).
     filter_keep_field: str | None
     filter_drop_field: str | None
     filter_values: tuple[int, ...] | tuple[str, ...] | None
+    filter_drop_values: tuple[int, ...] | tuple[str, ...] | None
 
     # Optional dynamic source for the keep-filter's include set (see
     # include_values.py). URL unset = today's static behavior. Mode
@@ -181,52 +186,56 @@ def _parse_filter_values(raw: str) -> tuple[int, ...] | tuple[str, ...]:
     """
     tokens = tuple(t.strip() for t in raw.split(",") if t.strip())
     if not tokens:
-        raise RuntimeError("MILLPOND_FILTER_VALUES must contain at least one value")
+        # Both directions parse through here; name both vars so a 3am
+        # operator debugging the drop side isn't misdirected to the keep var.
+        raise RuntimeError("MILLPOND_FILTER_VALUES / MILLPOND_FILTER_DROP_VALUES must contain at least one value")
     try:
         return tuple(int(t) for t in tokens)
     except ValueError:
         return tokens
 
 
-def _load_filter_fields() -> tuple[str | None, str | None, tuple[int, ...] | tuple[str, ...] | None]:
-    """Read MILLPOND_FILTER_{KEEP,DROP}_FIELD_NAME + MILLPOND_FILTER_VALUES.
+def _load_filter_fields() -> tuple[
+    str | None,
+    str | None,
+    tuple[int, ...] | tuple[str, ...] | None,
+    tuple[int, ...] | tuple[str, ...] | None,
+]:
+    """Read MILLPOND_FILTER_{KEEP,DROP}_FIELD_NAME + their values vars.
 
-    At most one of keep/drop may be set. If either is set, FILTER_VALUES is
-    required. Field names must be safe identifiers so misconfigurations
-    surface at startup rather than under load. Drop is reserved for a
-    future change — config rejects it explicitly with a clear message
-    rather than silently accepting and doing nothing.
+    Keep pairs with MILLPOND_FILTER_VALUES (unchanged contract); drop
+    pairs with MILLPOND_FILTER_DROP_VALUES. The directions may be set
+    together (keep ∩ ¬drop) or alone; each field-with-values pairing is
+    enforced so a half-configured filter surfaces at startup rather than
+    silently passing everything. Field names must be safe identifiers.
+
+    Note: the original drop reservation shared MILLPOND_FILTER_VALUES.
+    Implemented drop uses its OWN values var instead — sharing one list
+    between an allowlist and a denylist would make the composed case
+    (CP-driven keep + operator blacklist) unexpressible.
     """
     keep = os.environ.get("MILLPOND_FILTER_KEEP_FIELD_NAME", "").strip() or None
     drop = os.environ.get("MILLPOND_FILTER_DROP_FIELD_NAME", "").strip() or None
     values_raw = os.environ.get("MILLPOND_FILTER_VALUES", "").strip()
+    drop_values_raw = os.environ.get("MILLPOND_FILTER_DROP_VALUES", "").strip()
 
-    if keep and drop:
-        raise RuntimeError("MILLPOND_FILTER_KEEP_FIELD_NAME and MILLPOND_FILTER_DROP_FIELD_NAME are mutually exclusive")
+    if bool(keep) != bool(values_raw):
+        raise RuntimeError("MILLPOND_FILTER_VALUES must be set together with MILLPOND_FILTER_KEEP_FIELD_NAME")
+    if bool(drop) != bool(drop_values_raw):
+        raise RuntimeError("MILLPOND_FILTER_DROP_VALUES must be set together with MILLPOND_FILTER_DROP_FIELD_NAME")
 
-    active = keep or drop
-    if bool(active) != bool(values_raw):
-        raise RuntimeError(
-            "MILLPOND_FILTER_VALUES must be set together with "
-            "MILLPOND_FILTER_KEEP_FIELD_NAME (or MILLPOND_FILTER_DROP_FIELD_NAME)"
-        )
+    for field in (keep, drop):
+        if field is not None and not _SAFE_COLUMN_NAME.match(field):
+            raise RuntimeError(
+                f"Filter field name {field!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+            )
 
-    if active is None:
-        return None, None, None
-
-    if not _SAFE_COLUMN_NAME.match(active):
-        raise RuntimeError(
-            f"Filter field name {active!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
-        )
-
-    if drop:
-        # Reserved for a future change; rejecting explicitly today keeps the
-        # env-var namespace and the keep/drop mutual-exclusion contract
-        # stable so a later commit can flip the implementation on without
-        # any operator-facing config rename.
-        raise RuntimeError("MILLPOND_FILTER_DROP_FIELD_NAME is reserved for a future release; not implemented yet")
-
-    return keep, None, _parse_filter_values(values_raw)
+    return (
+        keep,
+        drop,
+        _parse_filter_values(values_raw) if keep else None,
+        _parse_filter_values(drop_values_raw) if drop else None,
+    )
 
 
 def _load_include_values_config(
@@ -496,7 +505,7 @@ def load() -> Config:
             "(allowed: earliest, latest) so the value gets validated."
         )
 
-    filter_keep_field, filter_drop_field, filter_values = _load_filter_fields()
+    filter_keep_field, filter_drop_field, filter_values, filter_drop_values = _load_filter_fields()
     sort_by = _load_sort_by()
     typed_columns = _load_typed_columns()
 
@@ -518,6 +527,7 @@ def load() -> Config:
         filter_keep_field=filter_keep_field,
         filter_drop_field=filter_drop_field,
         filter_values=filter_values,
+        filter_drop_values=filter_drop_values,
         **_load_include_values_config(filter_keep_field, filter_values),
         sort_by=sort_by,
         typed_columns=typed_columns,
@@ -547,6 +557,8 @@ def load() -> Config:
     )
     if cfg.filter_keep_field is not None:
         log.info("Filter (keep): %s in %s", cfg.filter_keep_field, cfg.filter_values)
+    if cfg.filter_drop_field is not None:
+        log.info("Filter (drop): %s in %s", cfg.filter_drop_field, cfg.filter_drop_values)
     if cfg.sort_by is not None:
         log.info("Sort by: %s (ascending)", ", ".join(cfg.sort_by))
     if cfg.typed_columns is not None:

@@ -97,8 +97,8 @@ def _apply_filter(table: pa.Table, cfg: config.Config, values: tuple[int, ...] |
          the consume loop.
 
     No-op when filter not configured. The drop-direction filter is
-    reserved at the config layer but not implemented here yet — config
-    rejects it explicitly at startup.
+    implemented separately in _apply_drop_filter, applied AFTER this one
+    (keep ∩ ¬drop).
     """
     if cfg.filter_keep_field is None or values is None:
         return table
@@ -166,6 +166,65 @@ def _apply_filter(table: pa.Table, cfg: config.Config, values: tuple[int, ...] |
         # over the minority the filter retained.
         for chunk in pc.value_counts(filtered[field]).to_pylist():
             metrics.filter_matched_total.labels(value=str(chunk["values"])).inc(chunk["counts"])
+    return filtered
+
+
+def _apply_drop_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
+    """Apply the drop-direction filter (denylist): drop records whose value
+    in `filter_drop_field` is in `filter_drop_values`; keep everything else.
+    Runs AFTER the keep-filter — the composed semantics are keep ∩ ¬drop
+    (e.g. the CP-driven include set minus an operator blacklist).
+
+    Failure semantics are the OPPOSITE of the keep-filter, deliberately:
+    an allowlist that can't evaluate fails closed (dropping the batch is
+    the conservative reading of "only deliver what's on the list"), but a
+    denylist that can't evaluate fails OPEN — keeping the batch leaks the
+    blacklisted minority temporarily, while dropping it would turn a
+    schema hiccup into data loss for every tenant. Unevaluable batches
+    WARN and pass through unchanged. Null field values are kept for the
+    same reason (a null can't match the blacklist).
+
+    Dropped rows count under `records_skipped_total{reason="filter_dropped"}`.
+    """
+    if cfg.filter_drop_field is None or cfg.filter_drop_values is None:
+        return table
+
+    field = cfg.filter_drop_field
+    if field not in table.column_names:
+        log.warning("Drop-filter field %r missing from batch; keeping batch unchanged (fail-open)", field)
+        return table
+
+    column = table[field]
+    if not (
+        pa.types.is_integer(column.type) or pa.types.is_string(column.type) or pa.types.is_large_string(column.type)
+    ):
+        log.warning(
+            "Drop-filter field %r has unsupported type %s; keeping batch unchanged (fail-open)",
+            field,
+            column.type,
+        )
+        return table
+
+    try:
+        value_array = pa.array(cfg.filter_drop_values).cast(column.type)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as e:
+        log.warning(
+            "Drop-filter values %r incompatible with column %r type %s (%s); keeping batch unchanged (fail-open)",
+            cfg.filter_drop_values,
+            field,
+            column.type,
+            e,
+        )
+        return table
+
+    # is_in returns false-or-null for null inputs depending on pyarrow
+    # version; fill_null(False) normalizes either way, keeping null rows
+    # (a null can't match the blacklist — fail-open, see docstring).
+    drop_mask = pc.fill_null(pc.is_in(column, value_array), False)
+    filtered = table.filter(pc.invert(drop_mask))
+    n_dropped = len(table) - len(filtered)
+    if n_dropped > 0:
+        metrics.records_skipped_total.labels(reason="filter_dropped").inc(n_dropped)
     return filtered
 
 
@@ -451,6 +510,7 @@ def main():
                         skipped = len(values) - len(table)
                         table = _coerce_columns(table, cfg)
                         table = _apply_filter(table, cfg, include_source.current())
+                        table = _apply_drop_filter(table, cfg)
                         if len(table) > 0:
                             pending.append(table)
                             pending_bytes += table.nbytes
