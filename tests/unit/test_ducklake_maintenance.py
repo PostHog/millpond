@@ -177,13 +177,31 @@ class TestArgparse:
         # argparse defaults read COMPACTION_* env at parser-build time, so a
         # lingering shell override (the justfile exports COMPACTION_MAX_FILES)
         # would make this test flaky — isolate and rebuild the parser.
-        for var in ("COMPACTION_THREADS", "COMPACTION_MEMORY_LIMIT", "COMPACTION_MAX_FILES"):
+        for var in (
+            "COMPACTION_THREADS",
+            "COMPACTION_MEMORY_LIMIT",
+            "COMPACTION_MAX_FILES",
+            "COMPACTION_MAX_OUTPUTS_PER_CALL",
+        ):
             monkeypatch.delenv(var, raising=False)
         parser = ducklake_maintenance.build_parser()
         args = parser.parse_args(["compact", "--tier", "1"])
         assert args.threads == 2
         assert args.memory_limit == "4GB"
         assert args.max_compacted_files == 80  # fallback aligned with justfile export
+        assert args.max_outputs_per_call is None  # unset = legacy single-call mode
+
+    def test_max_outputs_per_call_env(self, monkeypatch):
+        monkeypatch.setenv("COMPACTION_MAX_OUTPUTS_PER_CALL", "10")
+        parser = ducklake_maintenance.build_parser()
+        args = parser.parse_args(["compact", "--tier", "3"])
+        assert args.max_outputs_per_call == 10
+
+    def test_max_outputs_per_call_empty_env_is_unset(self, monkeypatch):
+        monkeypatch.setenv("COMPACTION_MAX_OUTPUTS_PER_CALL", "")
+        parser = ducklake_maintenance.build_parser()
+        args = parser.parse_args(["compact", "--tier", "3"])
+        assert args.max_outputs_per_call is None
 
     def test_compact_threads_memory_override(self):
         args = self.parser.parse_args(
@@ -825,18 +843,24 @@ class TestHeartbeat:
         assert net is None or (isinstance(net, tuple) and len(net) == 2 and all(v >= 0 for v in net))
 
 
-def _compact_conn(tables, merge_rows=None, fail_tables=(), candidates=(100, 1000)):
+def _compact_conn(tables, merge_rows=None, fail_tables=(), candidates=(100, 1000), merge_rows_seq=None):
     """A duckdb-conn-shaped MagicMock driving the per-table compact() flow.
 
     tables: (schema, table) pairs the candidate-driven enumeration returns
     (the mock returns them verbatim — production orders by backlog DESC).
-    merge_rows: {table_name: result rows} for its merge CALL (default []).
+    merge_rows: {table_name: result rows} for its merge CALL (default []) —
+    the SAME rows for every call to that table.
+    merge_rows_seq: {table_name: [rows_call1, rows_call2, ...]} — per-call
+    sequence for multi-call (max_outputs_per_call) tests; exhausted → [].
+    An Exception instance in the sequence is RAISED on that call (mid-loop
+    failure injection). Takes precedence over merge_rows for tables it names.
     fail_tables: table names whose merge CALL raises.
     """
     conn = MagicMock()
     # The CALL's table name is its second positional arg — parse it instead of
     # substring-matching, so a mock defect can't masquerade as a table failure.
     call_re = re.compile(r"ducklake_merge_adjacent_files\('[^']*', '([^']*)'")
+    seq_state = {k: list(v) for k, v in (merge_rows_seq or {}).items()}
 
     def _execute(sql, *a, **k):
         res = MagicMock()
@@ -849,7 +873,13 @@ def _compact_conn(tables, merge_rows=None, fail_tables=(), candidates=(100, 1000
             name = m.group(1)
             if name in fail_tables:
                 raise RuntimeError("DuckLakeCompactor: Files have different hive partition path")
-            res.fetchall.return_value = (merge_rows or {}).get(name, [])
+            if name in seq_state:
+                step = seq_state[name].pop(0) if seq_state[name] else []
+                if isinstance(step, Exception):
+                    raise step
+                res.fetchall.return_value = step
+            else:
+                res.fetchall.return_value = (merge_rows or {}).get(name, [])
         elif "ducklake_options" in sql:
             res.fetchone.return_value = ("134217728",)  # 128MiB, restore path
         elif "ducklake_data_file" in sql:
@@ -912,6 +942,219 @@ class TestCompactSql:
         )
 
         assert not _merge_calls(conn)
+
+
+class TestOutputsPerCall:
+    """max_outputs_per_call: many small always-committable txns per run.
+
+    The fork CALL's `max_compacted_files =>` bounds OUTPUT files (txn size),
+    while compact()'s run budget accounts INPUT files consumed. Unset must
+    be byte-identical legacy (single call per table, whole grant); set must
+    re-call each table with the small cap until the grant/budget drains or
+    a call produces nothing."""
+
+    _R = staticmethod(lambda n_inputs: [("posthog", "events_nrt", n_inputs, 10)])
+
+    def test_unset_is_legacy_single_call(self):
+        conn = _compact_conn(
+            [("main", "events_nrt")],
+            merge_rows={"events_nrt": [("main", "events_nrt", 929, 5)]},
+        )
+        ducklake_maintenance.compact(
+            conn, tier=3, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+        calls = _merge_calls(conn)
+        assert len(calls) == 1
+        # Single-table: whole budget in one call, exactly as before.
+        assert "max_compacted_files => 10" in calls[0]
+
+    def test_capped_recalls_until_budget_consumed(self):
+        # Budget 3000 inputs, cap 10 outputs/call; each call consumes 1000
+        # inputs -> exactly 3 calls, all with the small cap.
+        conn = _compact_conn(
+            [("main", "events_nrt")],
+            merge_rows_seq={"events_nrt": [self._R(1000), self._R(1000), self._R(1000), self._R(1000)]},
+        )
+        ducklake_maintenance.compact(
+            conn,
+            tier=3,
+            table=None,
+            dry_run=False,
+            threads=2,
+            memory_limit="16GB",
+            max_compacted_files=3000,
+            max_outputs_per_call=10,
+        )
+        calls = _merge_calls(conn)
+        assert len(calls) == 3
+        assert all("max_compacted_files => 10" in c for c in calls)
+
+    def test_capped_stops_when_table_drains(self):
+        # Second call returns nothing -> table drained; no third call, and
+        # the table is NOT counted as a no-op (it did work on call 1).
+        conn = _compact_conn(
+            [("main", "events_nrt")],
+            merge_rows_seq={"events_nrt": [self._R(500)]},
+        )
+        ducklake_maintenance.compact(
+            conn,
+            tier=3,
+            table=None,
+            dry_run=False,
+            threads=2,
+            memory_limit="16GB",
+            max_compacted_files=10000,
+            max_outputs_per_call=10,
+        )
+        assert len(_merge_calls(conn)) == 2  # work, then empty -> stop
+
+    def test_capped_first_call_empty_counts_noop(self, caplog):
+        conn = _compact_conn([("main", "events_nrt")], merge_rows_seq={"events_nrt": []})
+        with caplog.at_level(logging.INFO, logger="maintenance"):
+            ducklake_maintenance.compact(
+                conn,
+                tier=3,
+                table=None,
+                dry_run=False,
+                threads=2,
+                memory_limit="16GB",
+                max_compacted_files=10000,
+                max_outputs_per_call=10,
+            )
+        assert len(_merge_calls(conn)) == 1
+        assert "zero merge groups" in caplog.text
+
+    def test_capped_multi_table_drain_then_next_table(self):
+        # Table A drains (two productive calls then empty); table B still
+        # gets served. Nothing fails.
+        conn = _compact_conn(
+            [("main", "aaa"), ("main", "bbb")],
+            merge_rows_seq={
+                "aaa": [
+                    [("main", "aaa", 100, 10)],
+                    [("main", "aaa", 100, 10)],
+                ],
+                "bbb": [[("main", "bbb", 50, 5)]],
+            },
+        )
+        n_failed = ducklake_maintenance.compact(
+            conn,
+            tier=3,
+            table=None,
+            dry_run=False,
+            threads=2,
+            memory_limit="16GB",
+            max_compacted_files=1000,
+            max_outputs_per_call=10,
+        )
+        calls = _merge_calls(conn)
+        # aaa: 2 productive + 1 empty (drained) = 3; bbb: 1 productive + 1 empty = 2
+        assert len([c for c in calls if "'aaa'" in c]) == 3
+        assert len([c for c in calls if "'bbb'" in c]) == 2
+        assert n_failed == 0
+
+    def test_capped_mid_loop_failure_keeps_progress_and_serves_next_table(self, caplog):
+        # Table A: two productive calls, then the THIRD call raises — A is
+        # counted failed, its committed progress stands (rows from calls 1-2
+        # stay in the summary), and table B still gets served.
+        conn = _compact_conn(
+            [("main", "aaa"), ("main", "bbb")],
+            merge_rows_seq={
+                "aaa": [
+                    [("main", "aaa", 100, 10)],
+                    [("main", "aaa", 100, 10)],
+                    RuntimeError("DuckLakeCompactor: Files have different hive partition path"),
+                ],
+                "bbb": [[("main", "bbb", 50, 5)]],
+            },
+        )
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            n_failed = ducklake_maintenance.compact(
+                conn,
+                tier=3,
+                table=None,
+                dry_run=False,
+                threads=2,
+                memory_limit="16GB",
+                max_compacted_files=1000,
+                max_outputs_per_call=10,
+            )
+        calls = _merge_calls(conn)
+        assert len([c for c in calls if "'aaa'" in c]) == 3  # 2 productive + 1 failing
+        assert len([c for c in calls if "'bbb'" in c]) == 2  # productive + drain probe
+        assert n_failed == 1
+        assert "1/2 table(s) failed" in caplog.text
+
+    def test_capped_zero_input_rows_fail_loudly_not_forever(self):
+        # Progress guard: rows with zero inputs consumed must classify the
+        # table as failed (loud) instead of re-issuing identical merge txns
+        # until the activeDeadline kills the pod.
+        conn = _compact_conn(
+            [("main", "aaa")],
+            merge_rows_seq={"aaa": [[("main", "aaa", 0, 10)]] * 5},
+        )
+        n_failed = ducklake_maintenance.compact(
+            conn,
+            tier=3,
+            table=None,
+            dry_run=False,
+            threads=2,
+            memory_limit="16GB",
+            max_compacted_files=1000,
+            max_outputs_per_call=10,
+        )
+        assert len(_merge_calls(conn)) == 1  # no retry storm
+        assert n_failed == 1
+
+    def test_single_table_form_honors_cap(self):
+        # A manual `compact --table X` in a pod with the env set must NOT
+        # silently issue one giant txn — the loop applies there too.
+        conn = _compact_conn(
+            [],
+            merge_rows_seq={"events_nrt": [self._R(1000), self._R(1000)]},
+        )
+        ducklake_maintenance.compact(
+            conn,
+            tier=3,
+            table="events_nrt",
+            dry_run=False,
+            threads=2,
+            memory_limit="16GB",
+            max_compacted_files=5000,
+            max_outputs_per_call=10,
+        )
+        calls = _merge_calls(conn)
+        assert len(calls) == 3  # 2 productive + drain probe
+        assert all("max_compacted_files => 10" in c for c in calls)
+
+    def test_capped_respects_run_budget_mid_table(self):
+        # Budget 150 inputs; first call eats 100, second eats 100 -> budget
+        # crossed; no third call for this table and none for the next.
+        conn = _compact_conn(
+            [("main", "aaa"), ("main", "bbb")],
+            merge_rows_seq={
+                "aaa": [[("main", "aaa", 100, 10)], [("main", "aaa", 100, 10)], [("main", "aaa", 100, 10)]],
+                "bbb": [[("main", "bbb", 50, 5)]],
+            },
+        )
+        ducklake_maintenance.compact(
+            conn,
+            tier=3,
+            table=None,
+            dry_run=False,
+            threads=2,
+            memory_limit="16GB",
+            max_compacted_files=150,
+            max_outputs_per_call=10,
+        )
+        calls = _merge_calls(conn)
+        # multi-table grant = max(1, 150//2) = 75 -> aaa's first call (100
+        # inputs) already exceeds its grant -> ONE aaa call; bbb then gets
+        # grant min(remaining=50, 75) = 50, and its one call consumes all
+        # 50 -> budget exactly exhausted -> loop stops WITHOUT a wasted
+        # drain-probe call.
+        assert len([c for c in calls if "'aaa'" in c]) == 1
+        assert len([c for c in calls if "'bbb'" in c]) == 1
 
 
 class TestCompactPerTable:
