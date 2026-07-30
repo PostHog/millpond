@@ -358,20 +358,52 @@ class TestFilterConfig:
         with pytest.raises(RuntimeError, match="MILLPOND_FILTER_VALUES"):
             load()
 
-    def test_keep_and_drop_mutually_exclusive(self, monkeypatch):
-        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+    def test_drop_alone_parsed(self, monkeypatch):
         monkeypatch.setenv("MILLPOND_FILTER_DROP_FIELD_NAME", "team_id")
-        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1,2")
-        with pytest.raises(RuntimeError, match="mutually exclusive"):
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_VALUES", "47074")
+        cfg = load()
+        assert cfg.filter_drop_field == "team_id"
+        assert cfg.filter_drop_values == (47074,)
+        assert cfg.filter_keep_field is None
+        assert cfg.filter_values is None
+
+    def test_keep_and_drop_compose(self, monkeypatch):
+        # The load-shedding case this exists for: CP-driven keep-filter
+        # stays authoritative while an operator blacklist subtracts one
+        # tenant. Each direction pairs with its OWN values var.
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1,2,47074")
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_VALUES", "47074")
+        cfg = load()
+        assert cfg.filter_keep_field == "team_id"
+        assert cfg.filter_values == (1, 2, 47074)
+        assert cfg.filter_drop_field == "team_id"
+        assert cfg.filter_drop_values == (47074,)
+
+    def test_drop_field_without_drop_values_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_FIELD_NAME", "team_id")
+        with pytest.raises(RuntimeError, match="MILLPOND_FILTER_DROP_VALUES"):
             load()
 
-    def test_drop_direction_rejected_until_implemented(self, monkeypatch):
-        # Reserved namespace: drop is parsed and validated but explicitly
-        # refused so an operator setting it today gets a clear startup
-        # error rather than silently no-filtering.
+    def test_drop_values_without_drop_field_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_VALUES", "1,2")
+        with pytest.raises(RuntimeError, match="MILLPOND_FILTER_DROP_VALUES"):
+            load()
+
+    def test_drop_does_not_pair_with_keep_values(self, monkeypatch):
+        # The original reservation shared MILLPOND_FILTER_VALUES; the
+        # implementation deliberately does not — a drop field with only
+        # the keep-values var set is half-configured and must refuse.
         monkeypatch.setenv("MILLPOND_FILTER_DROP_FIELD_NAME", "team_id")
         monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1,2")
-        with pytest.raises(RuntimeError, match="reserved for a future release"):
+        with pytest.raises(RuntimeError, match="MILLPOND_FILTER"):
+            load()
+
+    def test_unsafe_drop_field_name_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_FIELD_NAME", "team_id; DROP TABLE x")
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_VALUES", "1")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
             load()
 
     def test_unsafe_field_name_rejected(self, monkeypatch):

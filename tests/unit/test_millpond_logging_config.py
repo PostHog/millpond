@@ -63,6 +63,7 @@ def _minimal_config() -> Config:
         filter_keep_field=None,
         filter_drop_field=None,
         filter_values=None,
+        filter_drop_values=None,
         include_values_url=None,
         include_values_mode="shadow",
         include_values_poll_interval_s=60.0,

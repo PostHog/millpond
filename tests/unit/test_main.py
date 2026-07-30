@@ -646,6 +646,103 @@ def _capture_sort_skip_calls(mock_metrics):
     return sort_calls
 
 
+class TestApplyDropFilter:
+    """Drop-direction (denylist) filter. Composes AFTER the keep-filter;
+    fail-open on anything unevaluable (the opposite of keep — see the
+    docstring on _apply_drop_filter for why)."""
+
+    def _cfg(self, *, drop=None, drop_values=None):
+        cfg = MagicMock()
+        cfg.filter_drop_field = drop
+        cfg.filter_drop_values = drop_values
+        return cfg
+
+    def test_no_op_when_unconfigured(self):
+        from millpond.main import _apply_drop_filter
+
+        table = pa.table({"team_id": [1, 2, 3]})
+        result = _apply_drop_filter(table, self._cfg())
+        assert result is table
+
+    @patch("millpond.main.metrics")
+    def test_int_denylist_drops_matching_rows(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [1, 47074, 3, 47074, 5], "event": ["a", "b", "c", "d", "e"]})
+        result = _apply_drop_filter(table, self._cfg(drop="team_id", drop_values=(47074,)))
+
+        assert result.column("team_id").to_pylist() == [1, 3, 5]
+        assert result.column("event").to_pylist() == ["a", "c", "e"]
+        assert skip_calls == [("filter_dropped", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_string_values_cast_to_int_column(self, mock_metrics):
+        # Operator wrote MILLPOND_FILTER_DROP_VALUES with a stray
+        # non-numeric token → whole tuple parses as strings; safe cast to
+        # the int64 column must still match.
+        from millpond.main import _apply_drop_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [1, 47074, 3]})
+        result = _apply_drop_filter(table, self._cfg(drop="team_id", drop_values=("47074",)))
+        assert result.column("team_id").to_pylist() == [1, 3]
+
+    @patch("millpond.main.metrics")
+    def test_missing_field_fails_open(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"other": [1, 2, 3]})
+        result = _apply_drop_filter(table, self._cfg(drop="team_id", drop_values=(47074,)))
+        # Batch unchanged — a blacklist that can't evaluate must not drop.
+        assert result is table
+        assert skip_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_unsupported_column_type_fails_open(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": pa.array([1.5, 2.5], pa.float64())})
+        result = _apply_drop_filter(table, self._cfg(drop="team_id", drop_values=(47074,)))
+        assert result is table
+
+    @patch("millpond.main.metrics")
+    def test_uncastable_values_fail_open(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [1, 2]})
+        result = _apply_drop_filter(table, self._cfg(drop="team_id", drop_values=("not-a-number",)))
+        assert result is table
+
+    @patch("millpond.main.metrics")
+    def test_null_field_values_are_kept(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": pa.array([1, None, 47074], pa.int64())})
+        result = _apply_drop_filter(table, self._cfg(drop="team_id", drop_values=(47074,)))
+        # Null can't match a blacklist → kept; only the real match drops.
+        assert result.column("team_id").to_pylist() == [1, None]
+        assert skip_calls == [("filter_dropped", 1)]
+
+    @patch("millpond.main.metrics")
+    def test_composes_with_keep_filter(self, mock_metrics):
+        # The production shape: CP include set says {2, 47074, 50689},
+        # blacklist says drop 47074 → survivors are keep ∩ ¬drop.
+        from millpond.main import _apply_drop_filter, _apply_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = pa.table({"team_id": [2, 47074, 50689, 99999]})
+        keep_cfg = MagicMock()
+        keep_cfg.filter_keep_field = "team_id"
+        kept = _apply_filter(table, keep_cfg, (2, 47074, 50689))
+        result = _apply_drop_filter(kept, self._cfg(drop="team_id", drop_values=(47074,)))
+        assert result.column("team_id").to_pylist() == [2, 50689]
+
+
 class TestApplySort:
     """Hot-path pre-write sort behaviour.
 
