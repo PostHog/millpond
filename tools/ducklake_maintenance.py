@@ -1977,6 +1977,7 @@ def compact(
     threads: int,
     memory_limit: str,
     max_compacted_files: int,
+    max_outputs_per_call: int | None = None,
 ) -> int:
     """Compact files in tier N (1, 2, or 3) for the catalog or one table.
 
@@ -1985,6 +1986,19 @@ def compact(
     propagates its error raw instead). main() exports this as the
     maintenance_compact_tables_failed gauge so a permanently-poisoned
     table is alertable even though partial failure deliberately exits 0.
+
+    max_outputs_per_call decouples per-TRANSACTION size from the per-RUN
+    budget. The fork CALL's `max_compacted_files =>` bounds OUTPUT files
+    (txn size ~ outputs x target_file_size), while this function's run
+    budget accounts INPUT files consumed. Unset (default): one CALL per
+    table with the legacy grant — byte-identical behavior to before the
+    knob existed. Set: each CALL is capped at this many outputs and a
+    table is called REPEATEDLY (until its grant or the run budget is
+    consumed, or a call produces nothing) — many small always-committable
+    transactions per run instead of one. Built for the megaduck source
+    catalog, where a single large merge txn cannot commit inside the
+    activeDeadline (documented DeadlineExceeded history) but dozens of
+    ~10-output txns per run converge its tier-3 backlog.
     """
     spec = TIERS[tier]
     min_b, max_b, target = spec["min"], spec["max"], spec["target"]
@@ -2043,13 +2057,29 @@ def compact(
     noop_tables = 0
 
     if table:
-        # Single-table invocation: unchanged one-CALL semantics; an error
-        # propagates raw, exactly as before.
-        sql = _merge_adjacent_call(None, table, args, max_compacted_files)
+        # Single-table invocation. Errors propagate raw, exactly as before.
+        # max_outputs_per_call applies here too (review finding: silently
+        # ignoring the pod-wide env on a manual `compact --table` run would
+        # issue exactly the giant single txn the knob exists to prevent).
         heartbeat = _start_heartbeat(conn, f"compact tier-{tier} merge")
         try:
             with _scoped_target_file_size(conn, target):
-                result = conn.execute(sql).fetchall()
+                remaining = max_compacted_files
+                while remaining > 0:
+                    call_cap = remaining if max_outputs_per_call is None else min(max_outputs_per_call, remaining)
+                    sql = _merge_adjacent_call(None, table, args, call_cap)
+                    rows = conn.execute(sql).fetchall()
+                    if any(len(r) < 4 for r in rows):
+                        raise ValueError(f"unexpected merge result shape: {rows[:2]!r}")
+                    if not rows:
+                        break
+                    consumed = sum(r[2] for r in rows)
+                    if consumed <= 0:
+                        raise ValueError(f"merge returned rows but zero inputs consumed: {rows[:2]!r}")
+                    result.extend(rows)
+                    remaining -= consumed
+                    if max_outputs_per_call is None:
+                        break
         finally:
             heartbeat.set()
     else:
@@ -2102,52 +2132,89 @@ def compact(
                     )
                     break
                 grant = remaining if table_total == 1 else min(remaining, max(1, max_compacted_files // 2))
-                sql = _merge_adjacent_call(schema_name, table_name, args, grant)
-                heartbeat = _start_heartbeat(conn, f"compact tier-{tier} {schema_name}.{table_name}")
-                try:
-                    rows = conn.execute(sql).fetchall()
-                    # Validate shape BEFORE mutating shared state: if a fork/
-                    # version drift changes the CALL's result schema, this
-                    # table's accounting fails loudly but the run-wide
-                    # aggregation below never sees malformed rows.
-                    if any(len(r) < 4 for r in rows):
-                        raise ValueError(f"unexpected merge result shape: {rows[:2]!r}")
-                    if not rows:
-                        # >= 2 in-band files but zero merge groups: candidates
-                        # are per-partition singletons, row-id-non-contiguous,
-                        # or otherwise unmergeable. Counted so a catalog full
-                        # of these is visible, not a silent perpetual no-op.
-                        noop_tables += 1
-                    consumed = sum(r[2] for r in rows)
-                    result.extend(rows)
-                    remaining -= consumed
-                except duckdb.CatalogException:
-                    # Table vanished between enumeration and the CALL (dropped
-                    # mid-run) — benign, don't count it as a failure.
-                    log.warning(
-                        "compact tier-%d: %s.%s disappeared before merge (dropped?); skipping",
-                        tier,
-                        schema_name,
-                        table_name,
+                # Inner loop: legacy mode (max_outputs_per_call unset) makes
+                # exactly ONE call with the whole grant — unchanged behavior.
+                # Capped mode re-calls the same table with small per-txn
+                # output caps until the grant/budget is consumed or a call
+                # produces nothing (table drained for this tier).
+                call_idx = 0
+                while grant > 0 and remaining > 0:
+                    # min() with the grant: when the remaining grant is
+                    # smaller than the cap, degrade to exactly legacy
+                    # semantics — never issue a larger per-txn cap than the
+                    # legacy single call would have.
+                    call_cap = grant if max_outputs_per_call is None else min(max_outputs_per_call, grant)
+                    sql = _merge_adjacent_call(schema_name, table_name, args, call_cap)
+                    heartbeat = _start_heartbeat(
+                        conn,
+                        f"compact tier-{tier} {schema_name}.{table_name}"
+                        + (f" call {call_idx + 1}" if call_idx else ""),
                     )
-                except Exception:
-                    # Continue-on-error relies on the connection SURVIVING the
-                    # failed CALL (verified on duckdb 1.5.2 even for
-                    # InternalException, and pinned end-to-end by
-                    # test_compaction_isolation_integration). If a future
-                    # duckdb bump invalidates the instance on INTERNAL errors,
-                    # every table fails, the failure summary + gauge spike,
-                    # and the target_file_size restore raises — noisy, not
-                    # silent.
-                    failed.append(f"{schema_name}.{table_name}")
-                    log.exception(
-                        "compact tier-%d: %s.%s failed; continuing with remaining tables",
-                        tier,
-                        schema_name,
-                        table_name,
-                    )
-                finally:
-                    heartbeat.set()
+                    try:
+                        rows = conn.execute(sql).fetchall()
+                        # Validate shape BEFORE mutating shared state: if a fork/
+                        # version drift changes the CALL's result schema, this
+                        # table's accounting fails loudly but the run-wide
+                        # aggregation below never sees malformed rows.
+                        if any(len(r) < 4 for r in rows):
+                            raise ValueError(f"unexpected merge result shape: {rows[:2]!r}")
+                        if not rows:
+                            if call_idx == 0:
+                                # >= 2 in-band files but zero merge groups:
+                                # candidates are per-partition singletons,
+                                # row-id-non-contiguous, or otherwise
+                                # unmergeable. Counted so a catalog full of
+                                # these is visible, not a silent perpetual
+                                # no-op. (An empty LATER call just means the
+                                # table drained — not a no-op table.)
+                                noop_tables += 1
+                            break
+                        consumed = sum(r[2] for r in rows)
+                        if consumed <= 0:
+                            # Progress guard: termination of this loop rests
+                            # on every productive call consuming >= 2 inputs
+                            # (a merge group by definition). A fork bump that
+                            # reorders result columns or emits zero-input
+                            # rows must fail THIS table loudly, not re-issue
+                            # identical merge txns until the activeDeadline
+                            # kills the pod.
+                            raise ValueError(f"merge returned rows but zero inputs consumed: {rows[:2]!r}")
+                        result.extend(rows)
+                        remaining -= consumed
+                        grant -= consumed
+                    except duckdb.CatalogException:
+                        # Table vanished between enumeration and the CALL
+                        # (dropped mid-run) — benign, not a failure.
+                        log.warning(
+                            "compact tier-%d: %s.%s disappeared before merge (dropped?); skipping",
+                            tier,
+                            schema_name,
+                            table_name,
+                        )
+                        break
+                    except Exception:
+                        # Continue-on-error relies on the connection SURVIVING
+                        # the failed CALL (verified on duckdb 1.5.2 even for
+                        # InternalException, and pinned end-to-end by
+                        # test_compaction_isolation_integration). If a future
+                        # duckdb bump invalidates the instance on INTERNAL
+                        # errors, every table fails, the failure summary +
+                        # gauge spike, and the target_file_size restore raises
+                        # — noisy, not silent. A mid-loop failure keeps the
+                        # progress already committed by earlier calls.
+                        failed.append(f"{schema_name}.{table_name}")
+                        log.exception(
+                            "compact tier-%d: %s.%s failed; continuing with remaining tables",
+                            tier,
+                            schema_name,
+                            table_name,
+                        )
+                        break
+                    finally:
+                        heartbeat.set()
+                    call_idx += 1
+                    if max_outputs_per_call is None:
+                        break
     elapsed = time.monotonic() - t0
 
     # Aggregate result rows (one per output group: schema, table, input_files, output_files)
@@ -2383,7 +2450,22 @@ def build_parser() -> argparse.ArgumentParser:
         # Fallback matches the justfile's exported default: a direct python
         # invocation must not be 1250x more aggressive than `just compact-*`.
         default=_positive_int(os.environ.get("COMPACTION_MAX_FILES", "80")),
-        help="Cap on files merged per run (default $COMPACTION_MAX_FILES or 80)",
+        help="Cap on INPUT files merged per run (default $COMPACTION_MAX_FILES or 80)",
+    )
+    p.add_argument(
+        "--max-outputs-per-call",
+        type=_positive_int,
+        default=(
+            _positive_int(os.environ["COMPACTION_MAX_OUTPUTS_PER_CALL"])
+            if os.environ.get("COMPACTION_MAX_OUTPUTS_PER_CALL")
+            else None
+        ),
+        help=(
+            "Cap OUTPUT files per merge CALL/transaction (txn size ~ this x "
+            "target_file_size) and re-call each table until its grant is "
+            "consumed. Unset = legacy single-call-per-table behavior. "
+            "(default $COMPACTION_MAX_OUTPUTS_PER_CALL or unset)"
+        ),
     )
 
     # compact-probe
@@ -2487,6 +2569,7 @@ def main(argv: list[str] | None = None) -> None:
                     args.threads,
                     args.memory_limit,
                     args.max_compacted_files,
+                    max_outputs_per_call=args.max_outputs_per_call,
                 )
                 compact_tables_failed.labels(tier=str(args.tier)).set(n_failed)
             case "compact-probe":
