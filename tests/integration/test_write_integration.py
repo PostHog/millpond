@@ -52,8 +52,7 @@ class TestWritePath:
         write(conn, "events", batch, cache)
 
         cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            "SELECT column_name FROM information_schema.columns WHERE table_catalog = 'lake' AND table_name = 'events'"
         ).fetchall()
         col_names = {row[0] for row in cols}
         assert "_inserted_at" in col_names
@@ -72,8 +71,7 @@ class TestWritePath:
         write(conn, "events", batch, cache)
 
         cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            "SELECT column_name FROM information_schema.columns WHERE table_catalog = 'lake' AND table_name = 'events'"
         ).fetchall()
         col_names = {row[0] for row in cols}
         assert "a" in col_names
@@ -151,8 +149,7 @@ class TestVariantDualWrite:
         write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
 
         rows = conn.execute(
-            "SELECT id, properties, properties_variant IS NULL AS vnull "
-            "FROM lake.main.events ORDER BY id"
+            "SELECT id, properties, properties_variant IS NULL AS vnull FROM lake.main.events ORDER BY id"
         ).fetchall()
         assert rows[0] == (1, '{"ok": true}', False)
         assert rows[1][0] == 2
@@ -222,6 +219,43 @@ class TestVariantDualWrite:
         with pytest.raises(ValueError, match="properties_variant"):
             write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
 
+    def test_wrong_typed_companion_raises(self, conn, cache):
+        """Pre-existing non-VARIANT companion must fail loud, not dual-write."""
+        conn.execute("CREATE TABLE lake.main.events (properties VARCHAR, properties_variant VARCHAR)")
+        schema_mgr = SchemaManager(conn, "events")
+        # Seed cache with the wrong type so we exercise the known-column branch.
+        schema_mgr._load_table_schema()
+        assert schema_mgr._known_columns.get("properties_variant") == "VARCHAR"
+
+        batch = pa.table({"properties": ['{"a": 1}']})
+        with pytest.raises(ValueError, match="expected VARIANT"):
+            write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+        # Cache must not be rewritten to VARIANT after the failure.
+        assert schema_mgr._known_columns.get("properties_variant") == "VARCHAR"
+
+    def test_add_if_not_exists_noop_wrong_type_raises(self, conn, cache):
+        """ADD IF NOT EXISTS no-op on wrong-typed column must not poison the cache.
+
+        Cache starts empty for the companion so we take the ADD path; live
+        re-read after ADD must see VARCHAR and raise before caching VARIANT.
+        """
+        conn.execute("CREATE TABLE lake.main.events (properties VARCHAR, properties_variant VARCHAR)")
+        schema_mgr = SchemaManager(conn, "events")
+        # Only load properties into the cache shape by writing known_columns
+        # without the companion — simulate a stale view that will try ADD.
+        schema_mgr._known_columns = {"properties": "VARCHAR", "_inserted_at": "TIMESTAMP"}
+        schema_mgr._initialized = True
+
+        batch = pa.table({"properties": ['{"a": 1}']})
+        with pytest.raises(ValueError, match="expected VARIANT after ADD COLUMN"):
+            write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+        assert schema_mgr._known_columns.get("properties_variant") != "VARIANT"
+
+    def test_variant_columns_requires_schema_manager(self, conn, cache):
+        batch = pa.table({"properties": ['{"a": 1}']})
+        with pytest.raises(ValueError, match="requires a SchemaManager"):
+            write(conn, "events", batch, cache, schema_mgr=None, variant_columns=("properties",))
+
 
 @pytest.mark.integration
 class TestSchemaEvolution:
@@ -235,8 +269,7 @@ class TestSchemaEvolution:
         write(conn, "events", batch2, cache, schema_mgr)
 
         cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            "SELECT column_name FROM information_schema.columns WHERE table_catalog = 'lake' AND table_name = 'events'"
         ).fetchall()
         col_names = {row[0] for row in cols}
         assert "source" in col_names
@@ -283,8 +316,7 @@ class TestSchemaEvolution:
         write(conn, "events", batch2, cache, schema_mgr)
 
         cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            "SELECT column_name FROM information_schema.columns WHERE table_catalog = 'lake' AND table_name = 'events'"
         ).fetchall()
         col_names = {row[0] for row in cols}
         assert {"a", "b", "c", "_inserted_at"} <= col_names
@@ -482,9 +514,7 @@ class TestTimestampCoercionWritePath:
         # Data landed and the stored value is the right instant. DuckDB renders
         # TIMESTAMPTZ in the session timezone, so compare the instant (aware
         # equality is tz-independent) rather than its string form.
-        row = conn.execute(
-            "SELECT event, timestamp FROM lake.main.events WHERE uuid = 'u1'"
-        ).fetchone()
+        row = conn.execute("SELECT event, timestamp FROM lake.main.events WHERE uuid = 'u1'").fetchone()
         assert row[0] == "$pageview"
         assert row[1] == datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
 

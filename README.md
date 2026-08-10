@@ -147,9 +147,15 @@ For each listed source present in a batch, millpond:
 2. `ADD COLUMN IF NOT EXISTS {name}_variant VARIANT` on the DuckLake table
 3. Projects `try_cast(try_cast(col AS JSON) AS VARIANT) AS {name}_variant` on INSERT
 
-Malformed JSON nulls only the VARIANT companion (the string column still lands). DuckDB shreds VARIANT on Parquet write automatically — no millpond-side shredding config. Existing tables get the companion column via schema evolution on the first dual-write flush; historical rows keep a NULL companion until rewritten.
+Malformed JSON nulls only the VARIANT companion (the string column still lands). DuckDB shreds VARIANT on Parquet write automatically — no millpond-side shredding config. Existing tables get the companion column via schema evolution on the first dual-write flush; historical rows keep a NULL companion until rewritten. If `{name}_variant` already exists as a non-VARIANT type, startup writes fail loud (DuckLake cannot `ALTER VARCHAR → VARIANT`).
 
-This is an opt-in migration step: readers can move from `json_extract(properties, …)` to `properties_variant."$browser"` (etc.) once the companion is populated, then a later cutover can drop the string column if desired. DuckLake cannot `ALTER VARCHAR → VARIANT` in place, which is why dual-write (new column) is the supported path.
+This is an opt-in migration step: readers can move from `json_extract(properties, …)` to `properties_variant."$browser"` (etc.) once the companion is populated, then a later cutover can drop the string column if desired. Dual-write (new column) is the supported path for that reason.
+
+**Production caveats (canary first):**
+
+- **Key cardinality / shredding.** DuckDB auto-shreds VARIANT from the structure it sees at Parquet write time. PostHog-scale `properties` have a long tail of custom keys; a flush can produce very wide Parquet schemas (hundreds–thousands of shredded leaf fields). Prefer canarying on a filtered consumer or lower-cardinality table before enabling fleet-wide on `events`.
+- **Memory.** Dual-write keeps the VARCHAR column and materializes VARIANT at INSERT — peak flush memory is higher than string-only. Leave headroom vs `FLUSH_SIZE` and the pod limit when turning this on for large property blobs.
+- **Test coverage.** Unit/integration dual-write tests exercise the SQL cast and companion DDL against plain DuckDB; they do not exercise DuckLake catalog DDL, Parquet shredding, or data-inlining edge cases. Validate shredding and file shape on a real DuckLake canary before relying on query performance.
 
 ## Adaptive Backpressure
 

@@ -144,9 +144,7 @@ class TestEnsureTable:
         conn = MagicMock()
         _ensure_table(conn, "events", _sample_batch(), cache, partition_by="team_id,year(ts)")
         # Find the ALTER PARTITIONED BY call
-        alter_calls = [
-            call for call in conn.execute.call_args_list if "PARTITIONED BY" in str(call)
-        ]
+        alter_calls = [call for call in conn.execute.call_args_list if "PARTITIONED BY" in str(call)]
         assert len(alter_calls) == 1
         assert "team_id,year(ts)" in str(alter_calls[0])
 
@@ -199,13 +197,19 @@ class TestVariantColumnName:
 
 
 class TestBuildInsertSelectSql:
-    def test_no_variant_columns_matches_historical_shape(self):
+    def test_no_variant_columns_uses_star(self):
+        # Opt-in dual-write must not rewrite every writer's INSERT.
         sql = build_insert_select_sql(["event", "team_id"], None)
-        assert sql == '"event", "team_id", NOW() AS _inserted_at'
+        assert sql == "*, NOW() AS _inserted_at"
 
-    def test_empty_variant_tuple_is_noop(self):
+    def test_empty_variant_tuple_uses_star(self):
         sql = build_insert_select_sql(["event"], ())
-        assert sql == '"event", NOW() AS _inserted_at'
+        assert sql == "*, NOW() AS _inserted_at"
+
+    def test_configured_source_absent_from_batch_uses_star(self):
+        sql = build_insert_select_sql(["event"], ("properties",))
+        assert "properties_variant" not in sql
+        assert sql == "*, NOW() AS _inserted_at"
 
     def test_dual_writes_configured_source(self):
         sql = build_insert_select_sql(
@@ -213,18 +217,12 @@ class TestBuildInsertSelectSql:
             ("properties",),
         )
         assert '"properties"' in sql
-        assert (
-            'try_cast(try_cast("properties" AS JSON) AS VARIANT) AS "properties_variant"'
-            in sql
-        )
-        assert sql.endswith('NOW() AS _inserted_at')
+        assert 'try_cast(try_cast("properties" AS JSON) AS VARIANT) AS "properties_variant"' in sql
+        assert sql.endswith("NOW() AS _inserted_at")
         # Original column still present (dual-write, not replace).
         assert sql.index('"properties"') < sql.index("properties_variant")
-
-    def test_source_absent_from_batch_skipped(self):
-        sql = build_insert_select_sql(["event"], ("properties",))
-        assert "properties_variant" not in sql
-        assert sql == '"event", NOW() AS _inserted_at'
+        # Not the star form when dual-write is active.
+        assert not sql.startswith("*")
 
     def test_multiple_sources(self):
         sql = build_insert_select_sql(
@@ -233,6 +231,10 @@ class TestBuildInsertSelectSql:
         )
         assert 'AS "properties_variant"' in sql
         assert 'AS "person_properties_variant"' in sql
+
+    def test_escapes_embedded_quotes_in_identifiers(self):
+        sql = build_insert_select_sql(['weir"d', "properties"], ("properties",))
+        assert '"weir""d"' in sql
 
 
 class TestCheckVariantColumnCollision:

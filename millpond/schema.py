@@ -190,6 +190,26 @@ class SchemaManager:
                     )
                     metrics.errors_total.labels(type="schema").inc()
 
+    def _live_column_type(self, column_name: str) -> str | None:
+        """Read one column's type from information_schema (normalized).
+
+        Used after ``ADD COLUMN IF NOT EXISTS`` so the cache never trusts a
+        no-op ADD that left a wrong-typed column in place. Returns None when
+        the column is absent.
+        """
+        try:
+            result = self._conn.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' AND table_schema = ? "
+                "AND table_name = ? AND column_name = ?",
+                [self._schema_name, self._table_name, column_name],
+            ).fetchone()
+        except duckdb.CatalogException:
+            return None
+        if result is None:
+            return None
+        return _normalize_duckdb_type(result[0])
+
     def ensure_variant_columns(
         self,
         sources: tuple[str, ...],
@@ -203,6 +223,12 @@ class SchemaManager:
         ``ADD COLUMN IF NOT EXISTS``. Sources absent from this batch are
         skipped — no empty VARIANT column is added for columns the producer
         never sent.
+
+        Fail-loud on wrong type: if the companion already exists as anything
+        other than VARIANT (manual DDL, a payload field of that name, or a
+        concurrent race), raises ``ValueError`` and does not leave the type
+        cache poisoned. DuckLake cannot ``ALTER VARCHAR → VARIANT``, so the
+        operator must fix the table before dual-write can proceed.
 
         Called from ducklake.write after evolve() so the source VARCHAR
         columns exist first; the VARIANT companions are sink-managed and do
@@ -230,17 +256,13 @@ class SchemaManager:
             existing = self._known_columns.get(vname)
             if existing is not None:
                 if existing != "VARIANT":
-                    # Cannot ALTER VARCHAR → VARIANT (DuckLake widening-only).
-                    # Surface via metrics/logs; INSERT will fail on type mismatch
-                    # if the operator pointed at a table with a wrong-typed column.
-                    log.warning(
-                        "VARIANT dual-write target %s exists as %s, expected VARIANT; "
-                        "refusing to alter (DuckLake widening-only). Fix the table DDL "
-                        "or rename the dual-write target.",
-                        vname,
-                        existing,
-                    )
                     metrics.errors_total.labels(type="schema").inc()
+                    raise ValueError(
+                        f"VARIANT dual-write target {vname!r} exists as {existing}, "
+                        f"expected VARIANT; DuckLake cannot ALTER to VARIANT in place. "
+                        f"Drop/rename the column or remove {source!r} from "
+                        f"MILLPOND_VARIANT_COLUMNS."
+                    )
                 continue
 
             log.info("Schema evolution: adding VARIANT dual-write column %s", vname)
@@ -249,11 +271,28 @@ class SchemaManager:
                     f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
                     f'ADD COLUMN IF NOT EXISTS "{vname}" VARIANT'
                 )
-                self._known_columns[vname] = "VARIANT"
-                metrics.schema_columns_added_total.inc()
             except duckdb.Error as e:
-                log.warning("Failed to add VARIANT column %s: %s", vname, e)
                 metrics.errors_total.labels(type="schema").inc()
+                raise ValueError(f"Failed to add VARIANT column {vname!r}: {e}") from e
+
+            # ADD IF NOT EXISTS is a no-op when the column already exists under
+            # any type — do not trust the statement to mean "now VARIANT".
+            live = self._live_column_type(vname)
+            if live is None:
+                metrics.errors_total.labels(type="schema").inc()
+                raise ValueError(
+                    f"VARIANT dual-write target {vname!r} missing after ADD COLUMN; catalog state is inconsistent"
+                )
+            if live != "VARIANT":
+                metrics.errors_total.labels(type="schema").inc()
+                raise ValueError(
+                    f"VARIANT dual-write target {vname!r} exists as {live}, "
+                    f"expected VARIANT after ADD COLUMN IF NOT EXISTS (no-op on "
+                    f"wrong-typed column). Fix the table DDL or remove {source!r} "
+                    f"from MILLPOND_VARIANT_COLUMNS."
+                )
+            self._known_columns[vname] = "VARIANT"
+            metrics.schema_columns_added_total.inc()
 
     def invalidate(self) -> None:
         """Force a reload of the table schema on next evolve() call."""
