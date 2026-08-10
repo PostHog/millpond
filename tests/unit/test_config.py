@@ -626,7 +626,7 @@ class TestVariantColumnsConfig:
 
     def test_suffix_name_rejected(self, monkeypatch):
         monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties_variant")
-        with pytest.raises(RuntimeError, match="already ends with '_variant'"):
+        with pytest.raises(RuntimeError, match="already ends with"):
             load()
 
     def test_log_lists_mappings(self, monkeypatch, caplog):

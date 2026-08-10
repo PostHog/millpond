@@ -82,15 +82,18 @@ def _arrow_type_to_duckdb(arrow_type: pa.DataType) -> str:
 # Normalize to our canonical names to prevent spurious ALTER TABLE on every flush.
 _INFO_SCHEMA_TO_CANONICAL: dict[str, str] = {
     "TIMESTAMP WITH TIME ZONE": "TIMESTAMPTZ",
-    # information_schema may surface VARIANT under alternate spellings depending
-    # on catalog; normalize so ensure_variant_columns doesn't re-ADD every flush.
-    "Variant": "VARIANT",
 }
 
 
 def _normalize_duckdb_type(type_name: str) -> str:
     """Normalize a DuckDB type name from information_schema to our canonical form."""
-    return _INFO_SCHEMA_TO_CANONICAL.get(type_name, type_name)
+    if type_name in _INFO_SCHEMA_TO_CANONICAL:
+        return _INFO_SCHEMA_TO_CANONICAL[type_name]
+    # VARIANT spelling varies by catalog ("VARIANT" / "Variant"); compare
+    # case-insensitively so ensure_variant_columns never re-ADD every flush.
+    if type_name.upper() == "VARIANT":
+        return "VARIANT"
+    return type_name
 
 
 class SchemaManager:
@@ -127,16 +130,41 @@ class SchemaManager:
             self._known_columns = {}
             self._initialized = True
 
-    def evolve(self, batch_schema: pa.Schema) -> None:
-        """Compare incoming Arrow schema against table and issue DDL if needed."""
+    def _ensure_schema_loaded(self) -> bool:
+        """Load/reload known columns if needed. Returns False if the table is empty/missing."""
         if not self._initialized:
             self._load_table_schema()
-
         if not self._known_columns:
-            # Table was just created by _ensure_table, reload
+            # Table was just created by _ensure_table, or does not exist yet.
             self._load_table_schema()
             if not self._known_columns:
-                return
+                return False
+        return True
+
+    def _add_column(self, column_name: str, duckdb_type: str) -> bool:
+        """ADD COLUMN IF NOT EXISTS and update cache. Returns True on success.
+
+        On failure logs, bumps ``errors_total{type="schema"}``, and returns False
+        so callers can degrade rather than crash-loop the write path.
+        """
+        log.info("Schema evolution: adding column %s (%s)", column_name, duckdb_type)
+        try:
+            self._conn.execute(
+                f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
+                f'ADD COLUMN IF NOT EXISTS "{column_name}" {duckdb_type}'
+            )
+        except duckdb.Error as e:
+            log.warning("Failed to add column %s: %s", column_name, e)
+            metrics.errors_total.labels(type="schema").inc()
+            return False
+        self._known_columns[column_name] = duckdb_type
+        metrics.schema_columns_added_total.inc()
+        return True
+
+    def evolve(self, batch_schema: pa.Schema) -> None:
+        """Compare incoming Arrow schema against table and issue DDL if needed."""
+        if not self._ensure_schema_loaded():
+            return
 
         for field in batch_schema:
             if field.name == "_inserted_at":
@@ -150,18 +178,7 @@ class SchemaManager:
             duckdb_type = _arrow_type_to_duckdb(field.type)
 
             if field.name not in self._known_columns:
-                # New column
-                log.info("Schema evolution: adding column %s (%s)", field.name, duckdb_type)
-                try:
-                    self._conn.execute(
-                        f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
-                        f'ADD COLUMN IF NOT EXISTS "{field.name}" {duckdb_type}'
-                    )
-                    self._known_columns[field.name] = duckdb_type
-                    metrics.schema_columns_added_total.inc()
-                except duckdb.Error as e:
-                    log.warning("Failed to add column %s: %s", field.name, e)
-                    metrics.errors_total.labels(type="schema").inc()
+                self._add_column(field.name, duckdb_type)
 
             elif self._known_columns[field.name] != duckdb_type:
                 # Type mismatch — attempt widening
@@ -214,36 +231,28 @@ class SchemaManager:
         self,
         sources: tuple[str, ...],
         present_source_names: set[str],
-    ) -> None:
-        """ADD COLUMN IF NOT EXISTS for dual-write VARIANT companions.
+    ) -> frozenset[str]:
+        """Ensure VARIANT dual-write companions exist; return sources ready to project.
 
-        For each source name in ``sources`` that is present in the current
-        batch (``present_source_names``), ensure a ``{source}_variant`` column
-        of type VARIANT exists on the table. Idempotent across pods via
-        ``ADD COLUMN IF NOT EXISTS``. Sources absent from this batch are
-        skipped — no empty VARIANT column is added for columns the producer
-        never sent.
+        For each source in ``sources`` present in the batch, try to ensure a
+        ``{source}_variant`` VARIANT column. Returns the subset of sources whose
+        companion is confirmed VARIANT and safe to project on INSERT.
 
-        Fail-loud on wrong type: if the companion already exists as anything
-        other than VARIANT (manual DDL, a payload field of that name, or a
-        concurrent race), raises ``ValueError`` and does not leave the type
-        cache poisoned. DuckLake cannot ``ALTER VARCHAR → VARIANT``, so the
-        operator must fix the table before dual-write can proceed.
+        Degrades (excludes from the returned set) rather than raising when:
+        - the companion already exists as a non-VARIANT type (cannot ALTER in place)
+        - ADD COLUMN fails
+        - ADD IF NOT EXISTS no-ops on a wrong-typed column
 
-        Called from ducklake.write after evolve() so the source VARCHAR
-        columns exist first; the VARIANT companions are sink-managed and do
-        not appear in the Arrow batch schema.
+        Projection must only cover the returned set — otherwise INSERT binds a
+        missing/wrong-typed column and crash-loops the flush path. Bumps
+        ``errors_total{type="schema"}`` on every degrade so the misconfig is loud.
         """
         if not sources:
-            return
-        if not self._initialized:
-            self._load_table_schema()
-        if not self._known_columns:
-            # Table was just created — reload so we see the CTAS columns.
-            self._load_table_schema()
-            if not self._known_columns:
-                return
+            return frozenset()
+        if not self._ensure_schema_loaded():
+            return frozenset()
 
+        ready: set[str] = set()
         for source in sources:
             if source not in present_source_names:
                 continue
@@ -256,15 +265,22 @@ class SchemaManager:
             existing = self._known_columns.get(vname)
             if existing is not None:
                 if existing != "VARIANT":
-                    metrics.errors_total.labels(type="schema").inc()
-                    raise ValueError(
-                        f"VARIANT dual-write target {vname!r} exists as {existing}, "
-                        f"expected VARIANT; DuckLake cannot ALTER to VARIANT in place. "
-                        f"Drop/rename the column or remove {source!r} from "
-                        f"MILLPOND_VARIANT_COLUMNS."
+                    log.warning(
+                        "VARIANT dual-write target %s exists as %s, expected VARIANT; "
+                        "degrading to string-only for source %s (DuckLake cannot ALTER "
+                        "to VARIANT in place)",
+                        vname,
+                        existing,
+                        source,
                     )
+                    metrics.errors_total.labels(type="schema").inc()
+                    continue
+                ready.add(source)
                 continue
 
+            # Do not use _add_column's optimistic cache: ADD IF NOT EXISTS is a
+            # no-op when the column already exists under any type, so we must
+            # re-read the live type before recording VARIANT in the cache.
             log.info("Schema evolution: adding VARIANT dual-write column %s", vname)
             try:
                 self._conn.execute(
@@ -272,27 +288,33 @@ class SchemaManager:
                     f'ADD COLUMN IF NOT EXISTS "{vname}" VARIANT'
                 )
             except duckdb.Error as e:
+                log.warning(
+                    "Failed to add VARIANT column %s: %s; degrading to string-only for %s",
+                    vname,
+                    e,
+                    source,
+                )
                 metrics.errors_total.labels(type="schema").inc()
-                raise ValueError(f"Failed to add VARIANT column {vname!r}: {e}") from e
+                continue
 
-            # ADD IF NOT EXISTS is a no-op when the column already exists under
-            # any type — do not trust the statement to mean "now VARIANT".
             live = self._live_column_type(vname)
-            if live is None:
-                metrics.errors_total.labels(type="schema").inc()
-                raise ValueError(
-                    f"VARIANT dual-write target {vname!r} missing after ADD COLUMN; catalog state is inconsistent"
-                )
             if live != "VARIANT":
-                metrics.errors_total.labels(type="schema").inc()
-                raise ValueError(
-                    f"VARIANT dual-write target {vname!r} exists as {live}, "
-                    f"expected VARIANT after ADD COLUMN IF NOT EXISTS (no-op on "
-                    f"wrong-typed column). Fix the table DDL or remove {source!r} "
-                    f"from MILLPOND_VARIANT_COLUMNS."
+                if live is not None:
+                    self._known_columns[vname] = live
+                log.warning(
+                    "VARIANT dual-write target %s is %s after ADD COLUMN IF NOT EXISTS "
+                    "(expected VARIANT); degrading to string-only for source %s",
+                    vname,
+                    live,
+                    source,
                 )
+                metrics.errors_total.labels(type="schema").inc()
+                continue
             self._known_columns[vname] = "VARIANT"
             metrics.schema_columns_added_total.inc()
+            ready.add(source)
+
+        return frozenset(ready)
 
     def invalidate(self) -> None:
         """Force a reload of the table schema on next evolve() call."""

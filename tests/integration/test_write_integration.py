@@ -208,7 +208,11 @@ class TestVariantDualWrite:
         assert rows[0][1] is None
         assert rows[1][1] is not None
 
-    def test_source_collision_raises(self, conn, cache):
+    def test_source_companion_collision_nonfatal_still_dual_writes(self, conn, cache):
+        """Poison payload with both properties and properties_variant must not crash-loop.
+
+        Companion is stripped; source dual-writes into a real VARIANT column.
+        """
         schema_mgr = SchemaManager(conn, "events")
         batch = pa.table(
             {
@@ -216,40 +220,95 @@ class TestVariantDualWrite:
                 "properties_variant": ["already here"],
             }
         )
-        with pytest.raises(ValueError, match="properties_variant"):
-            write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
 
-    def test_wrong_typed_companion_raises(self, conn, cache):
-        """Pre-existing non-VARIANT companion must fail loud, not dual-write."""
-        conn.execute("CREATE TABLE lake.main.events (properties VARCHAR, properties_variant VARCHAR)")
+        cols = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            ).fetchall()
+        }
+        assert cols["properties_variant"] == "VARIANT"
+        (props, vtype) = conn.execute(
+            "SELECT properties, variant_typeof(properties_variant) FROM lake.main.events"
+        ).fetchone()
+        assert props == '{"a": 1}'
+        assert vtype.startswith("OBJECT")
+
+    def test_orphan_companion_payload_does_not_create_varchar_column(self, conn, cache):
+        """properties_variant alone in a batch must not evolve() as VARCHAR."""
         schema_mgr = SchemaManager(conn, "events")
-        # Seed cache with the wrong type so we exercise the known-column branch.
+        write(
+            conn,
+            "events",
+            pa.table({"event": ["x"], "properties_variant": ["poison"]}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        cols = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            ).fetchall()
+        }
+        assert "properties_variant" not in cols
+        assert "event" in cols
+
+        # Later real dual-write still works and creates VARIANT, not VARCHAR.
+        write(
+            conn,
+            "events",
+            pa.table({"event": ["y"], "properties": ['{"a": 1}']}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        type_row = conn.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_catalog = 'lake' AND table_name = 'events' "
+            "AND column_name = 'properties_variant'"
+        ).fetchone()
+        assert type_row[0] == "VARIANT"
+
+    def test_wrong_typed_companion_degrades_to_string_only(self, conn, cache):
+        """Pre-existing non-VARIANT companion: string still writes, no crash loop."""
+        conn.execute(
+            "CREATE TABLE lake.main.events ("
+            "properties VARCHAR, properties_variant VARCHAR, _inserted_at TIMESTAMP)"
+        )
+        schema_mgr = SchemaManager(conn, "events")
         schema_mgr._load_table_schema()
         assert schema_mgr._known_columns.get("properties_variant") == "VARCHAR"
 
         batch = pa.table({"properties": ['{"a": 1}']})
-        with pytest.raises(ValueError, match="expected VARIANT"):
-            write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
-        # Cache must not be rewritten to VARIANT after the failure.
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        # Source landed; companion left alone (NULL for this insert — not projected).
+        (props, companion) = conn.execute("SELECT properties, properties_variant FROM lake.main.events").fetchone()
+        assert props == '{"a": 1}'
+        assert companion is None
+        # Cache still reflects VARCHAR — not poisoned to VARIANT.
         assert schema_mgr._known_columns.get("properties_variant") == "VARCHAR"
 
-    def test_add_if_not_exists_noop_wrong_type_raises(self, conn, cache):
-        """ADD IF NOT EXISTS no-op on wrong-typed column must not poison the cache.
-
-        Cache starts empty for the companion so we take the ADD path; live
-        re-read after ADD must see VARCHAR and raise before caching VARIANT.
-        """
-        conn.execute("CREATE TABLE lake.main.events (properties VARCHAR, properties_variant VARCHAR)")
+    def test_add_if_not_exists_noop_wrong_type_degrades(self, conn, cache):
+        """ADD IF NOT EXISTS no-op on wrong type: no cache poison, string-only write."""
+        conn.execute(
+            "CREATE TABLE lake.main.events ("
+            "properties VARCHAR, properties_variant VARCHAR, _inserted_at TIMESTAMP)"
+        )
         schema_mgr = SchemaManager(conn, "events")
-        # Only load properties into the cache shape by writing known_columns
-        # without the companion — simulate a stale view that will try ADD.
         schema_mgr._known_columns = {"properties": "VARCHAR", "_inserted_at": "TIMESTAMP"}
         schema_mgr._initialized = True
 
         batch = pa.table({"properties": ['{"a": 1}']})
-        with pytest.raises(ValueError, match="expected VARIANT after ADD COLUMN"):
-            write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
-        assert schema_mgr._known_columns.get("properties_variant") != "VARIANT"
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        assert schema_mgr._known_columns.get("properties_variant") == "VARCHAR"
+        (props,) = conn.execute("SELECT properties FROM lake.main.events").fetchone()
+        assert props == '{"a": 1}'
 
     def test_variant_columns_requires_schema_manager(self, conn, cache):
         batch = pa.table({"properties": ['{"a": 1}']})

@@ -147,7 +147,12 @@ For each listed source present in a batch, millpond:
 2. `ADD COLUMN IF NOT EXISTS {name}_variant VARIANT` on the DuckLake table
 3. Projects `try_cast(try_cast(col AS JSON) AS VARIANT) AS {name}_variant` on INSERT
 
-Malformed JSON nulls only the VARIANT companion (the string column still lands). DuckDB shreds VARIANT on Parquet write automatically — no millpond-side shredding config. Existing tables get the companion column via schema evolution on the first dual-write flush; historical rows keep a NULL companion until rewritten. If `{name}_variant` already exists as a non-VARIANT type, startup writes fail loud (DuckLake cannot `ALTER VARCHAR → VARIANT`).
+Malformed JSON nulls only the VARIANT companion (the string column still lands). DuckDB shreds VARIANT on Parquet write automatically — no millpond-side shredding config. Existing tables get the companion column via schema evolution on the first dual-write flush; historical rows keep a NULL companion until rewritten.
+
+Degrades without crash-looping when dual-write cannot run cleanly:
+
+- Payload fields named `{name}_variant` are stripped non-fatally (`records_skipped_total{reason="variant_companion_collision"}`) so a poison key cannot evolve a VARCHAR companion or bind-conflict the INSERT.
+- If `{name}_variant` already exists as a non-VARIANT type, or ADD COLUMN fails, that source is omitted from the VARIANT projection (string column still writes); `errors_total{type="schema"}` is bumped. DuckLake cannot `ALTER VARCHAR → VARIANT`.
 
 This is an opt-in migration step: readers can move from `json_extract(properties, …)` to `properties_variant."$browser"` (etc.) once the companion is populated, then a later cutover can drop the string column if desired. Dual-write (new column) is the supported path for that reason.
 

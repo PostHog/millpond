@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from millpond import arrow_converter
+from millpond.schema import VARIANT_COLUMN_SUFFIX
 
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -115,9 +116,10 @@ class Config:
 
     # Optional source column names to dual-write as DuckLake VARIANT columns.
     # Each listed column is kept as-is (typically VARCHAR JSON text) and also
-    # written to `{name}_variant` via try_cast(try_cast(col AS JSON) AS VARIANT).
-    # DuckDB auto-shreds VARIANT on Parquet write. None disables dual-write
-    # (default — existing consumers are unaffected). See ducklake.write.
+    # written to `{name}{VARIANT_COLUMN_SUFFIX}` via
+    # try_cast(try_cast(col AS JSON) AS VARIANT). DuckDB auto-shreds VARIANT
+    # on Parquet write. None disables dual-write (default — existing consumers
+    # are unaffected). See ducklake.write.
     variant_columns: tuple[str, ...] | None
 
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
@@ -409,8 +411,9 @@ def _load_variant_columns() -> tuple[str, ...] | None:
     Format: comma-separated column names, e.g. ``properties,person_properties``.
     Whitespace trimmed; empty tokens dropped; duplicates de-duplicated (first
     wins). Column names must match the safe-identifier pattern — each source is
-    dual-written to ``{name}_variant`` via generated SQL, so injection-safe
-    identifiers are mandatory. Returns None when the env var is absent/whitespace.
+    dual-written to ``{name}{VARIANT_COLUMN_SUFFIX}`` via generated SQL, so
+    injection-safe identifiers are mandatory. Returns None when the env var is
+    absent/whitespace.
     """
     raw = os.environ.get("MILLPOND_VARIANT_COLUMNS", "").strip()
     if not raw:
@@ -430,11 +433,11 @@ def _load_variant_columns() -> tuple[str, ...] | None:
         # Reject names that already end in the dual-write suffix — the derived
         # column would be ``foo_variant_variant``, which is almost always a
         # misconfiguration (operator listed the sink column, not the source).
-        if name.endswith("_variant"):
+        if name.endswith(VARIANT_COLUMN_SUFFIX):
             raise RuntimeError(
-                f"MILLPOND_VARIANT_COLUMNS column {name!r} already ends with '_variant'; "
-                f"list the source JSON/VARCHAR column (e.g. 'properties'), not the "
-                f"derived VARIANT column name"
+                f"MILLPOND_VARIANT_COLUMNS column {name!r} already ends with "
+                f"{VARIANT_COLUMN_SUFFIX!r}; list the source JSON/VARCHAR column "
+                f"(e.g. 'properties'), not the derived VARIANT column name"
             )
         if name in seen:
             continue
@@ -618,6 +621,6 @@ def load() -> Config:
     if cfg.variant_columns is not None:
         log.info(
             "Dual-write VARIANT columns: %s",
-            ", ".join(f"{n} -> {n}_variant" for n in cfg.variant_columns),
+            ", ".join(f"{n} -> {n}{VARIANT_COLUMN_SUFFIX}" for n in cfg.variant_columns),
         )
     return cfg

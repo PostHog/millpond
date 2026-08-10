@@ -11,7 +11,7 @@ from millpond.ducklake import (
     _table_exists,
     _validate_partition_expr,
     build_insert_select_sql,
-    check_variant_column_collision,
+    drop_variant_companion_columns,
     variant_column_name,
 )
 
@@ -237,22 +237,25 @@ class TestBuildInsertSelectSql:
         assert '"weir""d"' in sql
 
 
-class TestCheckVariantColumnCollision:
-    def test_no_config_ok(self):
+class TestDropVariantCompanionColumns:
+    def test_no_config_unchanged(self):
         batch = pa.table({"properties": ["{}"], "properties_variant": ["x"]})
-        check_variant_column_collision(batch.schema, None)  # no raise
+        out = drop_variant_companion_columns(batch, None)
+        assert out.schema.names == ["properties", "properties_variant"]
 
-    def test_collision_raises(self):
-        batch = pa.table({"properties": ["{}"], "properties_variant": ["x"]})
-        with pytest.raises(ValueError, match="properties_variant"):
-            check_variant_column_collision(batch.schema, ("properties",))
+    def test_drops_companion_keeps_source(self):
+        batch = pa.table({"properties": ["{}"], "properties_variant": ["x"], "event": ["e"]})
+        out = drop_variant_companion_columns(batch, ("properties",))
+        assert out.schema.names == ["properties", "event"]
+        assert out.column("properties").to_pylist() == ["{}"]
 
-    def test_no_collision_when_source_absent(self):
-        # Batch has the derived name but not the source — dual-write is skipped
-        # for that source, so no collision to report.
+    def test_drops_orphan_companion_without_source(self):
+        # Companion alone would otherwise evolve() as VARCHAR — strip it.
         batch = pa.table({"event": ["x"], "properties_variant": ["y"]})
-        check_variant_column_collision(batch.schema, ("properties",))
+        out = drop_variant_companion_columns(batch, ("properties",))
+        assert out.schema.names == ["event"]
 
-    def test_clean_batch_ok(self):
+    def test_clean_batch_unchanged(self):
         batch = pa.table({"properties": ["{}"], "event": ["x"]})
-        check_variant_column_collision(batch.schema, ("properties",))
+        out = drop_variant_companion_columns(batch, ("properties",))
+        assert out.schema.names == ["properties", "event"]
