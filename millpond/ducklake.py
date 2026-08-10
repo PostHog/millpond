@@ -9,6 +9,7 @@ import pyarrow as pa
 
 from millpond import schema
 from millpond.config import Config
+from millpond.schema import SAFE_IDENTIFIER, variant_column_name
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,75 @@ def check_reserved_collision(batch_schema: pa.Schema, reserved: frozenset[str]) 
             f"DuckLake-reserved metadata column names; rename them "
             f"upstream or filter them out before write()."
         )
+
+
+def check_variant_column_collision(
+    batch_schema: pa.Schema,
+    variant_columns: tuple[str, ...] | None,
+) -> None:
+    """Raise if dual-write would collide with a source column name.
+
+    For each configured source column present in the batch, the write path
+    projects ``{source}_variant``. If the batch already carries that name,
+    INSERT BY NAME would either overwrite the source field's identity or
+    produce a duplicate select-list alias — fail loud instead.
+    """
+    if not variant_columns:
+        return
+    names = set(batch_schema.names)
+    collisions: list[str] = []
+    for source in variant_columns:
+        if source not in names:
+            continue
+        derived = variant_column_name(source)
+        if derived in names:
+            collisions.append(derived)
+    if collisions:
+        raise ValueError(
+            f"Source schema column(s) {sorted(collisions)!r} collide with "
+            f"VARIANT dual-write target names; rename them upstream or remove "
+            f"the source from MILLPOND_VARIANT_COLUMNS."
+        )
+
+
+def build_insert_select_sql(
+    column_names: list[str],
+    variant_columns: tuple[str, ...] | None,
+) -> str:
+    """Build the SELECT list for ``INSERT ... BY NAME (SELECT ... FROM batch)``.
+
+    Always projects every batch column by name plus ``NOW() AS _inserted_at``.
+    For each name in ``variant_columns`` that is present in ``column_names``,
+    also projects a companion VARIANT column:
+
+        try_cast(try_cast("properties" AS JSON) AS VARIANT) AS "properties_variant"
+
+    ``try_cast`` (not hard cast) so one malformed JSON value nulls only that
+    cell rather than failing the whole flush — the original string column is
+    still written, so no data is lost. Columns listed in ``variant_columns``
+    but absent from this batch are skipped (heterogeneous batches / schema
+    drift); the companion column stays NULL for those rows via the table
+    default / absent-from-INSERT BY NAME behavior.
+    """
+    active = frozenset(variant_columns or ())
+    present = set(column_names)
+    parts: list[str] = []
+    for name in column_names:
+        # Identifiers are double-quoted. Unsafe names (non-SAFE_IDENTIFIER) can
+        # still appear in the batch — CREATE TABLE AS copies them, and SELECT *
+        # historically included them. Quoting keeps the projection equivalent.
+        parts.append(f'"{name}"')
+        if name in active and name in present:
+            # Only dual-write when the source name is SQL-safe: the derived
+            # companion is added via ADD COLUMN with the same identifier rules
+            # SchemaManager uses, and an unsafe source cannot be a configured
+            # variant column (config rejects non-SAFE names at load).
+            if not SAFE_IDENTIFIER.match(name):
+                continue
+            vname = variant_column_name(name)
+            parts.append(f'try_cast(try_cast("{name}" AS JSON) AS VARIANT) AS "{vname}"')
+    parts.append("NOW() AS _inserted_at")
+    return ", ".join(parts)
 
 
 def _escape_libpq(value: str | None) -> str:
@@ -225,19 +295,58 @@ def write(
     schema_mgr: schema.SchemaManager | None = None,
     partition_by: str | None = None,
     schema_name: str = "main",
+    variant_columns: tuple[str, ...] | None = None,
 ) -> None:
-    """Write an Arrow table to DuckLake with _inserted_at timestamp."""
+    """Write an Arrow table to DuckLake with _inserted_at timestamp.
+
+    When ``variant_columns`` is set, each listed source column present in the
+    batch is dual-written: the original column is kept as-is, and a companion
+    ``{name}_variant`` column receives ``try_cast(try_cast(col AS JSON) AS
+    VARIANT)``. DuckDB auto-shreds VARIANT sub-fields on Parquet write.
+    """
     check_reserved_collision(batch.schema, RESERVED_COLUMNS)
+    check_variant_column_collision(batch.schema, variant_columns)
     _ensure_table(conn, table_name, batch, tables_ensured, partition_by, schema_name)
     if schema_mgr is not None:
         schema_mgr.evolve(batch.schema)
+        if variant_columns:
+            schema_mgr.ensure_variant_columns(variant_columns, set(batch.schema.names))
+    elif variant_columns:
+        # No SchemaManager: still need the VARIANT companion columns to exist
+        # before INSERT BY NAME, otherwise DuckDB rejects unknown targets.
+        # Callers that pass variant_columns without a schema_mgr (tests,
+        # one-shot scripts) get a best-effort ADD COLUMN here; production
+        # always goes through DuckLakeSink which owns a SchemaManager.
+        _ensure_variant_columns_raw(conn, table_name, schema_name, variant_columns, set(batch.schema.names))
+    select_list = build_insert_select_sql(list(batch.schema.names), variant_columns)
     conn.register("_arrow_batch", batch)
     try:
-        conn.execute(
-            f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT *, NOW() AS _inserted_at FROM _arrow_batch)"
-        )
+        conn.execute(f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT {select_list} FROM _arrow_batch)")
     finally:
         conn.unregister("_arrow_batch")
+
+
+def _ensure_variant_columns_raw(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    schema_name: str,
+    variant_columns: tuple[str, ...],
+    present_source_names: set[str],
+) -> None:
+    """ADD COLUMN IF NOT EXISTS for VARIANT companions without a SchemaManager.
+
+    Production uses SchemaManager.ensure_variant_columns (which also keeps the
+    type cache coherent). This path exists so the module-level write() helper
+    stays usable in tests that skip SchemaManager.
+    """
+    for source in variant_columns:
+        if source not in present_source_names or not SAFE_IDENTIFIER.match(source):
+            continue
+        vname = variant_column_name(source)
+        try:
+            conn.execute(f'ALTER TABLE lake.{schema_name}.{table_name} ADD COLUMN IF NOT EXISTS "{vname}" VARIANT')
+        except duckdb.Error as e:
+            log.warning("Failed to add VARIANT column %s: %s", vname, e)
 
 
 class DuckLakeSink:
@@ -282,6 +391,7 @@ class DuckLakeSink:
         self._partition_by = cfg.partition_by
         self._tables_ensured: set[str] = set()
         self._schema_mgr = schema.SchemaManager(self._conn, self._table_name, self._schema_name)
+        self._variant_columns = cfg.variant_columns
 
     def write(self, batch: pa.Table) -> None:
         write(
@@ -292,6 +402,7 @@ class DuckLakeSink:
             self._schema_mgr,
             self._partition_by,
             self._schema_name,
+            self._variant_columns,
         )
 
     def reset_caches(self) -> None:

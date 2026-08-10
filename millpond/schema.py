@@ -22,6 +22,17 @@ from millpond import metrics
 # metric bump.
 SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
+# Dual-write suffix for VARIANT companion columns. Source `properties` →
+# sink `properties_variant`. Shared with ducklake.write so the ADD COLUMN
+# path and the INSERT projection never disagree on the derived name.
+VARIANT_COLUMN_SUFFIX = "_variant"
+
+
+def variant_column_name(source: str) -> str:
+    """Derived VARIANT companion name for a dual-written source column."""
+    return f"{source}{VARIANT_COLUMN_SUFFIX}"
+
+
 log = logging.getLogger(__name__)
 
 # PyArrow type → DuckDB SQL type
@@ -71,6 +82,9 @@ def _arrow_type_to_duckdb(arrow_type: pa.DataType) -> str:
 # Normalize to our canonical names to prevent spurious ALTER TABLE on every flush.
 _INFO_SCHEMA_TO_CANONICAL: dict[str, str] = {
     "TIMESTAMP WITH TIME ZONE": "TIMESTAMPTZ",
+    # information_schema may surface VARIANT under alternate spellings depending
+    # on catalog; normalize so ensure_variant_columns doesn't re-ADD every flush.
+    "Variant": "VARIANT",
 }
 
 
@@ -175,6 +189,71 @@ class SchemaManager:
                         e,
                     )
                     metrics.errors_total.labels(type="schema").inc()
+
+    def ensure_variant_columns(
+        self,
+        sources: tuple[str, ...],
+        present_source_names: set[str],
+    ) -> None:
+        """ADD COLUMN IF NOT EXISTS for dual-write VARIANT companions.
+
+        For each source name in ``sources`` that is present in the current
+        batch (``present_source_names``), ensure a ``{source}_variant`` column
+        of type VARIANT exists on the table. Idempotent across pods via
+        ``ADD COLUMN IF NOT EXISTS``. Sources absent from this batch are
+        skipped — no empty VARIANT column is added for columns the producer
+        never sent.
+
+        Called from ducklake.write after evolve() so the source VARCHAR
+        columns exist first; the VARIANT companions are sink-managed and do
+        not appear in the Arrow batch schema.
+        """
+        if not sources:
+            return
+        if not self._initialized:
+            self._load_table_schema()
+        if not self._known_columns:
+            # Table was just created — reload so we see the CTAS columns.
+            self._load_table_schema()
+            if not self._known_columns:
+                return
+
+        for source in sources:
+            if source not in present_source_names:
+                continue
+            if not SAFE_IDENTIFIER.match(source):
+                log.warning("Skipping VARIANT dual-write for unsafe source field name: %r", source)
+                metrics.records_skipped_total.labels(reason="unsafe_field_name").inc()
+                continue
+
+            vname = variant_column_name(source)
+            existing = self._known_columns.get(vname)
+            if existing is not None:
+                if existing != "VARIANT":
+                    # Cannot ALTER VARCHAR → VARIANT (DuckLake widening-only).
+                    # Surface via metrics/logs; INSERT will fail on type mismatch
+                    # if the operator pointed at a table with a wrong-typed column.
+                    log.warning(
+                        "VARIANT dual-write target %s exists as %s, expected VARIANT; "
+                        "refusing to alter (DuckLake widening-only). Fix the table DDL "
+                        "or rename the dual-write target.",
+                        vname,
+                        existing,
+                    )
+                    metrics.errors_total.labels(type="schema").inc()
+                continue
+
+            log.info("Schema evolution: adding VARIANT dual-write column %s", vname)
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
+                    f'ADD COLUMN IF NOT EXISTS "{vname}" VARIANT'
+                )
+                self._known_columns[vname] = "VARIANT"
+                metrics.schema_columns_added_total.inc()
+            except duckdb.Error as e:
+                log.warning("Failed to add VARIANT column %s: %s", vname, e)
+                metrics.errors_total.labels(type="schema").inc()
 
     def invalidate(self) -> None:
         """Force a reload of the table schema on next evolve() call."""

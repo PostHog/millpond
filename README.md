@@ -133,6 +133,24 @@ Why those columns: date-times arrive as strings, so inference types them `VARCHA
 
 The timestamp wire format is space-separated, UTC implied, with 0, 3, or 6 fractional digits depending on column/producer (e.g. `2024-01-01 12:00:00.123`); all parse. Each cleanly-coerced column increments `millpond_columns_coerced_total{target_type=...}`. Coercion is **non-fatal and type-consistent**: a present, configured column is always emitted as the target type — values that can't be cast (a producer format/type drift) are **nulled** (only the unconvertible ones; good values in the batch are kept), never left as the source type. That keeps buffered batches concat-compatible at flush and bumps `millpond_errors_total{type="column_coercion"}` so the drift is loud via metrics, without crashing the pod or risking offset commits past unwritten records. Columns absent from a batch or already the target type are left untouched, so the same map is safe across heterogeneous batches.
 
+### VARIANT dual-write (JSON properties → shredded VARIANT)
+
+JSON property blobs (e.g. PostHog `properties`) land as VARCHAR today. `MILLPOND_VARIANT_COLUMNS` dual-writes listed source columns into companion VARIANT columns so DuckDB can auto-shred common sub-fields into typed Parquet columns, without dropping the original string:
+
+```
+MILLPOND_VARIANT_COLUMNS=properties,person_properties
+```
+
+For each listed source present in a batch, millpond:
+
+1. Keeps the original column as-is (VARCHAR JSON text)
+2. `ADD COLUMN IF NOT EXISTS {name}_variant VARIANT` on the DuckLake table
+3. Projects `try_cast(try_cast(col AS JSON) AS VARIANT) AS {name}_variant` on INSERT
+
+Malformed JSON nulls only the VARIANT companion (the string column still lands). DuckDB shreds VARIANT on Parquet write automatically — no millpond-side shredding config. Existing tables get the companion column via schema evolution on the first dual-write flush; historical rows keep a NULL companion until rewritten.
+
+This is an opt-in migration step: readers can move from `json_extract(properties, …)` to `properties_variant."$browser"` (etc.) once the companion is populated, then a later cutover can drop the string column if desired. DuckLake cannot `ALTER VARCHAR → VARIANT` in place, which is why dual-write (new column) is the supported path.
+
 ## Adaptive Backpressure
 
 The consume batch size automatically scales based on how full the pending buffer is relative to the flush threshold. When the buffer is empty, millpond consumes at full speed. As the buffer approaches the flush size, the batch size drops proportionally, smoothing throughput during catchup and traffic spikes. OOM prevention comes from bounding librdkafka's internal fetch buffer via `queued.max.messages.kbytes` (16MB per partition).
@@ -258,6 +276,7 @@ See [Record Handling](#record-handling) for context. All four variables below ar
 | `MILLPOND_INCLUDE_VALUES_AUTH_TOKEN` | no | | Header value. Must be set together with the header name. |
 | `MILLPOND_SORT_BY` | no | | Comma-separated column names; the batch is sorted ascending by these in tuple order before each write. Missing fields cause the sort to be skipped (records still flow). |
 | `MILLPOND_TYPED_COLUMNS` | no | | Comma-separated `column:type` pairs pinning columns to a target type before write (types: `timestamptz`, `bigint`, `double`, `boolean`, `varchar`). Needed when writing into a table whose columns are already typed and JSON inference would diverge (date-times → `VARCHAR` vs `TIMESTAMPTZ`; all-null `project_id` → `VARCHAR` vs `BIGINT`). Column names validated as safe identifiers; types validated against the allowlist. |
+| `MILLPOND_VARIANT_COLUMNS` | no | | Comma-separated source column names to dual-write as DuckLake `VARIANT` companions (`properties` → `properties_variant`). Original string columns are kept. Malformed JSON nulls only the VARIANT side. Column names validated as safe identifiers; names ending in `_variant` are rejected (list the source, not the derived column). |
 
 ## Releases
 

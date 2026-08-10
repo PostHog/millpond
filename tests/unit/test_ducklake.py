@@ -10,6 +10,9 @@ from millpond.ducklake import (
     _sanitize_setting_value,
     _table_exists,
     _validate_partition_expr,
+    build_insert_select_sql,
+    check_variant_column_collision,
+    variant_column_name,
 )
 
 
@@ -185,3 +188,69 @@ class TestEnsureTable:
         conn.execute.side_effect = execute_side_effect
         _ensure_table(conn, "events", _sample_batch(), cache, partition_by="team_id")
         assert "events" in cache
+
+
+class TestVariantColumnName:
+    def test_suffix(self):
+        assert variant_column_name("properties") == "properties_variant"
+
+    def test_person_properties(self):
+        assert variant_column_name("person_properties") == "person_properties_variant"
+
+
+class TestBuildInsertSelectSql:
+    def test_no_variant_columns_matches_historical_shape(self):
+        sql = build_insert_select_sql(["event", "team_id"], None)
+        assert sql == '"event", "team_id", NOW() AS _inserted_at'
+
+    def test_empty_variant_tuple_is_noop(self):
+        sql = build_insert_select_sql(["event"], ())
+        assert sql == '"event", NOW() AS _inserted_at'
+
+    def test_dual_writes_configured_source(self):
+        sql = build_insert_select_sql(
+            ["event", "properties", "team_id"],
+            ("properties",),
+        )
+        assert '"properties"' in sql
+        assert (
+            'try_cast(try_cast("properties" AS JSON) AS VARIANT) AS "properties_variant"'
+            in sql
+        )
+        assert sql.endswith('NOW() AS _inserted_at')
+        # Original column still present (dual-write, not replace).
+        assert sql.index('"properties"') < sql.index("properties_variant")
+
+    def test_source_absent_from_batch_skipped(self):
+        sql = build_insert_select_sql(["event"], ("properties",))
+        assert "properties_variant" not in sql
+        assert sql == '"event", NOW() AS _inserted_at'
+
+    def test_multiple_sources(self):
+        sql = build_insert_select_sql(
+            ["properties", "person_properties"],
+            ("properties", "person_properties"),
+        )
+        assert 'AS "properties_variant"' in sql
+        assert 'AS "person_properties_variant"' in sql
+
+
+class TestCheckVariantColumnCollision:
+    def test_no_config_ok(self):
+        batch = pa.table({"properties": ["{}"], "properties_variant": ["x"]})
+        check_variant_column_collision(batch.schema, None)  # no raise
+
+    def test_collision_raises(self):
+        batch = pa.table({"properties": ["{}"], "properties_variant": ["x"]})
+        with pytest.raises(ValueError, match="properties_variant"):
+            check_variant_column_collision(batch.schema, ("properties",))
+
+    def test_no_collision_when_source_absent(self):
+        # Batch has the derived name but not the source — dual-write is skipped
+        # for that source, so no collision to report.
+        batch = pa.table({"event": ["x"], "properties_variant": ["y"]})
+        check_variant_column_collision(batch.schema, ("properties",))
+
+    def test_clean_batch_ok(self):
+        batch = pa.table({"properties": ["{}"], "event": ["x"]})
+        check_variant_column_collision(batch.schema, ("properties",))

@@ -15,7 +15,7 @@ import pytest
 
 from millpond.arrow_converter import coerce_typed_columns, convert
 from millpond.ducklake import write
-from millpond.schema import SchemaManager
+from millpond.schema import SchemaManager, variant_column_name
 
 
 @pytest.fixture()
@@ -78,6 +78,149 @@ class TestWritePath:
         col_names = {row[0] for row in cols}
         assert "a" in col_names
         assert "_inserted_at" in col_names
+
+
+@pytest.mark.integration
+class TestVariantDualWrite:
+    """Dual-write JSON/VARCHAR source columns as VARIANT companions.
+
+    Keeps the original string column and adds `{name}_variant` via
+    try_cast(try_cast(col AS JSON) AS VARIANT). Uses SchemaManager so
+    ADD COLUMN + type-cache stay coherent across flushes.
+    """
+
+    def test_dual_writes_properties_variant(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table(
+            {
+                "event": ["$pageview", "click"],
+                "properties": [
+                    '{"$browser": "Chrome", "width": 1920}',
+                    '{"$browser": "Firefox", "width": 1440}',
+                ],
+            }
+        )
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        cols = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            ).fetchall()
+        }
+        assert cols["properties"] in ("VARCHAR", "JSON")  # source stays text-ish
+        assert cols[variant_column_name("properties")] == "VARIANT"
+
+        rows = conn.execute(
+            "SELECT event, properties, "
+            "variant_typeof(properties_variant), "
+            'properties_variant."$browser", '
+            "properties_variant.width "
+            "FROM lake.main.events ORDER BY event"
+        ).fetchall()
+        assert len(rows) == 2
+        by_event = {r[0]: r for r in rows}
+        # Original string preserved on the source column
+        assert '"Chrome"' in by_event["$pageview"][1]
+        assert '"Firefox"' in by_event["click"][1]
+        # VARIANT is a parsed object (not VARCHAR holding JSON text)
+        assert by_event["$pageview"][2].startswith("OBJECT")
+        assert by_event["$pageview"][3] == "Chrome"
+        assert by_event["$pageview"][4] == 1920
+        assert by_event["click"][3] == "Firefox"
+        assert by_event["click"][4] == 1440
+
+    def test_original_string_column_unchanged(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        raw = '{"a": 1, "b": "two"}'
+        batch = pa.table({"properties": [raw]})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        (stored,) = conn.execute("SELECT properties FROM lake.main.events").fetchone()
+        assert stored == raw
+
+    def test_malformed_json_nulls_variant_keeps_string(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table(
+            {
+                "id": [1, 2, 3],
+                "properties": ['{"ok": true}', "not json{{{", '{"ok": false}'],
+            }
+        )
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        rows = conn.execute(
+            "SELECT id, properties, properties_variant IS NULL AS vnull "
+            "FROM lake.main.events ORDER BY id"
+        ).fetchall()
+        assert rows[0] == (1, '{"ok": true}', False)
+        assert rows[1][0] == 2
+        assert rows[1][1] == "not json{{{"
+        assert rows[1][2] is True  # variant nulled
+        assert rows[2] == (3, '{"ok": false}', False)
+
+    def test_absent_source_column_skips_dual_write(self, conn, cache):
+        """Configured source missing from this batch → no companion projected.
+
+        Column may still exist from a prior batch; rows just get NULL there.
+        """
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table({"event": ["x"]})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        cols = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' AND table_name = 'events'"
+            ).fetchall()
+        }
+        # properties absent from batch → properties_variant never ADDed
+        assert "properties_variant" not in cols
+        assert "event" in cols
+
+    def test_existing_table_gains_variant_column_on_evolve(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        # First write without dual-write — table has properties VARCHAR only
+        write(
+            conn,
+            "events",
+            pa.table({"properties": ['{"a": 1}']}),
+            cache,
+            schema_mgr,
+        )
+        assert "properties_variant" not in schema_mgr._known_columns
+
+        # Second write enables dual-write — ADD COLUMN + populate
+        write(
+            conn,
+            "events",
+            pa.table({"properties": ['{"a": 2}']}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        assert schema_mgr._known_columns.get("properties_variant") == "VARIANT"
+
+        rows = conn.execute(
+            "SELECT properties, properties_variant FROM lake.main.events ORDER BY properties"
+        ).fetchall()
+        assert len(rows) == 2
+        # First row pre-dates the VARIANT column → NULL companion
+        assert rows[0][1] is None
+        assert rows[1][1] is not None
+
+    def test_source_collision_raises(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table(
+            {
+                "properties": ['{"a": 1}'],
+                "properties_variant": ["already here"],
+            }
+        )
+        with pytest.raises(ValueError, match="properties_variant"):
+            write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
 
 
 @pytest.mark.integration

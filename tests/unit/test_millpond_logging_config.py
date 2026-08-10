@@ -74,6 +74,7 @@ def _minimal_config() -> Config:
         include_values_auth_token=None,
         sort_by=None,
         typed_columns=None,
+        variant_columns=None,
         kafka_config_overrides=(),
     )
 

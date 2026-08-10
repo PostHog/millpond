@@ -580,6 +580,69 @@ class TestTypedColumnsConfig:
         assert any("Coerce typed columns: timestamp:timestamptz, project_id:bigint" in m for m in msgs)
 
 
+class TestVariantColumnsConfig:
+    """MILLPOND_VARIANT_COLUMNS — dual-write JSON/VARCHAR sources as VARIANT."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "1")
+        monkeypatch.setenv("POD_NAME", "millpond-events-0")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+
+    def test_unset_yields_none(self):
+        cfg = load()
+        assert cfg.variant_columns is None
+
+    def test_single_column(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        cfg = load()
+        assert cfg.variant_columns == ("properties",)
+
+    def test_multiple_columns_order_preserved(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties,person_properties")
+        cfg = load()
+        assert cfg.variant_columns == ("properties", "person_properties")
+
+    def test_whitespace_and_dedup(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", " properties , , properties , person_properties ")
+        cfg = load()
+        assert cfg.variant_columns == ("properties", "person_properties")
+
+    def test_whitespace_only_yields_none(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "   ")
+        cfg = load()
+        assert cfg.variant_columns is None
+
+    def test_unsafe_name_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "foo; DROP")
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            load()
+
+    def test_suffix_name_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties_variant")
+        with pytest.raises(RuntimeError, match="already ends with '_variant'"):
+            load()
+
+    def test_log_lists_mappings(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties,person_properties")
+        with caplog.at_level(logging.INFO, logger="millpond.config"):
+            load()
+        msgs = [r.message for r in caplog.records]
+        assert any(
+            "Dual-write VARIANT columns: properties -> properties_variant, "
+            "person_properties -> person_properties_variant" in m
+            for m in msgs
+        )
+
+
 class TestIncludeValuesConfig:
     """MILLPOND_INCLUDE_VALUES_* — the dynamic include-set source knobs and
     their validation against the static filter config."""

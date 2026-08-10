@@ -113,6 +113,13 @@ class Config:
     # own freshly-created table is unaffected).
     typed_columns: tuple[tuple[str, str], ...] | None
 
+    # Optional source column names to dual-write as DuckLake VARIANT columns.
+    # Each listed column is kept as-is (typically VARCHAR JSON text) and also
+    # written to `{name}_variant` via try_cast(try_cast(col AS JSON) AS VARIANT).
+    # DuckDB auto-shreds VARIANT on Parquet write. None disables dual-write
+    # (default — existing consumers are unaffected). See ducklake.write.
+    variant_columns: tuple[str, ...] | None
+
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
@@ -396,6 +403,49 @@ def _load_typed_columns() -> tuple[tuple[str, str], ...] | None:
     return tuple(pairs)
 
 
+def _load_variant_columns() -> tuple[str, ...] | None:
+    """Parse MILLPOND_VARIANT_COLUMNS into an ordered tuple of source column names.
+
+    Format: comma-separated column names, e.g. ``properties,person_properties``.
+    Whitespace trimmed; empty tokens dropped; duplicates de-duplicated (first
+    wins). Column names must match the safe-identifier pattern — each source is
+    dual-written to ``{name}_variant`` via generated SQL, so injection-safe
+    identifiers are mandatory. Returns None when the env var is absent/whitespace.
+    """
+    raw = os.environ.get("MILLPOND_VARIANT_COLUMNS", "").strip()
+    if not raw:
+        return None
+
+    seen: set[str] = set()
+    cols: list[str] = []
+    for token in raw.split(","):
+        name = token.strip()
+        if not name:
+            continue
+        if not _SAFE_COLUMN_NAME.match(name):
+            raise RuntimeError(
+                f"MILLPOND_VARIANT_COLUMNS column {name!r} contains unsafe characters "
+                f"(must match [a-zA-Z_][a-zA-Z0-9_]*)"
+            )
+        # Reject names that already end in the dual-write suffix — the derived
+        # column would be ``foo_variant_variant``, which is almost always a
+        # misconfiguration (operator listed the sink column, not the source).
+        if name.endswith("_variant"):
+            raise RuntimeError(
+                f"MILLPOND_VARIANT_COLUMNS column {name!r} already ends with '_variant'; "
+                f"list the source JSON/VARCHAR column (e.g. 'properties'), not the "
+                f"derived VARIANT column name"
+            )
+        if name in seen:
+            continue
+        seen.add(name)
+        cols.append(name)
+
+    if not cols:
+        return None
+    return tuple(cols)
+
+
 _VALID_AUTO_OFFSET_RESET = ("earliest", "latest")
 
 
@@ -508,6 +558,7 @@ def load() -> Config:
     filter_keep_field, filter_drop_field, filter_values, filter_drop_values = _load_filter_fields()
     sort_by = _load_sort_by()
     typed_columns = _load_typed_columns()
+    variant_columns = _load_variant_columns()
 
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
@@ -531,6 +582,7 @@ def load() -> Config:
         **_load_include_values_config(filter_keep_field, filter_values),
         sort_by=sort_by,
         typed_columns=typed_columns,
+        variant_columns=variant_columns,
         kafka_config_overrides=kafka_overrides,
         # No ``MILLPOND_`` prefix on POSTHOG_PROJECT_TOKEN: it's a
         # PostHog-wide secret typically sourced from a shared K8s Secret
@@ -563,4 +615,9 @@ def load() -> Config:
         log.info("Sort by: %s (ascending)", ", ".join(cfg.sort_by))
     if cfg.typed_columns is not None:
         log.info("Coerce typed columns: %s", ", ".join(f"{n}:{t}" for n, t in cfg.typed_columns))
+    if cfg.variant_columns is not None:
+        log.info(
+            "Dual-write VARIANT columns: %s",
+            ", ".join(f"{n} -> {n}_variant" for n in cfg.variant_columns),
+        )
     return cfg
