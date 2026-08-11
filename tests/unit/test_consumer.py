@@ -170,6 +170,7 @@ def _make_cfg(**overrides) -> Config:
         include_values_auth_token=None,
         sort_by=None,
         typed_columns=None,
+        variant_columns=None,
         kafka_config_overrides=(("security.protocol", "SSL"),),
     )
     defaults.update(overrides)

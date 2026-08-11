@@ -294,11 +294,14 @@ def _is_commit_contention(exc: BaseException) -> bool:
 
 
 def _write_with_retry(sink, consolidated):
-    """Write to the sink with exponential backoff on transient failures."""
+    """Write to the sink with exponential backoff on transient failures.
+
+    Returns the record count the sink actually wrote (0 when it skipped the
+    batch whole, e.g. every column was a VARIANT companion collision).
+    """
     for attempt in range(_WRITE_MAX_RETRIES):
         try:
-            sink.write(consolidated)
-            return
+            return sink.write(consolidated)
         except Exception as exc:
             error_type = "ducklake_commit_contention" if _is_commit_contention(exc) else "write_retry"
             metrics.errors_total.labels(type=error_type).inc()
@@ -334,7 +337,7 @@ def _flush(
     consolidated = _apply_sort(consolidated, cfg)
 
     t0 = time.monotonic()
-    _write_with_retry(sink, consolidated)
+    records_written = _write_with_retry(sink, consolidated)
     write_duration = time.monotonic() - t0
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded
@@ -377,7 +380,9 @@ def _flush(
     metrics.flush_duration_seconds.observe(write_duration)
     metrics.flush_size_bytes.observe(pending_bytes)
     metrics.flush_size_records.observe(pending_records)
-    metrics.records_written_total.inc(pending_records)
+    # The sink's count, not pending_records: a skipped batch (all columns
+    # were companion collisions) is records_skipped, not records_written.
+    metrics.records_written_total.inc(records_written)
     metrics.batches_flushed_total.labels(trigger=trigger).inc()
     server.health.record_flush()
 

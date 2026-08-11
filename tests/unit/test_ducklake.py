@@ -10,6 +10,9 @@ from millpond.ducklake import (
     _sanitize_setting_value,
     _table_exists,
     _validate_partition_expr,
+    build_insert_select_sql,
+    drop_variant_companion_columns,
+    variant_column_name,
 )
 
 
@@ -141,9 +144,7 @@ class TestEnsureTable:
         conn = MagicMock()
         _ensure_table(conn, "events", _sample_batch(), cache, partition_by="team_id,year(ts)")
         # Find the ALTER PARTITIONED BY call
-        alter_calls = [
-            call for call in conn.execute.call_args_list if "PARTITIONED BY" in str(call)
-        ]
+        alter_calls = [call for call in conn.execute.call_args_list if "PARTITIONED BY" in str(call)]
         assert len(alter_calls) == 1
         assert "team_id,year(ts)" in str(alter_calls[0])
 
@@ -185,3 +186,96 @@ class TestEnsureTable:
         conn.execute.side_effect = execute_side_effect
         _ensure_table(conn, "events", _sample_batch(), cache, partition_by="team_id")
         assert "events" in cache
+
+
+class TestVariantColumnName:
+    def test_suffix(self):
+        assert variant_column_name("properties") == "properties_variant"
+
+    def test_person_properties(self):
+        assert variant_column_name("person_properties") == "person_properties_variant"
+
+
+class TestBuildInsertSelectSql:
+    def test_no_variant_columns_uses_star(self):
+        # Opt-in dual-write must not rewrite every writer's INSERT.
+        sql = build_insert_select_sql(["event", "team_id"], None)
+        assert sql == "*, NOW() AS _inserted_at"
+
+    def test_empty_variant_tuple_uses_star(self):
+        sql = build_insert_select_sql(["event"], ())
+        assert sql == "*, NOW() AS _inserted_at"
+
+    def test_configured_source_absent_from_batch_uses_star(self):
+        sql = build_insert_select_sql(["event"], ("properties",))
+        assert "properties_variant" not in sql
+        assert sql == "*, NOW() AS _inserted_at"
+
+    def test_dual_writes_configured_source(self):
+        sql = build_insert_select_sql(
+            ["event", "properties", "team_id"],
+            ("properties",),
+        )
+        assert '"properties"' in sql
+        assert 'try_cast(try_cast("properties" AS JSON) AS VARIANT) AS "properties_variant"' in sql
+        assert sql.endswith("NOW() AS _inserted_at")
+        # Original column still present (dual-write, not replace).
+        assert sql.index('"properties"') < sql.index("properties_variant")
+        # Not the star form when dual-write is active.
+        assert not sql.startswith("*")
+
+    def test_multiple_sources(self):
+        sql = build_insert_select_sql(
+            ["properties", "person_properties"],
+            ("properties", "person_properties"),
+        )
+        assert 'AS "properties_variant"' in sql
+        assert 'AS "person_properties_variant"' in sql
+
+    def test_escapes_embedded_quotes_in_identifiers(self):
+        sql = build_insert_select_sql(['weir"d', "properties"], ("properties",))
+        assert '"weir""d"' in sql
+
+    def test_case_insensitive_source_match(self):
+        # DuckDB resolves identifiers case-insensitively — a Properties batch
+        # key feeds the same column as configured properties, so it must
+        # dual-write. Alias uses the configured source's casing.
+        sql = build_insert_select_sql(["Properties", "event"], ("properties",))
+        assert 'try_cast(try_cast("Properties" AS JSON) AS VARIANT) AS "properties_variant"' in sql
+
+    def test_case_variant_duplicates_project_companion_once(self):
+        # Two batch keys that casefold to the same source must not emit two
+        # companion aliases (duplicate alias would fail the INSERT).
+        sql = build_insert_select_sql(["Properties", "properties"], ("properties",))
+        assert sql.count('AS "properties_variant"') == 1
+
+
+class TestDropVariantCompanionColumns:
+    def test_no_config_unchanged(self):
+        batch = pa.table({"properties": ["{}"], "properties_variant": ["x"]})
+        out = drop_variant_companion_columns(batch, None)
+        assert out.schema.names == ["properties", "properties_variant"]
+
+    def test_drops_companion_keeps_source(self):
+        batch = pa.table({"properties": ["{}"], "properties_variant": ["x"], "event": ["e"]})
+        out = drop_variant_companion_columns(batch, ("properties",))
+        assert out.schema.names == ["properties", "event"]
+        assert out.column("properties").to_pylist() == ["{}"]
+
+    def test_drops_orphan_companion_without_source(self):
+        # Companion alone would otherwise evolve() as VARCHAR — strip it.
+        batch = pa.table({"event": ["x"], "properties_variant": ["y"]})
+        out = drop_variant_companion_columns(batch, ("properties",))
+        assert out.schema.names == ["event"]
+
+    def test_clean_batch_unchanged(self):
+        batch = pa.table({"properties": ["{}"], "event": ["x"]})
+        out = drop_variant_companion_columns(batch, ("properties",))
+        assert out.schema.names == ["properties", "event"]
+
+    def test_drops_case_variant_companion(self):
+        # DuckDB identifiers are case-insensitive: PROPERTIES_VARIANT would
+        # land in (and poison) the same catalog column as properties_variant.
+        batch = pa.table({"properties": ["{}"], "PROPERTIES_VARIANT": ["x"], "Properties_Variant": ["y"]})
+        out = drop_variant_companion_columns(batch, ("properties",))
+        assert out.schema.names == ["properties"]

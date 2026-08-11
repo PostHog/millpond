@@ -22,6 +22,17 @@ from millpond import metrics
 # metric bump.
 SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
+# Dual-write suffix for VARIANT companion columns. Source `properties` →
+# sink `properties_variant`. Shared with ducklake.write so the ADD COLUMN
+# path and the INSERT projection never disagree on the derived name.
+VARIANT_COLUMN_SUFFIX = "_variant"
+
+
+def variant_column_name(source: str) -> str:
+    """Derived VARIANT companion name for a dual-written source column."""
+    return f"{source}{VARIANT_COLUMN_SUFFIX}"
+
+
 log = logging.getLogger(__name__)
 
 # PyArrow type → DuckDB SQL type
@@ -76,7 +87,13 @@ _INFO_SCHEMA_TO_CANONICAL: dict[str, str] = {
 
 def _normalize_duckdb_type(type_name: str) -> str:
     """Normalize a DuckDB type name from information_schema to our canonical form."""
-    return _INFO_SCHEMA_TO_CANONICAL.get(type_name, type_name)
+    if type_name in _INFO_SCHEMA_TO_CANONICAL:
+        return _INFO_SCHEMA_TO_CANONICAL[type_name]
+    # VARIANT spelling varies by catalog ("VARIANT" / "Variant"); compare
+    # case-insensitively so ensure_variant_columns never re-ADD every flush.
+    if type_name.upper() == "VARIANT":
+        return "VARIANT"
+    return type_name
 
 
 class SchemaManager:
@@ -113,16 +130,108 @@ class SchemaManager:
             self._known_columns = {}
             self._initialized = True
 
-    def evolve(self, batch_schema: pa.Schema) -> None:
-        """Compare incoming Arrow schema against table and issue DDL if needed."""
+    def _ensure_schema_loaded(self) -> bool:
+        """Load/reload known columns if needed. Returns False if the table is empty/missing."""
         if not self._initialized:
             self._load_table_schema()
-
         if not self._known_columns:
-            # Table was just created by _ensure_table, reload
+            # Table was just created by _ensure_table, or does not exist yet.
             self._load_table_schema()
             if not self._known_columns:
+                return False
+        return True
+
+    def _column_type(self, column_name: str) -> str | None:
+        """Cached type for a column, matched case-insensitively.
+
+        The cache is keyed by catalog-stored casing while callers hold
+        config-cased names; DuckDB resolves identifiers case-insensitively, so
+        an exact-case get() would miss (and re-ADD) a case-differing column.
+        """
+        lname = column_name.lower()
+        for name, typ in self._known_columns.items():
+            if name.lower() == lname:
+                return typ
+        return None
+
+    def _set_column_type(self, column_name: str, duckdb_type: str) -> None:
+        """Update the cache under the existing (catalog-cased) key if one matches.
+
+        A plain ``dict[column_name] = type`` could create a second entry that
+        differs only in case, leaving _column_type to return the stale one.
+        """
+        lname = column_name.lower()
+        for name in self._known_columns:
+            if name.lower() == lname:
+                self._known_columns[name] = duckdb_type
                 return
+        self._known_columns[column_name] = duckdb_type
+
+    def _add_column(self, column_name: str, duckdb_type: str, require_verified: bool = False) -> bool:
+        """ADD COLUMN IF NOT EXISTS, re-read the live schema, and update the cache.
+
+        The live schema is re-read (via the shared _load_table_schema path)
+        rather than trusted because ADD IF NOT EXISTS is a no-op when the
+        column already exists under any type (e.g. created by another writer) —
+        caching the requested type would silently mask the mismatch.
+
+        When the advisory re-read itself fails after a successful ADD:
+        - ``require_verified=False`` (evolve's ordinary columns): trust the ADD
+          and cache the requested type — at worst a stale wrong type triggers a
+          widening attempt on a later flush.
+        - ``require_verified=True`` (VARIANT companions): return False so the
+          caller degrades for this flush — projecting into an unverified column
+          risks silently corrupting it via implicit casts.
+
+        Returns True when the column is known (or trusted) to exist as
+        ``duckdb_type``; on failure logs, bumps ``errors_total{type="schema"}``,
+        and returns False so callers degrade rather than crash-loop the write
+        path.
+        """
+        log.info("Schema evolution: adding column %s (%s)", column_name, duckdb_type)
+        try:
+            self._conn.execute(
+                f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
+                f'ADD COLUMN IF NOT EXISTS "{column_name}" {duckdb_type}'
+            )
+        except duckdb.Error as e:
+            log.warning("Failed to add column %s: %s", column_name, e)
+            metrics.errors_total.labels(type="schema").inc()
+            return False
+        try:
+            self._load_table_schema()
+        except duckdb.Error as e:
+            # Transient catalog error on an advisory re-read must not fail the
+            # flush (the ADD itself succeeded).
+            metrics.errors_total.labels(type="schema").inc()
+            if require_verified:
+                log.warning("Cannot verify type of %s after ADD COLUMN: %s; degrading", column_name, e)
+                return False
+            log.warning("Schema re-read failed after adding %s: %s; trusting the ADD", column_name, e)
+            self._set_column_type(column_name, duckdb_type)
+            metrics.schema_columns_added_total.inc()
+            return True
+        live = self._column_type(column_name)
+        if live is None:
+            log.warning("Column %s missing after ADD COLUMN IF NOT EXISTS", column_name)
+            metrics.errors_total.labels(type="schema").inc()
+            return False
+        if live != duckdb_type:
+            log.warning(
+                "Column %s is %s after ADD COLUMN IF NOT EXISTS (expected %s); keeping live type",
+                column_name,
+                live,
+                duckdb_type,
+            )
+            metrics.errors_total.labels(type="schema").inc()
+            return False
+        metrics.schema_columns_added_total.inc()
+        return True
+
+    def evolve(self, batch_schema: pa.Schema) -> None:
+        """Compare incoming Arrow schema against table and issue DDL if needed."""
+        if not self._ensure_schema_loaded():
+            return
 
         for field in batch_schema:
             if field.name == "_inserted_at":
@@ -135,23 +244,12 @@ class SchemaManager:
 
             duckdb_type = _arrow_type_to_duckdb(field.type)
 
-            if field.name not in self._known_columns:
-                # New column
-                log.info("Schema evolution: adding column %s (%s)", field.name, duckdb_type)
-                try:
-                    self._conn.execute(
-                        f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
-                        f'ADD COLUMN IF NOT EXISTS "{field.name}" {duckdb_type}'
-                    )
-                    self._known_columns[field.name] = duckdb_type
-                    metrics.schema_columns_added_total.inc()
-                except duckdb.Error as e:
-                    log.warning("Failed to add column %s: %s", field.name, e)
-                    metrics.errors_total.labels(type="schema").inc()
+            existing = self._column_type(field.name)
+            if existing is None:
+                self._add_column(field.name, duckdb_type)
 
-            elif self._known_columns[field.name] != duckdb_type:
+            elif existing != duckdb_type:
                 # Type mismatch — attempt widening
-                existing = self._known_columns[field.name]
                 log.info(
                     "Schema evolution: widening column %s from %s to %s",
                     field.name,
@@ -163,7 +261,7 @@ class SchemaManager:
                         f"ALTER TABLE lake.{self._schema_name}.{self._table_name} "
                         f'ALTER COLUMN "{field.name}" SET DATA TYPE {duckdb_type}'
                     )
-                    self._known_columns[field.name] = duckdb_type
+                    self._set_column_type(field.name, duckdb_type)
                     metrics.schema_columns_widened_total.inc()
                 except duckdb.Error as e:
                     # DuckLake rejects invalid promotions — log and continue
@@ -175,6 +273,83 @@ class SchemaManager:
                         e,
                     )
                     metrics.errors_total.labels(type="schema").inc()
+
+    def live_variant_column_names(self) -> frozenset[str]:
+        """Lowercased names of VARIANT columns in the live table schema.
+
+        Only the sink creates VARIANT columns (evolve maps nested Arrow types
+        to JSON), so every VARIANT column is sink-managed. write() uses this to
+        strip colliding payload fields even when the local variant_columns
+        config is absent or stale (mixed fleet).
+        """
+        if not self._ensure_schema_loaded():
+            return frozenset()
+        return frozenset(name.lower() for name, typ in self._known_columns.items() if typ == "VARIANT")
+
+    def ensure_variant_columns(
+        self,
+        sources: tuple[str, ...],
+        present_source_names: set[str],
+    ) -> frozenset[str]:
+        """Ensure VARIANT dual-write companions exist; return sources ready to project.
+
+        For each source in ``sources`` present in the batch, try to ensure a
+        ``{source}_variant`` VARIANT column. Returns the subset of sources whose
+        companion is confirmed VARIANT and safe to project on INSERT.
+
+        Degrades (excludes from the returned set) rather than raising when:
+        - the companion already exists as a non-VARIANT type (cannot ALTER in place)
+        - ADD COLUMN fails
+        - ADD IF NOT EXISTS no-ops on a wrong-typed column
+
+        Presence matching is case-insensitive: a ``Properties`` batch key feeds
+        the same DuckDB column as configured ``properties``, so it must dual-write
+        rather than silently skip. Projection must only cover the returned set —
+        otherwise INSERT binds a missing/wrong-typed column and crash-loops the
+        flush path. Bumps ``errors_total{type="schema"}`` on every degrade so
+        the misconfig is loud.
+        """
+        if not sources:
+            return frozenset()
+        if not self._ensure_schema_loaded():
+            return frozenset()
+
+        present_lower = {name.lower() for name in present_source_names}
+        ready: set[str] = set()
+        for source in sources:
+            if source.lower() not in present_lower:
+                continue
+            # Unreachable via config.load() (which rejects unsafe names), but
+            # kept as defense-in-depth: vname is embedded in generated DDL.
+            # No records are skipped on this path, so it's a schema error.
+            if not SAFE_IDENTIFIER.match(source):
+                log.warning("Skipping VARIANT dual-write for unsafe source field name: %r", source)
+                metrics.errors_total.labels(type="schema").inc()
+                continue
+
+            vname = variant_column_name(source)
+            existing = self._column_type(vname)
+            if existing == "VARIANT":
+                ready.add(source)
+                continue
+            if existing is not None:
+                log.warning(
+                    "VARIANT dual-write target %s exists as %s, expected VARIANT; "
+                    "degrading to string-only for source %s (DuckLake cannot ALTER "
+                    "to VARIANT in place)",
+                    vname,
+                    existing,
+                    source,
+                )
+                metrics.errors_total.labels(type="schema").inc()
+                continue
+
+            if self._add_column(vname, "VARIANT", require_verified=True):
+                ready.add(source)
+            else:
+                log.warning("Degrading to string-only for source %s", source)
+
+        return frozenset(ready)
 
     def invalidate(self) -> None:
         """Force a reload of the table schema on next evolve() call."""

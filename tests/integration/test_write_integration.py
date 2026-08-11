@@ -15,7 +15,7 @@ import pytest
 
 from millpond.arrow_converter import coerce_typed_columns, convert
 from millpond.ducklake import write
-from millpond.schema import SchemaManager
+from millpond.schema import SchemaManager, variant_column_name
 
 
 @pytest.fixture()
@@ -38,6 +38,22 @@ def cache() -> set[str]:
     return set()
 
 
+def _table_columns(conn, table: str = "events") -> dict[str, str]:
+    """column_name → data_type for a lake table (catalog-stored casing).
+
+    Single home for the information_schema assertion query so a change to how
+    columns are read (schema filter, type rename) lands in one place.
+    """
+    return {
+        row[0]: row[1]
+        for row in conn.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_catalog = 'lake' AND table_name = ?",
+            [table],
+        ).fetchall()
+    }
+
+
 @pytest.mark.integration
 class TestWritePath:
     def test_basic_write(self, conn, cache):
@@ -51,11 +67,7 @@ class TestWritePath:
         batch = pa.table({"event": ["click"]})
         write(conn, "events", batch, cache)
 
-        cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events'"
-        ).fetchall()
-        col_names = {row[0] for row in cols}
+        col_names = _table_columns(conn)
         assert "_inserted_at" in col_names
 
     def test_multiple_writes_accumulate(self, conn, cache):
@@ -71,13 +83,322 @@ class TestWritePath:
         batch = pa.table({"a": pa.array([], type=pa.int64())})
         write(conn, "events", batch, cache)
 
-        cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events'"
-        ).fetchall()
-        col_names = {row[0] for row in cols}
+        col_names = _table_columns(conn)
         assert "a" in col_names
         assert "_inserted_at" in col_names
+
+
+@pytest.mark.integration
+class TestVariantDualWrite:
+    """Dual-write JSON/VARCHAR source columns as VARIANT companions.
+
+    Keeps the original string column and adds `{name}_variant` via
+    try_cast(try_cast(col AS JSON) AS VARIANT). Uses SchemaManager so
+    ADD COLUMN + type-cache stay coherent across flushes.
+    """
+
+    def test_dual_writes_properties_variant(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table(
+            {
+                "event": ["$pageview", "click"],
+                "properties": [
+                    '{"$browser": "Chrome", "width": 1920}',
+                    '{"$browser": "Firefox", "width": 1440}',
+                ],
+            }
+        )
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        cols = _table_columns(conn)
+        assert cols["properties"] in ("VARCHAR", "JSON")  # source stays text-ish
+        assert cols[variant_column_name("properties")] == "VARIANT"
+
+        rows = conn.execute(
+            "SELECT event, properties, "
+            "variant_typeof(properties_variant), "
+            'properties_variant."$browser", '
+            "properties_variant.width "
+            "FROM lake.main.events ORDER BY event"
+        ).fetchall()
+        assert len(rows) == 2
+        by_event = {r[0]: r for r in rows}
+        # Original string preserved on the source column
+        assert '"Chrome"' in by_event["$pageview"][1]
+        assert '"Firefox"' in by_event["click"][1]
+        # VARIANT is a parsed object (not VARCHAR holding JSON text)
+        assert by_event["$pageview"][2].startswith("OBJECT")
+        assert by_event["$pageview"][3] == "Chrome"
+        assert by_event["$pageview"][4] == 1920
+        assert by_event["click"][3] == "Firefox"
+        assert by_event["click"][4] == 1440
+
+    def test_original_string_column_unchanged(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        raw = '{"a": 1, "b": "two"}'
+        batch = pa.table({"properties": [raw]})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        (stored,) = conn.execute("SELECT properties FROM lake.main.events").fetchone()
+        assert stored == raw
+
+    def test_malformed_json_nulls_variant_keeps_string(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table(
+            {
+                "id": [1, 2, 3],
+                "properties": ['{"ok": true}', "not json{{{", '{"ok": false}'],
+            }
+        )
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        rows = conn.execute(
+            "SELECT id, properties, properties_variant IS NULL AS vnull FROM lake.main.events ORDER BY id"
+        ).fetchall()
+        assert rows[0] == (1, '{"ok": true}', False)
+        assert rows[1][0] == 2
+        assert rows[1][1] == "not json{{{"
+        assert rows[1][2] is True  # variant nulled
+        assert rows[2] == (3, '{"ok": false}', False)
+
+    def test_absent_source_column_skips_dual_write(self, conn, cache):
+        """Configured source missing from this batch → no companion projected.
+
+        Column may still exist from a prior batch; rows just get NULL there.
+        """
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table({"event": ["x"]})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        cols = _table_columns(conn)
+        # properties absent from batch → properties_variant never ADDed
+        assert "properties_variant" not in cols
+        assert "event" in cols
+
+    def test_existing_table_gains_variant_column_on_evolve(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        # First write without dual-write — table has properties VARCHAR only
+        write(
+            conn,
+            "events",
+            pa.table({"properties": ['{"a": 1}']}),
+            cache,
+            schema_mgr,
+        )
+        assert "properties_variant" not in schema_mgr._known_columns
+
+        # Second write enables dual-write — ADD COLUMN + populate
+        write(
+            conn,
+            "events",
+            pa.table({"properties": ['{"a": 2}']}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        assert schema_mgr._known_columns.get("properties_variant") == "VARIANT"
+
+        rows = conn.execute(
+            "SELECT properties, properties_variant FROM lake.main.events ORDER BY properties"
+        ).fetchall()
+        assert len(rows) == 2
+        # First row pre-dates the VARIANT column → NULL companion
+        assert rows[0][1] is None
+        assert rows[1][1] is not None
+
+    def test_source_companion_collision_nonfatal_still_dual_writes(self, conn, cache):
+        """Poison payload with both properties and properties_variant must not crash-loop.
+
+        Companion is stripped; source dual-writes into a real VARIANT column.
+        """
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table(
+            {
+                "properties": ['{"a": 1}'],
+                "properties_variant": ["already here"],
+            }
+        )
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        cols = _table_columns(conn)
+        assert cols["properties_variant"] == "VARIANT"
+        (props, vtype) = conn.execute(
+            "SELECT properties, variant_typeof(properties_variant) FROM lake.main.events"
+        ).fetchone()
+        assert props == '{"a": 1}'
+        assert vtype.startswith("OBJECT")
+
+    def test_orphan_companion_payload_does_not_create_varchar_column(self, conn, cache):
+        """properties_variant alone in a batch must not evolve() as VARCHAR."""
+        schema_mgr = SchemaManager(conn, "events")
+        write(
+            conn,
+            "events",
+            pa.table({"event": ["x"], "properties_variant": ["poison"]}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        cols = _table_columns(conn)
+        assert "properties_variant" not in cols
+        assert "event" in cols
+
+        # Later real dual-write still works and creates VARIANT, not VARCHAR.
+        write(
+            conn,
+            "events",
+            pa.table({"event": ["y"], "properties": ['{"a": 1}']}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        assert _table_columns(conn)["properties_variant"] == "VARIANT"
+
+    def test_wrong_typed_companion_degrades_to_string_only(self, conn, cache):
+        """Pre-existing non-VARIANT companion: string still writes, no crash loop."""
+        conn.execute(
+            "CREATE TABLE lake.main.events ("
+            "properties VARCHAR, properties_variant VARCHAR, _inserted_at TIMESTAMP)"
+        )
+        schema_mgr = SchemaManager(conn, "events")
+        schema_mgr._load_table_schema()
+        assert schema_mgr._known_columns.get("properties_variant") == "VARCHAR"
+
+        batch = pa.table({"properties": ['{"a": 1}']})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        # Source landed; companion left alone (NULL for this insert — not projected).
+        (props, companion) = conn.execute("SELECT properties, properties_variant FROM lake.main.events").fetchone()
+        assert props == '{"a": 1}'
+        assert companion is None
+        # Cache still reflects VARCHAR — not poisoned to VARIANT.
+        assert schema_mgr._known_columns.get("properties_variant") == "VARCHAR"
+
+    def test_add_if_not_exists_noop_wrong_type_degrades(self, conn, cache):
+        """ADD IF NOT EXISTS no-op on wrong type: no cache poison, string-only write."""
+        conn.execute(
+            "CREATE TABLE lake.main.events ("
+            "properties VARCHAR, properties_variant VARCHAR, _inserted_at TIMESTAMP)"
+        )
+        schema_mgr = SchemaManager(conn, "events")
+        schema_mgr._known_columns = {"properties": "VARCHAR", "_inserted_at": "TIMESTAMP"}
+        schema_mgr._initialized = True
+
+        batch = pa.table({"properties": ['{"a": 1}']})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        assert schema_mgr._known_columns.get("properties_variant") == "VARCHAR"
+        (props,) = conn.execute("SELECT properties FROM lake.main.events").fetchone()
+        assert props == '{"a": 1}'
+
+    def test_variant_columns_requires_schema_manager(self, conn, cache):
+        batch = pa.table({"properties": ['{"a": 1}']})
+        with pytest.raises(ValueError, match="requires a SchemaManager"):
+            write(conn, "events", batch, cache, schema_mgr=None, variant_columns=("properties",))
+
+    def test_all_companion_poison_batch_skipped_nonfatally(self, conn, cache):
+        """A batch whose every column is a companion collision must not crash-loop.
+
+        After the drop the batch has zero columns; SELECT * over a zero-column
+        relation errors, so write() must skip the flush instead of raising.
+        """
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table({"properties_variant": ["poison", "poison2"]})
+        written = write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        assert written == 0  # skipped records must not count as written
+        tables = conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'lake'"
+        ).fetchall()
+        assert tables == []  # nothing created, nothing written, no exception
+
+    def test_genuine_zero_column_batch_still_fails_loudly(self, conn, cache):
+        """A batch that arrives with zero columns did not collide — no silent skip.
+
+        The companion-collision skip is gated on the drop actually emptying the
+        batch; an upstream bug producing a 0-column batch must keep surfacing
+        as a write failure, not vanish under a misleading skip reason.
+        """
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table({"a": [1, 2]}).drop_columns(["a"])
+        assert batch.num_columns == 0 and batch.num_rows == 2
+        with pytest.raises(duckdb.Error):
+            write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+    def test_unconfigured_writer_cannot_poison_live_variant_column(self, conn, cache):
+        """Mixed fleet: a writer without variant_columns must not write into a
+        live VARIANT companion (implicit VARCHAR→VARIANT cast would store a
+        string-wrapped variant invisible to `companion.field` queries)."""
+        schema_mgr = SchemaManager(conn, "events")
+        # Configured writer creates the VARIANT companion.
+        write(
+            conn,
+            "events",
+            pa.table({"properties": ['{"a": 1}']}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        assert _table_columns(conn)["properties_variant"] == "VARIANT"
+
+        # Unconfigured writer (fresh SchemaManager, no variant_columns) gets a
+        # poison payload carrying the companion key.
+        other_mgr = SchemaManager(conn, "events")
+        written = write(
+            conn,
+            "events",
+            pa.table({"properties": ['{"a": 2}'], "properties_variant": ["poison"]}),
+            cache,
+            other_mgr,
+        )
+        assert written == 1
+        rows = conn.execute(
+            "SELECT properties, variant_typeof(properties_variant) FROM lake.main.events "
+            "WHERE properties_variant IS NOT NULL ORDER BY properties"
+        ).fetchall()
+        # Both rows hold parsed objects — no string-wrapped variant landed.
+        assert [r[1].startswith("OBJECT") for r in rows] == [True]
+        # The unconfigured writer's row has a NULL companion (dropped field,
+        # no dual-write config), not the poison payload.
+        (companion,) = conn.execute(
+            "SELECT properties_variant IS NULL FROM lake.main.events WHERE properties = '{\"a\": 2}'"
+        ).fetchone()
+        assert companion is True
+
+    def test_write_returns_record_count(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table({"properties": ['{"a": 1}', '{"b": 2}']})
+        assert write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",)) == 2
+
+    def test_case_variant_companion_key_dropped(self, conn, cache):
+        """PROPERTIES_VARIANT lands in the same catalog column — must be stripped."""
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table(
+            {
+                "properties": ['{"a": 1}'],
+                "PROPERTIES_VARIANT": ["poison"],
+            }
+        )
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        cols = _table_columns(conn)
+        assert cols["properties_variant"] == "VARIANT"
+        (props, vtype) = conn.execute(
+            "SELECT properties, variant_typeof(properties_variant) FROM lake.main.events"
+        ).fetchone()
+        assert props == '{"a": 1}'
+        assert vtype.startswith("OBJECT")
+
+    def test_case_variant_source_key_still_dual_writes(self, conn, cache):
+        """A Properties batch key feeds the configured properties column case-insensitively."""
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table({"Properties": ['{"a": 1}']})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        cols = {k.lower(): v for k, v in _table_columns(conn).items()}
+        assert cols["properties_variant"] == "VARIANT"
+        (vtype,) = conn.execute("SELECT variant_typeof(properties_variant) FROM lake.main.events").fetchone()
+        assert vtype.startswith("OBJECT")
 
 
 @pytest.mark.integration
@@ -91,11 +412,7 @@ class TestSchemaEvolution:
         batch2 = pa.table({"event": ["view"], "source": ["web"]})
         write(conn, "events", batch2, cache, schema_mgr)
 
-        cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events'"
-        ).fetchall()
-        col_names = {row[0] for row in cols}
+        col_names = _table_columns(conn)
         assert "source" in col_names
 
         # Verify data landed correctly
@@ -111,11 +428,7 @@ class TestSchemaEvolution:
         batch = pa.table({"x": pa.array([1], type=pa.int64())})
         schema_mgr.evolve(batch.schema)
 
-        type_result = conn.execute(
-            "SELECT data_type FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events' AND column_name = 'x'"
-        ).fetchone()
-        assert type_result[0] == "BIGINT"
+        assert _table_columns(conn)["x"] == "BIGINT"
 
     def test_widen_float_to_double(self, conn):
         conn.execute("CREATE TABLE lake.main.events (x FLOAT)")
@@ -124,11 +437,7 @@ class TestSchemaEvolution:
         batch = pa.table({"x": pa.array([1.0], type=pa.float64())})
         schema_mgr.evolve(batch.schema)
 
-        type_result = conn.execute(
-            "SELECT data_type FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events' AND column_name = 'x'"
-        ).fetchone()
-        assert type_result[0] == "DOUBLE"
+        assert _table_columns(conn)["x"] == "DOUBLE"
 
     def test_multiple_new_columns_at_once(self, conn, cache):
         batch1 = pa.table({"a": [1]})
@@ -139,12 +448,8 @@ class TestSchemaEvolution:
         batch2 = pa.table({"a": [2], "b": ["x"], "c": [3.0]})
         write(conn, "events", batch2, cache, schema_mgr)
 
-        cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = 'lake' AND table_name = 'events'"
-        ).fetchall()
-        col_names = {row[0] for row in cols}
-        assert {"a", "b", "c", "_inserted_at"} <= col_names
+        col_names = _table_columns(conn)
+        assert {"a", "b", "c", "_inserted_at"} <= set(col_names)
 
         # Verify data integrity
         rows = conn.execute("SELECT a, b, c FROM lake.main.events ORDER BY a").fetchall()
@@ -339,9 +644,7 @@ class TestTimestampCoercionWritePath:
         # Data landed and the stored value is the right instant. DuckDB renders
         # TIMESTAMPTZ in the session timezone, so compare the instant (aware
         # equality is tz-independent) rather than its string form.
-        row = conn.execute(
-            "SELECT event, timestamp FROM lake.main.events WHERE uuid = 'u1'"
-        ).fetchone()
+        row = conn.execute("SELECT event, timestamp FROM lake.main.events WHERE uuid = 'u1'").fetchone()
         assert row[0] == "$pageview"
         assert row[1] == datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
 
@@ -351,12 +654,7 @@ class TestTimestampCoercionWritePath:
         batch = coerce_typed_columns(self._nrt_batch(), self.TS_PAIRS)
         write(conn, "events", batch, cache, SchemaManager(conn, "events"), schema_name="main")
 
-        types = dict(
-            conn.execute(
-                "SELECT column_name, data_type FROM information_schema.columns "
-                "WHERE table_catalog = 'lake' AND table_name = 'events'"
-            ).fetchall()
-        )
+        types = _table_columns(conn)
         for c in self.TS_COLS:
             assert types[c] == "TIMESTAMP WITH TIME ZONE"
 

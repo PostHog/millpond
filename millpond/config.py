@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from millpond import arrow_converter
+from millpond.schema import SAFE_IDENTIFIER, VARIANT_COLUMN_SUFFIX
 
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -113,6 +114,14 @@ class Config:
     # own freshly-created table is unaffected).
     typed_columns: tuple[tuple[str, str], ...] | None
 
+    # Optional source column names to dual-write as DuckLake VARIANT columns.
+    # Each listed column is kept as-is (typically VARCHAR JSON text) and also
+    # written to `{name}{VARIANT_COLUMN_SUFFIX}` via
+    # try_cast(try_cast(col AS JSON) AS VARIANT). DuckDB auto-shreds VARIANT
+    # on Parquet write. None disables dual-write (default — existing consumers
+    # are unaffected). See ducklake.write.
+    variant_columns: tuple[str, ...] | None
+
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
@@ -173,9 +182,6 @@ def _require(name: str) -> str:
     return val
 
 
-_SAFE_COLUMN_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-
-
 def _parse_filter_values(raw: str) -> tuple[int, ...] | tuple[str, ...]:
     """Parse MILLPOND_FILTER_VALUES into a homogeneous tuple.
 
@@ -225,7 +231,7 @@ def _load_filter_fields() -> tuple[
         raise RuntimeError("MILLPOND_FILTER_DROP_VALUES must be set together with MILLPOND_FILTER_DROP_FIELD_NAME")
 
     for field in (keep, drop):
-        if field is not None and not _SAFE_COLUMN_NAME.match(field):
+        if field is not None and not SAFE_IDENTIFIER.match(field):
             raise RuntimeError(
                 f"Filter field name {field!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
             )
@@ -323,26 +329,46 @@ def _load_include_values_config(
     )
 
 
-def _load_sort_by() -> tuple[str, ...] | None:
-    """Parse MILLPOND_SORT_BY into a tuple of column names.
+def _require_safe_column(env_name: str, name: str) -> None:
+    """Raise at startup when a configured column name is unsafe for generated SQL.
 
-    Comma-separated; whitespace trimmed; empty tokens dropped. Each name
-    must match the safe-identifier pattern (`[a-zA-Z_][a-zA-Z0-9_]*`) so
-    a misconfiguration surfaces at startup, not at the first flush.
-    Returns None when the env var is absent or whitespace-only.
+    Uses schema.SAFE_IDENTIFIER — the same gate the write path applies per
+    field — so a name accepted here can never be silently skipped at flush time.
     """
-    raw = os.environ.get("MILLPOND_SORT_BY", "").strip()
+    if not SAFE_IDENTIFIER.match(name):
+        raise RuntimeError(f"{env_name} column {name!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)")
+
+
+def _parse_column_list(env_name: str) -> tuple[str, ...] | None:
+    """Parse a comma-separated env var into an ordered tuple of column names.
+
+    Whitespace trimmed; empty tokens dropped; duplicates de-duplicated (first
+    wins). Each name must match the safe-identifier pattern so a
+    misconfiguration surfaces at startup, not at the first flush. Returns None
+    when the env var is absent or whitespace-only.
+    """
+    raw = os.environ.get(env_name, "").strip()
     if not raw:
         return None
-    fields = tuple(t.strip() for t in raw.split(",") if t.strip())
-    if not fields:
+    seen: set[str] = set()
+    cols: list[str] = []
+    for token in raw.split(","):
+        name = token.strip()
+        if not name:
+            continue
+        _require_safe_column(env_name, name)
+        if name in seen:
+            continue
+        seen.add(name)
+        cols.append(name)
+    if not cols:
         return None
-    for field in fields:
-        if not _SAFE_COLUMN_NAME.match(field):
-            raise RuntimeError(
-                f"MILLPOND_SORT_BY field {field!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
-            )
-    return fields
+    return tuple(cols)
+
+
+def _load_sort_by() -> tuple[str, ...] | None:
+    """Parse MILLPOND_SORT_BY into a tuple of column names."""
+    return _parse_column_list("MILLPOND_SORT_BY")
 
 
 def _load_typed_columns() -> tuple[tuple[str, str], ...] | None:
@@ -375,10 +401,7 @@ def _load_typed_columns() -> tuple[tuple[str, str], ...] | None:
             raise RuntimeError(f"MILLPOND_TYPED_COLUMNS entry {token!r} must be 'column:type'")
         name, _, type_name = token.partition(":")
         name, type_name = name.strip(), type_name.strip().lower()
-        if not _SAFE_COLUMN_NAME.match(name):
-            raise RuntimeError(
-                f"MILLPOND_TYPED_COLUMNS column {name!r} contains unsafe characters (must match [a-zA-Z_][a-zA-Z0-9_]*)"
-            )
+        _require_safe_column("MILLPOND_TYPED_COLUMNS", name)
         if type_name not in arrow_converter.COERCIBLE_TYPES:
             raise RuntimeError(
                 f"MILLPOND_TYPED_COLUMNS type {type_name!r} for column {name!r} must be one of "
@@ -394,6 +417,34 @@ def _load_typed_columns() -> tuple[tuple[str, str], ...] | None:
     if not pairs:
         return None
     return tuple(pairs)
+
+
+def _load_variant_columns() -> tuple[str, ...] | None:
+    """Parse MILLPOND_VARIANT_COLUMNS into an ordered tuple of source column names.
+
+    Format: comma-separated column names, e.g. ``properties,person_properties``.
+    Whitespace trimmed; empty tokens dropped; duplicates de-duplicated (first
+    wins). Column names must match the safe-identifier pattern — each source is
+    dual-written to ``{name}{VARIANT_COLUMN_SUFFIX}`` via generated SQL, so
+    injection-safe identifiers are mandatory. Returns None when the env var is
+    absent/whitespace.
+    """
+    cols = _parse_column_list("MILLPOND_VARIANT_COLUMNS")
+    if cols is None:
+        return None
+    for name in cols:
+        # Reject names that already end in the dual-write suffix — the derived
+        # column would be ``foo_variant_variant``, which is almost always a
+        # misconfiguration (operator listed the sink column, not the source).
+        # Case-insensitive: DuckDB resolves identifiers case-insensitively, so
+        # ``properties_VARIANT`` names the same sink column.
+        if name.lower().endswith(VARIANT_COLUMN_SUFFIX):
+            raise RuntimeError(
+                f"MILLPOND_VARIANT_COLUMNS column {name!r} already ends with "
+                f"{VARIANT_COLUMN_SUFFIX!r}; list the source JSON/VARCHAR column "
+                f"(e.g. 'properties'), not the derived VARIANT column name"
+            )
+    return cols
 
 
 _VALID_AUTO_OFFSET_RESET = ("earliest", "latest")
@@ -508,6 +559,7 @@ def load() -> Config:
     filter_keep_field, filter_drop_field, filter_values, filter_drop_values = _load_filter_fields()
     sort_by = _load_sort_by()
     typed_columns = _load_typed_columns()
+    variant_columns = _load_variant_columns()
 
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
@@ -531,6 +583,7 @@ def load() -> Config:
         **_load_include_values_config(filter_keep_field, filter_values),
         sort_by=sort_by,
         typed_columns=typed_columns,
+        variant_columns=variant_columns,
         kafka_config_overrides=kafka_overrides,
         # No ``MILLPOND_`` prefix on POSTHOG_PROJECT_TOKEN: it's a
         # PostHog-wide secret typically sourced from a shared K8s Secret
@@ -563,4 +616,9 @@ def load() -> Config:
         log.info("Sort by: %s (ascending)", ", ".join(cfg.sort_by))
     if cfg.typed_columns is not None:
         log.info("Coerce typed columns: %s", ", ".join(f"{n}:{t}" for n, t in cfg.typed_columns))
+    if cfg.variant_columns is not None:
+        log.info(
+            "Dual-write VARIANT columns: %s",
+            ", ".join(f"{n} -> {n}{VARIANT_COLUMN_SUFFIX}" for n in cfg.variant_columns),
+        )
     return cfg
