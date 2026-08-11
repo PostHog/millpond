@@ -316,6 +316,10 @@ def _stub_catalog(conn):
         "data_file_id BIGINT, table_id BIGINT, partition_key_index BIGINT, partition_value VARCHAR)"
     )
     conn.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_file_column_stats ("
+        "data_file_id BIGINT, table_id BIGINT, column_id BIGINT)"
+    )
+    conn.execute(
         "CREATE TABLE __ducklake_metadata_lake.ducklake_snapshot ("
         "snapshot_id BIGINT, snapshot_time VARCHAR, schema_version BIGINT)"
     )
@@ -327,6 +331,42 @@ def _stub_catalog(conn):
 
 def _builtin(name):
     return next(q for q in dm.load_queries(None, set()) if q.name == name)
+
+
+class TestBuiltinMetadataLookups:
+    @pytest.mark.parametrize(
+        ("query_name", "metric_name", "expected"),
+        [
+            ("ducklake_metadata_live_file_lookup", "files", 1),
+            ("ducklake_metadata_partition_value_lookup", "values", 2),
+            ("ducklake_metadata_file_column_stats_lookup", "stats", 2),
+        ],
+    )
+    def test_reads_only_metadata_for_one_live_file(self, conn, registry, query_name, metric_name, expected):
+        _stub_catalog(conn)
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
+            "(1, 1, 0, NULL, 'live', 100, 10),"
+            "(2, 1, 0, 1, 'expired', 100, 10)"
+        )
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_file_partition_value VALUES "
+            "(1, 1, 0, '2026-01-01'),"
+            "(1, 1, 1, '00'),"
+            "(2, 1, 0, 'expired')"
+        )
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_file_column_stats VALUES (1, 1, 10),(1, 1, 11),(2, 1, 10)"
+        )
+
+        q = _builtin(query_name)
+        assert q.interval_seconds == 60 * 60
+        assert "LIMIT 256" in q.sql
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+        _run(conn, q, gauges[q.name], sm)
+
+        assert _gauge_value(registry, f"{query_name}_{metric_name}") == expected
 
 
 class TestBuiltinFilesPerBand:
