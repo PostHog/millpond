@@ -173,6 +173,9 @@ class TestFlushErrorDistinction:
         cfg.sort_by = None
         kafka = MagicMock()
         table = pa.table({"a": [1, 2]})
+        # Sinks return the count actually written; _flush feeds it to
+        # records_written_total.
+        sink.write.return_value = table.num_rows
         offsets = {("topic", 0): 42}
         return sink, cfg, kafka, table, offsets
 

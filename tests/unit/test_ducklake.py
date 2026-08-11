@@ -236,6 +236,19 @@ class TestBuildInsertSelectSql:
         sql = build_insert_select_sql(['weir"d', "properties"], ("properties",))
         assert '"weir""d"' in sql
 
+    def test_case_insensitive_source_match(self):
+        # DuckDB resolves identifiers case-insensitively — a Properties batch
+        # key feeds the same column as configured properties, so it must
+        # dual-write. Alias uses the configured source's casing.
+        sql = build_insert_select_sql(["Properties", "event"], ("properties",))
+        assert 'try_cast(try_cast("Properties" AS JSON) AS VARIANT) AS "properties_variant"' in sql
+
+    def test_case_variant_duplicates_project_companion_once(self):
+        # Two batch keys that casefold to the same source must not emit two
+        # companion aliases (duplicate alias would fail the INSERT).
+        sql = build_insert_select_sql(["Properties", "properties"], ("properties",))
+        assert sql.count('AS "properties_variant"') == 1
+
 
 class TestDropVariantCompanionColumns:
     def test_no_config_unchanged(self):
@@ -259,3 +272,10 @@ class TestDropVariantCompanionColumns:
         batch = pa.table({"properties": ["{}"], "event": ["x"]})
         out = drop_variant_companion_columns(batch, ("properties",))
         assert out.schema.names == ["properties", "event"]
+
+    def test_drops_case_variant_companion(self):
+        # DuckDB identifiers are case-insensitive: PROPERTIES_VARIANT would
+        # land in (and poison) the same catalog column as properties_variant.
+        batch = pa.table({"properties": ["{}"], "PROPERTIES_VARIANT": ["x"], "Properties_Variant": ["y"]})
+        out = drop_variant_companion_columns(batch, ("properties",))
+        assert out.schema.names == ["properties"]

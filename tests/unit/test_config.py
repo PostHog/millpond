@@ -629,6 +629,13 @@ class TestVariantColumnsConfig:
         with pytest.raises(RuntimeError, match="already ends with"):
             load()
 
+    def test_suffix_name_rejected_case_insensitive(self, monkeypatch):
+        # DuckDB identifiers are case-insensitive, so properties_VARIANT names
+        # the same sink column — the misconfiguration guard must still fire.
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties_VARIANT")
+        with pytest.raises(RuntimeError, match="already ends with"):
+            load()
+
     def test_log_lists_mappings(self, monkeypatch, caplog):
         import logging
 

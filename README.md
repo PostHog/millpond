@@ -151,7 +151,7 @@ Malformed JSON nulls only the VARIANT companion (the string column still lands).
 
 Degrades without crash-looping when dual-write cannot run cleanly:
 
-- Payload fields named `{name}_variant` are stripped non-fatally (`records_skipped_total{reason="variant_companion_collision"}`) so a poison key cannot evolve a VARCHAR companion or bind-conflict the INSERT.
+- Payload fields named `{name}_variant` (any casing — DuckDB identifiers are case-insensitive) are stripped non-fatally (`variant_companion_columns_dropped_total`; records still land minus the field) so a poison key cannot evolve a VARCHAR companion or bind-conflict the INSERT. Writers also strip any payload field whose *live* table column is VARIANT, so a pod whose `MILLPOND_VARIANT_COLUMNS` is unset or stale (mixed fleet) cannot corrupt a companion via the implicit VARCHAR→VARIANT cast. A batch left with zero columns by the strip is skipped whole (`records_skipped_total{reason="variant_companion_collision"}` — those records *are* lost and excluded from `records_written_total`) instead of crash-looping the partition.
 - If `{name}_variant` already exists as a non-VARIANT type, or ADD COLUMN fails, that source is omitted from the VARIANT projection (string column still writes); `errors_total{type="schema"}` is bumped. DuckLake cannot `ALTER VARCHAR → VARIANT`.
 
 This is an opt-in migration step: readers can move from `json_extract(properties, …)` to `properties_variant."$browser"` (etc.) once the companion is populated, then a later cutover can drop the string column if desired. Dual-write (new column) is the supported path for that reason.

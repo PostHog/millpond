@@ -9,7 +9,7 @@ import pyarrow as pa
 
 from millpond import metrics, schema
 from millpond.config import Config
-from millpond.schema import SAFE_IDENTIFIER, variant_column_name
+from millpond.schema import variant_column_name
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,11 @@ def check_reserved_collision(batch_schema: pa.Schema, reserved: frozenset[str]) 
     append step explodes deep in the stack (duplicate column on the
     post-write projection). Catch it at the top of `write()` with a
     clear message instead.
+
+    Deliberately fatal, unlike the non-fatal VARIANT companion drops in
+    _drop_protected_columns: silently dropping a payload `_inserted_at` would
+    re-stamp replayed data and change its partition placement, which the
+    reserved-columns contract predating dual-write chose to surface loudly.
     """
     collisions = sorted(name for name in batch_schema.names if name in reserved)
     if collisions:
@@ -41,31 +46,23 @@ def check_reserved_collision(batch_schema: pa.Schema, reserved: frozenset[str]) 
         )
 
 
-def variant_companion_names(variant_columns: tuple[str, ...] | None) -> frozenset[str]:
-    """Sink-managed companion names for a dual-write config (e.g. properties_variant)."""
-    if not variant_columns:
-        return frozenset()
-    return frozenset(variant_column_name(s) for s in variant_columns)
+def _drop_protected_columns(batch: pa.Table, protected_lower: frozenset[str] | set[str]) -> pa.Table:
+    """Drop batch columns whose lowercased name is a sink-managed VARIANT target.
 
+    Matching is case-insensitive because DuckDB resolves identifiers
+    case-insensitively — a ``PROPERTIES_VARIANT`` key would land in the same
+    catalog column as ``properties_variant``. Bumps
+    ``variant_companion_columns_dropped_total`` once per dropped field name
+    (records still land, so this is not a ``records_skipped_total`` reason).
 
-def drop_variant_companion_columns(
-    batch: pa.Table,
-    variant_columns: tuple[str, ...] | None,
-) -> pa.Table:
-    """Strip sink-managed ``{source}_variant`` columns from the batch non-fatally.
-
-    Kafka payloads can carry a literal ``properties_variant`` key. Leaving it in
-    the batch would let evolve() ADD it as VARCHAR (silent corruption when a
-    later dual-write projects VARIANT into it) or collide with the INSERT
-    projection (crash loop). Drop companions before ensure_table/evolve/insert;
-    keep dual-writing from the real source column when present. Bumps
-    ``records_skipped_total{reason="variant_companion_collision"}`` once per
-    dropped field name (same cadence as ``unsafe_field_name``).
+    NB: reserved metadata names (``_inserted_at``, ``year``…) deliberately do
+    NOT go through this drop path — check_reserved_collision keeps its fatal
+    policy because silently re-stamping ``_inserted_at`` on replayed data would
+    change partition placement; that trade-off predates dual-write.
     """
-    companions = variant_companion_names(variant_columns)
-    if not companions:
+    if not protected_lower:
         return batch
-    drop = [n for n in batch.schema.names if n in companions]
+    drop = [n for n in batch.schema.names if n.lower() in protected_lower]
     if not drop:
         return batch
     for name in drop:
@@ -74,8 +71,26 @@ def drop_variant_companion_columns(
             "target; dual-write continues from the configured source when present",
             name,
         )
-        metrics.records_skipped_total.labels(reason="variant_companion_collision").inc()
+        metrics.variant_companion_columns_dropped_total.inc()
     return batch.drop_columns(drop)
+
+
+def drop_variant_companion_columns(
+    batch: pa.Table,
+    variant_columns: tuple[str, ...] | None,
+) -> pa.Table:
+    """Strip config-managed ``{source}_variant`` columns from the batch non-fatally.
+
+    Kafka payloads can carry a literal ``properties_variant`` key. Leaving it in
+    the batch would let evolve() ADD it as VARCHAR (silent corruption when a
+    later dual-write projects VARIANT into it) or collide with the INSERT
+    projection (crash loop). Drop companions before ensure_table/evolve/insert;
+    keep dual-writing from the real source column when present. write() also
+    drops any column whose *live* table type is VARIANT, protecting writers
+    whose local config is absent or stale (mixed fleet).
+    """
+    protected = {variant_column_name(s).lower() for s in variant_columns or ()}
+    return _drop_protected_columns(batch, protected)
 
 
 def _quote_ident(name: str) -> str:
@@ -97,20 +112,29 @@ def build_insert_select_sql(
 
         try_cast(try_cast("properties" AS JSON) AS VARIANT) AS "properties_variant"
 
-    Identifiers are quote-escaped (``"`` → ``""``) so a Kafka key containing a
-    quote cannot break the INSERT or inject SQL. ``try_cast`` nulls malformed
-    JSON on the VARIANT side only; the original string column still lands.
+    Source matching is case-insensitive (DuckDB resolves identifiers
+    case-insensitively, so a ``Properties`` batch column feeds the same catalog
+    column as configured ``properties``); the companion alias always uses the
+    configured source's casing, projected at most once per source. Identifiers
+    are quote-escaped (``"`` → ``""``) so a Kafka key containing a quote cannot
+    break the INSERT or inject SQL — the sole gate on these names, which is why
+    no SAFE_IDENTIFIER filter re-runs here: silently dropping a ready source
+    would leave a permanently-NULL companion with no signal. ``try_cast`` nulls
+    malformed JSON on the VARIANT side only; the original string column still
+    lands.
     """
-    active = frozenset(variant_columns or ())
-    dual_write_sources = [name for name in column_names if name in active and SAFE_IDENTIFIER.match(name)]
-    if not dual_write_sources:
+    active = {s.lower(): s for s in (variant_columns or ())}
+    if not any(name.lower() in active for name in column_names):
         return "*, NOW() AS _inserted_at"
 
     parts: list[str] = []
+    projected: set[str] = set()
     for name in column_names:
         parts.append(_quote_ident(name))
-        if name in active and SAFE_IDENTIFIER.match(name):
-            vname = variant_column_name(name)
+        source = active.get(name.lower())
+        if source is not None and source not in projected:
+            projected.add(source)
+            vname = variant_column_name(source)
             qname = _quote_ident(name)
             parts.append(f"try_cast(try_cast({qname} AS JSON) AS VARIANT) AS {_quote_ident(vname)}")
     parts.append("NOW() AS _inserted_at")
@@ -303,8 +327,11 @@ def write(
     partition_by: str | None = None,
     schema_name: str = "main",
     variant_columns: tuple[str, ...] | None = None,
-) -> None:
+) -> int:
     """Write an Arrow table to DuckLake with _inserted_at timestamp.
+
+    Returns the number of records actually written (0 when the batch is
+    skipped whole) so callers can keep records_written_total honest.
 
     When ``variant_columns`` is set, each listed source column present in the
     batch is dual-written: the original column is kept as-is, and a companion
@@ -324,7 +351,30 @@ def write(
         raise ValueError("VARIANT dual-write requires a SchemaManager (schema_mgr is None)")
     # Drop sink-managed companion names before CREATE/evolve so a Kafka key
     # named properties_variant cannot land as VARCHAR or collide on INSERT.
+    had_columns = batch.num_columns > 0
     batch = drop_variant_companion_columns(batch, variant_columns)
+    if schema_mgr is not None:
+        # Also drop any column whose *live* table type is VARIANT. Only the
+        # sink creates VARIANT columns (evolve maps nested Arrow types to
+        # JSON), so every VARIANT column is sink-managed. This protects
+        # writers whose variant_columns config is absent or stale (mixed
+        # fleet): INSERT BY NAME would otherwise implicitly cast the raw JSON
+        # text into a string-wrapped variant — silent corruption invisible to
+        # `companion.field` queries.
+        batch = _drop_protected_columns(batch, schema_mgr.live_variant_column_names())
+    if had_columns and batch.num_columns == 0:
+        # Every field was a companion collision (poison producer). SELECT *
+        # over a zero-column relation errors, so skip the flush instead of
+        # crash-looping the partition on the same batch. These records ARE
+        # lost, hence records_skipped_total (unlike the per-column drops).
+        # Gated on had_columns: a batch that arrives with zero columns did
+        # not collide with anything and must keep failing loudly below.
+        log.warning(
+            "Skipping batch of %d record(s): all columns collided with VARIANT dual-write targets",
+            batch.num_rows,
+        )
+        metrics.records_skipped_total.labels(reason="variant_companion_collision").inc(batch.num_rows)
+        return 0
     _ensure_table(conn, table_name, batch, tables_ensured, partition_by, schema_name)
     ready_sources: tuple[str, ...] | None = None
     if schema_mgr is not None:
@@ -338,6 +388,7 @@ def write(
         conn.execute(f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT {select_list} FROM _arrow_batch)")
     finally:
         conn.unregister("_arrow_batch")
+    return batch.num_rows
 
 
 class DuckLakeSink:
@@ -384,8 +435,8 @@ class DuckLakeSink:
         self._schema_mgr = schema.SchemaManager(self._conn, self._table_name, self._schema_name)
         self._variant_columns = cfg.variant_columns
 
-    def write(self, batch: pa.Table) -> None:
-        write(
+    def write(self, batch: pa.Table) -> int:
+        return write(
             self._conn,
             self._table_name,
             batch,
