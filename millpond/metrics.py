@@ -194,6 +194,16 @@ _variant_companion_columns_dropped_total = Counter(
     "Payload columns dropped for colliding with a VARIANT dual-write companion",
     ["pipeline", "broker_source"],
 )
+# Flushes that fell back to string-only because the VARIANT projection failed
+# at write time (e.g. a JSON integer above INT64_MAX overflows DuckDB's
+# shredded Parquet column). Counts flushes, not records; the rows still land,
+# with a NULL companion. Nonzero means some rows are missing VARIANT data —
+# read alongside errors_total{type="variant_write"}.
+_variant_write_fallback_total = Counter(
+    "millpond_variant_write_fallback_total",
+    "Flushes written string-only after the VARIANT projection failed",
+    ["pipeline", "broker_source"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -244,6 +254,7 @@ schema_columns_widened_total = _schema_columns_widened_total
 sort_skipped_total = _sort_skipped_total
 columns_coerced_total = _columns_coerced_total
 variant_companion_columns_dropped_total = _variant_companion_columns_dropped_total
+variant_write_fallback_total = _variant_write_fallback_total
 include_values_size = _include_values_size
 include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds
 include_values_pending_removals = _include_values_pending_removals
@@ -271,6 +282,7 @@ def init(pipeline: str, broker_source: str = ""):
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total, variant_companion_columns_dropped_total
+    global variant_write_fallback_total
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
@@ -322,6 +334,7 @@ def init(pipeline: str, broker_source: str = ""):
     variant_companion_columns_dropped_total = _variant_companion_columns_dropped_total.labels(
         pipeline=pipeline, broker_source=bs
     )
+    variant_write_fallback_total = _variant_write_fallback_total.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_size = _rdkafka_msg_size.labels(pipeline=pipeline, broker_source=bs)

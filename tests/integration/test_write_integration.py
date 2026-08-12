@@ -33,6 +33,23 @@ def conn():
 
 
 @pytest.fixture()
+def ducklake_conn(tmp_path):
+    """A REAL local DuckLake catalog (Parquet on disk), not the in-memory stand-in.
+
+    The `conn` fixture above is plain DuckDB: it never writes Parquet, so it
+    cannot exercise VARIANT shredding — the step that broke production on
+    2026-08-12. Use this fixture for anything that depends on the physical
+    write. Shredding only trips above DuckLake's data-inlining threshold, so
+    such tests need a few hundred rows, not one.
+    """
+    c = duckdb.connect()
+    c.execute("INSTALL ducklake; LOAD ducklake;")
+    c.execute(f"ATTACH 'ducklake:{tmp_path}/meta.ducklake' AS lake (DATA_PATH '{tmp_path}/data')")
+    yield c
+    c.close()
+
+
+@pytest.fixture()
 def cache() -> set[str]:
     """Per-test caller-owned ensure cache (formerly module-level `_tables_ensured`)."""
     return set()
@@ -161,6 +178,89 @@ class TestVariantDualWrite:
         assert rows[1][2] is True  # variant nulled
         assert rows[2] == (3, '{"ok": false}', False)
 
+    # Rows needed to push a DuckLake write past data-inlining into a real
+    # Parquet file, where VARIANT shredding actually happens.
+    _SHRED_ROWS = 200
+    _HUGE_INT_JSON = '{"n": 9223372036854775999}'  # > INT64_MAX
+
+    def test_huge_json_integer_falls_back_to_string_only(self, ducklake_conn, cache):
+        """A JSON integer above INT64_MAX must not wedge the partition.
+
+        2026-08-12 incident: try_cast accepts the value (valid VARIANT), but
+        DuckDB's shredded Parquet write overflows converting UINT64 → INT64,
+        failing the whole INSERT. Every NRT pod crash-looped on one tenant's
+        payload. The batch must land string-only instead.
+        """
+        conn = ducklake_conn
+        schema_mgr = SchemaManager(conn, "events")
+        n = self._SHRED_ROWS
+        batch = pa.table({"id": list(range(n)), "properties": [self._HUGE_INT_JSON] * n})
+        written = write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        assert written == n
+        rows, nulls = conn.execute(
+            "SELECT count(*), count(*) FILTER (WHERE properties_variant IS NULL) FROM lake.main.events"
+        ).fetchone()
+        assert rows == n  # every record still lands...
+        assert nulls == n  # ...with a NULL companion (batch degraded, not lost)
+        assert conn.execute("SELECT properties FROM lake.main.events LIMIT 1").fetchone()[0] == self._HUGE_INT_JSON
+
+    def test_clean_batch_after_fallback_still_dual_writes(self, ducklake_conn, cache):
+        """The fallback is per-flush, not sticky — later clean batches dual-write."""
+        conn = ducklake_conn
+        schema_mgr = SchemaManager(conn, "events")
+        n = self._SHRED_ROWS
+        write(
+            conn,
+            "events",
+            pa.table({"id": list(range(n)), "properties": [self._HUGE_INT_JSON] * n}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        write(
+            conn,
+            "events",
+            pa.table({"id": [10_000] * n, "properties": ['{"ok": true}'] * n}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        poisoned, clean = conn.execute(
+            "SELECT count(*) FILTER (WHERE id < 10000 AND properties_variant IS NULL), "
+            "count(*) FILTER (WHERE id = 10000 AND properties_variant IS NOT NULL) "
+            "FROM lake.main.events"
+        ).fetchone()
+        assert poisoned == n  # poison batch degraded
+        assert clean == n  # the next batch dual-writes normally
+
+    def test_insert_failure_unrelated_to_variant_still_raises(self, conn, cache):
+        """The fallback must not swallow failures the retry can't fix.
+
+        When the string-only retry fails too, the projection wasn't the cause
+        and the error has to reach the caller (main.py's retry/crash path).
+        """
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table({"id": [1], "properties": ['{"ok": true}']})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        class _FailingInserts:
+            """duckdb connections reject attribute patching; wrap instead."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                if sql.lstrip().upper().startswith("INSERT"):
+                    raise duckdb.Error("catalog write conflict")
+                return self._real.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        with pytest.raises(duckdb.Error, match="catalog write conflict"):
+            write(_FailingInserts(conn), "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
     def test_absent_source_column_skips_dual_write(self, conn, cache):
         """Configured source missing from this batch → no companion projected.
 
@@ -257,8 +357,7 @@ class TestVariantDualWrite:
     def test_wrong_typed_companion_degrades_to_string_only(self, conn, cache):
         """Pre-existing non-VARIANT companion: string still writes, no crash loop."""
         conn.execute(
-            "CREATE TABLE lake.main.events ("
-            "properties VARCHAR, properties_variant VARCHAR, _inserted_at TIMESTAMP)"
+            "CREATE TABLE lake.main.events (properties VARCHAR, properties_variant VARCHAR, _inserted_at TIMESTAMP)"
         )
         schema_mgr = SchemaManager(conn, "events")
         schema_mgr._load_table_schema()
@@ -277,8 +376,7 @@ class TestVariantDualWrite:
     def test_add_if_not_exists_noop_wrong_type_degrades(self, conn, cache):
         """ADD IF NOT EXISTS no-op on wrong type: no cache poison, string-only write."""
         conn.execute(
-            "CREATE TABLE lake.main.events ("
-            "properties VARCHAR, properties_variant VARCHAR, _inserted_at TIMESTAMP)"
+            "CREATE TABLE lake.main.events (properties VARCHAR, properties_variant VARCHAR, _inserted_at TIMESTAMP)"
         )
         schema_mgr = SchemaManager(conn, "events")
         schema_mgr._known_columns = {"properties": "VARCHAR", "_inserted_at": "TIMESTAMP"}

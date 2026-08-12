@@ -383,9 +383,42 @@ def write(
             ready = schema_mgr.ensure_variant_columns(variant_columns, set(batch.schema.names))
             ready_sources = tuple(s for s in variant_columns if s in ready) or None
     select_list = build_insert_select_sql(list(batch.schema.names), ready_sources)
+    insert_sql = f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT {select_list} FROM _arrow_batch)"
     conn.register("_arrow_batch", batch)
     try:
-        conn.execute(f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT {select_list} FROM _arrow_batch)")
+        try:
+            conn.execute(insert_sql)
+        except duckdb.Error:
+            if ready_sources is None:
+                raise
+            # The VARIANT projection can fail at WRITE time on values the
+            # cast itself accepted: DuckDB shreds VARIANT into typed Parquet
+            # columns, and a JSON integer above INT64_MAX arrives as UINT64
+            # and overflows the shredded column ("Type UINT64 with value ...
+            # out of range for INT64" — 2026-08-12 incident, every NRT pod
+            # crash-looped on one tenant's payload). try_cast cannot guard
+            # it: the value is valid VARIANT, only unshreddable.
+            #
+            # Retry the same batch string-only. The failed INSERT committed
+            # nothing, the string column still lands, and the companion is
+            # NULL for these rows — the same degradation ensure_variant_columns
+            # applies for a wrong-typed companion, rather than a poison batch
+            # wedging the partition forever. Re-raise if the retry also
+            # fails: then the projection was not the cause.
+            log.warning(
+                "VARIANT dual-write INSERT failed for %d record(s); retrying string-only "
+                "(companion NULL for this batch). Sources: %s",
+                batch.num_rows,
+                ", ".join(ready_sources),
+                exc_info=True,
+            )
+            metrics.errors_total.labels(type="variant_write").inc()
+            metrics.variant_write_fallback_total.inc()
+            fallback_sql = (
+                f"INSERT INTO lake.{schema_name}.{table_name} BY NAME "
+                f"(SELECT {build_insert_select_sql(list(batch.schema.names), None)} FROM _arrow_batch)"
+            )
+            conn.execute(fallback_sql)
     finally:
         conn.unregister("_arrow_batch")
     return batch.num_rows
