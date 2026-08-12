@@ -194,11 +194,13 @@ _variant_companion_columns_dropped_total = Counter(
     "Payload columns dropped for colliding with a VARIANT dual-write companion",
     ["pipeline", "broker_source"],
 )
-# Flushes that fell back to string-only because the VARIANT projection failed
-# at write time (e.g. a JSON integer above INT64_MAX overflows DuckDB's
-# shredded Parquet column). Counts flushes, not records; the rows still land,
-# with a NULL companion. Nonzero means some rows are missing VARIANT data —
-# read alongside errors_total{type="variant_write"}.
+# Flushes that fell back to string-only because a value reached the VARIANT
+# column that DuckDB could not shred, despite the per-row guard in
+# ducklake._variant_projection. Counts completed fallbacks (incremented after
+# the string-only write succeeds), not attempts. Expected to stay at zero:
+# nonzero means the guard pattern missed a value shape, so the whole batch
+# lost its companions and a partly-written Parquet file was abandoned. Read
+# alongside errors_total{type="variant_write"}.
 _variant_write_fallback_total = Counter(
     "millpond_variant_write_fallback_total",
     "Flushes written string-only after the VARIANT projection failed",

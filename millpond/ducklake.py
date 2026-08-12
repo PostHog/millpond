@@ -98,6 +98,52 @@ def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+# Matches a JSON numeric literal in VALUE position with 19+ digits — i.e. one
+# that may exceed INT64. Anchoring on the delimiters (`:`/`,`/`[` before,
+# `,`/`}`/`]` after) keeps long digit runs *inside string values* (session ids
+# and the like) out of the match, which a bare digit-run pattern would falsely
+# flag. 19 digits is deliberately one short of certain overflow
+# (INT64_MAX = 9223372036854775807): over-matching costs a row its companion,
+# under-matching costs the partition its liveness.
+_UNSHREDDABLE_JSON_INT = r"[:,\[]\s*-?[0-9]{19,}\s*[,}\]]"
+
+
+def _is_unshreddable_value_error(exc: BaseException) -> bool:
+    """True for DuckDB's out-of-range conversion error on a VARIANT write.
+
+    Matches the shape reported for both integer widths seen in practice
+    ("Type UINT64 with value ... can't be cast because the value is out of
+    range for the destination type INT64", and the INT128 variant), and
+    nothing else — commit contention and IO failures must stay retryable.
+    """
+    msg = str(exc)
+    return "out of range for the destination type" in msg and "can't be cast" in msg
+
+
+def _variant_projection(qname: str) -> str:
+    """VARIANT cast for one source column, guarding values DuckDB cannot shred.
+
+    ``try_cast`` is not sufficient protection here. A JSON integer above
+    INT64_MAX casts *successfully* into a valid UINT64 (or INT128) variant —
+    sub-field access even returns it — but DuckDB shreds VARIANT into typed
+    Parquet columns on write, and there the value overflows the INT64 shredded
+    column and fails the whole INSERT. On 2026-08-12 that crash-looped every
+    prod NRT consumer: offsets never advance, so the same batch fails forever.
+
+    So the guard has to run per row, before the value reaches the column:
+    rows whose JSON carries an unshreddable integer get a NULL companion (the
+    string column is authoritative and unaffected), and every other row in the
+    batch keeps its VARIANT. Batch-level recovery cannot do this — retrying a
+    failed INSERT costs the whole batch its companions, leaks the abandoned
+    Parquet file, and cannot help at all when a small write is inlined into the
+    catalog rather than written to Parquet.
+    """
+    return (
+        f"CASE WHEN regexp_matches({qname}, '{_UNSHREDDABLE_JSON_INT}') THEN NULL "
+        f"ELSE try_cast(try_cast({qname} AS JSON) AS VARIANT) END"
+    )
+
+
 def build_insert_select_sql(
     column_names: list[str],
     variant_columns: tuple[str, ...] | None,
@@ -121,7 +167,8 @@ def build_insert_select_sql(
     no SAFE_IDENTIFIER filter re-runs here: silently dropping a ready source
     would leave a permanently-NULL companion with no signal. ``try_cast`` nulls
     malformed JSON on the VARIANT side only; the original string column still
-    lands.
+    lands, as it does for the unshreddable-integer guard in
+    ``_variant_projection``.
     """
     active = {s.lower(): s for s in (variant_columns or ())}
     if not any(name.lower() in active for name in column_names):
@@ -136,7 +183,7 @@ def build_insert_select_sql(
             projected.add(source)
             vname = variant_column_name(source)
             qname = _quote_ident(name)
-            parts.append(f"try_cast(try_cast({qname} AS JSON) AS VARIANT) AS {_quote_ident(vname)}")
+            parts.append(f"{_variant_projection(qname)} AS {_quote_ident(vname)}")
     parts.append("NOW() AS _inserted_at")
     return ", ".join(parts)
 
@@ -388,37 +435,40 @@ def write(
     try:
         try:
             conn.execute(insert_sql)
-        except duckdb.Error:
-            if ready_sources is None:
-                raise
-            # The VARIANT projection can fail at WRITE time on values the
-            # cast itself accepted: DuckDB shreds VARIANT into typed Parquet
-            # columns, and a JSON integer above INT64_MAX arrives as UINT64
-            # and overflows the shredded column ("Type UINT64 with value ...
-            # out of range for INT64" — 2026-08-12 incident, every NRT pod
-            # crash-looped on one tenant's payload). try_cast cannot guard
-            # it: the value is valid VARIANT, only unshreddable.
+        except duckdb.Error as e:
+            # Backstop only. _variant_projection nulls the companion per row
+            # for values DuckDB cannot shred, so this should never fire; it
+            # exists because the alternative to an unrecognized unshreddable
+            # value is the 2026-08-12 crash loop (offsets never advance, so
+            # one poison batch wedges the partition forever).
             #
-            # Retry the same batch string-only. The failed INSERT committed
-            # nothing, the string column still lands, and the companion is
-            # NULL for these rows — the same degradation ensure_variant_columns
-            # applies for a wrong-typed companion, rather than a poison batch
-            # wedging the partition forever. Re-raise if the retry also
-            # fails: then the projection was not the cause.
+            # Deliberately narrow: only the out-of-range conversion signature
+            # is absorbed. Commit contention, S3 flaps and every other write
+            # failure must reach main.py's _write_with_retry, which classifies
+            # them, retries with backoff, and calls reset_caches() to reload
+            # the schema cache — recovery this function must not pre-empt.
+            if ready_sources is None or not _is_unshreddable_value_error(e):
+                raise
             log.warning(
-                "VARIANT dual-write INSERT failed for %d record(s); retrying string-only "
-                "(companion NULL for this batch). Sources: %s",
+                "VARIANT dual-write INSERT hit an unshreddable value not caught by the "
+                "row guard (%d record(s), sources: %s); retrying string-only. This costs "
+                "the whole batch its companions and abandons the partly-written Parquet "
+                "file, so treat a nonzero variant_write_fallback_total as a bug in the "
+                "guard pattern, not routine degradation.",
                 batch.num_rows,
                 ", ".join(ready_sources),
                 exc_info=True,
             )
-            metrics.errors_total.labels(type="variant_write").inc()
-            metrics.variant_write_fallback_total.inc()
             fallback_sql = (
                 f"INSERT INTO lake.{schema_name}.{table_name} BY NAME "
                 f"(SELECT {build_insert_select_sql(list(batch.schema.names), None)} FROM _arrow_batch)"
             )
             conn.execute(fallback_sql)
+            # Only now is the string-only write real: counting before the
+            # retry inflates both metrics by one per outer-retry attempt
+            # during an outage where nothing landed at all.
+            metrics.errors_total.labels(type="variant_write").inc()
+            metrics.variant_write_fallback_total.inc()
     finally:
         conn.unregister("_arrow_batch")
     return batch.num_rows

@@ -33,23 +33,6 @@ def conn():
 
 
 @pytest.fixture()
-def ducklake_conn(tmp_path):
-    """A REAL local DuckLake catalog (Parquet on disk), not the in-memory stand-in.
-
-    The `conn` fixture above is plain DuckDB: it never writes Parquet, so it
-    cannot exercise VARIANT shredding — the step that broke production on
-    2026-08-12. Use this fixture for anything that depends on the physical
-    write. Shredding only trips above DuckLake's data-inlining threshold, so
-    such tests need a few hundred rows, not one.
-    """
-    c = duckdb.connect()
-    c.execute("INSTALL ducklake; LOAD ducklake;")
-    c.execute(f"ATTACH 'ducklake:{tmp_path}/meta.ducklake' AS lake (DATA_PATH '{tmp_path}/data')")
-    yield c
-    c.close()
-
-
-@pytest.fixture()
 def cache() -> set[str]:
     """Per-test caller-owned ensure cache (formerly module-level `_tables_ensured`)."""
     return set()
@@ -178,42 +161,77 @@ class TestVariantDualWrite:
         assert rows[1][2] is True  # variant nulled
         assert rows[2] == (3, '{"ok": false}', False)
 
-    # Rows needed to push a DuckLake write past data-inlining into a real
-    # Parquet file, where VARIANT shredding actually happens.
-    _SHRED_ROWS = 200
-    _HUGE_INT_JSON = '{"n": 9223372036854775999}'  # > INT64_MAX
+    # > INT64_MAX (and a 30-digit one, which DuckDB parses as INT128). Both
+    # cast to a valid VARIANT and both explode when the write shreds them.
+    _HUGE_INT_JSON = '{"n": 9223372036854775999}'
+    _HUGE_INT128_JSON = '{"n": 123456789012345678901234567890}'
 
-    def test_huge_json_integer_falls_back_to_string_only(self, ducklake_conn, cache):
+    def test_unshreddable_integer_nulls_only_its_own_row(self, ducklake_conn, cache):
         """A JSON integer above INT64_MAX must not wedge the partition.
 
-        2026-08-12 incident: try_cast accepts the value (valid VARIANT), but
-        DuckDB's shredded Parquet write overflows converting UINT64 → INT64,
-        failing the whole INSERT. Every NRT pod crash-looped on one tenant's
-        payload. The batch must land string-only instead.
+        2026-08-12 incident: try_cast accepts the value (it IS a valid UINT64
+        variant), but DuckDB shreds VARIANT into typed Parquet columns on
+        write and overflows converting to INT64, failing the whole INSERT
+        forever since offsets never advance. The row guard must null just the
+        offending rows and leave their neighbours' companions intact.
         """
         conn = ducklake_conn
         schema_mgr = SchemaManager(conn, "events")
-        n = self._SHRED_ROWS
-        batch = pa.table({"id": list(range(n)), "properties": [self._HUGE_INT_JSON] * n})
+        batch = pa.table(
+            {
+                "id": [1, 2, 3, 4],
+                "properties": [
+                    self._HUGE_INT_JSON,
+                    '{"ok": true, "w": 1920}',
+                    '{"session": "12345678901234567890"}',  # long digits INSIDE a string
+                    self._HUGE_INT128_JSON,
+                ],
+            }
+        )
         written = write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
 
-        assert written == n
-        rows, nulls = conn.execute(
-            "SELECT count(*), count(*) FILTER (WHERE properties_variant IS NULL) FROM lake.main.events"
-        ).fetchone()
-        assert rows == n  # every record still lands...
-        assert nulls == n  # ...with a NULL companion (batch degraded, not lost)
-        assert conn.execute("SELECT properties FROM lake.main.events LIMIT 1").fetchone()[0] == self._HUGE_INT_JSON
+        assert written == 4
+        rows = conn.execute(
+            "SELECT id, properties, properties_variant IS NULL FROM lake.main.events ORDER BY id"
+        ).fetchall()
+        assert [r[2] for r in rows] == [True, False, False, True]
+        # Every source string is preserved verbatim, poison included.
+        assert rows[0][1] == self._HUGE_INT_JSON
+        assert rows[3][1] == self._HUGE_INT128_JSON
+        # The clean neighbours keep real parsed VARIANT data.
+        assert conn.execute("SELECT properties_variant.w FROM lake.main.events WHERE id = 2").fetchone()[0] == 1920
 
-    def test_clean_batch_after_fallback_still_dual_writes(self, ducklake_conn, cache):
-        """The fallback is per-flush, not sticky — later clean batches dual-write."""
+    def test_unshreddable_integer_never_reaches_inlined_catalog_state(self, ducklake_conn_inlining, cache):
+        """The inlining path commits without shredding — poison must not get in.
+
+        With data inlining a small write does NOT fail; the value lands in
+        catalog state and detonates later, when ducklake_flush_inlined_data
+        materializes it. No write-time retry can reach that, so the row guard
+        (not a fallback) is what has to prevent it.
+        """
+        conn = ducklake_conn_inlining
+        schema_mgr = SchemaManager(conn, "events")
+        write(
+            conn,
+            "events",
+            pa.table({"id": [1], "properties": [self._HUGE_INT_JSON]}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        # The poison row is stored string-only, so materializing inlined data
+        # (which unguarded would raise "INT128 ... out of range") succeeds.
+        conn.execute("CALL ducklake_flush_inlined_data('lake')")
+        assert conn.execute("SELECT properties_variant IS NULL FROM lake.main.events").fetchone()[0] is True
+
+    def test_clean_batch_after_poison_still_dual_writes(self, ducklake_conn, cache):
+        """The guard is per row and stateless — later clean batches dual-write."""
         conn = ducklake_conn
         schema_mgr = SchemaManager(conn, "events")
-        n = self._SHRED_ROWS
         write(
             conn,
             "events",
-            pa.table({"id": list(range(n)), "properties": [self._HUGE_INT_JSON] * n}),
+            pa.table({"id": [1], "properties": [self._HUGE_INT_JSON]}),
             cache,
             schema_mgr,
             variant_columns=("properties",),
@@ -221,45 +239,106 @@ class TestVariantDualWrite:
         write(
             conn,
             "events",
-            pa.table({"id": [10_000] * n, "properties": ['{"ok": true}'] * n}),
+            pa.table({"id": [2], "properties": ['{"ok": true}']}),
             cache,
             schema_mgr,
             variant_columns=("properties",),
         )
-        poisoned, clean = conn.execute(
-            "SELECT count(*) FILTER (WHERE id < 10000 AND properties_variant IS NULL), "
-            "count(*) FILTER (WHERE id = 10000 AND properties_variant IS NOT NULL) "
-            "FROM lake.main.events"
+        rows = conn.execute("SELECT id, properties_variant IS NULL FROM lake.main.events ORDER BY id").fetchall()
+        assert rows == [(1, True), (2, False)]
+
+    def test_second_source_keeps_its_companion(self, ducklake_conn, cache):
+        """Poison in one source must not null a healthy second source's companion."""
+        conn = ducklake_conn
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table(
+            {
+                "id": [1],
+                "properties": [self._HUGE_INT_JSON],
+                "person_properties": ['{"plan": "ent"}'],
+            }
+        )
+        write(
+            conn,
+            "events",
+            batch,
+            cache,
+            schema_mgr,
+            variant_columns=("properties", "person_properties"),
+        )
+        poisoned, healthy = conn.execute(
+            "SELECT properties_variant IS NULL, person_properties_variant.plan FROM lake.main.events"
         ).fetchone()
-        assert poisoned == n  # poison batch degraded
-        assert clean == n  # the next batch dual-writes normally
+        assert poisoned is True
+        assert healthy == "ent"
 
-    def test_insert_failure_unrelated_to_variant_still_raises(self, conn, cache):
-        """The fallback must not swallow failures the retry can't fix.
+    def test_retryable_insert_failure_is_not_absorbed(self, conn, cache):
+        """Only the unshreddable-value signature may trigger the fallback.
 
-        When the string-only retry fails too, the projection wasn't the cause
-        and the error has to reach the caller (main.py's retry/crash path).
+        Commit contention and IO failures must reach main.py's _write_with_retry,
+        which classifies them, backs off, and calls reset_caches(). Absorbing
+        them would permanently null companions for reasons unrelated to poison
+        data and blind the contention alert.
         """
         schema_mgr = SchemaManager(conn, "events")
         batch = pa.table({"id": [1], "properties": ['{"ok": true}']})
         write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
 
-        class _FailingInserts:
+        class _FailVariantInsertOnly:
             """duckdb connections reject attribute patching; wrap instead."""
 
-            def __init__(self, real):
+            def __init__(self, real, message):
                 self._real = real
+                self._message = message
+                self.insert_attempts = 0
 
             def execute(self, sql, *args, **kwargs):
                 if sql.lstrip().upper().startswith("INSERT"):
-                    raise duckdb.Error("catalog write conflict")
+                    self.insert_attempts += 1
+                    # Only the dual-write projection fails; a string-only
+                    # retry would succeed, so a fallback would be observable.
+                    if "try_cast" in sql:
+                        raise duckdb.Error(self._message)
                 return self._real.execute(sql, *args, **kwargs)
 
             def __getattr__(self, name):
                 return getattr(self._real, name)
 
-        with pytest.raises(duckdb.Error, match="catalog write conflict"):
-            write(_FailingInserts(conn), "events", batch, cache, schema_mgr, variant_columns=("properties",))
+        contention = _FailVariantInsertOnly(conn, "TransactionContext Error: could not serialize access")
+        with pytest.raises(duckdb.Error, match="could not serialize access"):
+            write(contention, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+        assert contention.insert_attempts == 1  # no string-only retry was attempted
+
+    def test_unshreddable_error_still_falls_back(self, conn, cache):
+        """The backstop stays available for value shapes the row guard misses."""
+        schema_mgr = SchemaManager(conn, "events")
+        batch = pa.table({"id": [1], "properties": ['{"ok": true}']})
+        write(conn, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+
+        class _FailVariantInsertOnly:
+            def __init__(self, real):
+                self._real = real
+                self.insert_attempts = 0
+
+            def execute(self, sql, *args, **kwargs):
+                if sql.lstrip().upper().startswith("INSERT"):
+                    self.insert_attempts += 1
+                    if "try_cast" in sql:
+                        raise duckdb.Error(
+                            "Invalid Input Error: Type UINT64 with value 1 can't be cast "
+                            "because the value is out of range for the destination type INT64"
+                        )
+                return self._real.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        wrapped = _FailVariantInsertOnly(conn)
+        written = write(wrapped, "events", batch, cache, schema_mgr, variant_columns=("properties",))
+        assert written == 1
+        assert wrapped.insert_attempts == 2  # dual-write attempt, then string-only
+        nulls = conn.execute("SELECT count(*) FROM lake.main.events WHERE properties_variant IS NULL").fetchone()[0]
+        assert nulls == 1
 
     def test_absent_source_column_skips_dual_write(self, conn, cache):
         """Configured source missing from this batch → no companion projected.
