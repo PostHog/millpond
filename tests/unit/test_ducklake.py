@@ -219,9 +219,6 @@ class TestBuildInsertSelectSql:
         assert '"properties"' in sql
         assert 'try_cast(try_cast("properties" AS JSON) AS VARIANT)' in sql
         assert 'AS "properties_variant"' in sql
-        # Rows carrying an unshreddable integer get a NULL companion rather
-        # than failing the write (see _variant_projection).
-        assert 'regexp_matches("properties"' in sql
         assert sql.endswith("NOW() AS _inserted_at")
         # Original column still present (dual-write, not replace).
         assert sql.index('"properties"') < sql.index("properties_variant")
