@@ -16,15 +16,27 @@ license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",
-    # Pinned exactly. 1.5.2 is the DuckDB release that ships DuckLake 1.0,
-    # the breaking-change rev of the ducklake extension that millpond/ducklake.py
-    # has been aligned against. The DuckLake 1.x line is pre-stable, and the
-    # extension repository does not expose installable version specifiers for
+    # Pinned exactly, and matched to pyducklake's own duckdb pin. The DuckDB
+    # version selects the ducklake extension channel: 1.5.2's channel is
+    # frozen at build 415a9ebd (2026-04-09), whose per-connection
+    # stats/schemas caches grow unbounded as catalog snapshots advance —
+    # the leak that OOM-killed viaduck every 4-6h (A/B-verified there:
+    # 415a9ebd leaks ~1MiB per snapshot-advancing bind; the 1.5.5-channel
+    # build is flat). The DuckLake 1.x line is pre-stable, and the extension
+    # repository does not expose installable version specifiers for
     # ducklake — INSTALL ducklake VERSION '...' returns 404. To compensate,
     # tests/unit/test_ducklake_pin.py asserts the build SHA of the loaded
     # extension as a drift canary. Bumping this DuckDB pin (or letting the
     # extension SHA move) requires updating that canary explicitly.
-    "duckdb==1.5.2",
+    "duckdb==1.5.5",
+    # Our DuckLake Python API (jghoman/pyducklake). Nothing imports it yet —
+    # it is here as a deliberate lockstep canary: pyducklake hard-pins its
+    # duckdb version (==1.5.5 as of 1.0.17, the first release on the safe
+    # extension channel above), so a future bump of either duckdb or
+    # pyducklake that the other hasn't matched makes `uv lock` unresolvable
+    # instead of silently splitting the two DuckLake stacks. Adoption of the
+    # API itself comes later.
+    "pyducklake>=1.0.17",
     "pyarrow>=18.0",
     "orjson>=3.10",
     "prometheus-client>=0.21",
@@ -84,6 +96,12 @@ norecursedirs = ["lakekeeper", ".venv", "node_modules"]
 
 [tool.uv]
 exclude-newer = "7 days"
+# Cooldown carve-out for our own package (jghoman/pyducklake): 1.0.17 was
+# published 2026-08-13 and is needed now for the safe ducklake extension
+# channel. Fixed date, not a rolling window — future pyducklake releases
+# re-enter the cooldown until this date is bumped alongside an intentional
+# version bump.
+exclude-newer-package = { pyducklake = "2026-08-14T00:00:00Z" }
 constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",

@@ -17,8 +17,8 @@ Asserts the per-table compact() loop:
 
 These tests also pin the load-bearing recovery property: the DuckDB
 connection survives the extension's InternalException, so the loop can keep
-going (verified on duckdb 1.5.2; a future duckdb that invalidates the
-instance on INTERNAL errors would fail here, loudly).
+going (verified on duckdb 1.5.2 and 1.5.5; a future duckdb that invalidates
+the instance on INTERNAL errors would fail here, loudly).
 
 Skips when the ducklake extension can't be installed (offline CI).
 """
@@ -65,7 +65,10 @@ def _poison_tables(conn: duckdb.DuckDBPyConnection, attach: str, table_names: tu
     is a substring of the other and the compactor's containment check fails
     regardless of which file leads the group). Direct UPDATE on the metadata
     duckdb file, with the lake detached."""
-    meta_path = conn.execute(f"SELECT path FROM duckdb_databases() WHERE database_name = '{META_SCHEMA}'").fetchone()[0]
+    # duckdb 1.5.5: the ducklake attach no longer lists the metadata db as
+    # its own duckdb_databases() row (formerly under META_SCHEMA); the
+    # attach's own row now carries the metadata file path.
+    meta_path = conn.execute(f"SELECT path FROM duckdb_databases() WHERE database_name = '{LAKE}'").fetchone()[0]
     conn.execute(f"DETACH {LAKE}")
     meta_conn = duckdb.connect(meta_path)
     for table_name in table_names:

@@ -164,9 +164,10 @@ class TestVariantDualWrite:
 
     # The ONLY window DuckDB accepts into a VARIANT but cannot shred is
     # (INT64_MAX, UINT64_MAX]. Verified against a real catalog: ns timestamps,
-    # snowflake ids, INT64_MAX itself, values above UINT64_MAX (kept as a
-    # VARIANT string) and negatives all shred fine. Getting this boundary wrong
-    # in either direction is the whole hazard, so the cases below pin it.
+    # snowflake ids, INT64_MAX itself, values outside [INT64_MIN, UINT64_MAX]
+    # (DOUBLE since duckdb 1.5.5; digit-preserving VARCHAR before) and
+    # negatives all shred fine. Getting this boundary wrong in either
+    # direction is the whole hazard, so the cases below pin it.
     _POISON_JSON = '{"n": 9223372036854775999}'  # INT64_MAX < n <= UINT64_MAX
 
     def test_unshreddable_integer_is_coerced_keeping_the_rest_of_the_row(self, ducklake_conn, cache):
@@ -228,12 +229,20 @@ class TestVariantDualWrite:
         # The three inside INT64's range keep numeric typing — a digit-count
         # heuristic would have stringified or nulled these.
         assert [r[2] for r in rows[:3]] == ["INT64"] * 3, rows
-        # Rows 4-5 read back as VARCHAR because that is how DuckDB itself
-        # represents out-of-INT64-range literals in a VARIANT; the sanitizer
-        # leaves them alone (they shred fine), and the digits survive.
+        # Rows 4-5 track DuckDB's own representation for numbers outside
+        # [INT64_MIN, UINT64_MAX]: DOUBLE since duckdb 1.5.5 (VARCHAR with
+        # digits preserved on 1.5.2 and earlier). Deliberate policy: the
+        # companion follows native DuckLake semantics — lossy for these
+        # pathological magnitudes — and exact digits live in the
+        # authoritative string column, asserted below. The sanitizer leaves
+        # them alone (they shred fine either way).
+        assert [r[2] for r in rows[3:]] == ["DOUBLE"] * 2, rows
+        assert conn.execute("SELECT properties_variant.v::DOUBLE FROM lake.main.events WHERE id = 5").fetchone()[
+            0
+        ] == float("-9223372036854775809")
         assert (
-            conn.execute("SELECT properties_variant.v FROM lake.main.events WHERE id = 5").fetchone()[0]
-            == "-9223372036854775809"
+            conn.execute("SELECT properties FROM lake.main.events WHERE id = 5").fetchone()[0]
+            == '{"v": -9223372036854775809}'
         )
 
     def test_digits_inside_a_string_value_are_untouched(self, ducklake_conn, cache):

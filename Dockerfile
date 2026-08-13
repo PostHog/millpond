@@ -70,13 +70,18 @@ USER millpond
 #
 # The DuckLake extension cannot be version-pinned at install time — the extension
 # repository doesn't expose pinned versions for it (INSTALL ducklake VERSION '...'
-# returns 404). The DuckDB Python pin (1.5.2 in pyproject.toml) locks the
-# DuckLake major line, and tests/unit/test_ducklake_pin.py asserts the loaded
-# extension's build SHA at runtime so a drift trips in CI rather than in prod.
+# returns 404), and the channel the duckdb pin selects is LIVE: it can re-serve
+# a new ducklake build under the same URL at any time. So the build SHA is
+# asserted HERE, failing the image build on drift — the release workflow runs
+# in parallel with CI, so the CI canary (tests/unit/test_ducklake_pin.py,
+# same SHA constant; update both together) alone cannot stop a drifted build
+# from reaching the fleet via the mutable tag. An unexpected ducklake build
+# must be unable to produce an image at all.
 # aws: required by CREATE SECRET (TYPE s3, PROVIDER credential_chain) — the
 # Pod-Identity path the tenant maintenance crons use. Without it DuckDB
 # auto-installs at runtime, which dies on a read-only root filesystem.
-RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres'); c.execute('INSTALL aws')"
+ARG DUCKLAKE_SHA=d8a1881e
+RUN python -c "import duckdb, os; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres'); c.execute('INSTALL aws'); c.execute('LOAD ducklake'); v = c.execute(\"SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake'\").fetchone()[0]; want = os.environ['DUCKLAKE_SHA']; assert v == want, f'ducklake extension channel drift: channel serves {v}, image validated against {want}'"
 
 # Build-time smoke test for the duckdb CLI as the runtime user. Catches any
 # regression where the CLI is installed somewhere the `millpond` user can't
