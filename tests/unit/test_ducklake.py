@@ -217,7 +217,8 @@ class TestBuildInsertSelectSql:
             ("properties",),
         )
         assert '"properties"' in sql
-        assert 'try_cast(try_cast("properties" AS JSON) AS VARIANT) AS "properties_variant"' in sql
+        assert 'try_cast(try_cast("properties" AS JSON) AS VARIANT)' in sql
+        assert 'AS "properties_variant"' in sql
         assert sql.endswith("NOW() AS _inserted_at")
         # Original column still present (dual-write, not replace).
         assert sql.index('"properties"') < sql.index("properties_variant")
@@ -241,7 +242,8 @@ class TestBuildInsertSelectSql:
         # key feeds the same column as configured properties, so it must
         # dual-write. Alias uses the configured source's casing.
         sql = build_insert_select_sql(["Properties", "event"], ("properties",))
-        assert 'try_cast(try_cast("Properties" AS JSON) AS VARIANT) AS "properties_variant"' in sql
+        assert 'try_cast(try_cast("Properties" AS JSON) AS VARIANT)' in sql
+        assert 'AS "properties_variant"' in sql
 
     def test_case_variant_duplicates_project_companion_once(self):
         # Two batch keys that casefold to the same source must not emit two

@@ -194,6 +194,28 @@ _variant_companion_columns_dropped_total = Counter(
     "Payload columns dropped for colliding with a VARIANT dual-write companion",
     ["pipeline", "broker_source"],
 )
+# Flushes that fell back to string-only because a value reached the VARIANT
+# column that DuckDB could not shred, despite the per-row guard in
+# ducklake._variant_projection. Counts completed fallbacks (incremented after
+# the string-only write succeeds), not attempts. Expected to stay at zero:
+# nonzero means the guard pattern missed a value shape, so the whole batch
+# lost its companions and a partly-written Parquet file was abandoned. Read
+# alongside errors_total{type="variant_write"}.
+# Rows whose JSON carried an integer in (INT64_MAX, UINT64_MAX] — the window
+# DuckDB accepts into a VARIANT but cannot shred into Parquet. Those values are
+# rewritten as JSON strings for the companion only; the source column is
+# untouched. Nonzero is normal for tenants sending large ids: it means
+# `companion.field` returns that one value as a string rather than a number.
+_variant_values_coerced_total = Counter(
+    "millpond_variant_values_coerced_total",
+    "Rows whose unshreddable integers were rewritten as strings for the VARIANT companion",
+    ["pipeline", "broker_source"],
+)
+_variant_write_fallback_total = Counter(
+    "millpond_variant_write_fallback_total",
+    "Flushes written string-only after the VARIANT projection failed",
+    ["pipeline", "broker_source"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -244,6 +266,8 @@ schema_columns_widened_total = _schema_columns_widened_total
 sort_skipped_total = _sort_skipped_total
 columns_coerced_total = _columns_coerced_total
 variant_companion_columns_dropped_total = _variant_companion_columns_dropped_total
+variant_write_fallback_total = _variant_write_fallback_total
+variant_values_coerced_total = _variant_values_coerced_total
 include_values_size = _include_values_size
 include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds
 include_values_pending_removals = _include_values_pending_removals
@@ -271,6 +295,7 @@ def init(pipeline: str, broker_source: str = ""):
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total, variant_companion_columns_dropped_total
+    global variant_write_fallback_total, variant_values_coerced_total
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
@@ -322,6 +347,8 @@ def init(pipeline: str, broker_source: str = ""):
     variant_companion_columns_dropped_total = _variant_companion_columns_dropped_total.labels(
         pipeline=pipeline, broker_source=bs
     )
+    variant_write_fallback_total = _variant_write_fallback_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_values_coerced_total = _variant_values_coerced_total.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_size = _rdkafka_msg_size.labels(pipeline=pipeline, broker_source=bs)

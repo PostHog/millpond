@@ -5,7 +5,9 @@ import os
 import re
 
 import duckdb
+import orjson
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from millpond import metrics, schema
 from millpond.config import Config
@@ -98,9 +100,138 @@ def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+# DuckDB shreds VARIANT into typed Parquet columns on write, and an integer in
+# (INT64_MAX, UINT64_MAX] becomes a UINT64 variant that overflows the INT64
+# shredded column — failing the INSERT even though try_cast accepted the value
+# and sub-field access returns it. On 2026-08-12 that crash-looped every prod
+# NRT consumer: offsets never advance, so one poison batch wedges the partition
+# forever. Verified empirically: values BELOW/AT INT64_MAX (ns timestamps,
+# snowflake ids), above UINT64_MAX (kept as a VARIANT string), and negatives
+# all shred fine. Only this window is dangerous.
+_INT64_MAX = 2**63 - 1
+_UINT64_MAX = 2**64 - 1
+
+# Cheap vectorized prefilter, run in Arrow to decide which rows are worth
+# parsing. It only has to be a SUPERSET of the danger window, and it assumes no
+# JSON structure — it matches inside strings too. Precision comes from the JSON
+# parse below, never from this pattern: an earlier attempt to make a regex the
+# predicate over raw JSON text was wrong in both directions at once (flagging
+# ubiquitous 19-digit ids while missing bare top-level numbers).
+#
+# Shaped to the window's decimal form so the common case skips the parse
+# entirely: every value in (2**63-1, 2**64-1] is either 19 digits starting with
+# 9, or 20 digits starting with 1. Nanosecond timestamps (19 digits, leading 1)
+# therefore do not trip it — with a plain `[0-9]{19,20}` they did, and the parse
+# pass ran on essentially every flush.
+_MAYBE_UNSHREDDABLE_DIGITS = r"(9[0-9]{18}|1[0-9]{19})"
+
+# Suffix for the hidden per-source column that carries sanitized JSON. Kept out
+# of the INSERT's output list, so the original source column still lands byte
+# for byte — the string column stays authoritative.
+_VARIANT_SRC_PREFIX = "__millpond_variant_src_"
+
+
+def _is_unshreddable_value_error(exc: BaseException) -> bool:
+    """True for DuckDB's out-of-range conversion error on a VARIANT write.
+
+    Matches the shape reported for the integer widths seen in practice ("Type
+    UINT64 with value ... can't be cast because the value is out of range for
+    the destination type INT64"), and nothing else — commit contention and IO
+    failures must stay retryable.
+    """
+    msg = str(exc)
+    return "out of range for the destination type" in msg and "can't be cast" in msg
+
+
+def _coerce_unshreddable_ints(raw: str | None) -> str | None:
+    """Rewrite integers DuckDB cannot shred as strings, preserving everything else.
+
+    Returns ``raw`` unchanged (same object) when nothing needs fixing, so
+    untouched rows keep their exact bytes. Malformed JSON is returned as-is —
+    ``try_cast`` nulls its companion anyway.
+    """
+    if raw is None:
+        return None
+    try:
+        doc = orjson.loads(raw)
+    except orjson.JSONDecodeError:
+        return raw
+
+    changed = False
+
+    def walk(node):
+        nonlocal changed
+        if isinstance(node, bool):
+            return node
+        if isinstance(node, int) and _INT64_MAX < node <= _UINT64_MAX:
+            changed = True
+            return str(node)
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        return node
+
+    fixed = walk(doc)
+    if not changed:
+        return raw
+    return orjson.dumps(fixed).decode()
+
+
+def sanitize_variant_sources(batch: pa.Table, sources: tuple[str, ...] | None) -> tuple[pa.Table, dict[str, str]]:
+    """Add hidden sanitized columns for sources carrying unshreddable integers.
+
+    Returns the batch (with any hidden columns appended) and a map of source →
+    column the VARIANT projection should read from. Sources needing no fix are
+    absent from the map and project from the original column, so the common
+    path adds one vectorized regex scan and nothing else.
+
+    Two stages on purpose. The Arrow-side prefilter is a cheap superset test
+    over the whole column at once; only the rows it flags — normally none — are
+    parsed and rewritten in Python, which is what makes the precise fix
+    affordable on a 256MB batch. The original column is never modified: the
+    string column must land exactly as received.
+    """
+    if not sources:
+        return batch, {}
+
+    by_lower = {name.lower(): name for name in batch.schema.names}
+    src_columns: dict[str, str] = {}
+    for source in sources:
+        name = by_lower.get(source.lower())
+        if name is None:
+            continue
+        column = batch.column(name)
+        if not pa.types.is_string(column.type) and not pa.types.is_large_string(column.type):
+            # Non-string sources (a batch whose values were all numeric, say)
+            # cannot be regex-scanned and cannot carry a JSON document; the
+            # backstop covers the rare unsigned-integer overflow.
+            continue
+        flagged = pc.match_substring_regex(column, _MAYBE_UNSHREDDABLE_DIGITS)
+        if not pc.any(flagged, min_count=0).as_py():
+            continue
+        values = column.to_pylist()
+        fixed = [_coerce_unshreddable_ints(v) for v in values]
+        n_coerced = sum(1 for before, after in zip(values, fixed, strict=True) if before is not after)
+        if not n_coerced:
+            continue
+        log.warning(
+            "Coerced unshreddable integer(s) to strings in %d row(s) of %r for the VARIANT "
+            "companion; the source column is unchanged",
+            n_coerced,
+            name,
+        )
+        metrics.variant_values_coerced_total.inc(n_coerced)
+        hidden = f"{_VARIANT_SRC_PREFIX}{source}"
+        batch = batch.append_column(hidden, pa.array(fixed, type=pa.string()))
+        src_columns[source] = hidden
+    return batch, src_columns
+
+
 def build_insert_select_sql(
     column_names: list[str],
     variant_columns: tuple[str, ...] | None,
+    variant_src: dict[str, str] | None = None,
 ) -> str:
     """Build the SELECT list for ``INSERT ... BY NAME (SELECT ... FROM batch)``.
 
@@ -122,20 +253,29 @@ def build_insert_select_sql(
     would leave a permanently-NULL companion with no signal. ``try_cast`` nulls
     malformed JSON on the VARIANT side only; the original string column still
     lands.
+
+    ``variant_src`` (from sanitize_variant_sources) redirects a source's VARIANT
+    cast to a hidden sanitized column. Hidden columns are only ever read inside
+    the cast, never emitted as output columns, so ``INSERT ... BY NAME`` never
+    sees a column the table does not have.
     """
     active = {s.lower(): s for s in (variant_columns or ())}
-    if not any(name.lower() in active for name in column_names):
+    hidden = set((variant_src or {}).values())
+    present = [name for name in column_names if name not in hidden]
+    # The star form would emit hidden columns as output columns, which the
+    # target table does not have — only safe when there are none.
+    if not hidden and not any(name.lower() in active for name in present):
         return "*, NOW() AS _inserted_at"
 
     parts: list[str] = []
     projected: set[str] = set()
-    for name in column_names:
+    for name in present:
         parts.append(_quote_ident(name))
         source = active.get(name.lower())
         if source is not None and source not in projected:
             projected.add(source)
             vname = variant_column_name(source)
-            qname = _quote_ident(name)
+            qname = _quote_ident((variant_src or {}).get(source, name))
             parts.append(f"try_cast(try_cast({qname} AS JSON) AS VARIANT) AS {_quote_ident(vname)}")
     parts.append("NOW() AS _inserted_at")
     return ", ".join(parts)
@@ -382,10 +522,52 @@ def write(
         if variant_columns:
             ready = schema_mgr.ensure_variant_columns(variant_columns, set(batch.schema.names))
             ready_sources = tuple(s for s in variant_columns if s in ready) or None
-    select_list = build_insert_select_sql(list(batch.schema.names), ready_sources)
+    # Rewrite integers DuckDB cannot shred (into hidden columns; the source
+    # columns themselves are untouched) before they reach the VARIANT cast.
+    batch, variant_src = sanitize_variant_sources(batch, ready_sources)
+    select_list = build_insert_select_sql(list(batch.schema.names), ready_sources, variant_src)
+    insert_sql = f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT {select_list} FROM _arrow_batch)"
     conn.register("_arrow_batch", batch)
     try:
-        conn.execute(f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT {select_list} FROM _arrow_batch)")
+        try:
+            conn.execute(insert_sql)
+        except duckdb.Error as e:
+            # Backstop only. sanitize_variant_sources rewrites the values
+            # DuckDB cannot shred, so this should never fire; it exists
+            # because the alternative to an unrecognized unshreddable value is
+            # the 2026-08-12 crash loop (offsets never advance, so one poison
+            # batch wedges the partition forever). The residual case it covers
+            # is a non-string source column holding an unsigned integer above
+            # INT64_MAX, which the Arrow-side scan cannot reach.
+            #
+            # Deliberately narrow: only the out-of-range conversion signature
+            # is absorbed. Commit contention, S3 flaps and every other write
+            # failure must reach main.py's _write_with_retry, which classifies
+            # them, retries with backoff, and calls reset_caches() to reload
+            # the schema cache — recovery this function must not pre-empt.
+            if ready_sources is None or not _is_unshreddable_value_error(e):
+                raise
+            log.warning(
+                "VARIANT dual-write INSERT hit an unshreddable value the sanitizer did not "
+                "reach (%d record(s), sources: %s); retrying string-only. This costs the "
+                "whole batch its companions and abandons the partly-written Parquet file, "
+                "so treat a nonzero variant_write_fallback_total as a gap in "
+                "sanitize_variant_sources, not routine degradation.",
+                batch.num_rows,
+                ", ".join(ready_sources),
+                exc_info=True,
+            )
+            fallback_sql = (
+                f"INSERT INTO lake.{schema_name}.{table_name} BY NAME "
+                f"(SELECT {build_insert_select_sql(list(batch.schema.names), None, variant_src)} "
+                f"FROM _arrow_batch)"
+            )
+            conn.execute(fallback_sql)
+            # Only now is the string-only write real: counting before the
+            # retry inflates both metrics by one per outer-retry attempt
+            # during an outage where nothing landed at all.
+            metrics.errors_total.labels(type="variant_write").inc()
+            metrics.variant_write_fallback_total.inc()
     finally:
         conn.unregister("_arrow_batch")
     return batch.num_rows
