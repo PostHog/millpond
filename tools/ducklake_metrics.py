@@ -254,6 +254,73 @@ queries:
       ORDER BY count DESC
       LIMIT 20
 
+  - name: ducklake_metadata_live_file_lookup
+    help: |
+      Hourly bounded metadata lookup for one live data file. This exercises
+      the catalog read path DuckLake uses after selecting a visible file,
+      without reading the file itself or exposing table/customer identifiers.
+    interval_mins: 60
+    values: [files]
+    sql: |
+      WITH target AS (
+        SELECT data_file_id
+        FROM __ducklake_metadata_lake.ducklake_data_file
+        WHERE end_snapshot IS NULL
+        LIMIT 1
+      )
+      SELECT COUNT(*) AS files
+      FROM (
+        SELECT df.data_file_id
+        FROM __ducklake_metadata_lake.ducklake_data_file df
+        JOIN target USING (data_file_id)
+        WHERE df.end_snapshot IS NULL
+        LIMIT 256
+      ) AS lookup_rows
+
+  - name: ducklake_metadata_partition_value_lookup
+    help: |
+      Hourly bounded metadata lookup for partition values of one live data
+      file. It exercises DuckLake's file-to-partition metadata read path
+      without querying data files or emitting partition values.
+    interval_mins: 60
+    values: [values]
+    sql: |
+      WITH target AS (
+        SELECT data_file_id
+        FROM __ducklake_metadata_lake.ducklake_data_file
+        WHERE end_snapshot IS NULL
+        LIMIT 1
+      )
+      SELECT COUNT(*) AS values
+      FROM (
+        SELECT fpv.partition_key_index
+        FROM __ducklake_metadata_lake.ducklake_file_partition_value fpv
+        JOIN target USING (data_file_id)
+        LIMIT 256
+      ) AS lookup_rows
+
+  - name: ducklake_metadata_file_column_stats_lookup
+    help: |
+      Hourly bounded metadata lookup for column statistics of one live data
+      file. It exercises DuckLake's file-statistics read path without reading
+      Parquet data or emitting column identifiers or statistics.
+    interval_mins: 60
+    values: [stats]
+    sql: |
+      WITH target AS (
+        SELECT data_file_id
+        FROM __ducklake_metadata_lake.ducklake_data_file
+        WHERE end_snapshot IS NULL
+        LIMIT 1
+      )
+      SELECT COUNT(*) AS stats
+      FROM (
+        SELECT fcs.column_id
+        FROM __ducklake_metadata_lake.ducklake_file_column_stats fcs
+        JOIN target USING (data_file_id)
+        LIMIT 256
+      ) AS lookup_rows
+
   - name: ducklake_catalog
     help: |
       DuckLake catalog format version. The numeric major.minor lands in the

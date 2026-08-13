@@ -87,6 +87,9 @@ Built-in queries (lake-wide; no `table_name` label by design):
 | `ducklake_compaction_candidates` | `tier` | `count` | `ducklake_data_file`; tier buckets match `ducklake_maintenance.py`'s `TIERS` (`tier1` < 1 MiB, `tier2` [1, 10) MiB, `tier3` [10, 64) MiB, `large` ≥ 64 MiB, plus `total`) |
 | `ducklake_snapshots` | — | `count`, `oldest_seconds_ago`, `newest_seconds_ago` | `ducklake_snapshot`; CASTs `snapshot_time` (VARCHAR) to TIMESTAMPTZ before time arithmetic |
 | `ducklake_files_per_partition_top20` | `partition` | `count` | Composite partition values joined with `/`; live files without partition_value rows surface as `<none>` |
+| `ducklake_metadata_live_file_lookup` | — | `files` | Hourly, bounded lookup of one live data-file metadata row; no data-file read or identifiers emitted |
+| `ducklake_metadata_partition_value_lookup` | — | `values` | Hourly, bounded lookup of partition metadata for one live data file; no partition values emitted |
+| `ducklake_metadata_file_column_stats_lookup` | — | `stats` | Hourly, bounded lookup of column-statistics metadata for one live data file; no statistics emitted |
 | `ducklake_catalog` | `suffix` | `format_version` | `ducklake_metadata` row with `key='version'` and `scope IS NULL`. Numeric `major.minor` (extracted via `regexp_extract`) lands in the gauge value; any trailing tag DuckLake attaches (`-dev1` on main after `MigrateV10`, future `-rcN`/`-betaN` shapes) lands in the `suffix` label. Empty `suffix=""` for clean releases. Polled every 60 minutes — value changes only on a DuckLake upgrade |
 
 Self-metrics (always on):
