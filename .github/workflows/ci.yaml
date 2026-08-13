@@ -50,8 +50,10 @@ jobs:
         #   - googleapis-common-*  Apache-2.0
         #   - opentelemetry-*      Apache-2.0
         #   - protobuf             BSD-3-Clause
+        #   - pyducklake           Apache-2.0 (ours; PEP 639-only metadata)
         # Remove entries here as the action's PEP 639 parser catches up.
         allow-dependencies-licenses: >-
+          pkg:pypi/pyducklake,
           pkg:pypi/googleapis-common-protos,
           pkg:pypi/opentelemetry-api,
           pkg:pypi/opentelemetry-exporter-otlp-proto-common,
