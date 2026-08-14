@@ -32,7 +32,7 @@ RUN test -n "$TARGETARCH" \
     && unzip -j -d /usr/local/bin /tmp/duckdb.zip duckdb \
     && chmod 0755 /usr/local/bin/duckdb \
     && rm /tmp/duckdb.zip \
-    && uv pip install --python /app/.venv/bin/python --reinstall --no-deps \
+    && uv pip install --python /app/.venv/bin/python --reinstall --no-cache --no-deps \
          "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb-1.5.5-cp312-cp312-linux_${WHEEL_ARCH}.whl" \
     && apt-get remove -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
