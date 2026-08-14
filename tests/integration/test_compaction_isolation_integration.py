@@ -17,7 +17,7 @@ Asserts the per-table compact() loop:
 
 These tests also pin the load-bearing recovery property: the DuckDB
 connection survives the extension's InternalException, so the loop can keep
-going (verified on duckdb 1.5.2; a future duckdb that invalidates the
+going (verified on duckdb 1.5.5; a future duckdb that invalidates the
 instance on INTERNAL errors would fail here, loudly).
 
 Skips when the ducklake extension can't be installed (offline CI).

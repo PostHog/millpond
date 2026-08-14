@@ -701,6 +701,12 @@ class TestVariantColumnsConfig:
         assert cfg.variant_columns is None
         assert cfg.variant_key_prefix is None
 
+    def test_illegal_shred_chars_rejected_at_load(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        monkeypatch.setenv("MILLPOND_VARIANT_KEYS", "foo'; DROP")
+        with pytest.raises(RuntimeError, match="MILLPOND_VARIANT_KEYS"):
+            load()
+
     def test_disabled_filter_warns(self, monkeypatch, caplog):
         import logging
 

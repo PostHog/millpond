@@ -129,7 +129,7 @@ class Config:
     # is an exact-name allowlist, unioned with the prefix. Applied recursively
     # so `$set` itself is shredded but `email` inside it is not. Both None =
     # auto-shred every key (the 2026-08 OOM path). Honored only by a DuckDB
-    # that implements variant_shred_key_prefix (PostHog fork); stock 1.5.2
+    # that implements variant_shred_key_prefix (PostHog fork); stock 1.5.5
     # logs and continues.
     variant_key_prefix: str | None
     variant_keys: tuple[str, ...] | None
@@ -467,14 +467,24 @@ def _load_variant_columns() -> tuple[str, ...] | None:
 # everything (the loud opt-out).
 _DEFAULT_VARIANT_KEY_PREFIX = "$"
 
+# Must stay in lockstep with ducklake._SHRED_SETTING_VALUE_RE — these
+# strings are interpolated into SET variant_shred_key_prefix / _keys.
+_SHRED_SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_$:.,+\-]+$")
+
+
+def _validate_shred_setting(env_name: str, val: str) -> str:
+    if not _SHRED_SETTING_VALUE_RE.match(val):
+        raise RuntimeError(f"{env_name}={val!r} has characters illegal in SET variant_shred_*")
+    return val
+
 
 def _parse_variant_keys(env_name: str) -> tuple[str, ...] | None:
     """Parse a comma-separated list of JSON object keys.
 
     Unlike `_parse_column_list` these are JSON keys, not SQL identifiers, so
-    `$browser` (and any other non-SAFE_IDENTIFIER name) is legal. They are
-    never interpolated into SQL — only used as Python set membership. Empty
-    tokens dropped; first-wins de-dup. Returns None when unset/whitespace.
+    `$browser` is legal. Values are later joined into SET variant_shred_keys
+    (see ducklake._apply_variant_shred_settings). Empty tokens dropped;
+    first-wins de-dup. Returns None when unset/whitespace.
     """
     raw = os.environ.get(env_name, "").strip()
     if not raw:
@@ -519,6 +529,11 @@ def _load_variant_key_filter(
         prefix: str | None = _DEFAULT_VARIANT_KEY_PREFIX
     else:
         prefix = prefix_raw.strip() or None
+    if prefix is not None:
+        _validate_shred_setting("MILLPOND_VARIANT_KEY_PREFIX", prefix)
+    if extra_keys is not None:
+        for key in extra_keys:
+            _validate_shred_setting("MILLPOND_VARIANT_KEYS", key)
     return prefix, extra_keys
 
 

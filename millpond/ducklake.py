@@ -344,10 +344,11 @@ def _apply_variant_shred_settings(
     if prefix is None and keys is None:
         return
 
-    def _set(name: str, value: str) -> None:
+    def _set(name: str, value: str) -> bool:
         safe = _sanitize_shred_setting_value(value)
         try:
             conn.execute(f"SET {name} = '{safe}'")
+            return True
         except duckdb.Error as e:
             log.warning(
                 "DuckDB rejected SET %s=%r (%s); VARIANT companions will auto-shred "
@@ -357,12 +358,15 @@ def _apply_variant_shred_settings(
                 value,
                 e,
             )
+            return False
 
+    applied = True
     if prefix is not None:
-        _set("variant_shred_key_prefix", prefix)
+        applied = _set("variant_shred_key_prefix", prefix) and applied
     if keys is not None:
-        _set("variant_shred_keys", ",".join(keys))
-    log.info("VARIANT shred allowlist: prefix=%r extra_keys=%s", prefix, ",".join(keys) if keys else "()")
+        applied = _set("variant_shred_keys", ",".join(keys)) and applied
+    if applied:
+        log.info("VARIANT shred allowlist: prefix=%r extra_keys=%s", prefix, ",".join(keys) if keys else "()")
 
 
 def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
@@ -401,7 +405,7 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     conn.execute(f"SET ducklake_max_retry_count = {int(cfg.ducklake_max_retry_count)}")
 
     # Shred allowlist: full VARIANT document, typed Parquet columns only for
-    # matching keys. Stock DuckDB 1.5.2 ignores these (unknown setting) and
+    # matching keys. Stock DuckDB 1.5.5 ignores these (unknown setting) and
     # auto-shreds every key — the 2026-08 OOM. The PostHog fork honors them
     # in the parquet writer. Fail open on an unknown setting so official
     # wheels still start; log loudly when a filter was requested.

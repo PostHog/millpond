@@ -306,11 +306,14 @@ class TestSanitizeVariantSourcesKeepsEveryKey:
 
 
 class TestApplyVariantShredSettings:
-    def test_unknown_setting_is_not_fatal(self):
-        # Stock DuckDB 1.5.2 has no variant_shred_key_prefix. connect() must
+    def test_unknown_setting_is_not_fatal(self, caplog):
+        # Stock DuckDB 1.5.5 has no variant_shred_key_prefix. connect() must
         # still succeed so official wheels start; the warning is the signal.
         conn = duckdb.connect()
-        _apply_variant_shred_settings(conn, "$", ("utm_source",))
+        with caplog.at_level("WARNING"):
+            _apply_variant_shred_settings(conn, "$", ("utm_source",))
+        assert any("rejected SET variant_shred_key_prefix" in r.message for r in caplog.records)
+        assert not any("VARIANT shred allowlist:" in r.message for r in caplog.records)
 
     def test_unset_is_noop(self):
         conn = duckdb.connect()
