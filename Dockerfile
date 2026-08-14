@@ -17,8 +17,10 @@ RUN uv sync --frozen --no-dev --extra msk-iam
 # fork cp312 wheel and installs the matching CLI. source_id is asserted in
 # the runtime stage.
 #
-# TARGETARCH is set by buildx (linux/amd64 → amd64, linux/arm64 → arm64).
-# Wheel tags use the GNU tuple (x86_64 / aarch64).
+# TARGETARCH is a BuildKit automatic ARG (linux/amd64 → amd64, linux/arm64
+# → arm64). Wheel tags use the GNU tuple (x86_64 / aarch64). Install the
+# wheel from its release URL so the PEP 427 filename is preserved (uv 0.12
+# rejects a dest named duckdb.whl).
 ARG TARGETARCH
 ARG DUCKDB_RELEASE=v1.5.5-posthog.2
 RUN test -n "$TARGETARCH" \
@@ -27,9 +29,9 @@ RUN test -n "$TARGETARCH" \
     && curl -fsSL "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb_cli-linux-${TARGETARCH}.zip" -o /tmp/duckdb.zip \
     && unzip -j -d /usr/local/bin /tmp/duckdb.zip duckdb \
     && chmod 0755 /usr/local/bin/duckdb \
-    && curl -fsSL "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb-1.5.5-cp312-cp312-linux_${WHEEL_ARCH}.whl" -o /tmp/duckdb.whl \
-    && uv pip install --python /app/.venv/bin/python --no-deps /tmp/duckdb.whl \
-    && rm /tmp/duckdb.zip /tmp/duckdb.whl \
+    && rm /tmp/duckdb.zip \
+    && uv pip install --python /app/.venv/bin/python --no-deps \
+         "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb-1.5.5-cp312-cp312-linux_${WHEEL_ARCH}.whl" \
     && apt-get remove -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 FROM python:3.12-slim
