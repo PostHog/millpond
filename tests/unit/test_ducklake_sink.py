@@ -35,6 +35,9 @@ def _ducklake_cfg(**overrides) -> MagicMock:
     cfg.rds_username = "ducklake"
     cfg.rds_password = "pass"
     cfg.partition_by = None
+    cfg.variant_columns = None
+    cfg.variant_key_prefix = None
+    cfg.variant_keys = None
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg

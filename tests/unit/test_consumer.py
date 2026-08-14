@@ -171,6 +171,8 @@ def _make_cfg(**overrides) -> Config:
         sort_by=None,
         typed_columns=None,
         variant_columns=None,
+        variant_key_prefix=None,
+        variant_keys=None,
         kafka_config_overrides=(("security.protocol", "SSL"),),
     )
     defaults.update(overrides)

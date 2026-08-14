@@ -1,10 +1,12 @@
 from unittest.mock import MagicMock, patch
 
 import duckdb
+import orjson
 import pyarrow as pa
 import pytest
 
 from millpond.ducklake import (
+    _apply_variant_shred_settings,
     _ensure_table,
     _escape_libpq,
     _sanitize_setting_value,
@@ -12,6 +14,7 @@ from millpond.ducklake import (
     _validate_partition_expr,
     build_insert_select_sql,
     drop_variant_companion_columns,
+    sanitize_variant_sources,
     variant_column_name,
 )
 
@@ -281,3 +284,35 @@ class TestDropVariantCompanionColumns:
         batch = pa.table({"properties": ["{}"], "PROPERTIES_VARIANT": ["x"], "Properties_Variant": ["y"]})
         out = drop_variant_companion_columns(batch, ("properties",))
         assert out.schema.names == ["properties"]
+
+
+class TestSanitizeVariantSourcesKeepsEveryKey:
+    def test_no_poison_digits_skips_parse(self):
+        raw = '{"$browser": "Chrome", "width": 1920}'
+        batch = pa.table({"properties": [raw]})
+        out, src = sanitize_variant_sources(batch, ("properties",))
+        assert src == {}
+        assert out.schema.names == ["properties"]
+
+    def test_poison_int_does_not_drop_siblings(self):
+        poison = 9223372036854775999
+        raw = orjson.dumps({"$n": poison, "width": 1, "custom": "x"}).decode()
+        batch = pa.table({"properties": [raw]})
+        out, src = sanitize_variant_sources(batch, ("properties",))
+        assert "properties" in src
+        rewritten = orjson.loads(out.column(src["properties"]).to_pylist()[0])
+        assert rewritten == {"$n": str(poison), "width": 1, "custom": "x"}
+        assert out.column("properties").to_pylist() == [raw]
+
+
+class TestApplyVariantShredSettings:
+    def test_unknown_setting_is_not_fatal(self):
+        # Stock DuckDB 1.5.2 has no variant_shred_key_prefix. connect() must
+        # still succeed so official wheels start; the warning is the signal.
+        conn = duckdb.connect()
+        _apply_variant_shred_settings(conn, "$", ("utm_source",))
+
+    def test_unset_is_noop(self):
+        conn = duckdb.connect()
+        _apply_variant_shred_settings(conn, None, None)
+        _apply_variant_shred_settings(conn, "", ())
