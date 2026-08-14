@@ -65,7 +65,11 @@ def _poison_tables(conn: duckdb.DuckDBPyConnection, attach: str, table_names: tu
     is a substring of the other and the compactor's containment check fails
     regardless of which file leads the group). Direct UPDATE on the metadata
     duckdb file, with the lake detached."""
-    meta_path = conn.execute(f"SELECT path FROM duckdb_databases() WHERE database_name = '{META_SCHEMA}'").fetchone()[0]
+    # 1.5.2 attached the catalog as a second database named METADATA_SCHEMA.
+    # 1.5.5 stores catalog tables in the lake attach itself (database_name=LAKE).
+    meta_path = conn.execute(
+        f"SELECT path FROM duckdb_databases() WHERE database_name = '{LAKE}'"
+    ).fetchone()[0]
     conn.execute(f"DETACH {LAKE}")
     meta_conn = duckdb.connect(meta_path)
     for table_name in table_names:

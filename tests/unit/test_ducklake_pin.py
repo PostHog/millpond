@@ -36,8 +36,8 @@ import duckdb
 # Update both constants together when revalidating against a new release.
 # The DuckDB version is exact; the DuckLake SHA is whatever the core
 # extension repo currently serves for that DuckDB version's platform.
-_VERIFIED_DUCKDB_VERSION = "1.5.2"
-_VERIFIED_DUCKLAKE_SHA = "415a9ebd"
+_VERIFIED_DUCKDB_VERSION = "1.5.5"
+_VERIFIED_DUCKLAKE_SHA = "d8a1881e"
 
 
 def test_duckdb_version_is_pinned():
