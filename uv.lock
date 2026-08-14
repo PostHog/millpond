@@ -6,6 +6,9 @@ requires-python = ">=3.12"
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
+[options.exclude-newer-package]
+pyducklake = "2026-08-14T00:00:00Z"
+
 [manifest]
 constraints = [
     { name = "pygments", specifier = ">=2.20.0" },
@@ -274,6 +277,7 @@ dependencies = [
     { name = "orjson" },
     { name = "prometheus-client" },
     { name = "pyarrow" },
+    { name = "pyducklake" },
     { name = "pytz" },
     { name = "pyyaml" },
 ]
@@ -301,6 +305,7 @@ requires-dist = [
     { name = "orjson", specifier = ">=3.10" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "pyarrow", specifier = ">=18.0" },
+    { name = "pyducklake", specifier = ">=1.0.17" },
     { name = "pytz", specifier = ">=2024.1" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
@@ -559,6 +564,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/88/a3/d2c462d4ef313521eaf2eff04d204ac60775263f1fb08c374b543f79f610/pyarrow-23.0.1-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:46718a220d64677c93bc243af1d44b55998255427588e400677d7192671845c7", size = 48259435, upload-time = "2026-02-16T10:13:49.226Z" },
     { url = "https://files.pythonhosted.org/packages/cc/f1/11a544b8c3d38a759eb3fbb022039117fd633e9a7b19e4841cc3da091915/pyarrow-23.0.1-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:a09f3876e87f48bc2f13583ab551f0379e5dfb83210391e68ace404181a20690", size = 50629149, upload-time = "2026-02-16T10:13:57.238Z" },
     { url = "https://files.pythonhosted.org/packages/50/f2/c0e76a0b451ffdf0cf788932e182758eb7558953f4f27f1aff8e2518b653/pyarrow-23.0.1-cp314-cp314t-win_amd64.whl", hash = "sha256:527e8d899f14bd15b740cd5a54ad56b7f98044955373a17179d5956ddb93d9ce", size = 28365807, upload-time = "2026-02-16T10:14:03.892Z" },
+]
+
+[[package]]
+name = "pyducklake"
+version = "1.0.17"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "duckdb" },
+    { name = "pyarrow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/7c/8d7d490b82d571344d57b8422bd039eba287fb7e3bacdd5594d60fc7828c/pyducklake-1.0.17.tar.gz", hash = "sha256:e161de7b6191d896ce70a507bdddae63344f854c3619fce48e3ac7d916ab6dad", size = 287687, upload-time = "2026-08-13T19:23:37.119Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1a/7f/cfbde07a44128741e00927029505324d6a02daeb8188dc56d8c21d09a321/pyducklake-1.0.17-py3-none-any.whl", hash = "sha256:ab2e0fb115b93826bb3725478f090668d5d505da606844a38fe5e5d3b7fa961e", size = 53030, upload-time = "2026-08-13T19:23:35.547Z" },
 ]
 
 [[package]]

@@ -2194,8 +2194,8 @@ def compact(
                         break
                     except Exception:
                         # Continue-on-error relies on the connection SURVIVING
-                        # the failed CALL (verified on duckdb 1.5.2 even for
-                        # InternalException, and pinned end-to-end by
+                        # the failed CALL (verified on duckdb 1.5.2 and 1.5.5,
+                        # even for InternalException, and pinned end-to-end by
                         # test_compaction_isolation_integration). If a future
                         # duckdb bump invalidates the instance on INTERNAL
                         # errors, every table fails, the failure summary +

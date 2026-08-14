@@ -80,6 +80,12 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
         "CREATE TABLE __ducklake_metadata_lake.ducklake_inlined_data_tables ("
         "table_id BIGINT, schema_version BIGINT, table_name VARCHAR)"
     )
+    c.execute(
+        "CREATE TABLE __ducklake_metadata_lake.ducklake_file_column_stats ("
+        "data_file_id BIGINT, table_id BIGINT, column_id BIGINT, column_size_bytes BIGINT, "
+        "value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, "
+        "contains_nan BOOLEAN, extra_stats VARCHAR)"
+    )
     # Seed: enough rows that every metric has a non-zero value.
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
@@ -114,6 +120,11 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
         "INSERT INTO __ducklake_metadata_lake.ducklake_inlined_data_tables VALUES "
         "(1, 1, 'ducklake_inlined_data_1_1'),"  # parent live → reachable
         "(99, 1, 'ducklake_inlined_data_99_1')"  # no parent ducklake_table row → unreachable
+    )
+    c.execute(
+        "INSERT INTO __ducklake_metadata_lake.ducklake_file_column_stats VALUES "
+        "(1, 1, 0, 1024, 1000, 10, 'a', 'z', false, NULL),"
+        "(1, 1, 1, 2048, 1000, 0, '0', '9', false, NULL)"
     )
 
 
