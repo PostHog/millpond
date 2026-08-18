@@ -426,9 +426,25 @@ bootstrap-index-file-partition-value-cover: _confirm-target
     @echo ">>> ducklake_file_partition_value_cover_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_cover_idx ON public.ducklake_file_partition_value USING btree (data_file_id, partition_key_index, partition_value);"
 
+# Table-scoped per-file stats fetch: `WHERE table_id = ? AND data_file_id IN
+# (...)`, the shape ClickHouse's DuckLake reader issues when listing a table's
+# files for a query (the catalog-side read behind
+# StorageObjectStorageSource file iteration). Composite so the IN-list
+# prunes inside the index without a table-wide scan.
+[group('bootstrap')]
+bootstrap-index-file-column-stats-table-file: _confirm-target
+    @echo ">>> ducklake_file_column_stats_table_file_idx"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_table_file_idx ON public.ducklake_file_column_stats USING btree (table_id, data_file_id);"
+
+# Same shape for partition values (ClickHouse partition-pruning fetches).
+[group('bootstrap')]
+bootstrap-index-file-partition-value-table-file: _confirm-target
+    @echo ">>> ducklake_file_partition_value_table_file_idx"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_file_idx ON public.ducklake_file_partition_value USING btree (table_id, data_file_id);"
+
 # Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
 [group('bootstrap')]
-bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-cover
+bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover
 
 # ----------------------------------------------------------------------------
 # state-metrics daemon
