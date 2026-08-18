@@ -40,6 +40,11 @@ dependencies = [
     "pyarrow>=18.0",
     "orjson>=3.10",
     "prometheus-client>=0.21",
+    # Raw Postgres driver for tools/ducklake_maintenance.py's ensure-indexes
+    # subcommand: CREATE INDEX CONCURRENTLY must run outside a transaction,
+    # and duckdb's postgres_execute always wraps in BEGIN. Binary wheel so the
+    # image needs no libpq toolchain.
+    "psycopg[binary]>=3.2",
     # Required by duckdb's Python conversion for TIMESTAMPTZ columns; the
     # stdlib zoneinfo module isn't accepted as a substitute as of 1.4.x.
     "pytz>=2024.1",

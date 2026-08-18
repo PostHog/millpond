@@ -1681,3 +1681,68 @@ class TestAcquireAdvisoryLock:
         conn.execute.return_value.fetchone.return_value = (False,)
         with pytest.raises(RuntimeError, match="advisory lock"):
             ducklake_maintenance._acquire_advisory_lock(conn)
+
+
+# ---------------------------------------------------------------------------
+# ensure-indexes
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogIndexes:
+    def test_names_are_unique(self):
+        names = [name for name, _ in ducklake_maintenance.CATALOG_INDEXES]
+        assert len(names) == len(set(names))
+
+    def test_definitions_target_known_catalog_tables(self):
+        known = {
+            "ducklake_data_file",
+            "ducklake_delete_file",
+            "ducklake_file_column_stats",
+            "ducklake_file_partition_value",
+        }
+        for name, definition in ducklake_maintenance.CATALOG_INDEXES:
+            table = definition.split(" ")[0]
+            assert table in known, f"{name} targets unknown catalog table {table}"
+
+    def test_live_names_match_megaduck(self):
+        """The names double as the idempotency key (IF NOT EXISTS) — renaming
+        one would build a duplicate index on catalogs that already have it."""
+        names = {name for name, _ in ducklake_maintenance.CATALOG_INDEXES}
+        # Indexes applied by hand on megaduck 2026-08 (both efforts); the
+        # routine adopts them by name.
+        assert "ducklake_file_column_stats_table_file_idx" in names
+        assert "ducklake_data_file_snapshot_read_idx" in names
+
+
+class TestEnsureIndexes:
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "catalog.internal")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "secret")
+
+    def test_dry_run_connects_nowhere(self, monkeypatch, caplog):
+        self._env(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            ducklake_maintenance.ensure_indexes(dry_run=True)
+        assert "[dry-run] CREATE INDEX CONCURRENTLY IF NOT EXISTS" in caplog.text
+        assert len(ducklake_maintenance.CATALOG_INDEXES) > 0
+
+    def test_real_run_executes_every_index(self, monkeypatch):
+        self._env(monkeypatch)
+        executed = []
+        cursor = MagicMock()
+        cursor.execute.side_effect = lambda stmt: executed.append(stmt)
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        conn.__enter__.return_value = conn
+        psycopg = MagicMock()
+        psycopg.connect.return_value = conn
+        monkeypatch.setitem(__import__("sys").modules, "psycopg", psycopg)
+
+        ducklake_maintenance.ensure_indexes(dry_run=False)
+
+        assert len(executed) == len(ducklake_maintenance.CATALOG_INDEXES)
+        for stmt in executed:
+            assert stmt.startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS")
+            assert " ON public.ducklake_" in stmt
+        psycopg.connect.assert_called_once()
+        assert psycopg.connect.call_args.kwargs.get("autocommit") is True
