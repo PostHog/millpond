@@ -103,56 +103,6 @@ S3_SECRET_NAME = "s3"
 # directly) must use PG_CATALOG_SCHEMA, not METADATA_SCHEMA.
 PG_CATALOG_SCHEMA = "public"
 
-# ---------------------------------------------------------------------------
-# Catalog index recipes (ensure-indexes)
-# ---------------------------------------------------------------------------
-#
-# Why this exists: the DuckLake catalog schema ships without secondary
-# indexes, and its per-snapshot listing/compaction predicates seq-scan
-# otherwise. Learned the hard way on megaduck (2026-08): 677M
-# ducklake_file_column_stats rows meant a `WHERE table_id = ...` listing took
-# minutes per query, and the ClickHouse DuckLake reader's changed-snapshot
-# guard retried until it flapped. Every entry is CREATE INDEX CONCURRENTLY
-# IF NOT EXISTS: additive, idempotent, and never blocks catalog writers.
-#
-# CONCURRENTLY cannot run through duckdb's postgres_execute (the extension
-# wraps it in BEGIN ... which Postgres rejects), so ensure_indexes() talks to
-# the catalog over a direct psycopg connection with autocommit.
-#
-# Names match the indexes already live on megaduck so adoption there is a
-# no-op; the set is the union of the ClickHouse-reader and compaction/metrics
-# access patterns.
-CATALOG_INDEXES: tuple[tuple[str, str], ...] = (
-    # Snapshot-visibility reads (the hot path for every table listing):
-    #   WHERE table_id = ? AND begin_snapshot <= ? AND (end_snapshot IS NULL OR ? < end_snapshot)
-    ("ducklake_data_file_snapshot_read_idx", "ducklake_data_file (table_id, begin_snapshot, end_snapshot)"),
-    ("ducklake_delete_file_snapshot_read_idx", "ducklake_delete_file (table_id, begin_snapshot, end_snapshot)"),
-    # Live-file scans (end_snapshot IS NULL) ordered by size, used by tiered
-    # compaction and the metrics daemon:
-    (
-        "ducklake_data_file_compaction_idx",
-        "ducklake_data_file (table_id, end_snapshot, file_size_bytes) WHERE end_snapshot IS NULL",
-    ),
-    (
-        "ducklake_data_file_compaction_order_idx",
-        "ducklake_data_file (table_id, end_snapshot, file_size_bytes, begin_snapshot, row_id_start, data_file_id) "
-        "WHERE end_snapshot IS NULL",
-    ),
-    ("ducklake_delete_file_table_idx", "ducklake_delete_file (table_id, end_snapshot) WHERE end_snapshot IS NULL"),
-    (
-        "ducklake_delete_file_metrics_idx",
-        "ducklake_delete_file (table_id, end_snapshot, file_size_bytes) WHERE end_snapshot IS NULL",
-    ),
-    # Per-file lookups by data_file_id (ClickHouse file listing joins, orphan
-    # healing):
-    ("ducklake_file_column_stats_file_idx", "ducklake_file_column_stats (data_file_id)"),
-    ("ducklake_file_partition_value_file_idx", "ducklake_file_partition_value (data_file_id)"),
-    # Table-scoped per-file reads: `WHERE table_id = ? AND data_file_id IN
-    # (...)` (the ClickHouse reader's stats/partition fetches):
-    ("ducklake_file_column_stats_table_file_idx", "ducklake_file_column_stats (table_id, data_file_id)"),
-    ("ducklake_file_partition_value_table_file_idx", "ducklake_file_partition_value (table_id, data_file_id)"),
-)
-
 # Companion SQL file: header conventions plus runtime-loadable macros.
 MAINTENANCE_SQL_PATH = Path(__file__).resolve().parent / "ducklake_maintenance.sql"
 
@@ -685,52 +635,6 @@ def cleanup(conn: duckdb.DuckDBPyConnection, days: int, dry_run: bool) -> None:
         # count, not actually-processed work — claiming a rate from that would
         # be misleading.
         _log_cleanup_throughput("cleanup", len(result), elapsed, _scheduled_for_deletion_count(conn))
-
-
-def ensure_indexes(dry_run: bool) -> None:
-    """Create the catalog's secondary indexes (CATALOG_INDEXES) idempotently.
-
-    Runs over a direct psycopg connection with autocommit: CREATE INDEX
-    CONCURRENTLY cannot run inside a transaction, and duckdb's postgres_execute
-    wraps everything in BEGIN (verified against megaduck 2026-08). Each
-    statement is `IF NOT EXISTS`, so the routine is safe to run on every
-    maintenance pass and cheap when the catalog is already indexed.
-    """
-    import psycopg  # local import: only this subcommand needs a raw pg driver
-
-    log.info(
-        "%sensure-indexes: %d index(es) against catalog schema %s",
-        "[dry-run] " if dry_run else "",
-        len(CATALOG_INDEXES),
-        PG_CATALOG_SCHEMA,
-    )
-    if dry_run:
-        for name, definition in CATALOG_INDEXES:
-            log.info(
-                "[dry-run] CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s.%s",
-                name,
-                PG_CATALOG_SCHEMA,
-                definition,
-            )
-        return
-
-    dsn = (
-        f"host={_require('DUCKLAKE_RDS_HOST')} "
-        f"port={os.environ.get('DUCKLAKE_RDS_PORT', '5432')} "
-        f"dbname={os.environ.get('DUCKLAKE_RDS_DATABASE', 'ducklake')} "
-        f"user={os.environ.get('DUCKLAKE_RDS_USERNAME', 'ducklake')} "
-        f"password={_require('DUCKLAKE_RDS_PASSWORD')} "
-        "sslmode=require"
-    )
-
-    with psycopg.connect(dsn, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            for name, definition in CATALOG_INDEXES:
-                statement = f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {PG_CATALOG_SCHEMA}.{definition}"
-                log.info("ensure-indexes: %s", name)
-                t0 = time.monotonic()
-                cur.execute(statement)
-                log.info("ensure-indexes: %s done in %.1fs", name, time.monotonic() - t0)
 
 
 def cleanup_all(conn: duckdb.DuckDBPyConnection) -> None:
@@ -2518,13 +2422,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--dry-run", action="store_true")
 
-    # ensure-indexes
-    p = sub.add_parser(
-        "ensure-indexes",
-        help="Create the catalog's secondary indexes (CATALOG_INDEXES) idempotently, CONCURRENTLY",
-    )
-    p.add_argument("--dry-run", action="store_true")
-
     # checkpoint
     sub.add_parser("checkpoint", help="CHECKPOINT (merge + expire + cleanup)")
 
@@ -2632,10 +2529,7 @@ def main(argv: list[str] | None = None) -> None:
     t0 = time.monotonic()
     status = "success"
     conn = None
-    # ensure-indexes speaks raw psycopg to the catalog and needs neither the
-    # DuckDB session nor its S3 wiring — skip the duckdb connect for it.
-    if args.command != "ensure-indexes":
-        conn = connect(debug=args.debug)
+    conn = connect(debug=args.debug)
     try:
         match args.command:
             case "expire":
@@ -2662,8 +2556,6 @@ def main(argv: list[str] | None = None) -> None:
                 fsck(conn, args.dry_run, args.max_iterations)
             case "orphans":
                 orphans(conn, args.dry_run)
-            case "ensure-indexes":
-                ensure_indexes(args.dry_run)
             case "maintain":
                 maintain(conn, args.days, args.dry_run)
             case "checkpoint":
