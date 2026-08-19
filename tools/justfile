@@ -446,6 +446,15 @@ bootstrap-index-file-partition-value-table-file: _confirm-target
 [group('bootstrap')]
 bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover
 
+# Apply the canonical DuckLake sort keys (tenant column first on every
+# tenant table): new writes and compaction outputs come out sorted, giving
+# tight parquet row-group stats, which is what the ClickHouse reader's
+# row-group pruning needs for team_id-filtered queries. Idempotent.
+[group('bootstrap')]
+ensure-sort-keys: _confirm-target
+    @echo ">>> ensure-sort-keys"
+    @env {{ _target_env }} python {{ ducklake_maintenance }} ensure-sort-keys
+
 # ----------------------------------------------------------------------------
 # state-metrics daemon
 # ----------------------------------------------------------------------------

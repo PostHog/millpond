@@ -1969,6 +1969,88 @@ def _merge_adjacent_call(schema_name: str | None, table_name: str, args: list[st
     )
 
 
+# Canonical DuckLake sort keys: (schema, table) -> sort columns. Applied to
+# megaduck on 2026-08-19; the cron keeps them in place (and applies them to
+# any catalog the routine runs against). The DuckLake extension sorts new
+# writes per file and honors the sort in compaction merges, so parquet
+# row-group min/max stats become tight for the tenant column — the
+# ClickHouse reader's row-group pruning then skips most of a file for
+# team_id-filtered queries (measured: 4/4 row groups reduced to 1 on sorted
+# files; before this, every file's stats spanned the full team_id range and
+# a `team_id = X` query was a full table scan).
+SORT_KEYS: dict[tuple[str, str], list[str]] = {
+    ("main", "events"): ["team_id", "timestamp"],
+    ("main", "events_nrt"): ["team_id", "timestamp"],
+    ("main", "heatmap_events"): ["team_id", "timestamp"],
+    ("main", "person"): ["team_id"],
+    ("main", "person_distinct_id"): ["team_id"],
+    ("main", "groups"): ["team_id"],
+}
+
+
+def _current_sort_keys(conn: duckdb.DuckDBPyConnection) -> dict[tuple[str, str], list[str]]:
+    """(schema, table) -> ordered sort expressions, from the catalog's sort tables."""
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT sch.schema_name, t.table_name, e.expression
+            FROM {METADATA_SCHEMA}.ducklake_sort_expression e
+            JOIN {METADATA_SCHEMA}.ducklake_sort_info i
+              ON i.sort_id = e.sort_id AND i.table_id = e.table_id AND i.end_snapshot IS NULL
+            JOIN {METADATA_SCHEMA}.ducklake_table t ON t.table_id = e.table_id
+            JOIN {METADATA_SCHEMA}.ducklake_schema sch ON sch.schema_id = t.schema_id
+            WHERE t.end_snapshot IS NULL
+            ORDER BY sch.schema_name, t.table_name, e.sort_key_index
+            """
+        ).fetchall()
+    except duckdb.CatalogException:
+        # Catalog predates sorted tables (no ducklake_sort_* tables yet).
+        return {}
+    current: dict[tuple[str, str], list[str]] = {}
+    for schema_name, table_name, expression in rows:
+        current.setdefault((schema_name, table_name), []).append(expression)
+    return current
+
+
+def ensure_sort_keys(
+    conn: duckdb.DuckDBPyConnection,
+    sort_keys: dict[tuple[str, str], list[str]] | None = None,
+    dry_run: bool = False,
+) -> list[tuple[str, str]]:
+    """Apply SORT_KEYS to the catalog, idempotently. Returns the tables (re)applied.
+
+    A table whose current sort key already matches is skipped; a table with a
+    different sort key is re-set (SET SORTED BY replaces the sort spec).
+    Dry-run reports what would change without touching the catalog.
+    """
+    wanted = SORT_KEYS if sort_keys is None else sort_keys
+    current = _current_sort_keys(conn)
+    applied: list[tuple[str, str]] = []
+    for (schema_name, table_name), columns in sorted(wanted.items()):
+        existing = current.get((schema_name, table_name))
+        if existing == columns:
+            log.info("ensure-sort-keys: %s.%s already sorted by (%s), skipping", schema_name, table_name, ", ".join(columns))
+            continue
+        key_sql = ", ".join(f'"{c}"' if not c.isidentifier() else c for c in columns)
+        log.info(
+            "ensure-sort-keys: %s %s.%s SET SORTED BY (%s)%s",
+            "would apply" if dry_run else "applying",
+            schema_name,
+            table_name,
+            ", ".join(columns),
+            " (dry run)" if dry_run else "",
+        )
+        if not dry_run:
+            if existing:
+                # SET SORTED BY appends a new sort spec; it does not end the old one.
+                conn.execute(f'ALTER TABLE {ATTACH_NAME}."{schema_name}"."{table_name}" RESET SORTED BY')
+            conn.execute(
+                f'ALTER TABLE {ATTACH_NAME}."{schema_name}"."{table_name}" SET SORTED BY ({key_sql})'
+            )
+        applied.append((schema_name, table_name))
+    return applied
+
+
 def compact(
     conn: duckdb.DuckDBPyConnection,
     tier: int,
@@ -2422,6 +2504,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--dry-run", action="store_true")
 
+    # ensure-sort-keys
+    p = sub.add_parser(
+        "ensure-sort-keys",
+        help="Apply the canonical DuckLake sort keys (SORT_KEYS) idempotently",
+        description=(
+            "Apply the canonical sort keys so new writes and compaction outputs are "
+            "sorted by the tenant column (tight parquet row-group stats -> ClickHouse "
+            "row-group pruning on team_id filters). Idempotent; safe to run every pass."
+        ),
+    )
+    p.add_argument("--dry-run", action="store_true")
+
     # checkpoint
     sub.add_parser("checkpoint", help="CHECKPOINT (merge + expire + cleanup)")
 
@@ -2556,6 +2650,8 @@ def main(argv: list[str] | None = None) -> None:
                 fsck(conn, args.dry_run, args.max_iterations)
             case "orphans":
                 orphans(conn, args.dry_run)
+            case "ensure-sort-keys":
+                ensure_sort_keys(conn, dry_run=args.dry_run)
             case "maintain":
                 maintain(conn, args.days, args.dry_run)
             case "checkpoint":
