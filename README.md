@@ -32,13 +32,14 @@ Single thread, single loop. Kafka is the buffer. Offset commit is explicit (afte
 ```
 K8s StatefulSet (N replicas)
   └─ Pod (ordinal 0..N-1)
-       └─ Single loop: consume → convert → [filter] → accumulate → [sort] → flush → commit
+       └─ Single loop: consume → convert → [coerce] → [filter] → accumulate → [sort] → flush → commit
 ```
 
 - One topic and one table per deployment
 - Static partition assignment via pod ordinal — no consumer groups
 - If a pod dies, its partitions stop being consumed until K8s restarts it
-- Optional filter and sort stages — see [Record Handling](#record-handling) below
+- Optional coercion, filter, and sort stages — see [Record Handling](#record-handling) below
+- The hot path is one thread; auxiliary threads only: an HTTP server on `:8000` (`/metrics`, `/healthz`, `/readyz`), librdkafka's stats callback, and the optional include-values poller
 
 ## Destination
 
@@ -51,7 +52,7 @@ Millpond writes to DuckLake. A single deployment writes to exactly one table —
 | Reader ecosystem | DuckDB-native; growing third-party support |
 | Partitioning | Caller-supplied via `DUCKLAKE_PARTITION_BY`; arbitrary DDL expression |
 | Schema evolution | DuckDB DDL (`ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN SET DATA TYPE` with widening enforcement) |
-| Maintenance tooling | Bundled (`tools/ducklake_maintenance.py` CronJob, `tools/ducklake_metrics.py` daemon) |
+| Maintenance tooling | Bundled (`tools/ducklake_maintenance.py` CronJob CLI, `tools/ducklake_metrics.py` exporter — daemon or one-shot push) |
 | `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) |
 | Multi-pod concurrent writes | Native; idempotent DDL handles races |
 
@@ -59,11 +60,11 @@ The sink (`millpond/ducklake.py`) exposes three methods to `main.py`: `write(bat
 
 ## Record Handling
 
-Two optional stages sit between Kafka conversion and the sink. Both are disabled when their env vars are unset.
+Several optional stages sit between Kafka conversion and the sink, applied in this order: column type coercion → allowlist filter → denylist filter → pending buffer → pre-write sort. Each is disabled when its env vars are unset.
 
 ### Allowlist filter
 
-Drops records whose value in a configured field is not in a configured allowlist. Applied immediately after JSON→Arrow conversion, before records enter the pending buffer.
+Drops records whose value in a configured field is not in a configured allowlist. Applied after JSON→Arrow conversion (and type coercion), before records enter the pending buffer.
 
 ```
 MILLPOND_FILTER_KEEP_FIELD_NAME=team_id
@@ -77,7 +78,13 @@ Two skip reasons are tracked on `millpond_records_skipped_total`:
 - `filter_field_missing` — column absent from this batch's schema, null for that row, or column type is not filterable (only integer and string columns are supported; bool, float, timestamp, struct, list, etc. are rejected explicitly to avoid silent surprising matches under PyArrow's `safe=True` cast semantics).
 - `filter_excluded` — column present and non-null but value not in the allowlist. Expected steady-state drop reason.
 
-`MILLPOND_FILTER_DROP_FIELD_NAME` is reserved at the config layer (mutex with keep) and currently rejected at startup. It will become a denylist filter in a future release without env-var churn.
+Kept rows are also counted per matched value on `millpond_filter_matched_total{value=…}` (cardinality bounded by the include set).
+
+### Denylist filter
+
+Drops records whose value in `MILLPOND_FILTER_DROP_FIELD_NAME` is in `MILLPOND_FILTER_DROP_VALUES` — its own values var, never shared with the keep list. Runs after the keep-filter, so the composed semantics are keep ∩ ¬drop (e.g. a CP-driven include set minus an operator blacklist muting one tenant during an incident). Dropped rows count as `records_skipped_total{reason="filter_dropped"}`.
+
+Failure semantics are deliberately the opposite of the keep-filter's: an allowlist that can't evaluate fails **closed** (drops the batch), a denylist that can't evaluate fails **open** — a missing field, unsupported column type, or incompatible value cast keeps the batch unchanged with a warning, so a schema hiccup can't turn the blacklist into data loss. Null field values are kept (a null can't match the blacklist).
 
 ### Dynamic allowlist source
 
@@ -224,10 +231,18 @@ Requires Docker (uses `keytool` from the Kafka container image for cert generati
 
 The `tools/` directory ships two DuckLake-only operational binaries inside the same image as the writer:
 
-- **`tools/ducklake_maintenance.py`** — CLI for snapshot expiry, file cleanup, orphan recovery, tiered compaction, fsck. Runs as a K8s CronJob.
-- **`tools/ducklake_metrics.py`** — Long-running Prometheus-exposition daemon for catalog-side lake-state metrics. Runs as a single-replica Deployment.
+- **`tools/ducklake_maintenance.py`** — CLI for snapshot expiry (incl. Postgres-native `expire-snapshots`), file cleanup, orphan recovery, tiered compaction, fsck, and one-shot repairs (`repair-partition-values`, `dedup-deletions`, `purge-orphan-stats`). Runs as a K8s CronJob.
+- **`tools/ducklake_metrics.py`** — Catalog-side lake-state metrics, either as a long-running Prometheus-exposition daemon or in one-shot push mode (`--once`, POSTing to `DUCKLAKE_METRICS_PUSH_URL` — the per-tenant metrics CronJob path).
 
-Subcommand and YAML schema reference, full env-var contract, and the `just` recipe inventory live in [`tools/README.md`](tools/README.md). Both binaries reuse the writer's `DUCKLAKE_RDS_*` / `DUCKDB_S3_*` / `DUCKLAKE_DATA_PATH` env vars.
+`tools/justfile` (copied to `/justfile` in the image) wraps both. Recipe groups:
+
+- `interactive` — `shell`: a DuckDB shell wired to the DuckLake with the same session setup as the subcommands
+- `lifecycle` — snapshot + file lifecycle: `expire`/`expire-snapshots` (+ chain-safe `expire-7d`), `cleanup`/`cleanup-all`/`cleanup-all-safe`, orphan handling (`find-orphans`, `heal-orphans`, `delete-orphaned-files`, `fsck`), `dedup-deletions`, `purge-orphan-stats`, `repair-partition-values`, `maintain`, `checkpoint`. Destructive recipes print the target catalog and, on a TTY, demand confirmation.
+- `compaction` — tiered `compact-to-tier-{1,2,3}` (+ dry-runs), `compact-all-tiers`, `compact-probe`, and chain-safe no-arg wrappers (`compact-all-tiers-default`) so the tenant-maintenance CronJob can run one flat recipe chain
+- `bootstrap` — `bootstrap-indexes`: the DuckLake catalog btrees (compaction scans, snapshot-range reads, per-file joins) via `psql`, all `CREATE INDEX CONCURRENTLY IF NOT EXISTS`
+- `metrics` — `ducklake-metrics` daemon recipes and chain-safe `metrics-once` for the per-tenant metrics CronJob
+
+Subcommand and YAML schema reference and the full env-var contract live in [`tools/README.md`](tools/README.md). Both binaries reuse the writer's `DUCKLAKE_RDS_*` / `DUCKDB_S3_*` / `DUCKLAKE_DATA_PATH` env vars.
 
 ## Configuration
 
@@ -244,6 +259,9 @@ All configuration via environment variables.
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
 | `GROUP_ID` | no | `millpond-{topic}-{ducklake_table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
+| `KAFKA_AUTO_OFFSET_RESET` | no | `earliest` | Applied only when no offset is committed for a partition: `earliest` (backfill/catch-up) or `latest` (NRT consumers — don't replay the retention window). `KAFKA_CONSUMER_AUTO_OFFSET_RESET` is rejected at startup; use this var. |
+| `KAFKA_CONSUMER_*` | no | | Passthrough to librdkafka: `KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL` → `security.protocol=SASL_SSL`. `KAFKA_CONSUMER_QUEUED_MAX_MESSAGES_KBYTES` overrides the 16MB-per-partition fetch-buffer default. `sasl.mechanisms=OAUTHBEARER` enables the MSK IAM token callback. |
+| `BROKER_SOURCE` | no | | Broker label attached to every metric (e.g. `msk`, `warpstream`) |
 | `CONSUME_BATCH_SIZE` | no | `1000` | Max messages per `consume()` call — amortizes Python↔C boundary cost |
 | `FETCH_MIN_BYTES` | no | `1048576` | Broker accumulates at least this many bytes before responding (1MB) |
 | `FETCH_MAX_WAIT_MS` | no | `500` | Max broker wait when `fetch.min.bytes` not yet satisfied |
@@ -255,6 +273,7 @@ All configuration via environment variables.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DUCKLAKE_TABLE` | yes | | Target DuckLake table name |
+| `DUCKLAKE_SCHEMA` | no | `main` | Target DuckLake schema |
 | `DUCKLAKE_DATA_PATH` | yes | | S3 path for DuckLake data files |
 | `DUCKLAKE_CONNECTION` | yes | | DuckDB connection string |
 | `DUCKLAKE_RDS_HOST` | yes | | Postgres host for DuckLake metadata |
@@ -262,6 +281,7 @@ All configuration via environment variables.
 | `DUCKLAKE_RDS_DATABASE` | no | `ducklake` | Postgres database name |
 | `DUCKLAKE_RDS_USERNAME` | no | `ducklake` | Postgres username |
 | `DUCKLAKE_RDS_PASSWORD` | yes | | Postgres password |
+| `DUCKLAKE_MAX_RETRY_COUNT` | no | `100` | DuckLake commit-retry budget (`SET ducklake_max_retry_count`). DuckLake's own default of 10 starves multi-writer deployments — losers of the snapshot-id race surface as `ducklake_snapshot_pkey` duplicate-key errors. Must be positive. |
 | `DUCKLAKE_PARTITION_BY` | no | | Hive-style partition expression (e.g. `year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)`). Applied via `ALTER TABLE SET PARTITIONED BY` on first write. |
 | `DUCKDB_S3_ACCESS_KEY_ID` | yes | | Static S3 access key for DuckDB |
 | `DUCKDB_S3_SECRET_ACCESS_KEY` | yes | | Static S3 secret for DuckDB |
@@ -272,13 +292,14 @@ All configuration via environment variables.
 
 ### Optional record handling
 
-See [Record Handling](#record-handling) for context. All four variables below are optional; unset means the corresponding stage is disabled.
+See [Record Handling](#record-handling) for context. All variables below are optional; unset means the corresponding stage is disabled.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `MILLPOND_FILTER_KEEP_FIELD_NAME` | no | | Column name to check against the allowlist. Must be set with `MILLPOND_FILTER_VALUES`. Validated as a safe identifier. |
-| `MILLPOND_FILTER_DROP_FIELD_NAME` | no | | Reserved for a future denylist filter; setting it today raises at startup. Mutually exclusive with `MILLPOND_FILTER_KEEP_FIELD_NAME`. |
-| `MILLPOND_FILTER_VALUES` | no | | Comma-separated allowed values. Auto-detected as int if every token parses as an integer, string otherwise. Required when either filter field name is set. |
+| `MILLPOND_FILTER_VALUES` | no | | Comma-separated allowed values. Auto-detected as int if every token parses as an integer, string otherwise. Required when the keep field name is set. |
+| `MILLPOND_FILTER_DROP_FIELD_NAME` | no | | Column name for the denylist filter. Must be set with `MILLPOND_FILTER_DROP_VALUES`. May be combined with the keep-filter (keep ∩ ¬drop). Validated as a safe identifier. |
+| `MILLPOND_FILTER_DROP_VALUES` | no | | Comma-separated denied values; same int/string auto-detection. Required when the drop field name is set. |
 | `MILLPOND_INCLUDE_VALUES_URL` | no | | HTTP endpoint returning a JSON array of allowlist values (see [Dynamic allowlist source](#dynamic-allowlist-source)). Requires the keep-filter to be configured. |
 | `MILLPOND_INCLUDE_VALUES_MODE` | no | `shadow` | `shadow` (static authoritative, endpoint observed for diff metrics) or `authoritative` (polled set live). Only valid with the URL set. |
 | `MILLPOND_INCLUDE_VALUES_POLL_INTERVAL_S` | no | `60` | Poll cadence, jittered ±10%. |
@@ -291,6 +312,18 @@ See [Record Handling](#record-handling) for context. All four variables below ar
 | `MILLPOND_TYPED_COLUMNS` | no | | Comma-separated `column:type` pairs pinning columns to a target type before write (types: `timestamptz`, `bigint`, `double`, `boolean`, `varchar`). Needed when writing into a table whose columns are already typed and JSON inference would diverge (date-times → `VARCHAR` vs `TIMESTAMPTZ`; all-null `project_id` → `VARCHAR` vs `BIGINT`). Column names validated as safe identifiers; types validated against the allowlist. |
 | `MILLPOND_VARIANT_COLUMNS` | no | | Comma-separated source column names to dual-write as DuckLake `VARIANT` companions (`properties` → `properties_variant`). Original string columns are kept. Malformed JSON nulls only the VARIANT side. Column names validated as safe identifiers; names ending in `_variant` are rejected (list the source, not the derived column). |
 
+### Log export (optional)
+
+Application logs go to stdout; setting `POSTHOG_PROJECT_TOKEN` additionally exports them to PostHog Logs via OTLP/HTTP.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `POSTHOG_PROJECT_TOKEN` | no | | Enables the OTLP export when set. No `MILLPOND_` prefix — it's the PostHog-wide secret name. |
+| `POSTHOG_LOGS_ENDPOINT` | no | `https://us.i.posthog.com/i/v1/logs` | Override for EU or self-hosted PostHog |
+| `MILLPOND_SERVICE_NAMESPACE` | no | `millpond` | OTLP `service.namespace` resource attribute |
+| `MILLPOND_SERVICE_INSTANCE_ID` | no | | OTLP `service.instance.id` — typically the chart's consumer key (e.g. `events`) |
+| `MILLPOND_SERVICE_VERSION` | no | package version | OTLP `service.version` override (e.g. the image digest) |
+
 ## Releases
 
 Every merge to `main` automatically:
@@ -299,6 +332,8 @@ Every merge to `main` automatically:
 3. Creates a GitHub release with changelog
 
 Images: `ghcr.io/posthog/millpond:v0.0.X` or `ghcr.io/posthog/millpond:latest`
+
+A manual `promote-to-prod` workflow retags a chosen release (default: latest) as `ghcr.io/posthog/millpond:prod`.
 
 ## Deployment
 
@@ -313,6 +348,8 @@ Partition count is discovered at startup via `admin.list_topics(topic=cfg.topic,
 ```python
 my_partitions = [p for p in range(partition_count) if p % replica_count == ordinal]
 ```
+
+Before assigning, the consumer recovers committed offsets that have fallen below the broker's log-start-offset: stale offsets are re-committed to the `KAFKA_AUTO_OFFSET_RESET` target, and lag/offset gauges are seeded for every assigned partition — so quiet partitions don't report `offset_out_of_range` and inflated `millpond_consumer_lag` across restarts.
 
 ### Updating
 
@@ -382,7 +419,7 @@ The flush path has two failure points, each with its own retry policy:
 | Lake write | 3 | 1s, 2s (last attempt raises immediately) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
 | Offset commit | 3 | 0.5s, 1s (last attempt raises immediately) | Re-raise → pod crashes, replays from last committed offset (duplicates bounded by one flush batch) |
 
-Both use `errors_total{type="write_retry"}` and `errors_total{type="offset_commit"}` counters so transient vs persistent failures are distinguishable in dashboards.
+Write failures are classified before counting: DuckLake catalog commit contention (retry-budget exhaustion, duplicate-key / serialization errors from Postgres) increments `errors_total{type="ducklake_commit_contention"}`; everything else increments `errors_total{type="write_retry"}`. Commit failures increment `errors_total{type="offset_commit"}`. Transient vs persistent failures stay distinguishable in dashboards.
 
 The write-retry loop catches `Exception` broadly to cover the backend's failure modes — `duckdb.Error` for DuckLake; `OSError` for S3; `KafkaException` for broker disconnects. Each retry invokes `sink.reset_caches()` to drop cached table/schema state so the next attempt re-checks the catalog (covers the case where another pod evolved the schema or recreated the table between attempts).
 
