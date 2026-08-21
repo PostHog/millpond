@@ -1439,11 +1439,11 @@ class TestCompactPerTable:
 
     def test_enumeration_is_candidate_driven_backlog_first(self):
         """The table list must come from the tier's candidate files — sized to
-        the tier band, >= 2 files per table (singletons can't merge), most
-        backlogged first — NOT information_schema. Alphabetical enumeration
-        over all live tables let 2-file cosmetic merges starve the real
-        backlog out of the budget (observed: 3,074 tables, budget gone on
-        five billing tables, the 15k-candidate events table never reached)."""
+        the tier band, grouped by partition values with >= 2 files per GROUP
+        (partition singletons can't merge, whatever the per-table count), most
+        mergeable-backlogged first — NOT information_schema. Per-table >= 2
+        let hourly-partitioned import catalogs (86% partition singletons
+        measured) keep the compactor grinding no-op CALLs forever."""
         conn = _compact_conn([("posthog", "events")])
         ducklake_maintenance.compact(
             conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
@@ -1452,14 +1452,22 @@ class TestCompactPerTable:
         assert len(enum_calls) == 1
         sql = enum_calls[0]
         assert "ducklake_data_file" in sql and "ducklake_table" in sql and "ducklake_schema" in sql
-        assert "ORDER BY COUNT(*) DESC" in sql, "most backlogged table must be served first"
+        # Mergeability is judged per (table, partition-values) group — the
+        # extension's own merge unit.
+        assert "ducklake_file_partition_value" in sql
+        assert "GROUP BY table_id, pk" in sql
+        assert "HAVING COUNT(*) >= 2" in sql
+        assert "ORDER BY SUM(m.n_mergeable) DESC" in sql, "most mergeable-backlogged table must be served first"
+        # The server-side statement (postgres_query wrapping the SQL as a
+        # quoted literal) must stay syntactically valid duckdb — a quote-
+        # doubling or composition regression fails here, not in prod.
+        assert len(duckdb.extract_statements(sql)) == 1
         assert "file_size_bytes < 1048576" in sql, "enumeration must be scoped to the tier's size band"
-        # Liveness on ALL FOUR relations: file, table, schema, and the
-        # delete-file anti-join. Dropping the table one silently enumerates
-        # renamed tables under stale names (perpetual CatalogException noise);
-        # dropping the delete-file one lets unmergeable delete-laden whales
-        # rank first and no-op forever.
-        assert sql.count("end_snapshot IS NULL") == 4
+        # Liveness everywhere it matters: file/table/schema in the candidate
+        # scan, the delete-file anti-join, and table/schema again in the
+        # final name resolution (a renamed table must not be enumerated
+        # under its stale name).
+        assert sql.count("end_snapshot IS NULL") == 6
         assert "NOT EXISTS" in sql and "ducklake_delete_file" in sql
         assert not any("information_schema" in c.args[0] for c in conn.execute.call_args_list)
 
@@ -1472,7 +1480,7 @@ class TestCompactPerTable:
         assert "file_size_bytes >= 1048576" in sql and "file_size_bytes < 10485760" in sql
 
     def test_all_singleton_candidates_logs_info_not_warning(self, caplog):
-        """Candidates exist but no table qualifies (all per-table singletons,
+        """Candidates exist but no table qualifies (all partition singletons,
         or delete-laden files excluded): benign INFO, zero merge CALLs, no
         raise — NOT a warning-level anomaly."""
         conn = _compact_conn([], candidates=(5, 1000))

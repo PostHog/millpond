@@ -181,3 +181,25 @@ def test_biggest_backlog_served_first_within_budget(lake):
 
     assert _live_file_count(conn, "zzz_big") < 6, "biggest backlog must be served first"
     assert _live_file_count(conn, "aaa_small") == 2, "budget must exhaust before the small table"
+
+
+def test_partition_singleton_only_table_is_not_enumerated(lake, caplog):
+    """The patch's core property: a table whose in-band files are ALL
+    partition singletons (one file per partition value — the hourly-import
+    shape) must not be enumerated at all, while a table with a >= 2-file
+    partition group still is."""
+    conn, _attach = lake
+    conn.execute(f"CREATE TABLE {LAKE}.main.hourly (h INTEGER, v VARCHAR)")
+    conn.execute(f"ALTER TABLE {LAKE}.main.hourly SET PARTITIONED BY (h)")
+    for h in range(4):  # every file its own partition -> zero mergeable groups
+        conn.execute(f"INSERT INTO {LAKE}.main.hourly VALUES ({h}, 'x')")
+    _seed_partitioned_table(conn, "mergeable", n_files=3)  # all files share y=2026
+
+    with caplog.at_level(logging.INFO, logger="maintenance"):
+        tables = ducklake_maintenance._enumerate_compaction_tables(conn, None, 1 << 20)
+
+    assert ("main", "hourly") not in tables
+    assert ("main", "mergeable") in tables
+    # File-backed lakes have no pg attach: the server-side attempt must fall
+    # back (a tightened except that breaks the fallback fails here).
+    assert "server-side enumeration unavailable" in caplog.text
