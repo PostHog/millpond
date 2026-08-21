@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
@@ -1726,7 +1727,7 @@ def _bytes_to_human(stored_value: str) -> str | None:
 
 
 @contextlib.contextmanager
-def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
+def _scoped_target_file_size(conn_getter: Callable[[], duckdb.DuckDBPyConnection | None], value: str):
     """Set target_file_size for the body, restore the prior catalog value on exit.
 
     Reads the prior GLOBAL value before the body runs and restores it in the
@@ -1748,10 +1749,14 @@ def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
       tier-specific value we set during the body.
     """
     _sanitize_setting_value(value)
-    prior_row = conn.execute(
-        f"SELECT value FROM ducklake_options('{ATTACH_NAME}') "
-        f"WHERE option_name = 'target_file_size' AND scope = 'GLOBAL'"
-    ).fetchone()
+    prior_row = (
+        conn_getter()
+        .execute(
+            f"SELECT value FROM ducklake_options('{ATTACH_NAME}') "
+            f"WHERE option_name = 'target_file_size' AND scope = 'GLOBAL'"
+        )
+        .fetchone()
+    )
     # Distinguish three cases so we only warn on a genuine conversion failure
     # (a prior GLOBAL value of 134217728 converts to '128MiB' which equals
     # DEFAULT_TARGET_FILE_SIZE — without this distinction we'd emit a noisy
@@ -1771,12 +1776,22 @@ def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
         else:
             restore = converted
     _sanitize_setting_value(restore)
-    conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{value}')")
+    conn_getter().execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{value}')")
     try:
         yield
     finally:
-        conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{restore}')")
-        log.info("target_file_size restored to %s", restore)
+        # conn_getter (not a bound conn): compact() may replace its connection
+        # mid-run after an instance-fatal error, and the restore must land on
+        # whichever connection is live at exit — or be skipped when none is.
+        current = conn_getter()
+        if current is None:
+            # A skipped restore leaves the tier target set; every tier target
+            # and the default are the same value in practice, and skipping
+            # beats blocking on a wedged instance.
+            log.warning("target_file_size restore skipped: no live connection")
+        else:
+            current.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{restore}')")
+            log.info("target_file_size restored to %s", restore)
 
 
 def _set_compaction_tuning(conn: duckdb.DuckDBPyConnection, threads: int, memory_limit: str) -> None:
@@ -1802,6 +1817,81 @@ def _set_compaction_tuning(conn: duckdb.DuckDBPyConnection, threads: int, memory
         threads,
         memory_limit,
     )
+
+
+# Errors after which the DuckDB instance must be treated as unusable. The
+# per-table continue-on-error contract assumed the connection survives a
+# failed CALL; production wedges (a hive-path compaction assertion followed by
+# total silence — no per-table logs, no heartbeats — until the activeDeadline
+# killed the run) showed an InternalException can leave the instance blocking
+# every later query without raising. Rebuilding the connection is the only
+# safe continuation.
+_INSTANCE_FATAL_ERRORS = (duckdb.InternalException, duckdb.FatalException)
+# One rebuild per run: duckdb memory_limit is per INSTANCE and a wedged
+# instance's buffers may never free (its close can hang), so every additional
+# live instance stacks another memory_limit against the pod cgroup. A second
+# invalidation in one run is systemic poison, not bad luck — stop compacting
+# and let the (exit-0) failure gauges tell the story.
+_MAX_CONNECTION_REBUILDS = 1
+
+# Rebuild count of the last compact() run, exported by main() as the
+# maintenance_compact_connection_rebuilds gauge. Module state rather than a
+# richer compact() return type so the existing int contract (failed tables)
+# and its callers stay untouched.
+_last_compact_rebuilds = 0
+
+
+def _connection_alive(conn: duckdb.DuckDBPyConnection, timeout_s: float = 5.0) -> bool:
+    """Probe the instance from a side thread so a wedged one can't hang us.
+
+    Most InternalExceptions (e.g. the hive-path compaction assertion) leave
+    the instance fully usable; the probe distinguishes those from the
+    production wedge where every later query blocks without raising.
+    """
+    alive: list[bool] = []
+
+    def _probe() -> None:
+        with contextlib.suppress(Exception):
+            conn.execute("SELECT 1").fetchone()
+            alive.append(True)
+
+    prober = threading.Thread(target=_probe, daemon=True)
+    prober.start()
+    prober.join(timeout=timeout_s)
+    return bool(alive)
+
+
+def _quiet_close(conn: duckdb.DuckDBPyConnection) -> None:
+    with contextlib.suppress(Exception):
+        conn.close()
+
+
+def _abandon_connection(conn: duckdb.DuckDBPyConnection) -> None:
+    """Close a possibly-wedged connection without risking a hang.
+
+    close() on an instance that just failed an internal assertion can block on
+    the same internal state that wedged it; run it from a daemon thread with a
+    short grace period and otherwise leak the object — the process is a
+    short-lived cron step.
+    """
+    with contextlib.suppress(Exception):
+        # Cancel any in-flight work first: it materially raises the odds the
+        # close completes, which is what actually frees the instance's buffers
+        # and rolls back its Postgres-side metadata session.
+        conn.interrupt()
+    closer = threading.Thread(target=_quiet_close, args=(conn,), daemon=True)
+    closer.start()
+    closer.join(timeout=5.0)
+    if closer.is_alive():
+        log.warning("abandoned a wedged duckdb connection without close()")
+
+
+def _fresh_compaction_connection(threads: int, memory_limit: str, target: str) -> duckdb.DuckDBPyConnection:
+    conn = connect()
+    _set_compaction_tuning(conn, threads, memory_limit)
+    _sanitize_setting_value(target)
+    conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{target}')")
+    return conn
 
 
 def _rss_bytes() -> int | None:
@@ -2033,6 +2123,8 @@ def compact(
         candidate_count,
         candidate_bytes,
     )
+    global _last_compact_rebuilds
+    _last_compact_rebuilds = 0
 
     if dry_run:
         return 0
@@ -2055,6 +2147,7 @@ def compact(
     failed: list[str] = []
     table_total = 1
     noop_tables = 0
+    rebuilds = 0
 
     if table:
         # Single-table invocation. Errors propagate raw, exactly as before.
@@ -2063,7 +2156,7 @@ def compact(
         # issue exactly the giant single txn the knob exists to prevent).
         heartbeat = _start_heartbeat(conn, f"compact tier-{tier} merge")
         try:
-            with _scoped_target_file_size(conn, target):
+            with _scoped_target_file_size(lambda: conn, target):
                 remaining = max_compacted_files
                 while remaining > 0:
                     call_cap = remaining if max_outputs_per_call is None else min(max_outputs_per_call, remaining)
@@ -2111,7 +2204,9 @@ def compact(
                 tier,
                 candidate_count,
             )
-        with _scoped_target_file_size(conn, target):
+        conn_dead = [False]
+        abort_run = False
+        with _scoped_target_file_size(lambda: None if conn_dead[0] else conn, target):
             # max_compacted_files stays a GLOBAL budget across the run — the
             # same bound as the old catalog-scope call — so run duration
             # stays predictable. Leftover tables wait for the next cron tick.
@@ -2124,7 +2219,7 @@ def compact(
             # served. Biggest backlog still gets the biggest cut; it just
             # can't take the whole pie.
             remaining = max_compacted_files
-            for schema_name, table_name in tables:
+            for table_index, (schema_name, table_name) in enumerate(tables):
                 if remaining <= 0:
                     log.info(
                         "compact tier-%d: file budget exhausted; remaining tables wait for the next run",
@@ -2192,16 +2287,63 @@ def compact(
                             table_name,
                         )
                         break
+                    except _INSTANCE_FATAL_ERRORS:
+                        failed.append(f"{schema_name}.{table_name}")
+                        heartbeat.set()
+                        if _connection_alive(conn):
+                            # The common case: the error was table-local and
+                            # the instance is fine — keep the long-standing
+                            # continue-on-error contract on the same conn.
+                            log.exception(
+                                "compact tier-%d: %s.%s failed; connection alive, continuing with remaining tables",
+                                tier,
+                                schema_name,
+                                table_name,
+                            )
+                            break
+                        # The production wedge: every later query would block
+                        # without raising, silencing the run until the
+                        # activeDeadline. Abandon the instance; progress
+                        # committed by earlier calls is durable.
+                        rebuilds += 1
+                        log.exception(
+                            "compact tier-%d: %s.%s left the connection unresponsive; rebuilding (%d/%d)",
+                            tier,
+                            schema_name,
+                            table_name,
+                            rebuilds,
+                            _MAX_CONNECTION_REBUILDS,
+                        )
+                        _abandon_connection(conn)
+                        if rebuilds > _MAX_CONNECTION_REBUILDS:
+                            log.error(
+                                "compact tier-%d: connection invalidated %d times in one run; "
+                                "abandoning the remaining tables (they count as failed)",
+                                tier,
+                                rebuilds,
+                            )
+                            conn_dead[0] = True
+                            abort_run = True
+                            break
+                        try:
+                            conn = _fresh_compaction_connection(threads, memory_limit, target)
+                        except Exception:
+                            # Correlated failure is likely (the catalog just
+                            # misbehaved); never let the rebuild's own error
+                            # wedge the run or land the restore on a dead conn.
+                            log.exception(
+                                "compact tier-%d: connection rebuild failed; "
+                                "abandoning the remaining tables (they count as failed)",
+                                tier,
+                            )
+                            conn_dead[0] = True
+                            abort_run = True
+                        break
                     except Exception:
-                        # Continue-on-error relies on the connection SURVIVING
-                        # the failed CALL (verified on duckdb 1.5.2 and 1.5.5,
-                        # even for InternalException, and pinned end-to-end by
-                        # test_compaction_isolation_integration). If a future
-                        # duckdb bump invalidates the instance on INTERNAL
-                        # errors, every table fails, the failure summary +
-                        # gauge spike, and the target_file_size restore raises
-                        # — noisy, not silent. A mid-loop failure keeps the
-                        # progress already committed by earlier calls.
+                        # Non-fatal per-table failure: the connection survives
+                        # the failed CALL and the loop continues on it. A
+                        # mid-loop failure keeps the progress already
+                        # committed by earlier calls.
                         failed.append(f"{schema_name}.{table_name}")
                         log.exception(
                             "compact tier-%d: %s.%s failed; continuing with remaining tables",
@@ -2215,6 +2357,10 @@ def compact(
                     call_idx += 1
                     if max_outputs_per_call is None:
                         break
+                if abort_run:
+                    failed.extend(f"{s}.{t}" for s, t in tables[table_index + 1 :])
+                    break
+    _last_compact_rebuilds = rebuilds
     elapsed = time.monotonic() - t0
 
     # Aggregate result rows (one per output group: schema, table, input_files, output_files)
@@ -2513,6 +2659,15 @@ def main(argv: list[str] | None = None) -> None:
         ["tier"],
         registry=registry,
     )
+    # A rebuild means the duckdb instance wedged mid-run and the tool
+    # recovered — a fork-bug signal worth alerting on at >= 1, distinct from
+    # ordinary per-table failures.
+    compact_connection_rebuilds = Gauge(
+        "maintenance_compact_connection_rebuilds",
+        "DuckDB instance invalidations handled (rebuilt or abandoned) in the last compact run",
+        ["tier"],
+        registry=registry,
+    )
     operation = args.command
     if hasattr(args, "days") and args.days < 1:
         parser.error("--days must be >= 1")
@@ -2572,6 +2727,7 @@ def main(argv: list[str] | None = None) -> None:
                     max_outputs_per_call=args.max_outputs_per_call,
                 )
                 compact_tables_failed.labels(tier=str(args.tier)).set(n_failed)
+                compact_connection_rebuilds.labels(tier=str(args.tier)).set(_last_compact_rebuilds)
             case "compact-probe":
                 compact_probe(conn, args.table, args.max_compacted_files)
     except Exception:
@@ -2581,10 +2737,15 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         elapsed = time.monotonic() - t0
         duration.labels(operation=operation, status=status).set(elapsed)
-        if conn is not None:
-            conn.close()
+        # Push BEFORE close: closing a wedged instance can block, and the
+        # metrics for a completed run must not be hostage to teardown.
         if pushgateway:
             _push(registry, pushgateway)
+        if conn is not None:
+            # Guarded close: after a mid-run rebuild this is the abandoned
+            # original (compact() owns the fresh one; process exit reaps it),
+            # and its close may hang on the wedged instance state.
+            _abandon_connection(conn)
         log.info("Operation %s finished: status=%s duration=%.1fs", operation, status, elapsed)
 
 
