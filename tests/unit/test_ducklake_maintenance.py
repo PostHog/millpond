@@ -1199,6 +1199,119 @@ class TestCompactPerTable:
         # target_file_size restored despite the partial failure.
         assert any("ducklake_set_option" in c.args[0] and "128MiB" in c.args[0] for c in conn.execute.call_args_list)
 
+    def test_survivable_instance_fatal_error_continues_on_same_connection(self, monkeypatch):
+        # Most InternalExceptions (the hive-path assertion included) leave the
+        # instance usable: the probe passes and the run must NOT rebuild.
+        conn = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            merge_rows_seq={
+                "events": [
+                    duckdb.InternalException(
+                        "INTERNAL Error: DuckLakeCompactor: Files have different hive partition path"
+                    ),
+                ]
+            },
+            merge_rows={"persons": [("posthog", "persons", 4, 1)]},
+        )
+        monkeypatch.setattr(
+            ducklake_maintenance,
+            "connect",
+            lambda debug=False: pytest.fail("must not rebuild when the instance is alive"),
+        )
+
+        n_failed = ducklake_maintenance.compact(
+            conn, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+
+        assert n_failed == 1
+        assert any("'persons'" in c for c in _merge_calls(conn))
+        conn.close.assert_not_called()
+
+    def test_wedged_connection_is_rebuilt_and_run_continues(self, monkeypatch):
+        # The production wedge: after the InternalException every query on the
+        # old instance blocks. Simulated by failing the liveness probe for the
+        # first connection only.
+        conn1 = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            merge_rows_seq={"events": [duckdb.InternalException("INTERNAL Error: boom")]},
+        )
+        conn2 = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            merge_rows={"persons": [("posthog", "persons", 4, 1)]},
+        )
+        monkeypatch.setattr(ducklake_maintenance, "connect", lambda debug=False: conn2)
+        monkeypatch.setattr(ducklake_maintenance, "_connection_alive", lambda c, timeout_s=5.0: c is not conn1)
+
+        n_failed = ducklake_maintenance.compact(
+            conn1, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+
+        assert n_failed == 1
+        # The failed table's CALL went to the old connection; the survivor's
+        # CALL and the target_file_size restore went to the fresh one.
+        assert any("'events'" in c for c in _merge_calls(conn1))
+        assert not any("'persons'" in c for c in _merge_calls(conn1))
+        assert any("'persons'" in c for c in _merge_calls(conn2))
+        assert any("ducklake_set_option" in c.args[0] and "128MiB" in c.args[0] for c in conn2.execute.call_args_list)
+        # Fresh connection got the compaction tuning reapplied.
+        assert any("SET threads" in c.args[0] for c in conn2.execute.call_args_list)
+        conn1.close.assert_called_once()
+        assert ducklake_maintenance._last_compact_rebuilds == 1
+
+    def test_repeated_wedges_abandon_the_run_without_raising(self, monkeypatch):
+        tables = [("posthog", f"t{i}") for i in range(6)]
+
+        def _poisoned():
+            return _compact_conn(
+                tables,
+                merge_rows_seq={f"t{i}": [duckdb.InternalException("INTERNAL Error: boom")] for i in range(6)},
+            )
+
+        rebuilt: list[MagicMock] = []
+
+        def _connect(debug=False):
+            conn = _poisoned()
+            rebuilt.append(conn)
+            return conn
+
+        monkeypatch.setattr(ducklake_maintenance, "connect", _connect)
+        monkeypatch.setattr(ducklake_maintenance, "_connection_alive", lambda c, timeout_s=5.0: False)
+
+        n_failed = ducklake_maintenance.compact(
+            _poisoned(), tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+        )
+
+        # Bounded: one rebuild, then the remaining tables are marked failed
+        # and the run returns (exit 0; the failure gauges tell the story).
+        assert len(rebuilt) == ducklake_maintenance._MAX_CONNECTION_REBUILDS
+        assert n_failed == len(tables)
+        assert ducklake_maintenance._last_compact_rebuilds == ducklake_maintenance._MAX_CONNECTION_REBUILDS + 1
+
+    def test_rebuild_failure_abandons_run_and_skips_restore(self, monkeypatch, caplog):
+        conn1 = _compact_conn(
+            [("posthog", "events"), ("posthog", "persons")],
+            merge_rows_seq={"events": [duckdb.InternalException("INTERNAL Error: boom")]},
+        )
+
+        def _connect(debug=False):
+            raise RuntimeError("duckgres unreachable")
+
+        monkeypatch.setattr(ducklake_maintenance, "connect", _connect)
+        monkeypatch.setattr(ducklake_maintenance, "_connection_alive", lambda c, timeout_s=5.0: False)
+
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            n_failed = ducklake_maintenance.compact(
+                conn1, tier=1, table=None, dry_run=False, threads=2, memory_limit="16GB", max_compacted_files=10
+            )
+
+        # Both tables count as failed, nothing raises, and the restore is
+        # skipped rather than executed on the abandoned connection: the only
+        # set_option on conn1 is the scope-entry SET, never the finally-restore.
+        assert n_failed == 2
+        assert "target_file_size restore skipped" in caplog.text
+        set_option_calls = [c.args[0] for c in conn1.execute.call_args_list if "ducklake_set_option" in c.args[0]]
+        assert len(set_option_calls) == 1
+
     def test_all_tables_failed_does_not_raise(self, caplog):
         """Per-table failures NEVER raise — the poison-set attractor: with
         candidate-driven enumeration, healthy tables drain OUT of the table
@@ -1395,7 +1508,7 @@ class TestScopedTargetFileSize:
         # equals the default — that's a healthy install, not a failure.
         conn = self._conn("134217728")
         with caplog.at_level(logging.WARNING, logger="maintenance"):
-            with ducklake_maintenance._scoped_target_file_size(conn, "5MiB"):
+            with ducklake_maintenance._scoped_target_file_size(lambda: conn, "5MiB"):
                 pass
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warnings == [], "no warning expected on a clean default-value round-trip"
@@ -1404,7 +1517,7 @@ class TestScopedTargetFileSize:
         # 64 MiB — operator value, not the default.
         conn = self._conn("67108864")
         with caplog.at_level(logging.WARNING, logger="maintenance"):
-            with ducklake_maintenance._scoped_target_file_size(conn, "5MiB"):
+            with ducklake_maintenance._scoped_target_file_size(lambda: conn, "5MiB"):
                 pass
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
@@ -1414,7 +1527,7 @@ class TestScopedTargetFileSize:
         # the warning is informative.
         conn = self._conn("12345678")
         with caplog.at_level(logging.WARNING, logger="maintenance"):
-            with ducklake_maintenance._scoped_target_file_size(conn, "5MiB"):
+            with ducklake_maintenance._scoped_target_file_size(lambda: conn, "5MiB"):
                 pass
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
@@ -1424,13 +1537,13 @@ class TestScopedTargetFileSize:
     def test_no_warning_when_prior_unset(self, caplog):
         conn = self._conn(None)
         with caplog.at_level(logging.WARNING, logger="maintenance"):
-            with ducklake_maintenance._scoped_target_file_size(conn, "5MiB"):
+            with ducklake_maintenance._scoped_target_file_size(lambda: conn, "5MiB"):
                 pass
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
     def test_restores_to_converted_prior(self):
         conn = self._conn("67108864")
-        with ducklake_maintenance._scoped_target_file_size(conn, "5MiB"):
+        with ducklake_maintenance._scoped_target_file_size(lambda: conn, "5MiB"):
             pass
         # The last execute call should be the restore SET to '64MiB'.
         last_sql = conn.execute.call_args_list[-1].args[0]
@@ -1439,7 +1552,7 @@ class TestScopedTargetFileSize:
 
     def test_restores_to_default_when_prior_unset(self):
         conn = self._conn(None)
-        with ducklake_maintenance._scoped_target_file_size(conn, "5MiB"):
+        with ducklake_maintenance._scoped_target_file_size(lambda: conn, "5MiB"):
             pass
         last_sql = conn.execute.call_args_list[-1].args[0]
         assert f"'{ducklake_maintenance.DEFAULT_TARGET_FILE_SIZE}'" in last_sql

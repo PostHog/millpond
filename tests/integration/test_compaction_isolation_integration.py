@@ -13,12 +13,14 @@ Asserts the per-table compact() loop:
   * still merges the healthy table's files,
   * reports (does NOT raise on) the poisoned table,
   * leaves the poisoned table's files untouched,
-  * raises only when EVERY table fails (systemic).
+  * never raises for per-table failures, even when every table fails.
 
-These tests also pin the load-bearing recovery property: the DuckDB
-connection survives the extension's InternalException, so the loop can keep
-going (verified on duckdb 1.5.2 and 1.5.5; a future duckdb that invalidates
-the instance on INTERNAL errors would fail here, loudly).
+These tests also pin the survivable half of the instance-fatal handling:
+this InternalException leaves the instance usable, the liveness probe
+passes, and the loop continues on the SAME connection. A duckdb where this
+error instead invalidated the instance would take the rebuild path, whose
+connect() has no environment here — the healthy-table assertion would then
+fail, loudly.
 
 Skips when the ducklake extension can't be installed (offline CI).
 """
