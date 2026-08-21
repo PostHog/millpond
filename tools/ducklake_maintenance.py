@@ -1891,7 +1891,7 @@ def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: fl
 def _enumerate_compaction_tables(
     conn: duckdb.DuckDBPyConnection, min_b: int | None, max_b: int
 ) -> list[tuple[str, str]]:
-    """Tables with >= 2 live files in the tier's size band, biggest backlog first.
+    """Tables with a MERGEABLE group in the tier's band, biggest backlog first.
 
     Candidate-driven (from ducklake_data_file), NOT information_schema: a
     catalog can carry thousands of live tables (dlt/Fivetran staging) with
@@ -1901,46 +1901,93 @@ def _enumerate_compaction_tables(
     early-alphabet tables (2-file cosmetic merges) eat the global file
     budget every run while the real backlog starved. Observed in prod:
     3,074 live tables, the budget exhausted on five 2-file billing tables,
-    and the 15k-candidate events table never reached. Candidate-count DESC
+    and the 15k-candidate events table never reached. Mergeable-count DESC
     serves the most backlogged table first; ties break by name for
-    determinism. Single-candidate tables can't merge and are excluded.
+    determinism.
+
+    Mergeability is judged per (table, partition values) group, matching the
+    extension's own grouping: merge_adjacent can never combine files from
+    different partitions, so a table whose in-band files are all partition
+    singletons is a guaranteed zero-group no-op. Enumerating those anyway is
+    what kept the compactor grinding an hourly-partitioned import catalog
+    forever (one measured catalog: 86% of 126k tier-1 candidates were
+    partition singletons), holding catalog contention against the tenant's
+    writer with zero merges to show for it. Row-id non-contiguity within a
+    group can still no-op an enumerated table — the caller's zero-group
+    accounting stays.
 
     Catalog-derived names are ordinary-DDL-controlled and get interpolated
     into the per-table CALL statements below, so anything outside the
     conservative identifier shape is skipped LOUDLY rather than quoted
     heroically (same defense as repair-partition-values discovery).
     """
-    where = [
-        "df.end_snapshot IS NULL",
-        "t.end_snapshot IS NULL",
-        "sch.end_snapshot IS NULL",
-        f"df.file_size_bytes < {max_b}",
-        # Mirror the compactor's own selection: merge_adjacent skips any file
-        # carrying live delete files, so counting them here would let an
-        # unmergeable-but-huge table rank first and no-op at the top of every
-        # run (rank inflated by files the extension refuses to touch).
-        (
-            f"NOT EXISTS (SELECT 1 FROM {METADATA_SCHEMA}.ducklake_delete_file dl "
-            "WHERE dl.data_file_id = df.data_file_id AND dl.end_snapshot IS NULL)"
-        ),
-    ]
-    if min_b is not None:
-        where.append(f"df.file_size_bytes >= {min_b}")
-    # NOTE: COUNT(*) >= 2 is per-TABLE; the extension merges per
-    # (partition_id, partition_values) group, so 2 candidates in different
-    # partitions still yield a zero-group no-op CALL. That's a wasted bind
-    # scan, not a correctness issue — do not read >= 2 as a mergeability
-    # guarantee. Zero-group CALLs are counted and logged by the caller.
-    rows = conn.execute(
-        "SELECT sch.schema_name, t.table_name "
-        f"FROM {METADATA_SCHEMA}.ducklake_data_file df "
-        f"JOIN {METADATA_SCHEMA}.ducklake_table t USING (table_id) "
-        f"JOIN {METADATA_SCHEMA}.ducklake_schema sch ON sch.schema_id = t.schema_id "
-        f"WHERE {' AND '.join(where)} "
-        "GROUP BY sch.schema_name, t.table_name "
-        "HAVING COUNT(*) >= 2 "
-        "ORDER BY COUNT(*) DESC, sch.schema_name, t.table_name"
-    ).fetchall()
+
+    def _enumeration_sql(schema: str) -> str:
+        where = [
+            "df.end_snapshot IS NULL",
+            "t.end_snapshot IS NULL",
+            "sch.end_snapshot IS NULL",
+            f"df.file_size_bytes < {max_b}",
+            # Mirror the compactor's own selection: merge_adjacent skips any file
+            # carrying live delete files, so counting them here would let an
+            # unmergeable-but-huge table rank first and no-op at the top of every
+            # run (rank inflated by files the extension refuses to touch).
+            (
+                f"NOT EXISTS (SELECT 1 FROM {schema}.ducklake_delete_file dl "
+                "WHERE dl.data_file_id = df.data_file_id AND dl.end_snapshot IS NULL)"
+            ),
+        ]
+        if min_b is not None:
+            where.append(f"df.file_size_bytes >= {min_b}")
+        return (
+            "WITH band_files AS ("
+            "  SELECT df.table_id, df.data_file_id "
+            f" FROM {schema}.ducklake_data_file df "
+            f" JOIN {schema}.ducklake_table t USING (table_id) "
+            f" JOIN {schema}.ducklake_schema sch ON sch.schema_id = t.schema_id "
+            f" WHERE {' AND '.join(where)} "
+            "), file_groups AS ("
+            "  SELECT bf.table_id, bf.data_file_id, "
+            "         COALESCE(string_agg(fpv.partition_value, '/' ORDER BY fpv.partition_key_index), '') AS pk "
+            f" FROM band_files bf "
+            f" LEFT JOIN {schema}.ducklake_file_partition_value fpv "
+            "    ON fpv.data_file_id = bf.data_file_id AND fpv.table_id = bf.table_id "
+            "  GROUP BY bf.table_id, bf.data_file_id "
+            "), mergeable AS ("
+            "  SELECT table_id, COUNT(*) AS n_mergeable "
+            "  FROM file_groups "
+            "  GROUP BY table_id, pk "
+            "  HAVING COUNT(*) >= 2 "
+            ") "
+            "SELECT sch.schema_name, t.table_name "
+            f"FROM mergeable m "
+            f"JOIN {schema}.ducklake_table t ON t.table_id = m.table_id AND t.end_snapshot IS NULL "
+            f"JOIN {schema}.ducklake_schema sch ON sch.schema_id = t.schema_id AND sch.end_snapshot IS NULL "
+            "GROUP BY sch.schema_name, t.table_name "
+            "ORDER BY SUM(m.n_mergeable) DESC, sch.schema_name, t.table_name"
+        )
+
+    # Server-side first: through the duckdb postgres scanner this query pulls
+    # the ENTIRE file_partition_value table client-side per call (projection
+    # pushdown only — measured), which is tens-to-hundreds of MB per tier on
+    # a megaduck-sized catalog. postgres_query ships the aggregation to the
+    # catalog (the bootstrap indexes cover it) and only (schema, table) rows
+    # cross the wire.
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', "
+            f"{_sql_string_literal(_enumeration_sql(PG_CATALOG_SCHEMA))})"
+        ).fetchall()
+    except duckdb.BinderException as error:
+        # No pg attach: the dev/file-backed lake shape. Expected there; the
+        # local form is identical modulo the schema prefix.
+        log.info("compact: server-side enumeration unavailable (%s); using local metadata attach", error)
+        rows = conn.execute(_enumeration_sql(METADATA_SCHEMA)).fetchall()
+    except duckdb.Error as error:
+        # The pg attach exists but the server-side query failed — every prod
+        # run degrading to the full client-side pull is worth alarming on.
+        log.warning("compact: server-side enumeration failed (%s); using local metadata attach", error)
+        rows = conn.execute(_enumeration_sql(METADATA_SCHEMA)).fetchall()
     tables: list[tuple[str, str]] = []
     for schema_name, table_name in rows:
         # _CATALOG_TABLE_NAME_RE (strict [A-Za-z0-9_]+, fullmatch): these names
@@ -2097,17 +2144,19 @@ def compact(
         tables = _enumerate_compaction_tables(conn, min_b, max_b)
         table_total = len(tables)
         log.info(
-            "compact tier-%d: %d table(s) with >= 2 tier candidates, biggest backlog first",
+            "compact tier-%d: %d table(s) with a mergeable partition group, biggest mergeable backlog first",
             tier,
             table_total,
         )
         if not tables and candidate_count > 0:
             # Candidates exist but no table qualified: every candidate is a
-            # per-table singleton (nothing to merge with — benign), or the
-            # holders were skipped by the identifier gate (per-table WARNs
-            # above say which). INFO, not a failure.
+            # partition singleton (nothing shares its partition values —
+            # benign, however many candidates a table holds), or the holders
+            # were skipped by the identifier gate (per-table WARNs above say
+            # which). INFO, not a failure.
             log.info(
-                "compact tier-%d: %d candidate file(s) but no table has >= 2 — nothing mergeable this run",
+                "compact tier-%d: %d candidate file(s) but none form a >= 2-file partition group — "
+                "nothing mergeable this run",
                 tier,
                 candidate_count,
             )
