@@ -57,7 +57,7 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
     c.execute(
         "CREATE TABLE __ducklake_metadata_lake.ducklake_delete_file ("
         "delete_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "
-        "path VARCHAR, file_size_bytes BIGINT)"
+        "data_file_id BIGINT, path VARCHAR, file_size_bytes BIGINT)"
     )
     c.execute(
         "CREATE TABLE __ducklake_metadata_lake.ducklake_file_partition_value ("
@@ -91,14 +91,20 @@ def _stub_full_catalog(c: duckdb.DuckDBPyConnection) -> None:
         "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
         "(1, 1, 0, NULL, 'a', 500000, 100, 1000),"
         "(2, 1, 0, NULL, 'b', 50000000, 100, 50000),"
-        "(3, 1, 0, NULL, 'c', 200000000, 200, 200000)"
+        "(3, 1, 0, NULL, 'c', 200000000, 200, 200000),"
+        # 4 pairs with 1 (same partition, both tier1) so the mergeable
+        # band metric has a non-zero group to report.
+        "(4, 1, 0, NULL, 'e', 400000, 100, 800)"
     )
-    c.execute("INSERT INTO __ducklake_metadata_lake.ducklake_delete_file VALUES (1, 1, 0, NULL, 'd1', 1024)")
+    # data_file_id=2: pins the delete-file exclusion to the tier3 file so
+    # the tier1 mergeable pair above stays clean.
+    c.execute("INSERT INTO __ducklake_metadata_lake.ducklake_delete_file VALUES (1, 1, 0, NULL, 2, 'd1', 1024)")
     c.execute(
         "INSERT INTO __ducklake_metadata_lake.ducklake_file_partition_value VALUES "
         "(1, 1, 0, '2026-05-01'),"
         "(2, 1, 0, '2026-05-01'),"
-        "(3, 1, 0, '2026-05-02')"
+        "(3, 1, 0, '2026-05-02'),"
+        "(4, 1, 0, '2026-05-01')"
     )
     c.execute("INSERT INTO __ducklake_metadata_lake.ducklake_snapshot VALUES (0, '2026-05-01 12:00:00+00', 0)")
     c.execute(
@@ -228,6 +234,9 @@ class TestDaemonHTTP:
                     "ducklake_delete_files_bytes",
                     "ducklake_files_per_band_count",
                     "ducklake_files_per_band_bytes",
+                    "ducklake_mergeable_files_per_band_count",
+                    "ducklake_mergeable_files_per_band_bytes",
+                    "ducklake_mergeable_files_per_band_groups",
                     "ducklake_snapshots_count",
                     "ducklake_snapshots_oldest_seconds_ago",
                     "ducklake_snapshots_newest_seconds_ago",

@@ -1007,3 +1007,127 @@ class TestRunOnce:
         # the filesystem — the semgrep dynamic-urllib hardening.
         monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
         assert dm._run_once([_once_query()], TENANT, "file:///etc/passwd", None) == 1
+
+
+# ---------------------------------------------------------------------------
+# server_sql: loader plumbing, fallback execution, and the mergeable-band
+# builtin's semantics (the only builtin that carries a server_sql form)
+# ---------------------------------------------------------------------------
+
+
+class TestServerSql:
+    def test_loader_accepts_server_sql(self):
+        q = dm._query_from_dict(
+            {
+                "name": "t_srv",
+                "help": "t",
+                "interval_mins": 1,
+                "sql": "SELECT 1 AS n",
+                "server_sql": "SELECT 1 AS n",
+                "values": ["n"],
+            },
+            "test",
+        )
+        assert q.server_sql == "SELECT 1 AS n"
+
+    def test_loader_defaults_server_sql_none(self):
+        q = dm._query_from_dict(
+            {"name": "t_srv", "help": "t", "interval_mins": 1, "sql": "SELECT 1 AS n", "values": ["n"]},
+            "test",
+        )
+        assert q.server_sql is None
+
+    def test_loader_rejects_non_string_server_sql(self):
+        with pytest.raises(ValueError, match="server_sql must be a string"):
+            dm._query_from_dict(
+                {
+                    "name": "t_srv",
+                    "help": "t",
+                    "interval_mins": 1,
+                    "sql": "SELECT 1 AS n",
+                    "server_sql": ["not", "a", "string"],
+                    "values": ["n"],
+                },
+                "test",
+            )
+
+    def test_falls_back_to_local_sql_without_pg_attach(self, conn, registry):
+        # Plain in-memory duckdb has no postgres_query table function, which
+        # is exactly the dev/file-lake + test-stub shape: the server form
+        # must degrade to the local form, still succeed, and only log once.
+        conn.execute("CREATE TABLE t (n BIGINT)")
+        conn.execute("INSERT INTO t VALUES (7)")
+        q = dm.Query(
+            name="t_fallback",
+            help="t",
+            sql="SELECT n FROM t",
+            interval_seconds=60,
+            labels=[],
+            values=["n"],
+            server_sql="SELECT n FROM public.t",
+        )
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is True
+        assert _gauge_value(registry, "t_fallback_n") == 7
+        # Error counter untouched: the fallback is an expected shape, not a failure.
+        errors = _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "t_fallback"})
+        assert errors is None or errors == 0
+
+    def test_mergeable_builtin_semantics(self, conn, registry):
+        # Executable-SQL test of the ducklake_mergeable_files_per_band
+        # builtin against a mimicked metadata schema: a tier1 pair in one
+        # partition group counts; a tier1 singleton partition does not; a
+        # file carrying a live delete file is excluded; `large` never
+        # appears.
+        conn.execute("CREATE SCHEMA __ducklake_metadata_lake")
+        conn.execute(
+            "CREATE TABLE __ducklake_metadata_lake.ducklake_data_file ("
+            "data_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "
+            "path VARCHAR, file_size_bytes BIGINT, partition_id BIGINT, record_count BIGINT)"
+        )
+        conn.execute(
+            "CREATE TABLE __ducklake_metadata_lake.ducklake_delete_file ("
+            "delete_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "
+            "data_file_id BIGINT, path VARCHAR, file_size_bytes BIGINT)"
+        )
+        conn.execute(
+            "CREATE TABLE __ducklake_metadata_lake.ducklake_file_partition_value ("
+            "data_file_id BIGINT, table_id BIGINT, partition_key_index BIGINT, partition_value VARCHAR)"
+        )
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
+            # tier1 pair, same partition -> mergeable (2 files, 1 group)
+            "(1, 1, 0, NULL, 'a', 100, 10, 1), (2, 1, 0, NULL, 'b', 200, 10, 1),"
+            # tier1 singleton partition -> excluded
+            "(3, 1, 0, NULL, 'c', 300, 10, 1),"
+            # tier1 pair BUT one carries a live delete file -> both drop
+            # (survivor becomes a singleton)
+            "(4, 1, 0, NULL, 'd', 400, 10, 1), (5, 1, 0, NULL, 'e', 500, 10, 1),"
+            # large pair, same partition -> band excluded entirely
+            "(6, 1, 0, NULL, 'f', 100000000, 10, 1), (7, 1, 0, NULL, 'g', 100000000, 10, 1),"
+            # dropped file (end_snapshot set) -> excluded
+            "(8, 1, 0, 5, 'h', 150, 10, 1)"
+        )
+        conn.execute("INSERT INTO __ducklake_metadata_lake.ducklake_delete_file VALUES (1, 1, 0, NULL, 4, 'dv', 10)")
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_file_partition_value VALUES "
+            "(1, 1, 0, 'p1'), (2, 1, 0, 'p1'),"
+            "(3, 1, 0, 'p2'),"
+            "(4, 1, 0, 'p3'), (5, 1, 0, 'p3'),"
+            "(6, 1, 0, 'p4'), (7, 1, 0, 'p4'),"
+            "(8, 1, 0, 'p1')"
+        )
+        queries = {q.name: q for q in dm.load_queries(None, set())}
+        q = queries["ducklake_mergeable_files_per_band"]
+        assert q.server_sql is not None  # ships the join to the catalog in prod
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is True
+        assert _gauge_value(registry, "ducklake_mergeable_files_per_band_count", {"band": "tier1"}) == 2
+        assert _gauge_value(registry, "ducklake_mergeable_files_per_band_bytes", {"band": "tier1"}) == 300
+        assert _gauge_value(registry, "ducklake_mergeable_files_per_band_groups", {"band": "tier1"}) == 1
+        for band in ("tier2", "tier3", "large"):
+            assert _gauge_value(registry, "ducklake_mergeable_files_per_band_count", {"band": band}) is None

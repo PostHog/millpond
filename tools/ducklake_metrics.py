@@ -72,6 +72,11 @@ from prometheus_client import (
 
 log = logging.getLogger("ducklake_metrics")
 
+# Query names whose server_sql fallback has already been logged — the
+# fallback is retried every run (self-healing if the attach appears after
+# a reconnect) but only worth one log line per process.
+_SERVER_SQL_FALLBACK_LOGGED: set[str] = set()
+
 
 # Built-in queries are embedded so the binary is self-contained; they parse
 # through the same loader as user YAML so the two paths can't diverge.
@@ -153,6 +158,93 @@ queries:
         COALESCE(SUM(file_size_bytes), 0) AS bytes
       FROM __ducklake_metadata_lake.ducklake_data_file
       WHERE end_snapshot IS NULL
+      GROUP BY band
+
+  - name: ducklake_mergeable_files_per_band
+    help: |
+      Compaction-tier files that are actually MERGEABLE: in-band files that
+      share a (table, partition-values) group with at least one other
+      in-band file, and carry no live delete files. Mirrors
+      `ducklake_maintenance.py`'s enumeration semantics (merge_adjacent
+      merges per partition group), so `ducklake_files_per_band` minus this
+      is the structural singleton floor compaction can never shrink —
+      graph THIS as the compaction queue, not the raw band count.
+      `groups` approximates the post-merge output file count. `large` is
+      excluded (never a compaction target). The partition-value join is
+      shipped to the catalog via `server_sql` where a direct Postgres
+      attach exists; the local form is the dev/file-lake fallback.
+    interval_mins: 15
+    labels: [band]
+    values: [count, bytes, groups]
+    sql: |
+      WITH band_files AS (
+        SELECT df.table_id, df.data_file_id, df.file_size_bytes,
+          CASE
+            WHEN df.file_size_bytes < 1048576  THEN 'tier1'
+            WHEN df.file_size_bytes < 10485760 THEN 'tier2'
+            ELSE 'tier3'
+          END AS band
+        FROM __ducklake_metadata_lake.ducklake_data_file df
+        WHERE df.end_snapshot IS NULL
+          AND df.file_size_bytes < 67108864
+          AND NOT EXISTS (
+            SELECT 1 FROM __ducklake_metadata_lake.ducklake_delete_file dl
+            WHERE dl.data_file_id = df.data_file_id AND dl.end_snapshot IS NULL
+          )
+      ), file_groups AS (
+        SELECT bf.band, bf.table_id, bf.data_file_id, bf.file_size_bytes,
+          COALESCE(string_agg(fpv.partition_value, '/' ORDER BY fpv.partition_key_index), '') AS pk
+        FROM band_files bf
+        LEFT JOIN __ducklake_metadata_lake.ducklake_file_partition_value fpv
+          ON fpv.data_file_id = bf.data_file_id AND fpv.table_id = bf.table_id
+        GROUP BY bf.band, bf.table_id, bf.data_file_id, bf.file_size_bytes
+      ), mergeable AS (
+        SELECT band, table_id, pk,
+          COUNT(*) AS n_files, SUM(file_size_bytes) AS n_bytes
+        FROM file_groups
+        GROUP BY band, table_id, pk
+        HAVING COUNT(*) >= 2
+      )
+      SELECT band,
+        COALESCE(SUM(n_files), 0) AS count,
+        COALESCE(SUM(n_bytes), 0) AS bytes,
+        COUNT(*) AS "groups"
+      FROM mergeable
+      GROUP BY band
+    server_sql: |
+      WITH band_files AS (
+        SELECT df.table_id, df.data_file_id, df.file_size_bytes,
+          CASE
+            WHEN df.file_size_bytes < 1048576  THEN 'tier1'
+            WHEN df.file_size_bytes < 10485760 THEN 'tier2'
+            ELSE 'tier3'
+          END AS band
+        FROM public.ducklake_data_file df
+        WHERE df.end_snapshot IS NULL
+          AND df.file_size_bytes < 67108864
+          AND NOT EXISTS (
+            SELECT 1 FROM public.ducklake_delete_file dl
+            WHERE dl.data_file_id = df.data_file_id AND dl.end_snapshot IS NULL
+          )
+      ), file_groups AS (
+        SELECT bf.band, bf.table_id, bf.data_file_id, bf.file_size_bytes,
+          COALESCE(string_agg(fpv.partition_value, '/' ORDER BY fpv.partition_key_index), '') AS pk
+        FROM band_files bf
+        LEFT JOIN public.ducklake_file_partition_value fpv
+          ON fpv.data_file_id = bf.data_file_id AND fpv.table_id = bf.table_id
+        GROUP BY bf.band, bf.table_id, bf.data_file_id, bf.file_size_bytes
+      ), mergeable AS (
+        SELECT band, table_id, pk,
+          COUNT(*) AS n_files, SUM(file_size_bytes) AS n_bytes
+        FROM file_groups
+        GROUP BY band, table_id, pk
+        HAVING COUNT(*) >= 2
+      )
+      SELECT band,
+        COALESCE(SUM(n_files), 0) AS count,
+        COALESCE(SUM(n_bytes), 0) AS bytes,
+        COUNT(*) AS "groups"
+      FROM mergeable
       GROUP BY band
 
   - name: ducklake_snapshots
@@ -387,6 +479,15 @@ class Query:
     interval_seconds: int
     labels: list[str] = field(default_factory=list)
     values: list[str] = field(default_factory=list)
+    # Optional Postgres-dialect form of the same query, shipped to the
+    # catalog via postgres_query() when the connection has the direct pg
+    # attach (same rationale as ducklake_maintenance's server-side
+    # enumeration: the duckdb postgres scanner pulls whole tables with
+    # projection pushdown only, so join-heavy metadata queries are
+    # tens-to-hundreds of MB per run client-side on a big catalog).
+    # Must return the same column names as `sql`. Falls back to `sql`
+    # on lakes without the attach (dev/file lakes, unit-test stubs).
+    server_sql: str | None = None
 
 
 def _validate_interval_mins(v: object) -> int:
@@ -427,6 +528,9 @@ def _query_from_dict(d: dict, source: str) -> Query:
         raise ValueError(f"{source}: query {name!r} labels must be a list of strings")
     if not isinstance(values, list) or not all(isinstance(x, str) for x in values):
         raise ValueError(f"{source}: query {name!r} values must be a list of strings")
+    server_sql = d.get("server_sql")
+    if server_sql is not None and not isinstance(server_sql, str):
+        raise ValueError(f"{source}: query {name!r} server_sql must be a string")
     return Query(
         name=name,
         help=d["help"],
@@ -434,6 +538,7 @@ def _query_from_dict(d: dict, source: str) -> Query:
         interval_seconds=_validate_interval_mins(d["interval_mins"]),
         labels=labels,
         values=values,
+        server_sql=server_sql,
     )
 
 
@@ -644,7 +749,23 @@ def _run_query(
     if liveness is not None:
         liveness.current_query_start = t0
     try:
-        cur = conn.execute(q.sql)
+        cur = None
+        if q.server_sql is not None:
+            # Server-side first (see Query.server_sql). Bind/catalog errors
+            # mean "this lake has no direct pg attach" (dev/file lakes,
+            # test stubs) — expected shape, fall back to the local form.
+            # Any other error is a real failure and takes the normal path.
+            try:
+                cur = conn.execute(
+                    f"SELECT * FROM postgres_query('{ducklake_maintenance.PG_ATTACH_NAME}', "
+                    f"{ducklake_maintenance._sql_string_literal(q.server_sql)})"
+                )
+            except (duckdb.BinderException, duckdb.CatalogException) as e:
+                if q.name not in _SERVER_SQL_FALLBACK_LOGGED:
+                    _SERVER_SQL_FALLBACK_LOGGED.add(q.name)
+                    log.info("query %s: server-side form unavailable (%s); using local metadata attach", q.name, e)
+        if cur is None:
+            cur = conn.execute(q.sql)
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
         try:
