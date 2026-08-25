@@ -454,9 +454,23 @@ bootstrap-index-file-partition-value-table-file: _confirm-target
     @echo ">>> ducklake_file_partition_value_table_file_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_file_idx ON public.ducklake_file_partition_value USING btree (table_id, data_file_id);"
 
+# Name-mapping lookup key for externally registered parquet (field-id
+# mapping, written by ducklake_add_data_files): readers fetch all rows for
+# a file's data_file.mapping_id. Upstream ships the table with NO indexes
+# and NO snapshot lineage (no begin/end_snapshot columns), so it is
+# invisible to expire and lookups on a registration-churned catalog are
+# full seq scans (observed: 2.27M rows / 169MB on duckling-posthog, >90%
+# orphaned mappings).
+#
+# Name-mapping lookup key for registered-parquet field-id mapping reads
+[group('bootstrap')]
+bootstrap-index-name-mapping: _confirm-target
+    @echo ">>> ducklake_name_mapping_mapping_idx"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_name_mapping_mapping_idx ON public.ducklake_name_mapping USING btree (mapping_id);"
+
 # Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
 [group('bootstrap')]
-bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-column-stats-table-column bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover
+bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-column-stats-table-column bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover bootstrap-index-name-mapping
 
 # ----------------------------------------------------------------------------
 # state-metrics daemon
