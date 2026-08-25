@@ -405,6 +405,18 @@ bootstrap-index-file-column-stats: _confirm-target
     @echo ">>> ducklake_file_column_stats_file_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_file_idx ON public.ducklake_file_column_stats USING btree (data_file_id);"
 
+# Per-column stats scope: (table_id, column_id) drives global column-stat
+# recomputation and per-column reads (top observed index on
+# duckling-posthog: 337K scans, ahead of every script-defined btree — it
+# existed there only as a hand-created stray, codified here so every
+# tenant gets it and rebuilds don't silently lose it).
+#
+# Per-column stats scope for global column-stat recomputation
+[group('bootstrap')]
+bootstrap-index-file-column-stats-table-column: _confirm-target
+    @echo ">>> ducklake_file_column_stats_table_column_idx"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_table_column_idx ON public.ducklake_file_column_stats USING btree (table_id, column_id);"
+
 # Partition-value join key for per-file lookups
 [group('bootstrap')]
 bootstrap-index-file-partition-value-file: _confirm-target
@@ -444,7 +456,7 @@ bootstrap-index-file-partition-value-table-file: _confirm-target
 
 # Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
 [group('bootstrap')]
-bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover
+bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-column-stats-table-column bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover
 
 # ----------------------------------------------------------------------------
 # state-metrics daemon
