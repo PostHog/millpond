@@ -149,6 +149,11 @@ def _coerce_unshreddable_ints(raw: str | None) -> str | None:
     Returns ``raw`` unchanged (same object) when nothing needs fixing, so
     untouched rows keep their exact bytes. Malformed JSON is returned as-is —
     ``try_cast`` nulls its companion anyway.
+
+    Every JSON object key is kept. Restricting *which* keys DuckDB shreds is
+    a parquet-writer concern (``variant_shred_key_prefix`` /
+    ``variant_shred_keys``), not a document-rewrite: dropping keys here would
+    make ``companion.custom_prop`` NULL.
     """
     if raw is None:
         return None
@@ -190,7 +195,8 @@ def sanitize_variant_sources(batch: pa.Table, sources: tuple[str, ...] | None) -
     over the whole column at once; only the rows it flags — normally none — are
     parsed and rewritten in Python, which is what makes the precise fix
     affordable on a 256MB batch. The original column is never modified: the
-    string column must land exactly as received.
+    string column must land exactly as received. Keys are never dropped —
+    the companion is the full document.
     """
     if not sources:
         return batch, {}
@@ -307,6 +313,62 @@ def _sanitize_setting_value(val: str) -> str:
     return val
 
 
+# `$` is a JSON key character (PostHog reserved properties) and must be legal
+# in the shred-allowlist SET strings. The S3 setting charset above is
+# narrower on purpose — those values are interpolated into SET s3_*.
+_SHRED_SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_$:.,+\-]+$")
+
+
+def _sanitize_shred_setting_value(val: str) -> str:
+    """Validate a variant shred-allowlist SET string."""
+    if not _SHRED_SETTING_VALUE_RE.match(val):
+        raise ValueError(f"Illegal character in VARIANT shred setting value: {val!r}")
+    return val
+
+
+def _apply_variant_shred_settings(
+    conn: duckdb.DuckDBPyConnection,
+    key_prefix: object,
+    extra_keys: object,
+) -> None:
+    """SET the parquet writer's shred allowlist. No-op when unset.
+
+    ``key_prefix`` / ``extra_keys`` are ``object`` so a MagicMock cfg in
+    tests (which has neither field as a real value) is ignored rather than
+    interpolated into SET.
+    """
+    prefix = key_prefix if isinstance(key_prefix, str) and key_prefix else None
+    keys: tuple[str, ...] | None = None
+    if isinstance(extra_keys, (tuple, list)) and extra_keys:
+        keys = tuple(str(k) for k in extra_keys)
+    if prefix is None and keys is None:
+        return
+
+    def _set(name: str, value: str) -> bool:
+        safe = _sanitize_shred_setting_value(value)
+        try:
+            conn.execute(f"SET {name} = '{safe}'")
+            return True
+        except duckdb.Error as e:
+            log.warning(
+                "DuckDB rejected SET %s=%r (%s); VARIANT companions will auto-shred "
+                "every distinct key. This is the 2026-08 OOM path unless the "
+                "PostHog duckdb fork (variant_shred_key_prefix) is loaded.",
+                name,
+                value,
+                e,
+            )
+            return False
+
+    applied = True
+    if prefix is not None:
+        applied = _set("variant_shred_key_prefix", prefix) and applied
+    if keys is not None:
+        applied = _set("variant_shred_keys", ",".join(keys)) and applied
+    if applied:
+        log.info("VARIANT shred allowlist: prefix=%r extra_keys=%s", prefix, ",".join(keys) if keys else "()")
+
+
 def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     """Initialize DuckDB with httpfs and ducklake, attach the catalog."""
     conn = duckdb.connect(cfg.ducklake_connection)
@@ -341,6 +403,13 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     # `ducklake_snapshot_pkey` duplicate-key violations. Loaded from
     # DUCKLAKE_MAX_RETRY_COUNT env (default 100).
     conn.execute(f"SET ducklake_max_retry_count = {int(cfg.ducklake_max_retry_count)}")
+
+    # Shred allowlist: full VARIANT document, typed Parquet columns only for
+    # matching keys. Stock DuckDB 1.5.5 ignores these (unknown setting) and
+    # auto-shreds every key — the 2026-08 OOM. The PostHog fork honors them
+    # in the parquet writer. Fail open on an unknown setting so official
+    # wheels still start; log loudly when a filter was requested.
+    _apply_variant_shred_settings(conn, cfg.variant_key_prefix, cfg.variant_keys)
 
     # Build a libpq connection string for DuckLake.
     # The 'postgres:' prefix tells DuckLake to use the Postgres extension
@@ -476,7 +545,10 @@ def write(
     When ``variant_columns`` is set, each listed source column present in the
     batch is dual-written: the original column is kept as-is, and a companion
     ``{name}_variant`` column receives ``try_cast(try_cast(col AS JSON) AS
-    VARIANT)``. DuckDB auto-shreds VARIANT sub-fields on Parquet write.
+    VARIANT)``. The companion is the full document. Which keys DuckDB shreds
+    into typed Parquet columns is a writer setting (``variant_shred_key_prefix``
+    / ``variant_shred_keys``, applied in ``connect``), not a rewrite of the
+    value.
 
     Dual-write is best-effort per source: companions that cannot be ensured as
     VARIANT are omitted from the INSERT projection (string column still lands).
@@ -524,6 +596,8 @@ def write(
             ready_sources = tuple(s for s in variant_columns if s in ready) or None
     # Rewrite integers DuckDB cannot shred (into hidden columns; the source
     # columns themselves are untouched) before they reach the VARIANT cast.
+    # Every key stays in the companion — shred allowlisting is a SET on the
+    # connection, not a document filter.
     batch, variant_src = sanitize_variant_sources(batch, ready_sources)
     select_list = build_insert_select_sql(list(batch.schema.names), ready_sources, variant_src)
     insert_sql = f"INSERT INTO lake.{schema_name}.{table_name} BY NAME (SELECT {select_list} FROM _arrow_batch)"

@@ -75,6 +75,8 @@ def _minimal_config() -> Config:
         sort_by=None,
         typed_columns=None,
         variant_columns=None,
+        variant_key_prefix=None,
+        variant_keys=None,
         kafka_config_overrides=(),
     )
 

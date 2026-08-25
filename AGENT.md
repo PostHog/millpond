@@ -473,7 +473,7 @@ Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTP
 | Package | Why |
 |---------|-----|
 | `confluent-kafka>=2.6` | librdkafka Python wrapper |
-| `duckdb==1.5.5` | DuckDB Python client (pinned; the ducklake extension is sensitive to minor-version moves) |
+| `duckdb==1.5.5` | DuckDB Python client (pinned; image overwrites with PostHog/duckdb `v1.5.5-posthog.5` for VARIANT shred allowlist). DuckLake extension SHA canary in `tests/unit/test_ducklake_pin.py`. |
 | `pyducklake>=1.0.17` | Our DuckLake Python API (unused yet; lockstep canary for the duckdb pin) |
 | `pyarrow>=18.0` | Arrow tables, zero-copy DuckDB integration |
 | `orjson>=3.10` | Fast JSON parsing (Rust) |

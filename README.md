@@ -154,7 +154,24 @@ For each listed source present in a batch, millpond:
 2. `ADD COLUMN IF NOT EXISTS {name}_variant VARIANT` on the DuckLake table
 3. Projects `try_cast(try_cast(col AS JSON) AS VARIANT) AS {name}_variant` on INSERT
 
-Malformed JSON nulls only the VARIANT companion (the string column still lands). DuckDB shreds VARIANT on Parquet write automatically — no millpond-side shredding config. Existing tables get the companion column via schema evolution on the first dual-write flush; historical rows keep a NULL companion until rewritten.
+Malformed JSON nulls only the VARIANT companion (the string column still lands). DuckDB shreds VARIANT on Parquet write automatically. Existing tables get the companion column via schema evolution on the first dual-write flush; historical rows keep a NULL companion until rewritten.
+
+**Which keys get shredded.** The companion is the full JSON document — `properties_variant.custom_prop` and `properties_variant."$set".email` both resolve. DuckDB's shredder, however, unions every distinct object key in the row group into typed Parquet columns, and PostHog custom properties are unbounded (2026-08 OOM, ~96k keys). So by default millpond asks the parquet writer to shred only keys that start with `$` (PostHog reserved properties), recursively: `$browser` is a typed column, `custom_prop` stays in the untyped VARIANT remainder, `$set.email` stays untyped inside `$set`. Stock DuckDB 1.5.5 does not honor that allowlist (it auto-shreds everything); the PostHog duckdb fork (`v1.5.5-posthog.5`, baked into the image) does, via `variant_shred_key_prefix` / `variant_shred_keys`.
+
+```
+# default when MILLPOND_VARIANT_COLUMNS is set: shred prefix=$
+MILLPOND_VARIANT_KEY_PREFIX=$
+
+# curated extras, unioned with the prefix
+MILLPOND_VARIANT_KEYS=utm_source,utm_medium
+
+# curated list only (no $ prefix)
+MILLPOND_VARIANT_KEY_PREFIX=
+MILLPOND_VARIANT_KEYS=$browser,$os,utm_source
+
+# shred every key (the OOM path — explicit opt-out, warned at startup)
+MILLPOND_VARIANT_KEY_PREFIX=
+```
 
 Degrades without crash-looping when dual-write cannot run cleanly:
 
@@ -167,7 +184,7 @@ This is an opt-in migration step: readers can move from `json_extract(properties
 
 **Production caveats (canary first):**
 
-- **Key cardinality / shredding.** DuckDB auto-shreds VARIANT from the structure it sees at Parquet write time. PostHog-scale `properties` have a long tail of custom keys; a flush can produce very wide Parquet schemas (hundreds–thousands of shredded leaf fields). Prefer canarying on a filtered consumer or lower-cardinality table before enabling fleet-wide on `events`.
+- **Key cardinality / shredding.** The companion is always the full document. The default `$` shred allowlist is what makes dual-write safe on `events`, and only on a DuckDB that honors `variant_shred_key_prefix`. Emptying `MILLPOND_VARIANT_KEY_PREFIX` without a tight `MILLPOND_VARIANT_KEYS` list re-enables shredding every key — the 2026-08 OOM. Prefer canarying on a filtered consumer before enabling fleet-wide.
 - **Memory.** Dual-write keeps the VARCHAR column and materializes VARIANT at INSERT — peak flush memory is higher than string-only. Leave headroom vs `FLUSH_SIZE` and the pod limit when turning this on for large property blobs.
 - **Test coverage.** Unit/integration dual-write tests exercise the SQL cast and companion DDL against plain DuckDB; they do not exercise DuckLake catalog DDL, Parquet shredding, or data-inlining edge cases. Validate shredding and file shape on a real DuckLake canary before relying on query performance.
 
@@ -311,6 +328,8 @@ See [Record Handling](#record-handling) for context. All variables below are opt
 | `MILLPOND_SORT_BY` | no | | Comma-separated column names; the batch is sorted ascending by these in tuple order before each write. Missing fields cause the sort to be skipped (records still flow). |
 | `MILLPOND_TYPED_COLUMNS` | no | | Comma-separated `column:type` pairs pinning columns to a target type before write (types: `timestamptz`, `bigint`, `double`, `boolean`, `varchar`). Needed when writing into a table whose columns are already typed and JSON inference would diverge (date-times → `VARCHAR` vs `TIMESTAMPTZ`; all-null `project_id` → `VARCHAR` vs `BIGINT`). Column names validated as safe identifiers; types validated against the allowlist. |
 | `MILLPOND_VARIANT_COLUMNS` | no | | Comma-separated source column names to dual-write as DuckLake `VARIANT` companions (`properties` → `properties_variant`). Original string columns are kept. Malformed JSON nulls only the VARIANT side. Column names validated as safe identifiers; names ending in `_variant` are rejected (list the source, not the derived column). |
+| `MILLPOND_VARIANT_KEY_PREFIX` | no | `$` when dual-write is on | `startswith` shred allowlist (recursive). Unmatched keys still land in the VARIANT companion, unshredded. Empty string disables the prefix match. Requires `MILLPOND_VARIANT_COLUMNS`. |
+| `MILLPOND_VARIANT_KEYS` | no | | Comma-separated extra JSON object keys to shred (unioned with the prefix). `$browser` is legal. Requires `MILLPOND_VARIANT_COLUMNS`. |
 
 ### Log export (optional)
 

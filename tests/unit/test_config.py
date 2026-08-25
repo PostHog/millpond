@@ -598,11 +598,17 @@ class TestVariantColumnsConfig:
     def test_unset_yields_none(self):
         cfg = load()
         assert cfg.variant_columns is None
+        assert cfg.variant_key_prefix is None
+        assert cfg.variant_keys is None
 
     def test_single_column(self, monkeypatch):
         monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
         cfg = load()
         assert cfg.variant_columns == ("properties",)
+        # Dual-write on ⇒ default prefix is `$` so custom keys never reach
+        # DuckDB's shredder. Empty prefix is the explicit opt-out.
+        assert cfg.variant_key_prefix == "$"
+        assert cfg.variant_keys is None
 
     def test_multiple_columns_order_preserved(self, monkeypatch):
         monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties,person_properties")
@@ -648,6 +654,67 @@ class TestVariantColumnsConfig:
             "person_properties -> person_properties_variant" in m
             for m in msgs
         )
+        assert any("VARIANT shred allowlist: prefix='$' extra_keys=()" in m for m in msgs)
+
+    def test_empty_prefix_disables_startswith(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        monkeypatch.setenv("MILLPOND_VARIANT_KEY_PREFIX", "")
+        cfg = load()
+        assert cfg.variant_key_prefix is None
+        assert cfg.variant_keys is None
+
+    def test_custom_prefix(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        monkeypatch.setenv("MILLPOND_VARIANT_KEY_PREFIX", "utm_")
+        cfg = load()
+        assert cfg.variant_key_prefix == "utm_"
+
+    def test_extra_keys_union_with_default_prefix(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        monkeypatch.setenv("MILLPOND_VARIANT_KEYS", "utm_source, $browser, utm_source")
+        cfg = load()
+        assert cfg.variant_key_prefix == "$"
+        assert cfg.variant_keys == ("utm_source", "$browser")
+
+    def test_curated_list_only(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        monkeypatch.setenv("MILLPOND_VARIANT_KEY_PREFIX", "")
+        monkeypatch.setenv("MILLPOND_VARIANT_KEYS", "$browser,$os,utm_source")
+        cfg = load()
+        assert cfg.variant_key_prefix is None
+        assert cfg.variant_keys == ("$browser", "$os", "utm_source")
+
+    def test_prefix_without_variant_columns_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_KEY_PREFIX", "$")
+        with pytest.raises(RuntimeError, match="requires MILLPOND_VARIANT_COLUMNS"):
+            load()
+
+    def test_keys_without_variant_columns_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_KEYS", "utm_source")
+        with pytest.raises(RuntimeError, match="requires MILLPOND_VARIANT_COLUMNS"):
+            load()
+
+    def test_empty_prefix_without_variant_columns_is_ok(self, monkeypatch):
+        # Unset dual-write + empty prefix is not a misconfig — nothing to filter.
+        monkeypatch.setenv("MILLPOND_VARIANT_KEY_PREFIX", "")
+        cfg = load()
+        assert cfg.variant_columns is None
+        assert cfg.variant_key_prefix is None
+
+    def test_illegal_shred_chars_rejected_at_load(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        monkeypatch.setenv("MILLPOND_VARIANT_KEYS", "foo'; DROP")
+        with pytest.raises(RuntimeError, match="MILLPOND_VARIANT_KEYS"):
+            load()
+
+    def test_disabled_filter_warns(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        monkeypatch.setenv("MILLPOND_VARIANT_KEY_PREFIX", "")
+        with caplog.at_level(logging.WARNING, logger="millpond.config"):
+            load()
+        assert any("VARIANT shred allowlist disabled" in r.message for r in caplog.records)
 
 
 class TestIncludeValuesConfig:

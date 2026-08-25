@@ -686,6 +686,57 @@ class TestVariantDualWrite:
 
 
 @pytest.mark.integration
+class TestVariantCompanionIsFullDocument:
+    """The VARIANT companion holds every JSON key.
+
+    Shred allowlisting (which keys become typed Parquet columns) does not
+    rewrite the document — ``companion.custom_prop`` and
+    ``companion."$set".email`` must resolve.
+    """
+
+    def test_custom_and_dollar_keys_both_queryable(self, conn, cache):
+        schema_mgr = SchemaManager(conn, "events")
+        raw = '{"$browser": "Chrome", "width": 1920, "custom_uuid": "aaaaaaaa-bbbb"}'
+        write(
+            conn,
+            "events",
+            pa.table({"properties": [raw]}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        assert conn.execute("SELECT properties FROM lake.main.events").fetchone()[0] == raw
+        browser, width, custom = conn.execute(
+            'SELECT properties_variant."$browser", properties_variant.width, '
+            "properties_variant.custom_uuid FROM lake.main.events"
+        ).fetchone()
+        assert browser == "Chrome"
+        assert width == 1920
+        assert custom == "aaaaaaaa-bbbb"
+
+    def test_nested_set_children_are_present(self, ducklake_conn, cache):
+        conn = ducklake_conn
+        schema_mgr = SchemaManager(conn, "events")
+        raw = '{"$set": {"email": "a@b.c", "$geoip_country_code": "US"}, "plan": "pro"}'
+        write(
+            conn,
+            "events",
+            pa.table({"properties": [raw]}),
+            cache,
+            schema_mgr,
+            variant_columns=("properties",),
+        )
+        geo, email, plan = conn.execute(
+            'SELECT properties_variant."$set"."$geoip_country_code", '
+            'properties_variant."$set".email, properties_variant.plan '
+            "FROM lake.main.events"
+        ).fetchone()
+        assert geo == "US"
+        assert email == "a@b.c"
+        assert plan == "pro"
+
+
+@pytest.mark.integration
 class TestSchemaEvolution:
     def test_add_new_column(self, conn, cache):
         batch1 = pa.table({"event": ["click"]})

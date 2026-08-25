@@ -121,6 +121,18 @@ class Config:
     # on Parquet write. None disables dual-write (default — existing consumers
     # are unaffected). See ducklake.write.
     variant_columns: tuple[str, ...] | None
+    # Which JSON object keys DuckDB shreds into typed Parquet columns.
+    # The VARIANT companion always holds the full document; unmatched keys
+    # stay in the untyped remainder and remain queryable
+    # (`companion.custom_prop` / `companion."$set".email`). `variant_key_prefix`
+    # is a startswith match (default "$" when dual-write is on). `variant_keys`
+    # is an exact-name allowlist, unioned with the prefix. Applied recursively
+    # so `$set` itself is shredded but `email` inside it is not. Both None =
+    # auto-shred every key (the 2026-08 OOM path). Honored only by a DuckDB
+    # that implements variant_shred_key_prefix (PostHog fork); stock 1.5.5
+    # logs and continues.
+    variant_key_prefix: str | None
+    variant_keys: tuple[str, ...] | None
 
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
@@ -447,6 +459,84 @@ def _load_variant_columns() -> tuple[str, ...] | None:
     return cols
 
 
+# Default shred allowlist when MILLPOND_VARIANT_COLUMNS is set. PostHog
+# reserved properties are `$`-prefixed and a bounded set; custom keys are
+# unbounded and are what OOMs DuckDB's VARIANT shredder (PostHog/duckdb#4).
+# The companion still contains every key — this only limits which ones
+# become typed Parquet columns. Empty prefix + empty keys = shred
+# everything (the loud opt-out).
+_DEFAULT_VARIANT_KEY_PREFIX = "$"
+
+# Must stay in lockstep with ducklake._SHRED_SETTING_VALUE_RE — these
+# strings are interpolated into SET variant_shred_key_prefix / _keys.
+_SHRED_SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_$:.,+\-]+$")
+
+
+def _validate_shred_setting(env_name: str, val: str) -> str:
+    if not _SHRED_SETTING_VALUE_RE.match(val):
+        raise RuntimeError(f"{env_name}={val!r} has characters illegal in SET variant_shred_*")
+    return val
+
+
+def _parse_variant_keys(env_name: str) -> tuple[str, ...] | None:
+    """Parse a comma-separated list of JSON object keys.
+
+    Unlike `_parse_column_list` these are JSON keys, not SQL identifiers, so
+    `$browser` is legal. Values are later joined into SET variant_shred_keys
+    (see ducklake._apply_variant_shred_settings). Empty tokens dropped;
+    first-wins de-dup. Returns None when unset/whitespace.
+    """
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return None
+    seen: set[str] = set()
+    keys: list[str] = []
+    for token in raw.split(","):
+        name = token.strip()
+        if not name:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        keys.append(name)
+    if not keys:
+        return None
+    return tuple(keys)
+
+
+def _load_variant_key_filter(
+    variant_columns: tuple[str, ...] | None,
+) -> tuple[str | None, tuple[str, ...] | None]:
+    """Resolve prefix + extra-key shred allowlist.
+
+    Requires MILLPOND_VARIANT_COLUMNS: a shred allowlist with no dual-write
+    is a silent no-op the operator cannot observe. Unset prefix defaults to
+    ``$`` when dual-write is on; an explicit empty prefix disables the
+    startswith match (curated-list-only, or shred-everything if keys are
+    also empty). The companion always contains the full document.
+    """
+    prefix_raw = os.environ.get("MILLPOND_VARIANT_KEY_PREFIX")
+    extra_keys = _parse_variant_keys("MILLPOND_VARIANT_KEYS")
+
+    if variant_columns is None:
+        if prefix_raw is not None and prefix_raw.strip() != "":
+            raise RuntimeError("MILLPOND_VARIANT_KEY_PREFIX requires MILLPOND_VARIANT_COLUMNS")
+        if extra_keys is not None:
+            raise RuntimeError("MILLPOND_VARIANT_KEYS requires MILLPOND_VARIANT_COLUMNS")
+        return None, None
+
+    if prefix_raw is None:
+        prefix: str | None = _DEFAULT_VARIANT_KEY_PREFIX
+    else:
+        prefix = prefix_raw.strip() or None
+    if prefix is not None:
+        _validate_shred_setting("MILLPOND_VARIANT_KEY_PREFIX", prefix)
+    if extra_keys is not None:
+        for key in extra_keys:
+            _validate_shred_setting("MILLPOND_VARIANT_KEYS", key)
+    return prefix, extra_keys
+
+
 _VALID_AUTO_OFFSET_RESET = ("earliest", "latest")
 
 
@@ -560,6 +650,7 @@ def load() -> Config:
     sort_by = _load_sort_by()
     typed_columns = _load_typed_columns()
     variant_columns = _load_variant_columns()
+    variant_key_prefix, variant_keys = _load_variant_key_filter(variant_columns)
 
     cfg = Config(
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
@@ -584,6 +675,8 @@ def load() -> Config:
         sort_by=sort_by,
         typed_columns=typed_columns,
         variant_columns=variant_columns,
+        variant_key_prefix=variant_key_prefix,
+        variant_keys=variant_keys,
         kafka_config_overrides=kafka_overrides,
         # No ``MILLPOND_`` prefix on POSTHOG_PROJECT_TOKEN: it's a
         # PostHog-wide secret typically sourced from a shared K8s Secret
@@ -621,4 +714,17 @@ def load() -> Config:
             "Dual-write VARIANT columns: %s",
             ", ".join(f"{n} -> {n}{VARIANT_COLUMN_SUFFIX}" for n in cfg.variant_columns),
         )
+        if cfg.variant_key_prefix is None and cfg.variant_keys is None:
+            log.warning(
+                "VARIANT shred allowlist disabled: DuckDB will shred every distinct "
+                "JSON key. This is the 2026-08 OOM path. Set MILLPOND_VARIANT_KEY_PREFIX "
+                "(default '$') or MILLPOND_VARIANT_KEYS."
+            )
+        else:
+            extra = ",".join(cfg.variant_keys) if cfg.variant_keys else ""
+            log.info(
+                "VARIANT shred allowlist: prefix=%r extra_keys=%s (full document still lands in the companion)",
+                cfg.variant_key_prefix,
+                extra or "()",
+            )
     return cfg

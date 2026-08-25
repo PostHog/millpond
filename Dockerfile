@@ -12,27 +12,36 @@ ARG MILLPOND_VERSION=0.0.0.dev0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=$MILLPOND_VERSION
 RUN uv sync --frozen --no-dev --extra msk-iam
 
-# Install DuckDB CLI from the upstream GitHub release. duckdb-cli is a single
-# static binary, so we avoid `uv tool install` here: that path installs a full
-# Python venv just to PATH a self-contained C++ binary, and its default install
-# location (/root/.local, mode 700 on python:3.12-slim) is unreachable by the
-# non-root `millpond` runtime user. Pin the version from pyproject.toml so the
-# CLI tracks the duckdb Python package.
+# PostHog/duckdb fork (VARIANT shred allowlist). pyproject pins duckdb==1.5.5
+# so CI/dev can use the official PyPI wheel; the image overwrites it with the
+# fork cp312 wheel and installs the matching CLI. source_id is asserted in
+# the runtime stage.
 #
-# TARGETARCH is set by buildx for each platform in the build matrix
-# (linux/amd64 → amd64, linux/arm64 → arm64). DuckDB names its release
-# assets with the same suffix, so this drops in directly. -j on unzip
-# extracts only the `duckdb` binary; the release zip also ships a LICENSE
-# we don't want polluting /usr/local/bin.
+# TARGETARCH is a BuildKit automatic ARG (linux/amd64 → amd64, linux/arm64
+# → arm64). Wheel tags use the GNU tuple (x86_64 / aarch64). Unpack the
+# fork wheel into site-packages — do not `uv pip install` it. The fork is
+# also versioned 1.5.5, and uv 0.12 resolves that to the locked PyPI
+# artifact even from the GitHub URL (source_id d8cdaa33fd).
 ARG TARGETARCH
+ARG DUCKDB_RELEASE=v1.5.5-posthog.5
+ARG DUCKDB_SOURCE_ID=697fa6fb44
 RUN test -n "$TARGETARCH" \
-    && case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
-    && V=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print(next(x.split('==')[1] for x in d if x.startswith('duckdb==')))") \
+    && case "$TARGETARCH" in amd64) WHEEL_ARCH=x86_64 ;; arm64) WHEEL_ARCH=aarch64 ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
     && apt-get update && apt-get install -y --no-install-recommends curl unzip \
-    && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${V}/duckdb_cli-linux-${TARGETARCH}.zip" -o /tmp/duckdb.zip \
+    && curl -fsSL "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb_cli-linux-${TARGETARCH}.zip" -o /tmp/duckdb.zip \
     && unzip -j -d /usr/local/bin /tmp/duckdb.zip duckdb \
     && chmod 0755 /usr/local/bin/duckdb \
     && rm /tmp/duckdb.zip \
+    && DUCKDB_RELEASE="$DUCKDB_RELEASE" WHEEL_ARCH="$WHEEL_ARCH" DUCKDB_SOURCE_ID="$DUCKDB_SOURCE_ID" \
+       /app/.venv/bin/python -c "\
+import os, pathlib, sysconfig, urllib.request, zipfile; \
+url = f\"https://github.com/PostHog/duckdb/releases/download/{os.environ['DUCKDB_RELEASE']}/duckdb-1.5.5-cp312-cp312-linux_{os.environ['WHEEL_ARCH']}.whl\"; \
+whl = pathlib.Path('/tmp/duckdb-fork.whl'); urllib.request.urlretrieve(url, whl); \
+zipfile.ZipFile(whl).extractall(sysconfig.get_paths()['purelib']); whl.unlink(); \
+import duckdb; c = duckdb.connect(); \
+ver, sid = c.execute('SELECT library_version, source_id FROM pragma_version()').fetchone(); \
+assert ver == 'v1.5.5', ver; \
+assert sid.startswith(os.environ['DUCKDB_SOURCE_ID']), sid" \
     && apt-get remove -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 FROM python:3.12-slim
@@ -80,8 +89,21 @@ USER millpond
 # aws: required by CREATE SECRET (TYPE s3, PROVIDER credential_chain) — the
 # Pod-Identity path the tenant maintenance crons use. Without it DuckDB
 # auto-installs at runtime, which dies on a read-only root filesystem.
+#
+# source_id must be the PostHog fork (v1.5.5-posthog.5). Official 1.5.5
+# wheels report a different hash (d8cdaa33fd) and do not honor
+# variant_shred_key_prefix.
 ARG DUCKLAKE_SHA=d8a1881e
-RUN python -c "import duckdb, os; c = duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres'); c.execute('INSTALL aws'); c.execute('LOAD ducklake'); v = c.execute(\"SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake'\").fetchone()[0]; want = os.environ['DUCKLAKE_SHA']; assert v == want, f'ducklake extension channel drift: channel serves {v}, image validated against {want}'"
+RUN python -c "\
+import duckdb, os; c = duckdb.connect(); \
+ver, sid = c.execute('SELECT library_version, source_id FROM pragma_version()').fetchone(); \
+assert ver == 'v1.5.5', ver; \
+assert sid.startswith('697fa6fb44'), sid; \
+c.execute('INSTALL httpfs'); c.execute('INSTALL ducklake'); c.execute('INSTALL postgres'); c.execute('INSTALL aws'); \
+c.execute('LOAD ducklake'); \
+v = c.execute(\"SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake'\").fetchone()[0]; \
+want = os.environ['DUCKLAKE_SHA']; \
+assert v == want, f'ducklake extension channel drift: channel serves {v}, image validated against {want}'"
 
 # Build-time smoke test for the duckdb CLI as the runtime user. Catches any
 # regression where the CLI is installed somewhere the `millpond` user can't
