@@ -45,6 +45,14 @@ class Config:
     # 100 default (the value DuckLake's own error message suggests).
     ducklake_max_retry_count: int
 
+    # Optional DuckDB memory_limit (e.g. "6GB"). Unset, DuckDB budgets
+    # ~80% of the cgroup limit and competes with the Arrow pending buffer
+    # for RSS during the partitioned INSERT — at large FLUSH_SIZE the sum
+    # can OOM the pod. Set, DuckDB spills to its temp dir beside the
+    # on-disk database file (the /tmp emptyDir in k8s) instead. Loaded
+    # from DUCKDB_MEMORY_LIMIT; None preserves the default behavior.
+    duckdb_memory_limit: str | None
+
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
     flush_interval_ms: int  # ms since last flush
@@ -507,6 +515,7 @@ def _load_ducklake_fields() -> dict[str, str | None]:
         "rds_password": _require("DUCKLAKE_RDS_PASSWORD"),
         "partition_by": partition_by,
         "ducklake_max_retry_count": ducklake_max_retry_count,
+        "duckdb_memory_limit": os.environ.get("DUCKDB_MEMORY_LIMIT") or None,
     }
 
 

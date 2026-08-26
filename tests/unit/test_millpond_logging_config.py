@@ -52,6 +52,7 @@ def _minimal_config() -> Config:
         rds_password="pass",
         partition_by=None,
         ducklake_max_retry_count=100,
+        duckdb_memory_limit=None,
         flush_size=104857600,
         flush_interval_ms=60000,
         fetch_min_bytes=1048576,
