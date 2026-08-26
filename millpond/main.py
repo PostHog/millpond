@@ -24,6 +24,23 @@ log = logging.getLogger(__name__)
 
 _LAG_SAMPLE_INTERVAL_S = 60.0  # how often to query watermark offsets for lag metrics
 _HEARTBEAT_INTERVAL_S = 60.0  # periodic log when idle (well under 300s liveness timeout)
+# Longest a single consume() may block. record_poll() runs only after consume
+# returns, and server.health marks the process dead at max_poll_age_s=300 —
+# so a consume timeout derived from a large FLUSH_INTERVAL_MS (e.g. 10min)
+# would starve the liveness probe on a quiet topic and SIGKILL the pod.
+# 60s also keeps the idle heartbeat cadence honest.
+_CONSUME_MAX_BLOCK_S = 60.0
+
+
+def _consume_timeout(remaining: float) -> float:
+    """Consume timeout for the main loop: the time left until the flush
+    interval fires, floored at 0.1s so we always poll, capped at
+    _CONSUME_MAX_BLOCK_S so liveness (record_poll) and the idle heartbeat
+    keep running on a quiet topic. Flush triggers are re-checked every
+    loop iteration, so the cap never delays a flush."""
+    return min(max(remaining, 0.1), _CONSUME_MAX_BLOCK_S)
+
+
 _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
 _COMMIT_MAX_RETRIES = 3
@@ -479,7 +496,7 @@ def main():
 
         while not shutdown:
             remaining = cfg.flush_interval_s - (time.monotonic() - last_flush)
-            timeout = max(remaining, 0.1)
+            timeout = _consume_timeout(remaining)
 
             batch_size = backpressure.compute_batch_size(pending_bytes, cfg.flush_size)
             msgs = kafka.consume(num_messages=batch_size, timeout=timeout)

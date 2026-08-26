@@ -982,3 +982,35 @@ class TestFlushCommit:
         # Committed offset is next-to-fetch (max consumed + 1).
         committed = kafka.commit.call_args.kwargs["offsets"]
         assert [(tp.partition, tp.offset) for tp in committed] == [(0, 101)]
+
+
+class TestConsumeTimeout:
+    """_consume_timeout must never exceed the liveness poll-age budget.
+
+    server.health marks the process dead when no poll lands for 300s
+    (max_poll_age_s), and record_poll only runs after consume() returns.
+    Before the cap, FLUSH_INTERVAL_MS=600000 on a quiet topic meant a
+    600s consume block -> liveness SIGKILL loop across the fleet.
+    """
+
+    def test_large_interval_capped_at_max_block(self):
+        from millpond.main import _CONSUME_MAX_BLOCK_S, _consume_timeout
+
+        assert _consume_timeout(600.0) == _CONSUME_MAX_BLOCK_S
+
+    def test_cap_stays_under_liveness_budget(self):
+        from millpond.main import _CONSUME_MAX_BLOCK_S
+        from millpond.server import _HealthState
+
+        assert _CONSUME_MAX_BLOCK_S < _HealthState().max_poll_age_s
+
+    def test_short_remaining_passes_through(self):
+        from millpond.main import _consume_timeout
+
+        assert _consume_timeout(30.0) == 30.0
+
+    def test_elapsed_interval_floors_at_poll_minimum(self):
+        from millpond.main import _consume_timeout
+
+        assert _consume_timeout(-5.0) == 0.1
+        assert _consume_timeout(0.0) == 0.1
