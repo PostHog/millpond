@@ -746,3 +746,32 @@ class TestIncludeValuesConfig:
         monkeypatch.setenv("MILLPOND_INCLUDE_VALUES_POLL_INTERVAL_S", "0")
         with pytest.raises(RuntimeError, match="must be positive"):
             load()
+
+
+class TestDuckdbMemoryLimit:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+
+    def test_default_none(self):
+        cfg = load()
+        assert cfg.duckdb_memory_limit is None
+
+    def test_explicit_value(self, monkeypatch):
+        monkeypatch.setenv("DUCKDB_MEMORY_LIMIT", "6GB")
+        cfg = load()
+        assert cfg.duckdb_memory_limit == "6GB"
+
+    def test_empty_string_treated_as_unset(self, monkeypatch):
+        # A chart rendering `value: ""` must not produce SET memory_limit = ''.
+        monkeypatch.setenv("DUCKDB_MEMORY_LIMIT", "")
+        cfg = load()
+        assert cfg.duckdb_memory_limit is None

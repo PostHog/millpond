@@ -342,6 +342,15 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     # DUCKLAKE_MAX_RETRY_COUNT env (default 100).
     conn.execute(f"SET ducklake_max_retry_count = {int(cfg.ducklake_max_retry_count)}")
 
+    # Optional memory cap (DUCKDB_MEMORY_LIMIT). Without it DuckDB budgets
+    # ~80% of the cgroup limit and races the Arrow pending buffer for RSS
+    # during the partitioned INSERT; with it DuckDB spills to the temp dir
+    # next to the on-disk database file. Requires a file-backed
+    # ducklake_connection (the k8s chart uses /tmp/duck.db on a writable
+    # emptyDir) — with :memory: there is no adjacent temp dir to spill to.
+    if cfg.duckdb_memory_limit is not None:
+        conn.execute(f"SET memory_limit = '{_sanitize_setting_value(cfg.duckdb_memory_limit)}'")
+
     # Build a libpq connection string for DuckLake.
     # The 'postgres:' prefix tells DuckLake to use the Postgres extension
     # for metadata storage rather than a local DuckDB file.
