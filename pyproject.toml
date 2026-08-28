@@ -39,6 +39,11 @@ dependencies = [
     "pyducklake>=1.0.17",
     "pyarrow>=18.0",
     "orjson>=3.10",
+    # Direct libpq for the drop-partitions maintenance op (postgres_execute
+    # imposes REPEATABLE READ, returns no result sets, and its duckdb
+    # teardown core-dumps after success). Same dependency and floor as
+    # viaduck, whose state store we read for the cursor guard.
+    "psycopg[binary]>=3.2",
     "prometheus-client>=0.21",
     # Required by duckdb's Python conversion for TIMESTAMPTZ columns; the
     # stdlib zoneinfo module isn't accepted as a substitute as of 1.4.x.
