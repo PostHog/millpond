@@ -30,20 +30,25 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import logging
 import os
+import random
 import re
 import sys
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
 
 import duckdb
-from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+import psycopg
+from prometheus_client import CollectorRegistry, Gauge, pushadd_to_gateway
 
 log = logging.getLogger("maintenance")
 
@@ -155,6 +160,13 @@ def _positive_int(s: str) -> int:
     n = int(s)
     if n < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
+def _nonneg_int(s: str) -> int:
+    n = int(s)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {n}")
     return n
 
 
@@ -2488,6 +2500,1183 @@ def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_fil
         log.info("compact-probe: %s", row)
 
 
+# ---------------------------------------------------------------------------
+# drop-partitions / list-droppable-partitions
+#
+# Server-side partition retention for DuckLake: forge the catalog writes of an
+# engine whole-file-drop commit (snapshot row, end_snapshot UPDATE, RELATIVE
+# stats decrement, deleted_from_table conflict token) WITHOUT the engine's
+# full-coverage scan — the fork's OCC conflicts insert-vs-delete at table
+# level and hard-aborts any DELETE whose window overlaps a concurrent insert,
+# so the engine path dies deterministically on high-commit-rate tables.
+# Design, verification trail and hazard list: DROP_PARTITIONS_PLAN.md (v3)
+# and partition-drop-findings.md.
+#
+# Unlike every other op in this file, these two do NOT use the duckdb-attach
+# postgres_execute path: it forces REPEATABLE READ, returns no result sets to
+# the driver, and its duckdb teardown core-dumps after success (observed exit
+# 134 on the compaction jobs). They run on a direct libpq (psycopg) connection
+# — native READ COMMITTED, real RETURNING, no duckdb lifecycle at all.
+# ---------------------------------------------------------------------------
+
+# Catalog versions this op is verified against (fork merge-upstream-2026-08-26).
+# A fork upgrade re-runs the validation protocol before this set moves.
+_DROP_CATALOG_VERSIONS = frozenset({"1.0", "1.1-dev1"})
+_DROP_STATEMENT_TIMEOUT_MS = 10_000
+_DROP_LOCK_TIMEOUT_MS = 5_000
+_DROP_MAX_ATTEMPTS = 50
+# Structural floor: never select files whose begin_snapshot is newer than the
+# newest snapshot older than (cutoff + 48h). Snapshot ids only move forward,
+# so applying it at selection time is safe.
+_DROP_FLOOR_HOURS = 48
+_DROP_MIN_CUTOFF_AGE_DAYS = 7
+# Retryable PG error classes: snapshot PK race (the universal max+1
+# allocation), serialization failure, lock_timeout, statement_timeout (the
+# last burns attempts against the same cap rather than retrying forever), and
+# deadlock (40P01). The engine's FlushDrop locks rows in ascending id order;
+# our leaf selection is ORDER BY data_file_id to match — though the UPDATE's
+# actual lock order is planner-chosen, so the retry, not the ordering, is the
+# real mitigation.
+_DROP_RETRYABLE_SQLSTATES = frozenset({"23505", "40001", "55P03", "57014", "40P01"})
+_DROP_LOCK_ATTEMPTS = 30
+_TIME_TRANSFORMS = ("year", "month", "day", "hour")  # composition order
+_SUPPORTED_TRANSFORMS = frozenset({"identity", *_TIME_TRANSFORMS})
+_NO_GUARD = 2**63 - 1  # begin_snapshot upper bound when the viaduck guard is off
+_SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+class _DropAbort(RuntimeError):
+    """Non-retryable: an assertion or precondition failed. Aborts the RUN."""
+
+
+class _LeafSkip(Exception):
+    """The leaf is not droppable this run (guard-ineligible or vanished). Not an error."""
+
+
+class _LeafOversized(_DropAbort):
+    """Pathological leaf (> --max-files). In --partition mode this aborts the
+    run (the operator explicitly asked for that leaf); the manifest loop
+    catches it, skips the leaf loudly, and continues the campaign."""
+
+
+class _LockContended(Exception):
+    """The maintenance advisory lock is held elsewhere mid-run; retryable
+    within the leaf attempt budget (crons interleave), then the run aborts."""
+
+
+@dataclass
+class _PartitionKey:
+    index: int
+    column_id: int
+    transform: str
+    column_name: str | None
+
+
+@dataclass
+class _PartitionSpec:
+    partition_id: int
+    keys: list[_PartitionKey]  # ordered by partition_key_index
+
+    @property
+    def grain(self) -> str:
+        return "hour" if any(k.transform == "hour" for k in self.keys) else "day"
+
+    def address(self, key: _PartitionKey) -> str:
+        """The name a leaf tuple uses for this key: identity keys by column
+        name, time keys by transform name (their source column is irrelevant
+        to the operator)."""
+        if key.transform == "identity":
+            return str(key.column_name)
+        return key.transform
+
+
+@dataclass
+class _LeafFile:
+    data_file_id: int
+    record_count: int
+    file_size_bytes: int
+    begin_snapshot: int
+
+
+@dataclass
+class _Leaf:
+    partition: str  # canonical "k=v,..." in spec order (display only)
+    values: dict[str, str]  # tuple address -> stored fpv value (round-trips exactly)
+    part_ts: datetime
+    files: list[_LeafFile] = field(default_factory=list)
+    oversized: bool = False
+
+    @property
+    def rows(self) -> int:
+        return sum(f.record_count for f in self.files)
+
+    @property
+    def bytes(self) -> int:
+        return sum(f.file_size_bytes for f in self.files)
+
+    @property
+    def max_begin_snapshot(self) -> int:
+        return max(f.begin_snapshot for f in self.files)
+
+
+def _pg_direct_connect() -> psycopg.Connection:
+    """Direct libpq connection to the catalog database (same DUCKLAKE_RDS_*
+    env vars as the duckdb ATTACH path). autocommit=True; the drop path opens
+    explicit short transactions with conn.transaction().
+
+    statement_timeout covers the autocommit-phase reads (guard/selection/lock)
+    — the drop txn overrides it with SET LOCAL. TCP keepalives bound a
+    half-open socket to ~90s instead of the kernel-default hours (a zombie
+    would otherwise hold the advisory lock and defeat --max-seconds)."""
+    conninfo = (
+        f"host={_escape_libpq(_require('DUCKLAKE_RDS_HOST'))} "
+        f"port={_escape_libpq(os.environ.get('DUCKLAKE_RDS_PORT', '5432'))} "
+        f"dbname={_escape_libpq(os.environ.get('DUCKLAKE_RDS_DATABASE', 'ducklake'))} "
+        f"user={_escape_libpq(os.environ.get('DUCKLAKE_RDS_USERNAME', 'ducklake'))} "
+        f"password={_escape_libpq(_require('DUCKLAKE_RDS_PASSWORD'))} "
+        f"application_name=millpond-drop-partitions "
+        f"keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=3 "
+        # 10-min session budget covers the driver-phase whole-table reads
+        # (enumeration pivot, unageable anti-join); the drop txn overrides it
+        # with SET LOCAL 10s.
+        f"options='-c statement_timeout=600000'"
+    )
+    return psycopg.connect(conninfo, autocommit=True, connect_timeout=10)
+
+
+def _resolve_table_id(pg: psycopg.Connection, schema_table: str) -> tuple[int, str, str]:
+    """Resolve schema.table -> table_id. Bare table_ids are refused (a
+    fat-fingered id is the worst possible outcome); the name resolution is
+    cross-checked for exactly one live row."""
+    parts = schema_table.split(".")
+    if len(parts) != 2 or not all(parts):
+        raise _DropAbort(f"--table must be schema.table (e.g. main.events_nrt), got {schema_table!r}")
+    schema_name, table_name = parts
+    rows = pg.execute(
+        f"SELECT t.table_id FROM {PG_CATALOG_SCHEMA}.ducklake_table t "
+        f"JOIN {PG_CATALOG_SCHEMA}.ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL "
+        f"WHERE s.schema_name = %s AND t.table_name = %s AND t.end_snapshot IS NULL",
+        (schema_name, table_name),
+    ).fetchall()
+    if len(rows) != 1:
+        raise _DropAbort(f"table {schema_table!r}: expected exactly 1 live catalog row, found {len(rows)}")
+    return rows[0][0], schema_name, table_name
+
+
+def _resolve_live_spec(pg: psycopg.Connection, table_id: int) -> _PartitionSpec:
+    """The table's LIVE partition spec: key indexes are per-spec-epoch via
+    data_file.partition_id, so every selection pins the live partition_id and
+    old-spec files are handled explicitly (never silently mis-bucketed)."""
+    s = PG_CATALOG_SCHEMA
+    rows = pg.execute(
+        f"SELECT partition_id FROM {s}.ducklake_partition_info WHERE table_id = %s AND end_snapshot IS NULL",
+        (table_id,),
+    ).fetchall()
+    if not rows:
+        raise _DropAbort(f"table_id={table_id} has no live partition spec (not a partitioned table?)")
+    if len(rows) > 1:
+        raise _DropAbort(f"table_id={table_id}: {len(rows)} live partition specs — catalog corruption")
+    partition_id = rows[0][0]
+    cols = pg.execute(
+        f"SELECT pc.partition_key_index, pc.column_id, pc.transform, c.column_name "
+        f"FROM {s}.ducklake_partition_column pc "
+        f"LEFT JOIN {s}.ducklake_column c "
+        f"  ON c.table_id = pc.table_id AND c.column_id = pc.column_id AND c.end_snapshot IS NULL "
+        f"WHERE pc.table_id = %s AND pc.partition_id = %s "
+        f"ORDER BY pc.partition_key_index",
+        (table_id, partition_id),
+    ).fetchall()
+    keys = [_PartitionKey(index=r[0], column_id=r[1], transform=r[2], column_name=r[3]) for r in cols]
+    if {k.index for k in keys} != set(range(len(keys))):
+        raise _DropAbort(f"table_id={table_id}: non-contiguous partition key indexes {[k.index for k in keys]}")
+    for k in keys:
+        if k.transform not in _SUPPORTED_TRANSFORMS:
+            raise _DropAbort(
+                f"table_id={table_id}: unsupported partition transform {k.transform!r} at key {k.index} "
+                "(only identity/year/month/day/hour are composable by this tool)"
+            )
+        if k.transform == "identity" and not k.column_name:
+            raise _DropAbort(f"table_id={table_id}: identity key {k.index} has no live column name")
+    transforms = {k.transform for k in keys}
+    for required in ("year", "month", "day"):
+        if required not in transforms:
+            raise _DropAbort(
+                f"table_id={table_id}: spec has no {required!r} time transform — "
+                "drop-partitions requires a time-partitioned table"
+            )
+    # Tuple addressing ambiguity: an identity column literally named 'year'
+    # etc. would collide with a time-transform address.
+    seen: set[str] = set()
+    for k in keys:
+        name = k.column_name if k.transform == "identity" else k.transform
+        if name in seen:
+            raise _DropAbort(f"table_id={table_id}: ambiguous partition tuple address {name!r}")
+        seen.add(name)
+    return _PartitionSpec(partition_id=partition_id, keys=keys)
+
+
+def _tuple_from_values(spec: _PartitionSpec, name_to_value: dict) -> dict[int, str]:
+    """Validate an address->value mapping against the spec -> {key_index: value}.
+    Must cover exactly the spec's keys; time-key values must be integers.
+    JSON manifests may carry real ints for time keys — those coerce via str;
+    anything else (floats, lists, …) is rejected."""
+    by_name = {spec.address(k): k for k in spec.keys}
+    out: dict[int, str] = {}
+    for name, value in name_to_value.items():
+        if name not in by_name:
+            raise _DropAbort(f"partition tuple key {name!r} not in spec {sorted(by_name)}")
+        k = by_name[name]
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = str(value)
+        if not isinstance(value, str):
+            raise _DropAbort(f"partition tuple key {name!r}: expected string/int value, got {type(value).__name__}")
+        if k.transform in _TIME_TRANSFORMS:
+            if not re.fullmatch(r"-?[0-9]{1,9}", value):
+                raise _DropAbort(f"time key {name!r} must be an integer, got {value!r}")
+        elif not value or re.search(r"[,\s=]", value):
+            raise _DropAbort(f"identity key {name!r}: illegal value {value!r}")
+        out[k.index] = value
+    missing = [name for name, k in by_name.items() if k.index not in out]
+    if missing:
+        raise _DropAbort(f"partition tuple missing keys {missing} (spec requires {sorted(by_name)})")
+    return out
+
+
+def _parse_partition_tuple(spec: _PartitionSpec, text: str) -> dict[int, str]:
+    """Parse 'team_id=2,year=2026,month=8,day=1,hour=13' -> {key_index: value}."""
+    name_to_value: dict[str, str] = {}
+    for part in text.split(","):
+        name, sep, value = part.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            raise _DropAbort(f"malformed partition tuple component {part!r} in {text!r}")
+        if name in name_to_value:
+            raise _DropAbort(f"partition tuple repeats key {name!r}")
+        name_to_value[name] = value
+    return _tuple_from_values(spec, name_to_value)
+
+
+def _canonical_leaf_str(spec: _PartitionSpec, values: dict[int, str]) -> str:
+    return ",".join(f"{spec.address(k)}={values[k.index]}" for k in spec.keys)
+
+
+def _compose_part_ts(spec: _PartitionSpec, values: dict[int, str | None]) -> datetime | None:
+    """Compose the partition instant from the spec's time-transform keys.
+
+    Python-side composition, deliberately NOT make_timestamptz in SQL: a CASE
+    guard cannot safely exclude invalid day-of-month combinations (SQL reorders
+    AND terms), so SQL composition can raise mid-enumeration; datetime() is
+    total under try/except and carries the same explicit-UTC, never-string-
+    comparison semantics the plan mandates."""
+    raw: dict[str, int] = {}
+    for t in _TIME_TRANSFORMS:
+        key = next((k for k in spec.keys if k.transform == t), None)
+        if key is None:
+            continue
+        v = values.get(key.index)
+        if v is None:
+            return None
+        try:
+            raw[t] = int(v)
+        except (TypeError, ValueError):
+            return None
+    try:
+        return datetime(raw["year"], raw["month"], raw["day"], raw.get("hour", 0), tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _check_cutoff(cutoff: datetime, grain: str, force_young: bool) -> None:
+    """Grain alignment + the young-cutoff refusal (shared by CLI and manifest
+    cutoffs)."""
+    aligned = cutoff.replace(minute=0, second=0, microsecond=0)
+    if grain == "day":
+        aligned = aligned.replace(hour=0)
+    if aligned != cutoff:
+        raise _DropAbort(f"cutoff {cutoff.isoformat()} is not aligned to the spec's {grain} grain")
+    age = datetime.now(UTC) - cutoff
+    if age < timedelta(days=_DROP_MIN_CUTOFF_AGE_DAYS) and not force_young:
+        raise _DropAbort(
+            f"cutoff {cutoff.isoformat()} is only {age.days}d old (< {_DROP_MIN_CUTOFF_AGE_DAYS}d); "
+            "pass --force-young-cutoff to override"
+        )
+
+
+def _resolve_cutoff(args: argparse.Namespace, grain: str) -> datetime:
+    """Exactly one of --cutoff / --retention-days; grain-aligned; refuses
+    cutoffs younger than 7 days without --force-young-cutoff."""
+    if args.cutoff and args.retention_days is not None:
+        raise _DropAbort("pass exactly one of --cutoff / --retention-days, not both")
+    if args.cutoff:
+        try:
+            cutoff = datetime.fromisoformat(args.cutoff)
+        except ValueError as e:
+            raise _DropAbort(f"--cutoff {args.cutoff!r} is not ISO 8601: {e}") from e
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        cutoff = cutoff.astimezone(UTC)
+    elif args.retention_days is not None:
+        # Computed cutoffs are truncated to the grain (explicit --cutoff
+        # values are NOT: misalignment there is an operator error to refuse).
+        cutoff = datetime.now(UTC) - timedelta(days=args.retention_days)
+        cutoff = cutoff.replace(minute=0, second=0, microsecond=0)
+        if grain == "day":
+            cutoff = cutoff.replace(hour=0)
+    else:
+        raise _DropAbort("one of --cutoff / --retention-days is required")
+    _check_cutoff(cutoff, grain, args.force_young_cutoff)
+    return cutoff
+
+
+def _floor_snapshot(pg: psycopg.Connection, cutoff: datetime) -> int:
+    """Structural floor: files with begin_snapshot NEWER than this are never
+    selected (young writes in old partitions survive).
+
+    Primary: newest snapshot older than (cutoff + 48h). But the megaduck
+    expire cron runs with 3-day retention, so no snapshot row that old
+    survives — the max() is NULL. Fallback: min(surviving snapshot_id) - 1,
+    i.e. the expiry horizon becomes the effective floor (~3d of write-time
+    protection instead of 12d; the cursor guard is the primary protection,
+    this is defense-in-depth). A NULL min means an empty catalog: fail
+    closed."""
+    s = PG_CATALOG_SCHEMA
+    row = pg.execute(
+        f"SELECT max(snapshot_id) FROM {s}.ducklake_snapshot WHERE snapshot_time < %s",
+        (cutoff + timedelta(hours=_DROP_FLOOR_HOURS),),
+    ).fetchone()
+    if row is not None and row[0] is not None:
+        return row[0]
+    row = pg.execute(f"SELECT min(snapshot_id) FROM {s}.ducklake_snapshot").fetchone()
+    if row is None or row[0] is None:
+        raise _DropAbort("floor: ducklake_snapshot is empty — refusing to derive a floor on an empty catalog")
+    floor = row[0] - 1
+    log.warning(
+        "floor: no snapshot older than cutoff+%dh survives expiry; using min(surviving)-1=%d "
+        "(expiry horizon is the effective floor, not retention-%dh)",
+        _DROP_FLOOR_HOURS,
+        floor,
+        _DROP_FLOOR_HOURS,
+    )
+    return floor
+
+
+@dataclass
+class _Guard:
+    snapshot_id: int  # min cursor; files with begin_snapshot >= this are ineligible
+    cursor_rows: int
+    oldest_cursor_time: datetime | None
+    overridden: bool
+
+
+def _cursor_guard(
+    pg: psycopg.Connection, state_schema: str, state_table: str, floor_time: datetime, allow_override: bool
+) -> _Guard:
+    """Min over ALL rows of viaduck's durable cursor store (direct SQL — never
+    scraped gauges: flush-failure rewinds move cursors backward below a sampled
+    value). Run-level abort when any consumer lags past the floor — that, not
+    the guard value, is the actual loss condition."""
+    for name, value in (("viaduck-state-schema", state_schema), ("viaduck-state-table", state_table)):
+        if not _SAFE_IDENTIFIER_RE.match(value):
+            raise _DropAbort(f"--{name} {value!r} is not a safe identifier")
+    qualified = f"{state_schema}.{state_table}"
+    try:
+        rows = pg.execute(
+            f"SELECT v.destination_id, v.instance_id, v.last_snapshot_id, s.snapshot_time "
+            f"FROM {qualified} v LEFT JOIN {PG_CATALOG_SCHEMA}.ducklake_snapshot s "
+            f"ON s.snapshot_id = v.last_snapshot_id"
+        ).fetchall()
+    except psycopg.errors.UndefinedTable:
+        rows = None
+
+    if not rows:
+        if not allow_override:
+            why = f"{qualified} does not exist" if rows is None else f"{qualified} has no cursor rows"
+            raise _DropAbort(
+                f"viaduck cursor guard: {why} — refusing to drop unguarded. "
+                "Fix the --viaduck-state-* arguments or pass --no-viaduck-guard."
+            )
+        log.warning("--no-viaduck-guard: cursor store unreadable/empty (%s); dropping UNGUARDED", qualified)
+        return _Guard(snapshot_id=_NO_GUARD, cursor_rows=0, oldest_cursor_time=None, overridden=True)
+
+    # Lag check: a cursor whose snapshot row is gone (expired) or older than
+    # the floor is >= (retention - 48h) behind — dropping could destroy rows it
+    # has not consumed. This aborts the RUN regardless of the guard value.
+    # A NULL last_snapshot_id (never-committed row) counts as lagging.
+    lagging = [(d, i, ls, ts) for d, i, ls, ts in rows if ls is None or ts is None or ts < floor_time]
+    guard = min((ls for _, _, ls, _ in rows if ls is not None), default=0)
+    oldest = min((ts for _, _, _, ts in rows if ts is not None), default=None)
+    if lagging and not allow_override:
+        worst = ", ".join(f"{d}/{i}@{ls}" for d, i, ls, _ in lagging[:5])
+        raise _DropAbort(
+            f"viaduck cursor lag beyond (cutoff + {_DROP_FLOOR_HOURS}h) on {len(lagging)} cursor row(s): "
+            f"{worst} — that is the actual loss condition; aborting. "
+            "--no-viaduck-guard prints and overrides."
+        )
+    if allow_override:
+        log.warning(
+            "--no-viaduck-guard override: min_cursor=%d oldest_cursor_time=%s lagging_rows=%d%s",
+            guard,
+            oldest,
+            len(lagging),
+            " (WOULD HAVE ABORTED)" if lagging else "",
+        )
+    return _Guard(snapshot_id=guard, cursor_rows=len(rows), oldest_cursor_time=oldest, overridden=allow_override)
+
+
+def _enumeration_sql(spec: _PartitionSpec) -> str:
+    """One aggregated fpv pass over the table (bitmap via the fpv table_id
+    index), pivoted to one row per data_file_id, joined to LIVE data files.
+    Not partition_id-filtered: old-spec live files must be SEEN so they fail
+    loud instead of silently never dropping."""
+    s = PG_CATALOG_SCHEMA
+    pivoted = ", ".join(
+        f"max(CASE WHEN fpv.partition_key_index = {k.index} THEN fpv.partition_value END) AS k{k.index}"
+        for k in spec.keys
+    )
+    cols = ", ".join(f"p.k{k.index}" for k in spec.keys)
+    return f"""
+SELECT p.data_file_id, {cols}, p.fpv_rows, p.fpv_keys,
+       df.record_count, df.file_size_bytes, df.begin_snapshot, df.partition_id
+FROM (
+  SELECT fpv.data_file_id, {pivoted},
+         count(*) AS fpv_rows, count(DISTINCT fpv.partition_key_index) AS fpv_keys
+  FROM {s}.ducklake_file_partition_value fpv
+  WHERE fpv.table_id = %s
+  GROUP BY fpv.data_file_id
+) p
+JOIN {s}.ducklake_data_file df ON df.data_file_id = p.data_file_id
+WHERE df.table_id = %s AND df.end_snapshot IS NULL
+"""
+
+
+def _classify_enumeration(
+    rows: list[tuple],
+    spec: _PartitionSpec,
+    cutoff: datetime,
+    floor_snap: int,
+    max_files: int,
+    max_rot: int,
+) -> tuple[list[_Leaf], dict]:
+    """Pure classification of enumeration rows -> leaf manifest.
+
+    Per file: fpv sanity (exactly the spec's key set, one value each, time
+    values composable) else rot-excluded; partition_id != live spec fails the
+    RUN when the file is provably in (or unprovably out of) the candidate
+    window; structural floor excludes young stragglers per-file. Returns
+    (leaves oldest-first, diagnostics)."""
+    n_keys = len(spec.keys)
+    rot = 0
+    rot_samples: list[int] = []
+    floored = 0
+    old_spec_blocking: list[tuple[int, str]] = []
+    buckets: dict[tuple[str, ...], _Leaf] = {}
+    for row in rows:
+        data_file_id = row[0]
+        values = {k.index: row[1 + i] for i, k in enumerate(spec.keys)}
+        fpv_rows, fpv_keys = row[1 + len(spec.keys)], row[2 + len(spec.keys)]
+        record_count, file_size_bytes, begin_snapshot, partition_id = row[-4:]
+        sane = fpv_rows == n_keys and fpv_keys == n_keys and all(v is not None for v in values.values())
+        part_ts = _compose_part_ts(spec, values) if sane else None
+        if partition_id != spec.partition_id:
+            # Old-spec file: never droppable by us (its fpv key semantics
+            # differ). Abort the run unless it is PROVABLY outside the
+            # candidate window — "can't compose its time" is not proof.
+            if part_ts is None or part_ts < cutoff:
+                old_spec_blocking.append((data_file_id, str(part_ts)))
+            else:
+                log.debug("old-spec file %d provably >= cutoff (%s); ignoring", data_file_id, part_ts)
+            continue
+        if not sane or part_ts is None:
+            rot += 1
+            if len(rot_samples) < 10:
+                rot_samples.append(data_file_id)
+            continue
+        if part_ts >= cutoff:
+            continue  # leaf above the retention cutoff — not a candidate
+        if begin_snapshot > floor_snap:
+            floored += 1
+            continue
+        bucket_key = tuple(str(values[k.index]) for k in spec.keys)
+        leaf = buckets.get(bucket_key)
+        if leaf is None:
+            leaf = buckets[bucket_key] = _Leaf(
+                partition=_canonical_leaf_str(spec, values),
+                values={spec.address(k): str(values[k.index]) for k in spec.keys},
+                part_ts=part_ts,
+            )
+        leaf.files.append(
+            _LeafFile(
+                data_file_id=data_file_id,
+                record_count=record_count or 0,
+                file_size_bytes=file_size_bytes or 0,
+                begin_snapshot=begin_snapshot,
+            )
+        )
+    if old_spec_blocking:
+        raise _DropAbort(
+            f"{len(old_spec_blocking)} live file(s) on a NON-LIVE partition spec are in/unverifiable in the "
+            f"candidate window (e.g. {old_spec_blocking[:3]}). Refusing to mis-bucket old-spec data — "
+            "run repair-partition-values (see runbook) and retry."
+        )
+    if rot > max_rot:
+        raise _DropAbort(
+            f"{rot} fpv-rot file(s) (samples {rot_samples}) exceed --max-rot {max_rot}; "
+            "run repair-partition-values (see runbook) and retry"
+        )
+    leaves = sorted(buckets.values(), key=lambda lf: (lf.part_ts, lf.partition))
+    for leaf in leaves:
+        if len(leaf.files) > max_files:
+            leaf.oversized = True
+    diagnostics = {"rot_files": rot, "rot_samples": rot_samples, "floored_files": floored}
+    return leaves, diagnostics
+
+
+def _assert_no_unageable_files(pg: psycopg.Connection, table_id: int) -> None:
+    """Live files with NO fpv rows at all (unpartitioned-era residue or
+    catalog rot): the fpv-pivot enumeration never sees them, so they would
+    linger forever without a word — and with partition_id == live spec they
+    would not even trip the old-spec check. Fail closed: the operator runs
+    repair-partition-values (which backfills partition_id/fpv) first."""
+    s = PG_CATALOG_SCHEMA
+    n = pg.execute(
+        f"SELECT count(*) FROM {s}.ducklake_data_file df "
+        f"WHERE df.table_id = %s AND df.end_snapshot IS NULL "
+        f"AND NOT EXISTS (SELECT 1 FROM {s}.ducklake_file_partition_value f WHERE f.data_file_id = df.data_file_id)",
+        (table_id,),
+    ).fetchone()[0]
+    if n:
+        samples = pg.execute(
+            f"SELECT df.data_file_id FROM {s}.ducklake_data_file df "
+            f"WHERE df.table_id = %s AND df.end_snapshot IS NULL "
+            f"AND NOT EXISTS ("
+            f"  SELECT 1 FROM {s}.ducklake_file_partition_value f WHERE f.data_file_id = df.data_file_id"
+            f") LIMIT 5",
+            (table_id,),
+        ).fetchall()
+        raise _DropAbort(
+            f"{n} live file(s) have NO partition values at all (e.g. ids {[r[0] for r in samples]}): "
+            "invisible to retention and undroppable by this tool. Run repair-partition-values (see runbook) and retry."
+        )
+
+
+def _leaf_selection_sql(spec: _PartitionSpec) -> str:
+    """Fresh per-leaf selection by fully-resolved tuple: live, live-spec,
+    below the structural floor, exactly the spec's fpv key set (no dups, no
+    extras), one EXISTS per key. Indexed lookups only."""
+    s = PG_CATALOG_SCHEMA
+    exists = " AND ".join(
+        f"EXISTS (SELECT 1 FROM {s}.ducklake_file_partition_value f{k.index} "
+        f"WHERE f{k.index}.data_file_id = df.data_file_id "
+        f"AND f{k.index}.partition_key_index = {k.index} AND f{k.index}.partition_value = %s)"
+        for k in spec.keys
+    )
+    return f"""
+SELECT df.data_file_id, df.record_count, df.file_size_bytes, df.begin_snapshot
+FROM {s}.ducklake_data_file df
+WHERE df.table_id = %s AND df.end_snapshot IS NULL AND df.partition_id = %s
+  AND df.begin_snapshot <= %s
+  AND (SELECT count(*) FROM {s}.ducklake_file_partition_value fx WHERE fx.data_file_id = df.data_file_id) = %s
+  AND {exists}
+ORDER BY df.data_file_id
+"""
+
+
+def _select_leaf_files(
+    pg: psycopg.Connection,
+    table_id: int,
+    spec: _PartitionSpec,
+    tuple_map: dict[int, str],
+    floor_snap: int,
+    max_files: int,
+) -> list[_LeafFile]:
+    params = (table_id, spec.partition_id, floor_snap, len(spec.keys)) + tuple(tuple_map[k.index] for k in spec.keys)
+    rows = pg.execute(_leaf_selection_sql(spec), params).fetchall()
+    files = [
+        _LeafFile(data_file_id=r[0], record_count=r[1] or 0, file_size_bytes=r[2] or 0, begin_snapshot=r[3])
+        for r in rows
+    ]
+    if len(files) > max_files:
+        raise _LeafOversized(f"pathological leaf: {len(files)} files > --max-files {max_files}; refusing to drop")
+    return files
+
+
+def _old_spec_leaf_check(
+    pg: psycopg.Connection, table_id: int, spec: _PartitionSpec, tuple_map: dict[int, str]
+) -> None:
+    """A bare --partition invocation skips enumeration, so re-run the old-spec
+    guard scoped to this tuple: any live file on a DIFFERENT partition_id whose
+    fpv rows match the tuple under the live key indexes is a mis-bucketing
+    hazard — fail loud."""
+    s = PG_CATALOG_SCHEMA
+    exists = " AND ".join(
+        f"EXISTS (SELECT 1 FROM {s}.ducklake_file_partition_value f{k.index} "
+        f"WHERE f{k.index}.data_file_id = df.data_file_id "
+        f"AND f{k.index}.partition_key_index = {k.index} AND f{k.index}.partition_value = %s)"
+        for k in spec.keys
+    )
+    row = pg.execute(
+        f"SELECT count(*) FROM {s}.ducklake_data_file df "
+        f"WHERE df.table_id = %s AND df.end_snapshot IS NULL AND df.partition_id IS DISTINCT FROM %s AND {exists}",
+        (table_id, spec.partition_id) + tuple(tuple_map[k.index] for k in spec.keys),
+    ).fetchone()
+    if row[0]:
+        raise _DropAbort(
+            f"{row[0]} live file(s) match the tuple but sit on a NON-LIVE partition spec "
+            f"(partition_id != {spec.partition_id}) — run repair-partition-values, never mis-bucket"
+        )
+
+
+def _assert_catalog_version(cur: psycopg.Cursor) -> None:
+    rows = cur.execute(f"SELECT value FROM {PG_CATALOG_SCHEMA}.ducklake_metadata WHERE key = 'version'").fetchall()
+    if len(rows) != 1 or rows[0][0] not in _DROP_CATALOG_VERSIONS:
+        raise _DropAbort(
+            f"catalog version pin: expected exactly one ducklake_metadata version row in "
+            f"{sorted(_DROP_CATALOG_VERSIONS)}, got {[r[0] for r in rows]} — re-validate the fork before moving the pin"
+        )
+
+
+def _guard_predicate(guard_sql: str | None) -> str:
+    """The cursor guard as a SELF-FRESHENING subquery evaluated in the same
+    READ COMMITTED statement snapshot as the rows it gates — a flush-failure
+    rewind (cursor moves BACKWARD) between driver pre-check and this statement
+    is caught here, not by a frozen scalar (M2/H1). None = --no-viaduck-guard."""
+    if guard_sql is None:
+        return "TRUE"
+    return f"begin_snapshot < (SELECT min(last_snapshot_id) FROM {guard_sql})"
+
+
+def _drop_leaf_txn(
+    pg: psycopg.Connection,
+    table_id: int,
+    leaf_files: list[_LeafFile],
+    guard_sql: str | None,
+    message: str,
+    check_isolation: bool,
+) -> dict:
+    """One leaf drop = one short transaction = one forged engine commit.
+
+    Order: version pin -> baseline read -> delete-vector assertion -> snapshot
+    INSERT (the PK race; next_file_id = baseline + 1 busts the per-process
+    stats ObjectCache — F1) -> file UPDATE (per-row liveness + the cursor
+    guard as an in-statement subquery) -> skipped-id classification (M1
+    tolerance) -> RELATIVE stats decrement from RETURNING sums -> conflict
+    token."""
+    ids = [f.data_file_id for f in leaf_files]
+    s = PG_CATALOG_SCHEMA
+    guard_pred = _guard_predicate(guard_sql)
+    with conn_transaction(pg) as cur:
+        cur.execute(f"SET LOCAL statement_timeout = '{_DROP_STATEMENT_TIMEOUT_MS}'")
+        cur.execute(f"SET LOCAL lock_timeout = '{_DROP_LOCK_TIMEOUT_MS}'")
+        if check_isolation:
+            iso = cur.execute("SHOW transaction_isolation").fetchone()[0]
+            if iso != "read committed":
+                raise _DropAbort(f"expected READ COMMITTED, got {iso!r}")
+        _assert_catalog_version(cur)
+        n_dv = cur.execute(
+            f"SELECT count(*) FROM {s}.ducklake_delete_file "
+            f"WHERE table_id = %s AND end_snapshot IS NULL AND data_file_id = ANY(%s)",
+            (table_id, ids),
+        ).fetchone()[0]
+        if n_dv:
+            raise _DropAbort(f"{n_dv} LIVE delete vector(s) reference leaf files — refusing to orphan them")
+        base = cur.execute(
+            f"SELECT snapshot_id, schema_version, next_catalog_id, next_file_id "
+            f"FROM {s}.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1"
+        ).fetchone()
+        if base is None:
+            raise _DropAbort("empty catalog: no rows in ducklake_snapshot")
+        snap = base[0] + 1
+        cur.execute(
+            f"INSERT INTO {s}.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, "
+            f"next_catalog_id, next_file_id) VALUES (%s, clock_timestamp(), %s, %s, %s)",
+            (snap, base[1], base[2], base[3] + 1),
+        )
+        updated = cur.execute(
+            f"UPDATE {s}.ducklake_data_file SET end_snapshot = %s "
+            f"WHERE data_file_id = ANY(%s) AND end_snapshot IS NULL AND {guard_pred} "
+            f"RETURNING data_file_id, record_count, file_size_bytes",
+            (snap, ids),
+        ).fetchall()
+        returned = {r[0] for r in updated}
+        skipped = [i for i in ids if i not in returned]
+        ended_concurrently = 0
+        if skipped:
+            info = cur.execute(
+                f"SELECT data_file_id, end_snapshot, begin_snapshot, ({guard_pred}) AS eligible "
+                f"FROM {s}.ducklake_data_file WHERE data_file_id = ANY(%s)",
+                (skipped,),
+            ).fetchall()
+            still_live_eligible = [r[0] for r in info if r[1] is None and r[3]]
+            still_live_ineligible = [r[0] for r in info if r[1] is None and not r[3]]
+            if still_live_eligible:
+                # Under READ COMMITTED the classification runs on a FRESHER
+                # snapshot than the UPDATE: a cursor that ADVANCED in between
+                # makes a correct guard-skip read eligible here. Re-check once
+                # after a beat; abort only if it persists (a real miss).
+                time.sleep(0.05)
+                info2 = cur.execute(
+                    f"SELECT data_file_id FROM {s}.ducklake_data_file "
+                    f"WHERE data_file_id = ANY(%s) AND end_snapshot IS NULL AND ({guard_pred})",
+                    (still_live_eligible,),
+                ).fetchall()
+                if info2:
+                    raise _DropAbort(
+                        f"UPDATE missed {len(info2)} row(s) it should have hit (still live AND guard-eligible "
+                        f"on recheck): {still_live_eligible[:5]} — tool bug, aborting"
+                    )
+                raise _LeafSkip("transient eligibility read on a skipped member (cursor advance mid-txn)")
+            if still_live_ineligible:
+                # The guard rewound (flush failure) between the driver
+                # pre-check and this txn: whole-leaf skip, not partial drop.
+                raise _LeafSkip(f"{len(still_live_ineligible)} member(s) became guard-ineligible mid-txn")
+            ended_concurrently = len(skipped)
+        if not updated:
+            raise _LeafSkip("leaf vanished: every member was ended concurrently (compaction)")
+        # Rewind verification: the guard subquery and the row locks share the
+        # UPDATE's statement snapshot, but a rewind committed BETWEEN that
+        # snapshot and now would have ended files the rewound consumer hasn't
+        # read. Fresh-statement check narrows the exposure to sub-ms; anything
+        # tighter needs the engine's conflict tokens (a rewind emits none).
+        if guard_sql is not None:
+            rewound = cur.execute(
+                f"SELECT count(*) FROM {s}.ducklake_data_file "
+                f"WHERE data_file_id = ANY(%s) AND end_snapshot = %s AND NOT ({guard_pred})",
+                (ids, snap),
+            ).fetchone()[0]
+            if rewound:
+                raise _LeafSkip(f"cursor rewound across {rewound} ended member(s) mid-drop — rolled back, retry later")
+        rows_delta = sum(r[1] or 0 for r in updated)
+        bytes_delta = sum(r[2] or 0 for r in updated)
+        stats_rows = cur.execute(
+            f"UPDATE {s}.ducklake_table_stats "
+            f"SET record_count = record_count - %s, file_size_bytes = file_size_bytes - %s "
+            f"WHERE table_id = %s AND record_count >= %s AND file_size_bytes >= %s AND record_count - %s > 0 "
+            f"RETURNING record_count",
+            (rows_delta, bytes_delta, table_id, rows_delta, bytes_delta, rows_delta),
+        ).fetchall()
+        if len(stats_rows) != 1:
+            diag = cur.execute(
+                f"SELECT record_count, file_size_bytes FROM {s}.ducklake_table_stats WHERE table_id = %s",
+                (table_id,),
+            ).fetchall()
+            raise _DropAbort(
+                f"stats assertion failed: expected exactly 1 row update, got {len(stats_rows)} "
+                f"(decrement rows={rows_delta} bytes={bytes_delta}; current stats rows: {diag})"
+            )
+        cur.execute(
+            f"INSERT INTO {s}.ducklake_snapshot_changes (snapshot_id, changes_made, author, commit_message) "
+            f"VALUES (%s, %s, 'drop-partitions', %s)",
+            (snap, f"deleted_from_table:{table_id}", message),
+        )
+    return {
+        "snapshot_id": snap,
+        "files": len(updated),
+        "rows": rows_delta,
+        "bytes": bytes_delta,
+        "ended_concurrently": ended_concurrently,
+    }
+
+
+@contextlib.contextmanager
+def conn_transaction(pg: psycopg.Connection):
+    """Explicit short transaction on the autocommit connection, yielding a
+    cursor; commit on clean exit, rollback on exception."""
+    with pg.transaction():
+        cur = pg.cursor()
+        try:
+            yield cur
+            cur.close()
+        except BaseException:
+            cur.close()
+            raise
+
+
+def _is_retryable_pg_error(exc: BaseException) -> bool:
+    return getattr(exc, "sqlstate", None) in _DROP_RETRYABLE_SQLSTATES
+
+
+def _lock_refresh(pg: psycopg.Connection) -> None:
+    """(Re)acquire the maintenance advisory lock for this leaf. Session-scoped
+    and REFCOUNTED, so reset to a clean state with unlock_all() first; a
+    dropped pg session loses the lock silently, which is why this runs per
+    leaf, not per run."""
+    pg.execute("SELECT pg_advisory_unlock_all()")
+    acquired = pg.execute(f"SELECT pg_try_advisory_lock({ADVISORY_LOCK_KEY_SQL})").fetchone()[0]
+    if not acquired:
+        raise _LockContended("another maintenance session holds the advisory lock")
+
+
+def _drop_leaf_with_retries(
+    pg_holder: dict,
+    table_id: int,
+    leaf_files: list[_LeafFile],
+    guard_sql: str | None,
+    message: str,
+    check_isolation: bool,
+    metrics: dict,
+    leaf: str = "?",
+    deadline: float | None = None,
+) -> dict:
+    """Retry wrapper: the whole short txn re-runs on retryable PG errors with
+    jittered backoff; cap _DROP_MAX_ATTEMPTS per leaf, then abort the run.
+
+    Retry classes: whitelisted sqlstates (23505 PK race / 40001 / 55P03 /
+    57014 / 40P01 deadlock — full rollback makes the drop idempotent) AND any
+    OperationalError/InterfaceError (connection loss, failover, admin
+    termination — broader than the whitelist on purpose; the txn re-verifies
+    everything on the next attempt). Connection loss reconnects and re-takes
+    the advisory lock on the next attempt (a dropped session loses the lock
+    silently). Lock contention gets its own budget (_DROP_LOCK_ATTEMPTS):
+    expire/cleanup crons can hold the lock for minutes."""
+    attempt = 0
+    lock_attempts = 0
+    need_iso_check = check_isolation
+    while True:
+        attempt += 1
+        if attempt > _DROP_MAX_ATTEMPTS:
+            raise _DropAbort(f"exceeded {_DROP_MAX_ATTEMPTS} attempts on one leaf — aborting the run")
+        if deadline is not None and time.monotonic() > deadline:
+            raise _DropAbort("wall-clock budget exhausted mid-leaf — aborting the run")
+        try:
+            pg = pg_holder["conn"]
+            if pg.closed:
+                log.warning("pg connection lost; reconnecting")
+                pg_holder["conn"] = pg = _pg_direct_connect()
+                need_iso_check = True  # new session: re-assert its isolation once
+            _lock_refresh(pg)
+            t0 = time.monotonic()
+            result = _drop_leaf_txn(pg, table_id, leaf_files, guard_sql, message, need_iso_check)
+            result["txn_ms"] = (time.monotonic() - t0) * 1000
+            result["attempts"] = attempt
+            return result
+        except (_LeafSkip, _DropAbort):
+            raise
+        except _LockContended as exc:
+            lock_attempts += 1
+            if lock_attempts > _DROP_LOCK_ATTEMPTS:
+                raise _DropAbort(
+                    f"advisory lock contended for {_DROP_LOCK_ATTEMPTS} consecutive attempts on one leaf "
+                    "— aborting the run (a long expire/cleanup is holding it; reschedule)"
+                ) from exc
+            metrics["retries"] += 1
+            sleep = min(8.0, random.uniform(2.0, 5.0) * (1 + lock_attempts / 10))
+            log.warning("leaf %s lock contended (attempt %d): %s; sleeping %.1fs", leaf, lock_attempts, exc, sleep)
+            time.sleep(sleep)
+            continue
+        except psycopg.Error as exc:
+            if _is_retryable_pg_error(exc) or isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)):
+                metrics["retries"] += 1
+                sleep = min(2.0, random.uniform(0.05, 0.15) * (1.5 ** min(attempt, 8)))
+                log.warning(
+                    "leaf %s attempt %d retryable (sqlstate=%s: %s); sleeping %.2fs",
+                    leaf,
+                    attempt,
+                    getattr(exc, "sqlstate", None),
+                    exc,
+                    sleep,
+                )
+                time.sleep(sleep)
+                continue
+            raise
+        finally:
+            pg = pg_holder.get("conn")
+            if pg is not None and not pg.closed:
+                with contextlib.suppress(Exception):
+                    pg.execute("SELECT pg_advisory_unlock_all()")
+
+
+def _load_manifest(path: str) -> dict:
+    try:
+        with open(path) as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise _DropAbort(f"cannot read manifest {path!r}: {e}") from e
+    if manifest.get("tool") != "list-droppable-partitions" or manifest.get("manifest_version") != 1:
+        raise _DropAbort(f"{path!r} is not a list-droppable-partitions v1 manifest")
+    missing = [k for k in ("table", "cutoff", "leaves") if k not in manifest]
+    if missing:
+        raise _DropAbort(f"manifest {path!r} is missing keys {missing}")
+    return manifest
+
+
+def list_droppable_partitions(args: argparse.Namespace, gauges: dict) -> None:
+    """Read-only enumeration: emit the leaf manifest (JSON) for every leaf
+    wholly below the cutoff. Never writes; never takes the advisory lock."""
+    with _pg_direct_connect() as pg:
+        table_id, schema_name, table_name = _resolve_table_id(pg, args.table)
+        spec = _resolve_live_spec(pg, table_id)
+        cutoff = _resolve_cutoff(args, spec.grain)
+        floor_snap = _floor_snapshot(pg, cutoff)
+        log.info(
+            "list-droppable-partitions: table=%s table_id=%d partition_id=%d cutoff=%s floor_snapshot=%d",
+            args.table,
+            table_id,
+            spec.partition_id,
+            cutoff.isoformat(),
+            floor_snap,
+        )
+        rows = pg.execute(_enumeration_sql(spec), (table_id, table_id)).fetchall()
+        _assert_no_unageable_files(pg, table_id)
+        leaves, diag = _classify_enumeration(rows, spec, cutoff, floor_snap, args.max_files, args.max_rot)
+    manifest = {
+        "tool": "list-droppable-partitions",
+        "manifest_version": 1,
+        "table": args.table,
+        "table_id": table_id,
+        "partition_id": spec.partition_id,
+        "spec": [f"{k.index}:{spec.address(k)}(column={k.column_name})" for k in spec.keys],
+        "cutoff": cutoff.isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
+        "floor_snapshot": floor_snap,
+        "leaves": [
+            {
+                "partition": leaf.partition,
+                "values": leaf.values,
+                "partition_ts": leaf.part_ts.isoformat(),
+                "files": len(leaf.files),
+                "rows": leaf.rows,
+                "bytes": leaf.bytes,
+                "max_begin_snapshot": leaf.max_begin_snapshot,
+                "oversized": leaf.oversized,
+                # The drop side re-selects by tuple (fresher); id lists are
+                # audit-only and huge at campaign scale — opt-in.
+                **({"file_ids": [f.data_file_id for f in leaf.files]} if args.with_file_ids else {}),
+            }
+            for leaf in leaves
+        ],
+        "diagnostics": diag,
+    }
+    out = json.dumps(manifest, indent=1)
+    oversized = [lf.partition for lf in leaves if lf.oversized]
+    log.info(
+        "enumeration: %d droppable leaves (%d files, %d rows, %d bytes); rot=%d floored=%d oversized=%s",
+        len(leaves),
+        sum(len(lf.files) for lf in leaves),
+        sum(lf.rows for lf in leaves),
+        sum(lf.bytes for lf in leaves),
+        diag["rot_files"],
+        diag["floored_files"],
+        oversized or "none",
+    )
+    gauges["excluded_rot"].labels(table=args.table).set(diag["rot_files"])
+    if args.out:
+        # Atomic write: a concurrent manifest reader must never see a
+        # truncated JSON (fail-closed, but needlessly).
+        tmp = Path(args.out).with_suffix(".tmp")
+        tmp.write_text(out + "\n")
+        os.replace(tmp, args.out)
+        log.info("manifest written to %s", args.out)
+    else:
+        print(out)
+
+
+def drop_partitions(args: argparse.Namespace, gauges: dict) -> None:
+    """Drop partition leaves, one forged OCC commit per leaf. Dry-run by
+    default; --execute writes. Leaf sources: --partition (one fully-resolved
+    tuple) or --manifest (list-droppable-partitions output, oldest first)."""
+    if bool(args.partition) == bool(args.manifest):
+        raise _DropAbort("exactly one of --partition / --manifest is required")
+    if args.manifest and (args.cutoff or args.retention_days is not None):
+        raise _DropAbort("--manifest supplies the cutoff; --cutoff/--retention-days are refused with it")
+    metrics = {
+        "retries": 0,
+        "aborts": 0,
+        "files_dropped": 0,
+        "leaves_dropped": 0,
+        "leaves_skipped": 0,
+        "skipped_files": 0,
+    }
+    holder: dict = {"conn": None}
+    t0 = time.monotonic()
+    run_clean = False
+    try:
+        holder["conn"] = _pg_direct_connect()
+        pg = holder["conn"]
+        table_id, schema_name, table_name = _resolve_table_id(pg, args.table)
+        spec = _resolve_live_spec(pg, table_id)
+        _assert_no_unageable_files(pg, table_id)
+        # The viaduck state identifiers get interpolated into SQL (in-txn guard
+        # subquery) — validate once up front, not just inside _cursor_guard.
+        for value in (args.viaduck_state_schema, args.viaduck_state_table):
+            if not _SAFE_IDENTIFIER_RE.match(value):
+                raise _DropAbort(f"viaduck state identifier {value!r} is not a safe identifier")
+        guard_sql = None if args.no_viaduck_guard else f"{args.viaduck_state_schema}.{args.viaduck_state_table}"
+
+        # Build the leaf work list. In manifest mode the cutoff comes from the
+        # manifest (stale manifests only get MORE conservative); in
+        # --partition mode from the CLI. The floor snapshot is derived once per
+        # RUN (monotonic — a stale floor is strictly more conservative); the
+        # cursor guard is re-read per leaf AND bound as an in-statement
+        # subquery. Selection is advisory; everything re-verifies in-txn.
+        work: list[tuple[str, dict[int, str]]] = []  # (canonical partition str, tuple_map)
+        if args.manifest:
+            manifest = _load_manifest(args.manifest)
+            if manifest["table"] != args.table:
+                raise _DropAbort(f"manifest table {manifest['table']!r} != --table {args.table!r}")
+            if manifest.get("table_id") != table_id or manifest.get("partition_id") != spec.partition_id:
+                raise _DropAbort(
+                    f"manifest table_id/partition_id ({manifest.get('table_id')}/{manifest.get('partition_id')}) "
+                    f"!= live ({table_id}/{spec.partition_id}) — table recreated or spec changed mid-campaign"
+                )
+            try:
+                cutoff = datetime.fromisoformat(manifest["cutoff"])
+            except ValueError as e:
+                raise _DropAbort(f"manifest cutoff {manifest['cutoff']!r} unparseable: {e}") from e
+            if cutoff.tzinfo is None:  # hand-built manifest: naive means UTC (never host-local)
+                cutoff = cutoff.replace(tzinfo=UTC)
+            cutoff = cutoff.astimezone(UTC)
+            _check_cutoff(cutoff, spec.grain, args.force_young_cutoff)
+            for entry in manifest["leaves"]:
+                work.append((entry["partition"], _tuple_from_values(spec, entry["values"])))
+        else:
+            cutoff = _resolve_cutoff(args, spec.grain)
+            tuple_map = _parse_partition_tuple(spec, args.partition)
+            part_ts = _compose_part_ts(spec, tuple_map)
+            if part_ts is None or part_ts >= cutoff:
+                raise _DropAbort(f"partition {args.partition!r} composes to {part_ts} — not below cutoff {cutoff}")
+            _old_spec_leaf_check(pg, table_id, spec, tuple_map)
+            work.append((_canonical_leaf_str(spec, tuple_map), tuple_map))
+        floor_snap = _floor_snapshot(pg, cutoff)
+        floor_time = cutoff + timedelta(hours=_DROP_FLOOR_HOURS)
+        log.info(
+            "drop-partitions: table=%s table_id=%d partition_id=%d cutoff=%s floor_snapshot=%d execute=%s leaves=%d",
+            args.table,
+            table_id,
+            spec.partition_id,
+            cutoff.isoformat(),
+            floor_snap,
+            args.execute,
+            len(work),
+        )
+
+        first_txn = True
+        for partition, tuple_map in work:
+            pg = holder["conn"]
+            if time.monotonic() - t0 > args.max_seconds:
+                log.warning("wall-clock budget %ds exhausted; stopping with leaves remaining", args.max_seconds)
+                break
+            # The enumeration invariant must hold on the mutating path too —
+            # re-verify per leaf (a stale or hand-built manifest is advisory).
+            part_ts = _compose_part_ts(spec, tuple_map)
+            if part_ts is None or part_ts >= cutoff:
+                log.info("leaf %s SKIPPED: no longer below the cutoff (or uncomposable)", partition)
+                metrics["leaves_skipped"] += 1
+                continue
+            guard = _cursor_guard(
+                pg, args.viaduck_state_schema, args.viaduck_state_table, floor_time, args.no_viaduck_guard
+            )
+            try:
+                leaf_files = _select_leaf_files(pg, table_id, spec, tuple_map, floor_snap, args.max_files)
+            except _LeafOversized as oversized:
+                if not args.manifest:
+                    raise  # single-leaf invocation: the operator asked for THIS leaf — abort
+                log.warning("leaf %s SKIPPED (oversized, needs manual review): %s", partition, oversized)
+                metrics["leaves_skipped"] += 1
+                continue
+            if not leaf_files:
+                log.info("leaf %s: nothing live below the cutoff — skipping", partition)
+                metrics["leaves_skipped"] += 1
+                continue
+            guard_blocked = [f.data_file_id for f in leaf_files if f.begin_snapshot >= guard.snapshot_id]
+            if guard_blocked:
+                log.info(
+                    "leaf %s SKIPPED: %d/%d members guard-ineligible (begin_snapshot >= cursor guard %d); "
+                    "it ages into eligibility",
+                    partition,
+                    len(guard_blocked),
+                    len(leaf_files),
+                    guard.snapshot_id,
+                )
+                metrics["leaves_skipped"] += 1
+                continue
+            if not args.execute:
+                log.info(
+                    "leaf %s: DRY-RUN would drop files=%d rows=%d bytes=%d (guard=%d cursors=%d oldest_cursor=%s)",
+                    partition,
+                    len(leaf_files),
+                    sum(f.record_count for f in leaf_files),
+                    sum(f.file_size_bytes for f in leaf_files),
+                    guard.snapshot_id,
+                    guard.cursor_rows,
+                    guard.oldest_cursor_time,
+                )
+                continue
+            message = (
+                f"drop-partitions table={schema_name}.{table_name} leaf={partition} "
+                f"campaign={args.campaign or '-'} files={len(leaf_files)}"
+            )
+            try:
+                result = _drop_leaf_with_retries(
+                    holder,
+                    table_id,
+                    leaf_files,
+                    guard_sql,
+                    message,
+                    first_txn,
+                    metrics,
+                    leaf=partition,
+                    deadline=t0 + args.max_seconds,
+                )
+            except _LeafSkip as skip:
+                log.info("leaf %s SKIPPED in-txn: %s", partition, skip)
+                metrics["leaves_skipped"] += 1
+                continue
+            first_txn = False
+            metrics["files_dropped"] += result["files"]
+            metrics["leaves_dropped"] += 1
+            metrics["skipped_files"] += result["ended_concurrently"]
+            log.info(
+                "leaf %s DROPPED: snapshot=%d files=%d rows=%d bytes=%d ended_concurrently=%d attempts=%d txn_ms=%.0f",
+                partition,
+                result["snapshot_id"],
+                result["files"],
+                result["rows"],
+                result["bytes"],
+                result["ended_concurrently"],
+                result["attempts"],
+                result["txn_ms"],
+            )
+            time.sleep(args.pace_ms / 1000.0)
+        run_clean = True
+    except _DropAbort:
+        metrics["aborts"] += 1
+        raise
+    except Exception:
+        # Non-_DropAbort propagation (psycopg failures, bugs): still an abort
+        # for the metric, exit code comes from main().
+        metrics["aborts"] += 1
+        raise
+    finally:
+        if holder["conn"] is not None:
+            with contextlib.suppress(Exception):
+                holder["conn"].close()
+        if args.execute:
+            # Dry-runs leave NO metric footprint: pushadd POST replaces
+            # same-name+label series, so a manual dry-run would otherwise
+            # zero the cron's counters and — worst — refresh
+            # last_success_timestamp, masking a wedged --execute cron.
+            gauges["files_dropped"].labels(table=args.table).set(metrics["files_dropped"])
+            gauges["leaves_dropped"].labels(table=args.table).set(metrics["leaves_dropped"])
+            gauges["leaves_skipped"].labels(table=args.table).set(metrics["leaves_skipped"])
+            gauges["retries"].labels(table=args.table).set(metrics["retries"])
+            gauges["aborts"].labels(table=args.table).set(metrics["aborts"])
+            gauges["skipped_files"].labels(table=args.table).set(metrics["skipped_files"])
+            # "success" = the run completed cleanly, even if every leaf
+            # skipped (a healthy all-skipped day must not read as staleness).
+            if run_clean:
+                gauges["last_success"].labels(table=args.table).set(time.time())
+    log.info(
+        "drop-partitions done: leaves_dropped=%d leaves_skipped=%d files_dropped=%d execute=%s",
+        metrics["leaves_dropped"],
+        metrics["leaves_skipped"],
+        metrics["files_dropped"],
+        args.execute,
+    )
+
+
+_DIRECT_PG_COMMANDS = frozenset({"drop-partitions", "list-droppable-partitions"})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="DuckLake maintenance operations",
@@ -2668,13 +3857,94 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--table", required=True)
     p.add_argument("--max-compacted-files", type=_positive_int, default=2)
 
+    # list-droppable-partitions (read-only; direct libpq, no duckdb lifecycle)
+    p = sub.add_parser(
+        "list-droppable-partitions",
+        help="Enumerate droppable partition leaves below the cutoff (read-only), emit a JSON manifest",
+    )
+    p.add_argument("--table", required=True, help="schema.table (e.g. main.events_nrt); bare table_id refused")
+    p.add_argument("--cutoff", default="", help="ISO 8601; partitions strictly older are droppable")
+    p.add_argument("--retention-days", type=_positive_int, default=None, help="Alternative to --cutoff: now - N days")
+    p.add_argument(
+        "--max-files",
+        type=_positive_int,
+        default=_positive_int(os.environ.get("DROP_PARTITIONS_MAX_FILES", "10000")),
+        help="Per-leaf sanity ceiling; oversized leaves are marked and the drop aborts on them",
+    )
+    p.add_argument(
+        "--max-rot",
+        type=int,
+        default=int(os.environ.get("DROP_PARTITIONS_MAX_ROT", "0")),
+        help="Tolerated fpv-rot file count before the run aborts (default 0 = any rot aborts)",
+    )
+    p.add_argument("--force-young-cutoff", action="store_true", help="Allow cutoffs younger than 7 days")
+    p.add_argument("--out", default="", help="Manifest output path (default: stdout)")
+    p.add_argument(
+        "--with-file-ids",
+        action="store_true",
+        help="Embed per-leaf file-id lists in the manifest (audit detail; large at campaign scale)",
+    )
+
+    # drop-partitions (direct libpq, no duckdb lifecycle; dry-run default)
+    p = sub.add_parser(
+        "drop-partitions",
+        help="Drop partition leaves via forged engine commits (dry-run unless --execute)",
+    )
+    p.add_argument("--table", required=True, help="schema.table (e.g. main.events_nrt); bare table_id refused")
+    p.add_argument(
+        "--partition",
+        default="",
+        help="One fully-resolved leaf tuple, e.g. team_id=2,year=2026,month=8,day=1,hour=13",
+    )
+    p.add_argument(
+        "--manifest", default="", help="list-droppable-partitions JSON manifest; loops its leaves oldest-first"
+    )
+    p.add_argument("--cutoff", default="", help="ISO 8601 (--partition mode only; manifest mode uses the manifest's)")
+    p.add_argument("--retention-days", type=_positive_int, default=None, help="Alternative to --cutoff: now - N days")
+    p.add_argument("--execute", action="store_true", help="Actually write (default: dry-run)")
+    p.add_argument(
+        "--max-files",
+        type=_positive_int,
+        default=_positive_int(os.environ.get("DROP_PARTITIONS_MAX_FILES", "10000")),
+        help="Per-leaf sanity ceiling (abort on a pathological leaf)",
+    )
+    p.add_argument(
+        "--no-viaduck-guard",
+        action="store_true",
+        help="Drop without the viaduck cursor guard; prints the lag numbers it overrides",
+    )
+    p.add_argument("--viaduck-state-schema", default=os.environ.get("VIADUCK_STATE_SCHEMA", "viaduck"))
+    p.add_argument("--viaduck-state-table", default=os.environ.get("VIADUCK_STATE_TABLE", "viaduck_state"))
+    p.add_argument("--force-young-cutoff", action="store_true", help="Allow cutoffs younger than 7 days")
+    p.add_argument(
+        "--pace-ms",
+        type=_nonneg_int,
+        default=_nonneg_int(os.environ.get("DROP_PARTITIONS_PACE_MS", "250")),
+        help="Sleep between leaf drops so expire/cleanup crons interleave",
+    )
+    p.add_argument(
+        "--max-seconds",
+        type=_positive_int,
+        default=_positive_int(os.environ.get("DROP_PARTITIONS_MAX_SECONDS", "3300")),
+        help="Wall-clock budget per invocation",
+    )
+    p.add_argument(
+        "--campaign", default=os.environ.get("CAMPAIGN", ""), help="Campaign id embedded in the commit message"
+    )
+
     return parser
 
 
 def _push(registry: CollectorRegistry, pushgateway: str) -> None:
-    """Push metrics to the pushgateway, logging but not raising on failure."""
+    """Push metrics to the pushgateway, logging but not raising on failure.
+
+    pushadd (POST), NOT push (PUT): every maintenance cron shares
+    job="ducklake-maintenance" with no grouping key, and a PUT replaces the
+    ENTIRE job group — the 15-minute compaction cron would delete the daily
+    drop-partitions' series minutes after they were pushed. POST replaces only
+    series with identical name+labels, so sibling ops' gauges survive."""
     try:
-        push_to_gateway(pushgateway, job="ducklake-maintenance", registry=registry)
+        pushadd_to_gateway(pushgateway, job="ducklake-maintenance", registry=registry)
     except Exception:
         log.exception("Failed to push metrics to %s", pushgateway)
 
@@ -2717,6 +3987,51 @@ def main(argv: list[str] | None = None) -> None:
         ["tier"],
         registry=registry,
     )
+    # drop-partitions gauges: per-RUN values (the pushgateway convention here —
+    # successive pushes overwrite). alerts key on aborts and on
+    # last_success_timestamp going stale for the daily cron.
+    drop_gauges = {
+        "files_dropped": Gauge(
+            "maintenance_drop_files_dropped_total",
+            "Files ended by drop-partitions in this run",
+            ["table"],
+            registry=registry,
+        ),
+        "leaves_dropped": Gauge(
+            "maintenance_drop_leaves_dropped_total",
+            "Partition leaves dropped in this run",
+            ["table"],
+            registry=registry,
+        ),
+        "leaves_skipped": Gauge(
+            "maintenance_drop_leaves_skipped_total",
+            "Leaves skipped this run (guard-ineligible / vanished / empty)",
+            ["table"],
+            registry=registry,
+        ),
+        "retries": Gauge(
+            "maintenance_drop_retries_total",
+            "Retryable PG errors and advisory-lock contention waits absorbed this run",
+            ["table"],
+            registry=registry,
+        ),
+        "aborts": Gauge("maintenance_drop_aborts_total", "Non-retryable aborts this run", ["table"], registry=registry),
+        "skipped_files": Gauge(
+            "maintenance_drop_skipped_files_total",
+            "Leaf members ended concurrently (compaction interleave), skipped mid-leaf",
+            ["table"],
+            registry=registry,
+        ),
+        "excluded_rot": Gauge(
+            "maintenance_drop_excluded_rot_files", "fpv-rot files excluded from selection", ["table"], registry=registry
+        ),
+        "last_success": Gauge(
+            "maintenance_drop_last_success_timestamp",
+            "Unix timestamp of the last cleanly-completed drop-partitions run (execute mode only)",
+            ["table"],
+            registry=registry,
+        ),
+    }
     operation = args.command
     if hasattr(args, "days") and args.days < 1:
         parser.error("--days must be >= 1")
@@ -2733,9 +4048,16 @@ def main(argv: list[str] | None = None) -> None:
     t0 = time.monotonic()
     status = "success"
     conn = None
-    conn = connect(debug=args.debug)
+    # drop-partitions / list-droppable-partitions run on a direct libpq
+    # connection and never touch duckdb (see the section header above them).
+    if args.command not in _DIRECT_PG_COMMANDS:
+        conn = connect(debug=args.debug)
     try:
         match args.command:
+            case "list-droppable-partitions":
+                list_droppable_partitions(args, drop_gauges)
+            case "drop-partitions":
+                drop_partitions(args, drop_gauges)
             case "expire":
                 expire(conn, args.days, args.dry_run)
             case "expire-snapshots":

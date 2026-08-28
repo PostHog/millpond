@@ -305,9 +305,19 @@ def _is_commit_contention(exc: BaseException) -> bool:
         "Exceeded the maximum retry count of ..."
       - Postgres (libpq): "duplicate key value violates unique constraint"
       - Postgres (libpq): "could not serialize access"
+      - DuckLake conflict checker (ducklake_transaction_state.cpp
+        ConflictCheck): "Transaction conflict - attempting to ..." — a
+        hard-abort (can_retry=false) after a concurrent snapshot's change
+        token, e.g. a drop-partitions catalog write ending files under an
+        in-flight insert. Absorbed by the retry below on a fresh baseline.
     """
     msg = str(exc)
-    return "maximum retry count" in msg or "duplicate key value" in msg or "could not serialize access" in msg
+    return (
+        "maximum retry count" in msg
+        or "duplicate key value" in msg
+        or "could not serialize access" in msg
+        or "Transaction conflict" in msg
+    )
 
 
 def _write_with_retry(sink, consolidated):

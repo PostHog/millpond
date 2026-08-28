@@ -51,7 +51,12 @@ jobs:
         #   - opentelemetry-*      Apache-2.0
         #   - protobuf             BSD-3-Clause
         #   - pyducklake           Apache-2.0 (ours; PEP 639-only metadata)
-        # Remove entries here as the action's PEP 639 parser catches up.
+        # Substantive (non-parser) exemptions:
+        #   - psycopg, psycopg-binary  LGPL family: we link, don't modify;
+        #     LGPL terms are satisfied — PostHog-cloud-infra precedent,
+        #     mirrored from viaduck's ci.yaml.
+        # Remove entries here as the action's PEP 639 parser catches up
+        # (parser-noise entries only; the LGPL exemption is permanent).
         allow-dependencies-licenses: >-
           pkg:pypi/pyducklake,
           pkg:pypi/googleapis-common-protos,
@@ -61,7 +66,9 @@ jobs:
           pkg:pypi/opentelemetry-proto,
           pkg:pypi/opentelemetry-sdk,
           pkg:pypi/opentelemetry-semantic-conventions,
-          pkg:pypi/protobuf
+          pkg:pypi/protobuf,
+          pkg:pypi/psycopg,
+          pkg:pypi/psycopg-binary
 
   build:
     runs-on: ubuntu-latest

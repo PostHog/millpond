@@ -311,6 +311,14 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     """Initialize DuckDB with httpfs and ducklake, attach the catalog."""
     conn = duckdb.connect(cfg.ducklake_connection)
 
+    # Pin the session timezone: the partition transforms
+    # (year/month/day/hour on the TIMESTAMPTZ _inserted_at) bind the SESSION
+    # timezone at write time, so partition values are UTC only if the session
+    # is. Today that holds merely de-facto (slim base image, no TZ config);
+    # pin it so a base-image or env change can never silently re-bucket every
+    # partition (drop-partitions composes partition times as UTC).
+    conn.execute("SET TimeZone = 'UTC'")
+
     # S3 config from env vars
     for key in (
         "DUCKDB_S3_ENDPOINT",

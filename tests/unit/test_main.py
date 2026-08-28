@@ -100,6 +100,15 @@ _DUCKLAKE_CONTENTION_MESSAGES = [
     # Postgres serialization failure under SERIALIZABLE isolation —
     # unlikely on duckling RDS today but cheap to classify
     "ERROR: could not serialize access due to concurrent update",
+    # DuckLake conflict-checker hard abort (can_retry=false) after a
+    # concurrent snapshot's change token — e.g. a drop-partitions catalog
+    # write ending files under an in-flight insert; absorbed by retry on a
+    # fresh baseline. Verbatim fork wording (ducklake_transaction_state.cpp
+    # ConflictCheck) so a wording change that drops the prefix is caught.
+    (
+        'Transaction conflict - attempting to insert into table with index "5"'
+        " - but another transaction has deleted from it"
+    ),
 ]
 
 

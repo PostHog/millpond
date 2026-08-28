@@ -93,6 +93,27 @@ class TestEscapeLibpq:
         assert _escape_libpq(None) == "''"
 
 
+class TestConnect:
+    def test_timezone_pinned_utc(self):
+        """Partition transforms (year/month/day/hour on the TIMESTAMPTZ
+        _inserted_at) bind the SESSION TimeZone at write time. The pin keeps
+        a base-image or env change from silently re-bucketing every
+        partition — drop-partitions composes partition times as UTC."""
+        from millpond.ducklake import connect
+
+        cfg = MagicMock()
+        cfg.ducklake_connection = ":memory:"
+        cfg.ducklake_max_retry_count = 100
+        cfg.duckdb_memory_limit = None
+        cfg.ducklake_data_path = "s3://bucket/prefix"
+        conn = MagicMock()
+        with patch("millpond.ducklake.duckdb") as mock_duckdb:
+            mock_duckdb.connect.return_value = conn
+            assert connect(cfg) is conn
+        statements = [c.args[0] for c in conn.execute.call_args_list]
+        assert any(s.strip() == "SET TimeZone = 'UTC'" for s in statements)
+
+
 def _sample_batch() -> pa.Table:
     return pa.table({"col_a": [1], "col_b": ["x"]})
 
