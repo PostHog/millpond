@@ -88,7 +88,12 @@ advisory; every drop re-verifies in its own transaction:
   string comparison. Cutoff aligned to the spec's finest time grain.
 - **Structural floor, applied at selection** (safe there: snapshot ids only
   move forward): never select files with `begin_snapshot` newer than the
-  newest snapshot older than (retention − 48h).
+  newest snapshot older than (retention − 48h). **Implementation note
+  (2026-08-28):** under megaduck's 3-day expire no snapshot row that old
+  survives, so the floor degenerates to `min(surviving snapshot_id) − 1` —
+  the expiry horizon (~3d) becomes the effective floor, not 12d. The cursor
+  guard is the primary straggler protection; the floor is defense-in-depth.
+  (v3's original formulation is vacuous wherever expire < retention − 48h.)
 - **One leaf per operation — no batching in the mutating path**: the
   drop op REQUIRES a fully resolved partition tuple
   (e.g. `team_id=2,year=2026,month=8,day=1,hour=13`) and drops exactly
@@ -100,11 +105,16 @@ advisory; every drop re-verifies in its own transaction:
 - **Campaigns are a driver loop over a read-only enumeration**: a
   companion `list-droppable-partitions` subcommand runs the aggregated
   fpv pass once (read-only) and emits the leaf manifest — tuple,
-  file-id list, file/row/byte counts, max begin_snapshot — for every
-  leaf wholly below the cutoff. The campaign driver (or the operator)
-  loops the drop op over the manifest, oldest first. Per-leaf drops
-  re-verify everything in-txn from the id list (indexed lookups; the
-  manifest is advisory like all selection). Progress is per-leaf
+  structured values, file/row/byte counts, max begin_snapshot — for
+  every leaf wholly below the cutoff. The campaign driver (or the
+  operator) loops the drop op over the manifest, oldest first.
+  **Implementation note (2026-08-28):** per-leaf drops re-SELECT by
+  tuple (indexed lookups) rather than consuming a manifest id list —
+  fresher, and equivalent because the floor excludes all
+  post-enumeration arrivals; manifest file-id lists are audit-only and
+  opt-in (`--with-file-ids`), since they're tens-hundreds of MB of dead
+  JSON at campaign scale. The manifest remains advisory like all
+  selection; everything re-verifies in-txn. Progress is per-leaf
   durable, resumable, and trivially rate-limited.
 - **Guard interaction**: the fresh per-invocation cursor guard applies
   to the WHOLE leaf — if any member file is guard-ineligible
