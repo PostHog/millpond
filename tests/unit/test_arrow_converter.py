@@ -144,6 +144,37 @@ class TestConvert:
         assert len(table) == 2
         assert table.schema.field("employee_count").type == pa.string()
 
+    def test_large_int_in_float_field_converts_lossily(self):
+        """An int above 2^53 in a float-inferred field must not crash the batch.
+
+        The session features topic emits float aggregates as integers when
+        whole; one record carried an integer above 2^53, and PyArrow refuses
+        the inexact int-to-double conversion in from_pylist. The converter
+        pre-casts ints to float when the inferred field type is floating —
+        nearest-double is the wanted semantics for a floating measure.
+        """
+        huge = 130184854372975800  # > 2^53, not exactly representable
+        messages = [
+            orjson.dumps({"mouse_sum_x": 1.5}),
+            orjson.dumps({"mouse_sum_x": huge}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert len(table) == 2
+        assert pa.types.is_floating(table.schema.field("mouse_sum_x").type)
+        assert table.column("mouse_sum_x").to_pylist() == [1.5, float(huge)]
+
+    def test_whole_int_in_float_field_stays_float(self):
+        """Whole-number ints in a float-inferred field become floats, not strings."""
+        messages = [
+            orjson.dumps({"velocity": 0.25}),
+            orjson.dumps({"velocity": 3}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert pa.types.is_floating(table.schema.field("velocity").type)
+        assert table.column("velocity").to_pylist() == [0.25, 3.0]
+
     def test_large_integer_precision_preserved(self):
         """Integers > 2^53 must not lose precision via float64 cast."""
         large_id = 2**53 + 1  # 9007199254740993 — not representable in float64
@@ -197,9 +228,7 @@ class TestDropNullTypedColumns:
     """
 
     def test_drops_pa_null_column(self):
-        table = pa.table(
-            {"a": pa.array([None, None], pa.null()), "b": ["x", "y"]}
-        )
+        table = pa.table({"a": pa.array([None, None], pa.null()), "b": ["x", "y"]})
         out = _drop_null_typed_columns(table)
         assert out.column_names == ["b"]
 
