@@ -417,14 +417,49 @@ def _flush(
         metrics.last_committed_offset.labels(partition=str(tp.partition)).set(tp.offset)
 
 
-def _update_lag_metrics(kafka, tp_offsets):
-    """Sample watermark offsets for lag metrics. Called periodically, not on every flush."""
-    for tp in tp_offsets:
+def _update_lag_metrics(kafka, admin, tp_offsets, auto_offset_reset):
+    """Refresh millpond_consumer_lag for every assigned partition.
+
+    Called periodically, not on every flush. Partitions that delivered
+    since the last flush use their flushed positions. Idle partitions fall
+    back to the librdkafka fetch position, then the committed offset, then
+    the auto.offset.reset target. Without the idle refresh, a partition
+    with zero deliveries keeps a frozen gauge for the whole pod lifetime
+    (PostHog/millpond#133). Watermarks come from one batched AdminClient
+    query instead of a per-partition consumer RPC.
+    """
+    positions = {tp.partition: tp.offset for tp in tp_offsets}
+    try:
+        assigned = kafka.assignment()
+    except Exception:
+        assigned = []
+    idle = [tp for tp in assigned if tp.partition not in positions]
+    if idle:
         try:
-            _lo, hi = kafka.get_watermark_offsets(tp, timeout=5)
-            metrics.consumer_lag.labels(partition=str(tp.partition)).set(hi - tp.offset)
+            for ptp in kafka.position(idle):
+                if ptp.offset >= 0:
+                    positions[ptp.partition] = ptp.offset
         except Exception:
-            pass  # best-effort lag tracking
+            pass  # fall through to committed, then the reset target
+        unresolved = [tp for tp in idle if tp.partition not in positions]
+        if unresolved:
+            try:
+                for ctp in kafka.committed(unresolved, timeout=5):
+                    if ctp.error is None and ctp.offset >= 0:
+                        positions[ctp.partition] = ctp.offset
+            except Exception:
+                pass  # the reset-target fallback below still applies
+    query = list(tp_offsets) + idle
+    if not query:
+        return
+    watermarks = consumer.query_watermarks(admin, query)
+    for partition, (low, high) in watermarks.items():
+        position = positions.get(partition)
+        if position is None:
+            # Fresh and never-fetched: librdkafka will start at the reset
+            # target on first fetch, so report lag from that position.
+            position = high if auto_offset_reset == "latest" else low
+        metrics.consumer_lag.labels(partition=str(partition)).set(max(0, high - position))
 
 
 def main():
@@ -474,6 +509,7 @@ def main():
         sink = ducklake.DuckLakeSink(cfg)
         log.info("Sink ready: table=%s", cfg.table_label)
         kafka = consumer.create(cfg)
+        lag_admin = consumer.make_admin_client(cfg)
         log.info("Kafka consumer created, partitions assigned")
         backpressure.init(cfg.consume_batch_size)
 
@@ -581,7 +617,7 @@ def main():
                     tp_offsets = [
                         TopicPartition(topic, partition, offset + 1) for (topic, partition), offset in offsets.items()
                     ]
-                    _update_lag_metrics(kafka, tp_offsets)
+                    _update_lag_metrics(kafka, lag_admin, tp_offsets, cfg.auto_offset_reset)
                     last_lag_sample = now
 
                 pending.clear()

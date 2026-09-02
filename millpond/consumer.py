@@ -111,7 +111,7 @@ def compute_assignment(partition_count: int, replica_count: int, ordinal: int) -
 _RECOVERY_TIMEOUT_S = 10.0
 
 
-def _query_watermarks(admin: AdminClient, tps: list[TopicPartition]) -> dict[int, tuple[int, int]]:
+def query_watermarks(admin: AdminClient, tps: list[TopicPartition]) -> dict[int, tuple[int, int]]:
     """Batched watermark fetch via AdminClient.list_offsets.
 
     Returns dict[partition_id, (low, high)]. Partitions whose
@@ -175,8 +175,9 @@ def _recover_stale_committed_offsets(consumer: Consumer, cfg: Config, partitions
          `auto.offset.reset` apply normally on first fetch is the correct
          fresh-consumer behaviour. Partitions whose committed-query carries an
          error are skipped (we'd otherwise read garbage from `.offset`).
-      2. Batched query of [low, high] watermarks for every remaining partition
-         via AdminClient.list_offsets (two RPCs, not 1-per-partition).
+      2. Batched query of [low, high] watermarks via AdminClient.list_offsets
+         (two RPCs, not 1-per-partition). Fresh partitions are included so
+         gauge seeding covers them; only committed ones enter the stale check.
       3. If committed >= low the offset is still within retention; do nothing.
       4. Committed < low: stale. Commit the `auto.offset.reset` target —
          `low` for "earliest", `high` for "latest". This is the same position
@@ -206,9 +207,13 @@ def _recover_stale_committed_offsets(consumer: Consumer, cfg: Config, partitions
         log.warning("Skipping stale-offset recovery: failed to query committed offsets", exc_info=True)
         return
 
-    # Filter to partitions that actually need a watermark check.
+    # Split partitions: committed ones need the stale check, fresh ones
+    # (OFFSET_INVALID) skip recovery but still need watermarks so
+    # _seed_startup_gauges can seed their lag from the reset target.
+    # Excluding them here left every fresh partition without a gauge for
+    # the whole pod lifetime (PostHog/millpond#133).
     needs_watermark: list[TopicPartition] = []
-    n_fresh = 0
+    fresh: list[TopicPartition] = []
     n_error = 0
     for tp in committed:
         if tp.error is not None:
@@ -221,12 +226,13 @@ def _recover_stale_committed_offsets(consumer: Consumer, cfg: Config, partitions
             n_error += 1
             continue
         if tp.offset == OFFSET_INVALID:
-            n_fresh += 1
+            fresh.append(tp)
             continue
         needs_watermark.append(tp)
+    n_fresh = len(fresh)
 
     admin = AdminClient(_base_kafka_config(cfg))
-    watermarks = _query_watermarks(admin, [TopicPartition(tp.topic, tp.partition) for tp in needs_watermark])
+    watermarks = query_watermarks(admin, [TopicPartition(tp.topic, tp.partition) for tp in needs_watermark + fresh])
 
     to_recover: list[TopicPartition] = []
     n_in_retention = 0
@@ -290,6 +296,12 @@ def _recover_stale_committed_offsets(consumer: Consumer, cfg: Config, partitions
     _seed_startup_gauges(cfg, committed, watermarks, to_recover if commit_ok else [])
 
 
+def make_admin_client(cfg: Config) -> AdminClient:
+    """AdminClient for batched watermark queries. Startup recovery and the
+    periodic lag sample in main.py share this construction."""
+    return AdminClient(_base_kafka_config(cfg))
+
+
 def _seed_startup_gauges(
     cfg: Config,
     committed: list,
@@ -300,10 +312,10 @@ def _seed_startup_gauges(
     assigned partition with a known position so the dashboard isn't haunted by
     stale gauge values from prior pod runs.
 
-    main.py's _update_lag_metrics / _flush only set these gauges for partitions
-    that delivered messages in *this* pod's lifetime. For quiet partitions
-    (zero deliveries during a run) the gauges retain whatever previous pods
-    last set — which for the stale-offset case is an inflated lag value that
+    main.py's _flush only sets these gauges for partitions that delivered
+    messages in *this* pod's lifetime, and the periodic lag sample fills in
+    idle ones. Without seeding, the gauges retain whatever previous pods
+    last set until the first sample — which for the stale-offset case is an inflated lag value that
     keeps showing on the dashboard well after recovery has fixed
     __consumer_offsets. Seed here so the gauges read truth at startup.
 
