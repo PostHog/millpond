@@ -135,6 +135,36 @@ def _stringify_mixed_type_values(records: list[dict], schema: pa.Schema) -> list
     return patched
 
 
+def _floatify_integers_in_float_fields(records: list[dict], schema: pa.Schema) -> list[dict]:
+    """Cast int values to float for fields the schema types as floating.
+
+    JSON producers emit whole floats as integers. PyArrow accepts an int in
+    a double column only when the conversion is exact; an integer above
+    2**53 makes ``pa.Table.from_pylist`` raise ``ArrowInvalid`` and the
+    batch crashes before any column coercion runs. Python ``float()`` is
+    deliberately lossy here — these fields are floating-point measures, so
+    nearest-double is the wanted semantics. Records are only copied when a
+    cast is needed.
+    """
+    float_fields = {f.name for f in schema if pa.types.is_floating(f.type)}
+    if not float_fields:
+        return records
+
+    out = []
+    changed = False
+    for record in records:
+        needs = [k for k in float_fields if type(record.get(k)) is int]
+        if not needs:
+            out.append(record)
+            continue
+        new_record = dict(record)
+        for k in needs:
+            new_record[k] = float(new_record[k])
+        out.append(new_record)
+        changed = True
+    return out if changed else records
+
+
 def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
     """Serialize nested dicts and lists to JSON strings.
 
@@ -320,6 +350,7 @@ def convert(messages: list[bytes]) -> pa.Table | None:
     if patched is not records:
         # Mixed types were found and coerced — re-infer schema with string types
         schema = _build_schema(patched)
+    patched = _floatify_integers_in_float_fields(patched, schema)
     table = pa.Table.from_pylist(patched, schema=schema)
     table = _normalize_numeric_types(table)
     table = _drop_null_typed_columns(table)
