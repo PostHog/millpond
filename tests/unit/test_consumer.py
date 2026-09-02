@@ -688,6 +688,36 @@ class TestRecoverStaleCommittedOffsets:
         _cfg, _committed, _watermarks, recovered = mock_seed.call_args[0]
         assert recovered == []
 
+    @patch("millpond.consumer.metrics")
+    def test_fresh_partitions_seed_gauges_earliest(self, mock_metrics):
+        """Fresh partitions (OFFSET_INVALID) skip recovery but still get
+        watermarks, so seeding covers them (PostHog/millpond#133). Under
+        earliest, the seed position is low and the gauge shows the full
+        in-retention depth instead of never existing."""
+        cfg = _make_cfg(auto_offset_reset="earliest")
+        consumer = self._make_consumer(committed_offsets={0: OFFSET_INVALID, 1: 150})
+        gauges = {}
+        mock_metrics.consumer_lag.labels.side_effect = lambda partition: gauges.setdefault(partition, MagicMock())
+        with _FakeAdminContext(watermarks={0: (100, 200), 1: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0, 1])
+
+        consumer.commit.assert_not_called()
+        gauges["0"].set.assert_called_once_with(100)  # high - low: the full backlog
+        gauges["1"].set.assert_called_once_with(50)  # high - committed
+
+    @patch("millpond.consumer.metrics")
+    def test_fresh_partitions_seed_gauges_latest(self, mock_metrics):
+        """Under latest, a fresh partition starts at the head, so the seeded
+        lag is zero — present and truthful rather than absent."""
+        cfg = _make_cfg(auto_offset_reset="latest")
+        consumer = self._make_consumer(committed_offsets={0: OFFSET_INVALID})
+        gauges = {}
+        mock_metrics.consumer_lag.labels.side_effect = lambda partition: gauges.setdefault(partition, MagicMock())
+        with _FakeAdminContext(watermarks={0: (100, 200)}):
+            _recover_stale_committed_offsets(consumer, cfg, [0])
+
+        gauges["0"].set.assert_called_once_with(0)
+
 
 def _make_committed(committed_offsets: dict, errors: dict | None = None) -> list:
     """Build the `committed` list the seeder expects: SimpleNamespace entries

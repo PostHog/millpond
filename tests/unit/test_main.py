@@ -8,6 +8,7 @@ from confluent_kafka import KafkaException
 from millpond.main import (
     _convert_batch,
     _flush,
+    _update_lag_metrics,
     _write_with_retry,
 )
 
@@ -1023,3 +1024,78 @@ class TestConsumeTimeout:
 
         assert _consume_timeout(-5.0) == 0.1
         assert _consume_timeout(0.0) == 0.1
+
+
+class TestUpdateLagMetrics:
+    """_update_lag_metrics refreshes the lag gauge for every assigned
+    partition, not only the ones in the flushed batch — the runtime half of
+    PostHog/millpond#133. Watermarks come from one batched query via
+    consumer.query_watermarks."""
+
+    def _tp(self, partition, offset=-1001):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(topic="t", partition=partition, offset=offset, error=None)
+
+    def _run(self, kafka, tp_offsets, watermarks, auto_offset_reset="earliest"):
+        gauges = {}
+        with (
+            patch("millpond.main.metrics") as mock_metrics,
+            patch("millpond.consumer.query_watermarks", return_value=watermarks),
+        ):
+            mock_metrics.consumer_lag.labels.side_effect = lambda partition: gauges.setdefault(partition, MagicMock())
+            _update_lag_metrics(kafka, MagicMock(), tp_offsets, auto_offset_reset)
+        return gauges
+
+    def test_batch_partitions_use_flushed_positions(self):
+        kafka = MagicMock()
+        kafka.assignment.return_value = [self._tp(0)]
+        gauges = self._run(kafka, [self._tp(0, offset=150)], {0: (100, 200)})
+        gauges["0"].set.assert_called_once_with(50)
+        kafka.position.assert_not_called()
+
+    def test_idle_partition_uses_fetch_position(self):
+        kafka = MagicMock()
+        kafka.assignment.return_value = [self._tp(0), self._tp(1)]
+        kafka.position.return_value = [self._tp(1, offset=150)]
+        gauges = self._run(kafka, [self._tp(0, offset=190)], {0: (100, 200), 1: (100, 200)})
+        gauges["0"].set.assert_called_once_with(10)
+        gauges["1"].set.assert_called_once_with(50)
+        kafka.committed.assert_not_called()
+
+    def test_idle_partition_falls_back_to_committed(self):
+        kafka = MagicMock()
+        kafka.assignment.return_value = [self._tp(1)]
+        kafka.position.return_value = [self._tp(1)]  # OFFSET_INVALID
+        kafka.committed.return_value = [self._tp(1, offset=120)]
+        gauges = self._run(kafka, [], {1: (100, 200)})
+        gauges["1"].set.assert_called_once_with(80)
+
+    def test_fresh_idle_partition_uses_reset_target(self):
+        """No fetch position, no committed offset: report lag from the
+        auto.offset.reset target so deep-backlog partitions stay visible
+        while they wait their turn in the drain."""
+        kafka = MagicMock()
+        kafka.assignment.return_value = [self._tp(2)]
+        kafka.position.return_value = [self._tp(2)]
+        kafka.committed.return_value = [self._tp(2)]
+        gauges = self._run(kafka, [], {2: (100, 200)}, auto_offset_reset="earliest")
+        gauges["2"].set.assert_called_once_with(100)
+        gauges = self._run(kafka, [], {2: (100, 200)}, auto_offset_reset="latest")
+        gauges["2"].set.assert_called_once_with(0)
+
+    def test_kafka_errors_degrade_to_batch_only(self):
+        """assignment()/position() failures must not break the batch-partition
+        refresh — the sample stays best-effort."""
+        kafka = MagicMock()
+        kafka.assignment.side_effect = RuntimeError("broker down")
+        gauges = self._run(kafka, [self._tp(0, offset=150)], {0: (100, 200)})
+        gauges["0"].set.assert_called_once_with(50)
+
+    def test_no_partitions_no_query(self):
+        kafka = MagicMock()
+        kafka.assignment.return_value = []
+        with patch("millpond.consumer.query_watermarks") as qw:
+            with patch("millpond.main.metrics"):
+                _update_lag_metrics(kafka, MagicMock(), [], "earliest")
+            qw.assert_not_called()
