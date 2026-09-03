@@ -14,6 +14,9 @@ permissions:
 
 jobs:
   release:
+    # Only run in the canonical repo — forks must not push images, tags,
+    # or deployment dispatches.
+    if: github.repository == 'PostHog/millpond'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -103,9 +106,52 @@ jobs:
           MILLPOND_VERSION=${{ steps.next_tag.outputs.version }}
         tags: |
           ghcr.io/posthog/millpond:${{ steps.next_tag.outputs.tag }}
+          ghcr.io/posthog/millpond:${{ github.sha }}
           ghcr.io/posthog/millpond:latest
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    # --- Deploy: pin the pushed image by digest in PostHog/charts ---
+    # The production deployment must not follow mutable tags (:prod,
+    # :latest). Instead we record the manifest digest of the image built
+    # here in the charts state file (state/millpond.yaml) via a
+    # repository_dispatch. ArgoCD then rolls the pinned
+    # <commit>@sha256:<digest> reference with prod-approval gating.
+    # The :latest / :prod tag pushes above stay for back-compat until the
+    # charts-side cutover lands.
+
+    - name: Get image digest
+      id: digest
+      run: |
+        digest=$(docker buildx imagetools inspect --raw ghcr.io/posthog/millpond:${{ github.sha }} | sha256sum | awk '{print "sha256:"$1}')
+        echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+    - name: Get deployer token
+      id: deployer
+      uses: getsentry/action-github-app-token@d4b5da6c5e37703f8c3b3e43abb5705b46e159cc # v3.0.0
+      with:
+        app_id: ${{ secrets.GH_APP_CHARTS_DEPLOYER_APP_ID }}
+        private_key: ${{ secrets.GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY }}
+
+    - name: Trigger deployment via Charts repo
+      uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+      with:
+        token: ${{ steps.deployer.outputs.token }}
+        repository: PostHog/charts
+        event-type: commit_state_update
+        client-payload: |
+          {
+            "values": {
+              "image": {
+                "sha": "${{ github.sha }}@${{ steps.digest.outputs.digest }}"
+              }
+            },
+            "release": "millpond",
+            "commit": ${{ toJson(github.event.head_commit) }},
+            "repository": ${{ toJson(github.repository) }},
+            "labels": [],
+            "timestamp": "${{ github.event.head_commit.timestamp }}"
+          }
 
     - name: Create git tag
       env:

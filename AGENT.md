@@ -440,8 +440,9 @@ Every merge to `main` triggers `.github/workflows/release.yaml`:
 
 1. Auto-bumps patch version from latest git tag (`v0.0.1` → `v0.0.2`)
 2. Builds a source tarball (`millpond-v0.0.X.tar.gz`) containing `pyproject.toml`, `uv.lock`, and all source — attached to the GitHub release
-3. Builds and pushes Docker image to `ghcr.io/posthog/millpond:<tag>` and `:latest`
-4. Creates GitHub release with auto-generated changelog
+3. Builds and pushes Docker image to `ghcr.io/posthog/millpond:<tag>`, `:<commit-sha>`, and `:latest`
+4. Dispatches `commit_state_update` to PostHog/charts with the manifest digest, so `state/millpond.yaml` records `<commit>@sha256:<digest>` and ArgoCD rolls the pinned image (prod-approval gated). Deployment must not follow the mutable `:prod`/`:latest` tags.
+5. Creates GitHub release with auto-generated changelog
 
 The tarball is the primary artifact for external Docker builds (e.g. `posthog-cloud-infra`). It includes the lockfile so `uv sync --frozen` produces reproducible installs with pinned binary wheels. Do not distribute standalone wheels — they lack the lockfile and resolve unpinned deps from PyPI.
 
