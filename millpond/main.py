@@ -23,9 +23,9 @@ from millpond import (
 log = logging.getLogger(__name__)
 
 _LAG_SAMPLE_INTERVAL_S = 60.0  # how often to query watermark offsets for lag metrics
-_HEARTBEAT_INTERVAL_S = 60.0  # periodic log when idle (well under 300s liveness timeout)
+_HEARTBEAT_INTERVAL_S = 60.0  # periodic log when idle (well under 480s liveness timeout)
 # Longest a single consume() may block. record_poll() runs only after consume
-# returns, and server.health marks the process dead at max_poll_age_s=300 —
+# returns, and server.health marks the process dead at max_poll_age_s=480 —
 # so a consume timeout derived from a large FLUSH_INTERVAL_MS (e.g. 10min)
 # would starve the liveness probe on a quiet topic and SIGKILL the pod.
 # 60s also keeps the idle heartbeat cadence honest.

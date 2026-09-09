@@ -11,7 +11,8 @@ log = logging.getLogger(__name__)
 class _HealthState:
     """Tracks recency of poll and flush for health checks."""
 
-    def __init__(self, max_poll_age_s: float = 300):
+    # Allow slow writes to finish while staying below Kafka's 600s max poll interval.
+    def __init__(self, max_poll_age_s: float = 480):
         self.max_poll_age_s = max_poll_age_s
         self._last_poll: float = 0
         self._last_flush: float = 0
