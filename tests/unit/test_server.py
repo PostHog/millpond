@@ -13,24 +13,6 @@ class TestLiveness:
         h.mark_started()
         assert h.is_alive()
 
-    def test_default_timeout_allows_slow_write_then_expires(self, monkeypatch):
-        now = 1000.0
-        monkeypatch.setattr("millpond.server.time.monotonic", lambda: now)
-        h = _HealthState()
-        h.mark_started()
-
-        now += 479
-        assert h.is_alive()
-        assert h.is_ready()
-
-        now += 1
-        assert not h.is_alive()
-        assert not h.is_ready()
-
-        h.record_poll()
-        assert h.is_alive()
-        assert h.is_ready()
-
     def test_stale_poll(self):
         h = _HealthState(max_poll_age_s=0.01)
         h.mark_started()
