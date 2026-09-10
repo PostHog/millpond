@@ -749,6 +749,23 @@ def _run_query(
     if liveness is not None:
         liveness.current_query_start = t0
     try:
+        # Explicit transaction bracket, NOT for atomicity (these are
+        # single read-only statements) but for remote-connection hygiene.
+        # Under autocommit, duckdb-postgres ends the REMOTE transaction
+        # lazily: after a statement completes, the attached-Postgres
+        # connection sits in its REPEATABLE READ transaction ("idle in
+        # transaction" in pg_stat_activity) until the next statement
+        # reuses it — for this daemon, the entire inter-query interval
+        # (minutes). An idle-in-transaction snapshot on the shared
+        # catalog pins vacuum and lengthens every writer's OCC conflict
+        # window. An explicit COMMIT ends the remote transaction eagerly
+        # (verified against megaduck 2026-09-10: bare scan left the
+        # connection in-transaction for the full idle window;
+        # pg_pool_max_connections=0 did NOT help — the primary
+        # connection is exempt from the pool; a BEGIN/COMMIT bracket
+        # returned it clean). Safe here: the scheduler is strictly
+        # serial on this connection.
+        conn.execute("BEGIN")
         cur = None
         if q.server_sql is not None:
             # Server-side first (see Query.server_sql). Bind/catalog errors
@@ -761,6 +778,17 @@ def _run_query(
                     f"{ducklake_maintenance._sql_string_literal(q.server_sql)})"
                 )
             except (duckdb.BinderException, duckdb.CatalogException) as e:
+                # The failed statement may have aborted the explicit
+                # transaction; reopen it so the fallback runs cleanly.
+                # ROLLBACK is best-effort: depending on the duckdb
+                # version the failed statement either aborts the
+                # transaction (ROLLBACK required) or unwinds it
+                # (ROLLBACK raises "no transaction is active").
+                try:
+                    conn.execute("ROLLBACK")
+                except duckdb.Error:
+                    pass
+                conn.execute("BEGIN")
                 if q.name not in _SERVER_SQL_FALLBACK_LOGGED:
                     _SERVER_SQL_FALLBACK_LOGGED.add(q.name)
                     log.info("query %s: server-side form unavailable (%s); using local metadata attach", q.name, e)
@@ -768,6 +796,10 @@ def _run_query(
             cur = conn.execute(q.sql)
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
+        # Commit as soon as the cursor is drained: gauge bookkeeping
+        # below must not extend the remote transaction's lifetime, and a
+        # gauge-side exception must not leave the transaction open.
+        conn.execute("COMMIT")
         try:
             label_idx = [cols.index(name) for name in q.labels]
             value_idx = [cols.index(name) for name in q.values]
@@ -795,6 +827,13 @@ def _run_query(
         log.debug("query %s: %d rows in %.3fs", q.name, len(rows), elapsed)
         return True
     except Exception:
+        # Close any transaction the failure left open (including the
+        # explicit bracket above). Best-effort: on a dead connection the
+        # ROLLBACK fails too, and the reconnect path owns recovery.
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001
+            pass
         log.exception("query %s failed", q.name)
         self_metrics.errors.labels(tenant, q.name).inc()
         return False

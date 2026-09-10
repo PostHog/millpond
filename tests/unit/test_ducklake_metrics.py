@@ -269,6 +269,58 @@ class TestRunQuery:
 
         assert _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "t_mismatch"}) == 1
 
+    def test_success_leaves_no_open_transaction(self, conn, registry):
+        # Regression (2026-09-10): under autocommit, duckdb-postgres ended
+        # the remote transaction lazily, so the daemon's attached-Postgres
+        # connection sat "idle in transaction" on the shared catalog for
+        # the whole inter-query interval. _run_query now brackets every
+        # query in an explicit BEGIN/COMMIT. A leftover open transaction
+        # makes the BEGIN below raise ("cannot start a transaction within
+        # a transaction").
+        q = dm.Query(name="t_txn", help="t", sql="SELECT 1 AS n", interval_seconds=60, labels=[], values=["n"])
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is True
+        conn.execute("BEGIN")
+        conn.execute("COMMIT")
+
+    def test_failure_leaves_no_open_transaction(self, conn, registry):
+        # The failure path must roll the bracket back, not leak it.
+        q = dm.Query(
+            name="t_txn_fail", help="t", sql="SELECT * FROM no_such_table", interval_seconds=60, labels=[], values=["n"]
+        )
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is False
+        conn.execute("BEGIN")
+        conn.execute("COMMIT")
+
+    def test_server_sql_fallback_still_works_inside_bracket(self, conn, registry):
+        # The server-side form fails on a lake without the pg attach
+        # (BinderException / CatalogException). The bracket must survive
+        # that failed statement and run the local fallback in a fresh
+        # transaction.
+        conn.execute("CREATE TABLE fb (n INTEGER)")
+        conn.execute("INSERT INTO fb VALUES (7)")
+        q = dm.Query(
+            name="t_fallback",
+            help="t",
+            sql="SELECT n FROM fb",
+            server_sql="SELECT n FROM fb",
+            interval_seconds=60,
+            labels=[],
+            values=["n"],
+        )
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is True
+        assert _gauge_value(registry, "t_fallback_n") == 7.0
+        conn.execute("BEGIN")
+        conn.execute("COMMIT")
+
 
 # ---------------------------------------------------------------------------
 # Built-in: ducklake_pending_deletes — validate the SQL shape against an
