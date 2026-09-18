@@ -25,7 +25,7 @@ import pytest
 from pyarrow import fs as pafs
 from pyhoglake import IncarnationChangedError, NotFoundError, ValidationError
 
-from millpond.hoglake import HoglakeSink, is_retryable
+from millpond.hoglake import HoglakeSink, is_retryable, table_schema_for_batch
 from millpond.main import _flush
 from tests.hoglake_stack import stack
 
@@ -440,6 +440,40 @@ class TestRestartAndReset:
             assert is_retryable(caught.value) is True
             sink.reset_caches()
             assert sink.write(_batch(3)) == 3
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+
+    def test_external_drop_recreate_is_refused_not_published(self, hog_stack, client):
+        # The RECREATE case, which the drop-only test above cannot reach.
+        # Once the name resolves again, every check that was supposed to
+        # catch this passed: `_prepare`'s own `table.info()` adopts the
+        # new incarnation into the pyhoglake handle, and a defaulted
+        # `expected_table_uuid` is then read off that same refreshed
+        # value — so the client pre-flight, the server's guard and
+        # `_check_destination_still_ours` all compared fresh against
+        # fresh. The commit landed on a table this sink had never
+        # reconciled, and the only thing still naming the dead one was
+        # the idempotency key.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(_batch(2), kafka_offsets=(("events", 0, 0, 1),)) == 2
+            dead = _table(client, cfg).table_uuid
+            _table(client, cfg).drop()
+            ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
+            reborn = ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
+            assert reborn.table_uuid != dead
+
+            with pytest.raises(IncarnationChangedError) as caught:
+                sink.write(_batch(2), kafka_offsets=(("events", 0, 2, 3),))
+            assert is_retryable(caught.value) is True
+            assert _record_count(client, cfg) == 0, "the flush published across incarnations"
+
+            # Retryable, so main.py resets and re-resolves — which is
+            # also what puts the recreated table through _reconcile_specs.
+            sink.reset_caches()
+            assert sink.write(_batch(3), kafka_offsets=(("events", 0, 2, 4),)) == 3
         finally:
             sink.close()
         assert _record_count(client, cfg) == 3
