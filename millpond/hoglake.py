@@ -68,6 +68,7 @@ import logging
 import os
 import tempfile
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import httpx
@@ -339,7 +340,16 @@ def _is_answered_refusal(exc: BaseException) -> bool:
     return isinstance(exc, HoglakeError) and exc.status_code in (409, 422)
 
 
-def _count_orphans(count: int, why: str) -> None:
+# How many orphan uris one warning line will carry. The fanout is one
+# file per observed partition tuple, so a `team_id`-partitioned flush can
+# orphan hundreds at once and the whole list would be the log line. The
+# cap is a LOG concern only — the metric books every object either way —
+# and the line says how many it left out so nobody reads a truncated list
+# as the complete one.
+_ORPHAN_URIS_LOGGED = 20
+
+
+def _count_orphans(count: int, why: str, uris: Sequence[str] = ()) -> None:
     """Record parquet objects uploaded to the lake that no commit
     references.
 
@@ -347,10 +357,31 @@ def _count_orphans(count: int, why: str) -> None:
     counter is the whole observability story for them; an uncounted
     orphan path is storage nobody can find. Every path that can leave one
     routes through here.
+
+    `uris` name the objects, and naming them is the point. The obvious
+    alternative — "sweep the `{idempotency_key}/` prefix" — is WRONG and
+    was shipped on this branch: pyhoglake names objects
+    `{uuid4}-{index}.parquet` under that prefix, so a retry under the
+    SAME key writes fresh names beside the old ones. An operator who
+    sweeps the prefix after a later attempt succeeded deletes live,
+    committed files. The uris are the only safe unit of cleanup.
     """
     if count <= 0:
         return
-    log.warning("Orphaned %d uploaded parquet file(s) in the lake: %s", count, why)
+    if uris:
+        listed = list(uris[:_ORPHAN_URIS_LOGGED])
+        omitted = len(uris) - len(listed)
+        log.warning(
+            "Orphaned %d uploaded parquet file(s) in the lake: %s. Delete these objects by name, "
+            "never the prefix they share (a retry under the same idempotency key writes new names "
+            "beside them): %s%s",
+            count,
+            why,
+            ", ".join(listed),
+            f" — and {omitted} more not listed here" if omitted else "",
+        )
+    else:
+        log.warning("Orphaned %d uploaded parquet file(s) in the lake: %s", count, why)
     metrics.hoglake_orphaned_files_total.inc(count)
 
 
@@ -897,61 +928,48 @@ class HoglakeSink:
                     # finally runs against the table we are writing to.
                     expected_table_uuid=self._table_uuid,
                 )
-            except ValidationError:
-                # ZERO, and never `len(files) - 1`. pyhoglake validates
-                # file i and THEN uploads file i, and every file in this
-                # fanout is a slice of ONE aligned table: the same
-                # schema and field ids, the same partition arity (both
-                # come from the `info` this method resolved), and every
-                # group non-empty (each is the rows carrying one
-                # observed partition tuple). So each of pyhoglake's
-                # three prepare-side refusals — "schema/field IDs
-                # differ", "partition arity differs", "must contain
-                # rows" — is a property of the whole set rather than of
-                # one file, and can only fire at index 0, before a byte
-                # is uploaded.
+            except Exception as e:
+                # ONE arm, because there is now one question and
+                # pyhoglake answers it. Since 1.1.1 every exception
+                # leaving `prepare_append_files` carries what it had
+                # already written: `uploaded_files` is how many uploads
+                # CLOSED cleanly, `uploaded_uris` names exactly those.
+                # A refusal raised before the first upload carries 0 and
+                # (), so the same read covers the validation refusals,
+                # the catalog-side failures and the object-store ones
+                # alike.
                 #
-                # The concurrent-`add_column` race `write()` self-heals
-                # IS this refusal: it fires, the re-aligned flush then
-                # succeeds, and booking N-1 orphans for it sent an
-                # operator sweeping for objects that were never written.
-                raise
-            except (HoglakeError, httpx.HTTPError, ValueError):
-                # Also zero. Everything `prepare_append_files` does over
-                # the network or against the catalog happens before the
-                # upload loop — the idempotency key's UUID parse
-                # (ValueError), the read-snapshot refresh, and the
-                # incarnation pre-flight (HoglakeError / httpx, and
-                # `IncarnationChangedError` among them) — and the
-                # uploads themselves go through pyarrow's filesystem,
-                # which reports failure as OSError, never as either of
-                # these. A 503 from a convoyed catalog, a read timeout
-                # or a 404 on a dropped table therefore wrote nothing,
-                # and counting them meant up to (retries x fanout)
-                # phantom orphans per flush.
-                raise
-            except Exception:
-                # The one genuinely unknown case: an OSError out of the
-                # local parquet read or the S3 upload, which may have
-                # left some of the fanout in object storage. pyhoglake
-                # reports no progress information, so every count
-                # available here is partly invented — and a counter that
-                # books storage nobody wrote is worse than one that
-                # misses some, because it sends operators sweeping for
-                # objects that do not exist. The uncertainty goes in the
-                # log, which can say "up to" and name the prefix that
-                # makes the sweep decidable; the metric does not move.
-                log.warning(
-                    "Prepared upload of %s.%s failed partway through a %d-file fanout: up to %d "
-                    "parquet object(s) may have been written and left unreferenced under the "
-                    "%s/ prefix of the table's data path. They are deliberately not counted in "
-                    "millpond_hoglake_orphaned_files_total, which never books storage that "
-                    "cannot be shown to have been written.",
-                    self._cfg.hoglake_namespace,
-                    self._cfg.hoglake_table,
-                    len(files),
-                    len(files),
-                    key,
+                # This used to be three arms whose only content was an
+                # argument about where in someone else's control flow
+                # each failure could fire ("a validation refusal is a
+                # property of the whole set, so it fires at index 0";
+                # "the catalog work all precedes the upload loop"). The
+                # arguments were re-derived from pyhoglake's source and
+                # happened to hold, but deducing another library's
+                # progress is exactly the defect class this branch
+                # already shipped twice — once booking a whole fanout
+                # that was never uploaded, once booking N-1 for a
+                # refusal that self-heals into a successful flush. Read
+                # the number; do not reconstruct it.
+                #
+                # getattr with defaults, and not only for an older
+                # client: pyhoglake stamps best-effort and suppresses
+                # the AttributeError from an exception type whose
+                # __slots__ refuse the attributes. Zero is then the
+                # honest answer, and raising an AttributeError over a
+                # live object-store failure is not.
+                #
+                # The file that FAILED is in neither number — its upload
+                # may never have opened, or may have closed badly over a
+                # TRUNCATED object that really is there. So the count is
+                # a lower bound on objects present, and the log says so.
+                _count_orphans(
+                    int(getattr(e, "uploaded_files", 0)),
+                    f"the prepared upload of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} "
+                    f"failed partway through a {len(files)}-file fanout. The file it failed on is not "
+                    "among these and is not counted, but a failed close can leave a truncated object, "
+                    "so treat it as possibly present too",
+                    getattr(e, "uploaded_uris", ()),
                 )
                 raise
         # Blind append, exactly as `Table.append` does it.
@@ -1141,7 +1159,7 @@ class HoglakeSink:
             len(files),
         )
         metrics.hoglake_commit_replays_total.labels(outcome="already_published").inc()
-        _count_orphans(len(files), "the offset range was already published")
+        _count_orphans(len(files), "the offset range was already published", [f["path"] for f in files])
         self._clear_prepared()
         return 0
 
@@ -1168,7 +1186,7 @@ class HoglakeSink:
             len(files),
             why,
         )
-        _count_orphans(len(files), why)
+        _count_orphans(len(files), why, [f["path"] for f in files])
         self._clear_prepared()
 
     def _clear_prepared(self) -> None:

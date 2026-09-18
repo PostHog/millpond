@@ -240,6 +240,24 @@ def _batch(**cols) -> pa.Table:
     return pa.table(cols) if cols else pa.table({"uuid": ["a"], "event": ["e"], "team_id": [1], "properties": ["{}"]})
 
 
+# The shape pyhoglake really builds: `{data_path}/data/{ns}/{table}/
+# {idempotency_key}/{uuid4}-{index}.parquet`. The uuid4 in every name is
+# why the prefix is not sweepable — a retry under the SAME key lands new
+# names beside these.
+_URI_BASE = "s3://bucket/lake/data/analytics/events/9a1f0f0e-0000-0000-0000-00000000dead"
+
+
+def _stamped(exc: BaseException, count: int, uris: tuple[str, ...] | None = None) -> BaseException:
+    """An exception as pyhoglake>=1.1.1 hands it back from
+    `prepare_append_files`: `uploaded_files` is how many uploads CLOSED
+    cleanly and `uploaded_uris` names exactly those, in order. A refusal
+    raised before the first upload carries 0 / ()."""
+    exc.uploaded_files = count
+    exc.uploaded_uris = uris if uris is not None else tuple(f"{_URI_BASE}/u{i}-{i}.parquet" for i in range(count))
+    assert len(exc.uploaded_uris) == count, "pyhoglake keeps these two consistent; so must the fake"
+    return exc
+
+
 def _rows(n: int) -> pa.Table:
     """An n-row events batch."""
     return pa.table({"uuid": [f"u{i}" for i in range(n)], "team_id": list(range(n))})
@@ -1532,22 +1550,17 @@ class TestRefusedCommitsDropThePayload:
     )
     @pytest.mark.parametrize("rows", [1, 3])
     @patch("millpond.hoglake.metrics")
-    def test_a_prepare_refusal_is_never_counted_whatever_the_fanout(self, mock_metrics, rows, detail):
-        # pyhoglake validates file i and THEN uploads file i, and every
-        # file millpond hands it is a slice of ONE aligned table: same
-        # schema and field ids, same partition arity, every group
-        # non-empty. So each of its three refusals is a property of the
-        # whole set and fires at index 0, before a byte goes up —
-        # whether the fanout is one file or three.
-        #
-        # The previous shape of this test asserted N-1 for a 3-file
-        # fanout, which is N-1 phantom orphans every time: a concurrent
-        # add_column trips this refusal, `write()` self-heals, the flush
-        # SUCCEEDS, and the operator is still sent sweeping for two
-        # objects that were never written.
+    def test_a_prepare_refusal_that_uploaded_nothing_counts_zero(self, mock_metrics, rows, detail):
+        # A pre-upload refusal comes back stamped 0 / (), and the sink
+        # books zero because it READ that — not because it reasoned
+        # about where in pyhoglake's loop the refusal fires. The
+        # reasoning is what this branch got wrong twice: an earlier
+        # shape asserted N-1 for a 3-file fanout, which is N-1 phantom
+        # orphans every time a concurrent add_column trips the refusal
+        # and `write()` self-heals into a flush that SUCCEEDS.
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        table.prepare_append_files.side_effect = ValidationError(detail, status_code=None)
+        table.prepare_append_files.side_effect = _stamped(ValidationError(detail, status_code=None), 0)
         with pytest.raises(ValidationError):
             s.write(
                 pa.table({"uuid": [f"u{i}" for i in range(rows)], "team_id": list(range(rows))}),
@@ -1567,38 +1580,127 @@ class TestRefusedCommitsDropThePayload:
     )
     @patch("millpond.hoglake.metrics")
     def test_a_prepare_that_fails_before_the_first_byte_is_not_counted(self, mock_metrics, exc):
-        # Everything prepare_append_files does over the network or
-        # against the catalog — the key's UUID parse, the read-snapshot
-        # refresh, the incarnation pre-flight — runs BEFORE the upload
-        # loop, and the upload itself is pyarrow's, which raises OSError
-        # rather than any of these. So a 503 from a convoyed catalog, a
-        # 404 on a dropped table, or a read timeout wrote zero bytes,
-        # and the retry ladder (8 attempts x an 8-way fanout) turned
-        # that into up to 64 phantom orphans a flush.
+        # The catalog-side failures — the key's UUID parse, the
+        # read-snapshot refresh, the incarnation pre-flight — all come
+        # back stamped zero, so the retry ladder (8 attempts x an 8-way
+        # fanout) cannot book 64 phantom orphans a flush.
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        table.prepare_append_files.side_effect = exc
+        table.prepare_append_files.side_effect = _stamped(exc, 0)
         with pytest.raises(type(exc)):
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
         mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
 
     @patch("millpond.hoglake.metrics")
-    def test_a_prepare_that_may_have_failed_mid_fanout_warns_without_counting(self, mock_metrics, caplog):
-        # The one case where objects really may be in storage: pyarrow's
-        # S3 upload failing partway through the fanout. pyhoglake does
-        # not report how far it got, so any number recorded here is
-        # partly invented — and a counter that books storage nobody
-        # wrote sends operators sweeping for nothing. The uncertainty
-        # goes in the log, with the prefix that makes the sweep
-        # decidable; the metric stays sound.
+    def test_a_prepare_that_failed_mid_fanout_counts_exactly_what_landed(self, mock_metrics, caplog):
+        # pyarrow's S3 upload failing partway through a fanout: two
+        # objects closed cleanly, the third raised. pyhoglake reports
+        # the two, so the sink books two — not the fanout width, not
+        # nothing.
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        table.prepare_append_files.side_effect = OSError("S3 reset midway")
+        uris = (f"{_URI_BASE}/aaaa-0.parquet", f"{_URI_BASE}/bbbb-1.parquet")
+        table.prepare_append_files.side_effect = _stamped(OSError("S3 reset midway"), 2, uris)
         with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(2)
+        assert "Orphaned 2 uploaded parquet file(s)" in caplog.text
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_orphan_log_names_the_uris_and_retracts_the_prefix_sweep(self, mock_metrics, caplog):
+        # Object names are `{uuid4}-{index}.parquet` under the
+        # `{idempotency_key}/` prefix, and a retry under the SAME key
+        # writes new names beside the old ones. So an operator who
+        # sweeps the prefix after a later attempt succeeds deletes live,
+        # committed files. The log names the objects, and says so.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        uris = (f"{_URI_BASE}/aaaa-0.parquet", f"{_URI_BASE}/bbbb-1.parquet")
+        table.prepare_append_files.side_effect = _stamped(OSError("S3 reset midway"), 2, uris)
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
+            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
+        for uri in uris:
+            assert uri in caplog.text
+        assert "never the prefix" in caplog.text
+        # The old advice — a fanout-width upper bound and the prefix as
+        # the thing to sweep — must be gone.
+        assert "up to" not in caplog.text
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_file_that_failed_is_uncounted_but_flagged_as_possibly_there(self, mock_metrics, caplog):
+        # A close that fails can leave a TRUNCATED object behind, and
+        # pyhoglake cannot name it. The count is therefore a lower bound
+        # on what is in storage, and the log has to say so or the sweep
+        # walks past a real object.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        uris = (f"{_URI_BASE}/aaaa-0.parquet",)
+        table.prepare_append_files.side_effect = _stamped(OSError("close failed"), 1, uris)
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
+            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        assert "truncated" in caplog.text
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_wide_fanout_logs_a_capped_list_and_says_what_it_omitted(self, mock_metrics, caplog):
+        # One line per flush, not one line per team. The cap is a log
+        # concern only: the metric still books every object.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        uris = tuple(f"{_URI_BASE}/f{i:03d}-{i}.parquet" for i in range(25))
+        table.prepare_append_files.side_effect = _stamped(OSError("S3 reset midway"), len(uris), uris)
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
+            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(25)
+        listed = [uri for uri in uris if uri in caplog.text]
+        assert len(listed) == hoglake._ORPHAN_URIS_LOGGED
+        assert listed == list(uris[: hoglake._ORPHAN_URIS_LOGGED])
+        assert f"{len(uris) - hoglake._ORPHAN_URIS_LOGGED} more" in caplog.text
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_older_client_without_the_attributes_counts_zero(self, mock_metrics, caplog):
+        # The floor is pyhoglake>=1.1.1, but the stamp is best effort at
+        # the source too: pyhoglake suppresses the AttributeError from an
+        # exception type whose __slots__ refuse it. Either way the read
+        # must degrade to zero, never to a second exception thrown over
+        # the first.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        bare = OSError("S3 reset midway")
+        assert not hasattr(bare, "uploaded_files")
+        table.prepare_append_files.side_effect = bare
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError) as caught:
+            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
+        assert caught.value is bare  # the original error, not an AttributeError over it
         mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
-        assert "up to 3" in caplog.text
-        assert "not counted" in caplog.text
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_discarded_payload_names_the_objects_it_orphans(self, mock_metrics, caplog):
+        # Retracting the prefix sweep took away the only way an operator
+        # could locate these, so the paths the payload already carries
+        # have to reach the log.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = CommitConflictError("commit_conflict", status_code=409)
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(CommitConflictError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        paths = [f["path"] for f in catalog.commit_prepared.call_args[0][0]["appends"][0]["files"]]
+        assert paths
+        for path in paths:
+            assert path in caplog.text
+        assert "never the prefix" in caplog.text
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_already_published_flush_names_the_objects_it_orphans(self, mock_metrics, caplog):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError(
+            "validation", status_code=422, detail="idempotency_key reused with a different request"
+        )
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 0
+        paths = [f["path"] for f in catalog.commit_prepared.call_args[0][0]["appends"][0]["files"]]
+        assert paths
+        for path in paths:
+            assert path in caplog.text
 
     @patch("millpond.hoglake.metrics")
     def test_close_counts_an_unpublished_payload(self, mock_metrics):
