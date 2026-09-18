@@ -75,14 +75,17 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:29093
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093,HOST://0.0.0.0:29092
+      # Empty-host listener form, per the apache/kafka image's own
+      # compose examples — the docker wrapper's storage-format step
+      # rejects 0.0.0.0 outright.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:29093,HOST://:29092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://127.0.0.1:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      CLUSTER_ID: millpond-hog-it-cluster-0001
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     ports:
       - "127.0.0.1:29092:29092"
     healthcheck:

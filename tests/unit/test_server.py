@@ -1,5 +1,6 @@
 import time
 
+from millpond import server
 from millpond.server import _HealthState
 
 
@@ -94,3 +95,24 @@ class TestStatusBody:
         body = h.status_body()
         assert "flush=" in body
         assert "flush=never" not in body
+
+
+class TestStartPort:
+    def test_env_port_honored(self, monkeypatch):
+        # MILLPOND_HTTP_PORT lets test harnesses (and any colocated
+        # deployment) move the metrics/health server off :8000 without
+        # changing the default behavior.
+        monkeypatch.setenv("MILLPOND_HTTP_PORT", "0")  # 0 = ephemeral
+        srv = server.start()
+        try:
+            assert srv.server_port != 8000
+        finally:
+            srv.shutdown()
+
+    def test_explicit_port_still_wins(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_HTTP_PORT", "0")
+        srv = server.start(port=0)
+        try:
+            assert srv.server_port != 8000
+        finally:
+            srv.shutdown()

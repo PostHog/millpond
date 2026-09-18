@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -104,7 +105,15 @@ def _make_handler():
     return Handler
 
 
-def start(port: int = 8000) -> HTTPServer:
+def start(port: int | None = None) -> HTTPServer:
+    """Start the metrics/health HTTP server.
+
+    Port resolution: explicit argument, else MILLPOND_HTTP_PORT, else
+    8000 (the historical default — charts and probes depend on it).
+    The env override exists for test harnesses running millpond as a
+    host process next to other services."""
+    if port is None:
+        port = int(os.environ.get("MILLPOND_HTTP_PORT", "8000"))
     server = HTTPServer(("", port), _make_handler())
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
