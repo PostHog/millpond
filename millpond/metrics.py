@@ -225,16 +225,29 @@ _hoglake_files_written_total = Counter(
     "Parquet files registered with the hoglake catalog",
     ["pipeline", "broker_source"],
 )
-# Hoglake destination only: commits resolved from the server's receipt
-# rather than by publishing. `outcome="already_published"` means this
-# flush's Kafka offset range was already in the lake under a different
-# registration — the pod died after the commit applied and before the
-# offsets committed, and the replay recognized it. Non-zero is healthy
-# (it is the duplicate that did NOT happen); a rising rate means pods
-# are dying mid-flush.
+# Hoglake destination only: commits that went out more than once. Two
+# outcomes, and the difference is the whole story:
+#
+#   outcome="replayed" — this process re-sent an uncertain commit (a lost
+#     response, a reset, a 503) and got a 200. The server either answered
+#     from its receipt or applied it then; either way the rows published
+#     exactly once and the retry did its job. This is the IN-PROCESS
+#     guarantee working, and it was previously invisible — a resolved
+#     replay was indistinguishable from a first publish.
+#
+#   outcome="already_published" — a NEW process rebuilt a flush whose
+#     boundary matched one already in the lake (same table incarnation,
+#     same complete offset range), so the server refused the rebuilt
+#     payload against its receipt and millpond published nothing. The pod
+#     died after a commit applied and before the offsets committed, and
+#     the replayed boundary happened to repeat. This is a duplicate that
+#     did NOT happen, not a guarantee: the boundary is not reproducible
+#     in general, so the SAME crash with a boundary that shifts by one
+#     record duplicates instead. A rising rate means pods are dying
+#     mid-flush; a flat zero does not mean no duplicates.
 _hoglake_commit_replays_total = Counter(
     "millpond_hoglake_commit_replays_total",
-    "Hoglake commits resolved from an existing receipt instead of publishing",
+    "Hoglake commits sent more than once, by how the resend resolved",
     ["pipeline", "broker_source", "outcome"],
 )
 # Hoglake destination only: parquet objects millpond uploaded and never
@@ -244,6 +257,15 @@ _hoglake_commit_replays_total = Counter(
 # them, so these objects are billed storage until an operator sweeps
 # them. Every one sits under the `{idempotency_key}/` prefix of its
 # table's data path, which is what makes the sweep tractable.
+#
+# Counts every path that can leave one: a prepare that fails partway
+# through the fanout upload, a commit the server refuses (409/422), a
+# rebuilt flush the receipt declines, a payload superseded by the next
+# flush, and a payload still unpublished at close(). The partial-upload
+# count is an upper bound — pyhoglake does not report how far it got —
+# except in the single-file case, where a validation refusal is known to
+# have uploaded nothing. The one orphan nobody can count is the one a
+# SIGKILL leaves between prepare and commit.
 _hoglake_orphaned_files_total = Counter(
     "millpond_hoglake_orphaned_files_total",
     "Parquet objects uploaded to the lake but never registered in a commit",

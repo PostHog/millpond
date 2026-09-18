@@ -38,6 +38,28 @@ Kafka offsets commit only after `write()` returns. A commit refused by
 the server (409) may orphan an uploaded parquet file — that is cleanup's
 problem by hoglake design, never the catalog's, and never a duplicate
 row.
+
+What the idempotency key buys, precisely, because the difference
+matters at 3am:
+
+* IN PROCESS it is exact. The uploaded registration is held in memory
+  for the life of the flush, so a retry after a lost response is the
+  same request byte for byte, and the server answers it from its
+  receipt. A commit whose response is lost publishes its rows exactly
+  once. This holds without the key being derived from anything at all —
+  a random key per flush would do — but a derived one costs nothing and
+  is what makes the next paragraph possible.
+* ACROSS A RESTART it is opportunistic. Nothing is held: the rebuilt
+  flush stamps a fresh `_inserted_at` and uploads under fresh object
+  names, so the replayed request is never byte-identical, and the most
+  the key can do is recognize a repeated BOUNDARY (same table
+  incarnation, same complete offset range per partition) and decline to
+  publish over it a second time. The boundary is NOT reproducible in
+  general — the size trigger accumulates per poll batch, the time
+  trigger is wall-clock, the filter's allowlist is mutable, and every
+  partition in the flush has to coincide — so the pipeline is
+  at-least-once across process boundaries, with the duplicate suppressed
+  in the case where the boundary does repeat.
 """
 
 from __future__ import annotations

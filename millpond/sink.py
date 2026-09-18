@@ -99,10 +99,13 @@ class Sink(Protocol):
         eagerly on any call including empty; Hoglake refuses a zero-row
         append on a partitioned table — neither path is exercised in
         steady state.)
-      * `write()` returns the record count actually written (0 when the
-        backend skipped the batch whole, e.g. every column was a VARIANT
-        companion collision) so main.py keeps `records_written_total`
-        honest.
+      * `write()` returns the record count THIS CALL actually wrote (0
+        when the backend skipped the batch whole, e.g. every column was
+        a VARIANT companion collision) so main.py keeps
+        `records_written_total` honest. "This call" is literal: the
+        hoglake backend also answers 0 when the server resolved the
+        commit from a receipt, because then some earlier process
+        published the rows and this one published none.
       * `reset_caches()` is invoked only by the write-retry loop in
         `main.py` after a write failure. Sinks should not self-reset
         on internal recovery; surface the failure and let the retry path

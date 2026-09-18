@@ -529,6 +529,81 @@ class TestLostCommitResponse:
         assert {o for o in objects if o.endswith(".parquet")} <= {p.removeprefix("s3://") for p in registered}
 
 
+class TestNewProcessReplay:
+    """What the key does and does not buy ACROSS a process boundary.
+
+    In-process the guarantee is exact: the payload is held, the retry is
+    byte-identical, the receipt resolves it. Across a restart neither of
+    those holds — the rebuilt flush stamps a fresh `_inserted_at` and
+    uploads under fresh uuid4 names — so all the key can do is recognize
+    a repeated BOUNDARY and refuse to publish twice over it.
+
+    And the boundary is not reproducible. It is whatever the size and
+    time triggers happened to cut at: a size trigger accumulates per poll
+    batch, the time trigger is wall-clock, the filter's allowlist is
+    mutable, and every partition in the flush has to coincide. So the
+    pipeline is at-least-once across process boundaries, with the key
+    suppressing the duplicate in the case where the boundary does repeat.
+
+    Both halves are pinned here, because a claim that only holds in the
+    lucky case is worse than no claim: it is the one an operator reasons
+    with at 3am.
+    """
+
+    def _flush_as_new_process(self, cfg, batch, offsets):
+        """A fresh sink over the same table — the restart, minus the
+        process boundary. Nothing survives but the catalog."""
+        sink = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table))
+        try:
+            kafka = MagicMock()
+            _flush(sink, cfg, kafka, batch, batch.nbytes, batch.num_rows, offsets, 1.0)
+            return kafka
+        finally:
+            sink.close()
+
+    def test_the_same_boundary_from_a_new_process_publishes_once(self, hog_stack, client):
+        # The pod died after the commit applied and before the offsets
+        # committed; Kafka replayed the identical range and the flush was
+        # rebuilt from scratch.
+        cfg = _fresh()
+        batch = _batch(5)
+        offsets = {("events", 0): (12, 16)}
+        self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5
+        kafka = self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5, "the replayed boundary published a second copy"
+        # The offsets still commit: the rows ARE in the lake, just not
+        # because of this process.
+        kafka.commit.assert_called_once()
+
+    def test_a_shifted_boundary_from_a_new_process_duplicates(self, hog_stack, client):
+        # The honest half. The restart re-consumed the same records but
+        # its flush cut at a different offset, so this is a different
+        # publication by every name anyone has — and the rows land twice.
+        # AT-LEAST-ONCE, which is what the docs now say.
+        cfg = _fresh()
+        batch = _batch(5)
+        self._flush_as_new_process(cfg, batch, {("events", 0): (12, 16)})
+        assert _record_count(client, cfg) == 5
+        self._flush_as_new_process(cfg, batch, {("events", 0): (12, 19)})
+        assert _record_count(client, cfg) == 10
+
+    def test_a_recreated_table_does_not_answer_from_the_old_receipt(self, hog_stack, client):
+        # Receipts are per catalog and survive a table drop with no
+        # cascade. Without the incarnation in the key, this sequence
+        # reported the second flush as already published and advanced
+        # over rows that were in a dropped table: 5 rows written, 0 in
+        # the lake, offsets committed.
+        cfg = _fresh()
+        batch = _batch(5)
+        offsets = {("events", 0): (12, 16)}
+        self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5
+        _table(client, cfg).drop()
+        self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5, "the recreated table answered from its predecessor's receipt"
+
+
 class TestAtLeastOnce:
     def test_server_outage_no_offset_advance_then_clean_retry(self, hog_stack, client):
         """The at-least-once sequencing against a real outage: stop the
