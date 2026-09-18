@@ -143,6 +143,8 @@ def _make_cfg(**overrides) -> Config:
         hoglake_s3_secret_key=None,
         hoglake_s3_region=None,
         hoglake_partition_by=None,
+        hoglake_max_retry_count=None,
+        hoglake_request_timeout_s=None,
         bootstrap_servers="localhost:9092",
         topic="test-topic",
         group_id="test-group",

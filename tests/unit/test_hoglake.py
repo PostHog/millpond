@@ -44,6 +44,8 @@ def _cfg(**overrides) -> MagicMock:
     cfg.hoglake_s3_secret_key = "sk"
     cfg.hoglake_s3_region = "us-east-1"
     cfg.hoglake_partition_by = None
+    cfg.hoglake_max_retry_count = 8
+    cfg.hoglake_request_timeout_s = 30.0
     cfg.sort_by = None
     cfg.ordinal = 0
     for k, v in overrides.items():
@@ -172,16 +174,34 @@ class TestHoglakeSinkInit:
 
 
 class TestIsRetryable:
+    """Every exception here is built in the SHAPE pyhoglake actually
+    produces. The client raises server errors through `_raise`, which
+    always passes `status_code=` — a statusless instance is only ever
+    the client-side variant, and the two classify differently, so a test
+    that constructs the convenient one proves nothing about production."""
+
     @pytest.mark.parametrize(
         "exc",
         [
-            CommitConflictError("conflict", status_code=409),  # OCC — retry on a fresh baseline
-            NotFoundError("gone", status_code=404),  # table dropped; re-ensure after reset
-            IncarnationChangedError("recreated"),  # re-resolve the live incarnation
+            CommitConflictError("commit conflict", status_code=409),  # OCC — retry on a fresh baseline
+            NotFoundError("not found", status_code=404),  # table dropped; re-ensure after reset
+            # BOTH incarnation shapes. The server-raised one carries 409
+            # plus the recreation marker (client.py maps it off the
+            # CommitConflictError body); the client's own pre-flight
+            # re-resolve raises it with no status at all.
+            IncarnationChangedError(
+                "table x was recreated: expected uuid ...",
+                status_code=409,
+                detail="the table was recreated",
+            ),
+            IncarnationChangedError("was recreated"),
             httpx.ConnectError("refused"),
             httpx.ReadTimeout("slow"),
-            HoglakeError("boom", status_code=503),  # commit admission backpressure
-            HoglakeError("boom", status_code=500),
+            HoglakeError("commit_queue_timeout", status_code=503),  # admission backpressure
+            HoglakeError("internal_error", status_code=500),
+            HoglakeError("too many requests", status_code=429),
+            HoglakeError("request timeout", status_code=408),
+            HoglakeError("client-side failure"),  # no status: never reached the server
             OSError("S3 flake"),  # pyarrow S3 upload failures
             RuntimeError("unknown"),  # unknown → assume transient
         ],
@@ -192,15 +212,61 @@ class TestIsRetryable:
     @pytest.mark.parametrize(
         "exc",
         [
-            ValidationError("bad", status_code=422),
+            ValidationError("validation", status_code=422),
             UnsupportedTypeError("no mapping"),
-            AlreadyExistsError("exists", status_code=409),
+            AlreadyExistsError("already_exists", status_code=409),
             ExpiredError("expired", status_code=410),
-            MalformedResponseError("garbage"),
+            MalformedResponseError("TableInfo: missing field 'columns'"),
+            HoglakeError("bad_request", status_code=400),
         ],
     )
     def test_not_retryable(self, exc):
         assert hoglake.is_retryable(exc) is False
+
+    def test_sink_exposes_the_classifier_to_the_retry_loop(self):
+        # main._write_with_retry duck-types `is_retryable` off the sink;
+        # an unwired classifier is a classifier that never runs.
+        s, *_ = _sink()
+        assert s.is_retryable(ValidationError("validation", status_code=422)) is False
+        assert s.is_retryable(CommitConflictError("conflict", status_code=409)) is True
+
+
+class TestRetryBudgetAndBackpressure:
+    def test_budget_comes_from_config(self):
+        s, *_ = _sink(_cfg(hoglake_max_retry_count=7))
+        attempts, base = s.write_retry_budget()
+        assert attempts == 7
+        assert base > 0
+
+    def test_client_built_with_the_configured_timeout(self):
+        cfg = _cfg(hoglake_request_timeout_s=12.5)
+        with patch("millpond.hoglake.HoglakeClient") as mock_client:
+            hoglake.HoglakeSink(cfg)
+        assert mock_client.call_args.kwargs["timeout"] == 12.5
+
+    def test_retry_after_header_is_captured_and_consumed_once(self):
+        # pyhoglake drops Retry-After entirely (it maps status codes and
+        # nothing else), so the sink reads it off the response itself.
+        s, *_ = _sink()
+        s._note_response(httpx.Response(503, headers={"Retry-After": "1"}))
+        assert s.retry_after_hint() == 1.0
+        # One-shot: a hint from a past failure must not govern the next one.
+        assert s.retry_after_hint() is None
+
+    def test_retry_after_ignored_on_a_success(self):
+        s, *_ = _sink()
+        s._note_response(httpx.Response(200, headers={"Retry-After": "90"}))
+        assert s.retry_after_hint() is None
+
+    def test_unparseable_retry_after_is_ignored(self):
+        s, *_ = _sink()
+        s._note_response(httpx.Response(503, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}))
+        assert s.retry_after_hint() is None
+
+    def test_no_hint_without_a_header(self):
+        s, *_ = _sink()
+        s._note_response(httpx.Response(503))
+        assert s.retry_after_hint() is None
 
 
 # ---------------------------------------------------------------------------

@@ -98,6 +98,18 @@ class Config:
     # triples, validated against the server's transform vocabulary at
     # load() — an unmappable expression refuses startup, never a batch.
     hoglake_partition_by: tuple[tuple[str, str, int | None], ...] | None
+    # Write-path retry budget for the hoglake destination — the
+    # counterpart of ducklake_max_retry_count, and needed for the same
+    # reason from the other direction: DuckLake retries internally
+    # (100x) under millpond's 3 outer attempts, while hoglake retries
+    # not at all, so those 3 attempts were the entire budget against a
+    # catalog whose backpressure signal (503 + Retry-After: 1) assumes
+    # the client will come back.
+    hoglake_max_retry_count: int | None
+    # Per-request HTTP timeout for the catalog client. pyhoglake's own
+    # default is a hardcoded 30s with no way to change it from the
+    # constructor's caller unless it is passed explicitly.
+    hoglake_request_timeout_s: float | None
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
@@ -606,6 +618,8 @@ _NONE_HOGLAKE_FIELDS: dict = dict.fromkeys(
         "hoglake_s3_secret_key",
         "hoglake_s3_region",
         "hoglake_partition_by",
+        "hoglake_max_retry_count",
+        "hoglake_request_timeout_s",
     )
 )
 
@@ -714,8 +728,20 @@ def _load_hoglake_fields() -> dict:
             )
         names[env_name] = value
 
+    # Retry budget + request timeout. The product of the two is the
+    # worst-case time a single flush can spend inside sink.write(), and
+    # the consume loop is single threaded: server.health marks the
+    # process dead at max_poll_age_s=480 and record_poll only runs
+    # between consume() calls. The defaults (8 x 30s of requests, plus a
+    # backoff ladder main.py caps at 30s a step, ~330s worst case) sit
+    # inside that with room to spare. Raise both together at your peril.
+    max_retries = _positive_int("HOGLAKE_MAX_RETRY_COUNT", 8)
+    timeout_s = _positive_float("HOGLAKE_REQUEST_TIMEOUT_S", 30.0)
+
     partition_raw = os.environ.get("HOGLAKE_PARTITION_BY", "").strip()
     return {
+        "hoglake_max_retry_count": max_retries,
+        "hoglake_request_timeout_s": timeout_s,
         "hoglake_url": _require("HOGLAKE_URL"),
         "hoglake_catalog": catalog,
         "hoglake_namespace": names["HOGLAKE_NAMESPACE"],
@@ -727,6 +753,36 @@ def _load_hoglake_fields() -> dict:
         "hoglake_s3_region": os.environ.get("HOGLAKE_S3_REGION", "").strip() or None,
         "hoglake_partition_by": _parse_hoglake_partition_by(partition_raw) if partition_raw else None,
     }
+
+
+def _positive_int(env_name: str, default: int) -> int:
+    """A positive-integer env knob, or its default. Zero is refused for
+    the same reason DUCKLAKE_MAX_RETRY_COUNT refuses it: an operator
+    misrendering an unset value as "0" should fail loudly, not silently
+    deploy a pipeline with no retries at all."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{env_name}={raw!r} must be a positive integer") from None
+    if value <= 0:
+        raise RuntimeError(f"{env_name}={value!r} must be a positive integer")
+    return value
+
+
+def _positive_float(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise RuntimeError(f"{env_name}={raw!r} must be a positive number") from None
+    if value <= 0:
+        raise RuntimeError(f"{env_name}={value!r} must be a positive number")
+    return value
 
 
 def _load_http_port() -> int:

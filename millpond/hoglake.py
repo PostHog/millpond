@@ -49,6 +49,8 @@ from pyhoglake import (
     ExpiredError,
     HoglakeClient,
     HoglakeError,
+    IncarnationChangedError,
+    MalformedResponseError,
     NotFoundError,
     S3Config,
     UnsupportedTypeError,
@@ -112,52 +114,85 @@ _PROMOTIONS: dict[tuple[str, str], str] = {
 }
 
 
+# 4xx codes that mean "not now" rather than "not ever". Everything else
+# in the 4xx range is a request the server will refuse identically
+# forever. 429 is generic rate limiting; 408 is the server giving up on
+# a slow request. Hoglake's own admission backpressure is a 503, which
+# the 5xx rule below already covers.
+_RETRYABLE_CLIENT_STATUS: frozenset[int] = frozenset({408, 429})
+
+# Statuses whose `Retry-After` header is worth honoring: the server is
+# saying "not now, try again in N seconds". 503 is hoglake's commit
+# admission backpressure (`commit_queue_timeout`, `Retry-After: 1`).
+_RETRY_AFTER_STATUS: frozenset[int] = frozenset({429, 503})
+
+# Base backoff for this backend's retry ladder, matching main.py's
+# DuckLake default. The doubling and its ceiling live in main.py; only
+# the attempt count is configurable, because that is the part DuckLake's
+# inner loop was silently providing.
+_WRITE_BASE_DELAY_S = 1.0
+
+
 def is_retryable(exc: BaseException) -> bool:
     """Classify a write-path failure: is a fresh attempt (after
     reset_caches) worth anything?
+
+    WIRED IN, not advisory: `HoglakeSink.is_retryable` exposes this to
+    `main._write_with_retry`, which skips the remaining budget and
+    re-raises immediately when it answers False. The alternative —
+    letting the loop burn its whole ladder on a 422 that cannot become
+    valid by waiting — delays the crash the operator needs to see and
+    buries the real error under repeated identical failures.
 
     Retryable — transient by nature:
       * `CommitConflictError` (OCC 409; the server says retry on a fresh
         baseline, and `retryable=True` on the class agrees)
       * `NotFoundError` (table/namespace dropped mid-run; the next
         attempt re-ensures it)
-      * `IncarnationChangedError` (drop+recreate under the same name;
-        reset_caches re-resolves the live incarnation — millpond's
-        contract is "write to the name", so adopting the new incarnation
-        on the NEXT attempt is correct; pyhoglake guarantees zero rows
-        landed on the refused commit)
+      * `IncarnationChangedError` — BOTH shapes. The server raises it as
+        a 409 carrying the recreation marker; the client's own pre-flight
+        re-resolve raises it with no status at all. Either way the table
+        was dropped and recreated under the same name, reset_caches
+        re-resolves the live incarnation, and millpond's contract is
+        "write to the name" — so adopting the new incarnation on the NEXT
+        attempt is correct, and the refused commit registered zero rows.
       * transport errors / timeouts (httpx), OSError (pyarrow S3 upload)
-      * any HoglakeError with a 5xx status (503 = commit admission
-        backpressure with Retry-After)
+      * any HoglakeError with a 5xx status (503 `commit_queue_timeout` is
+        the server's explicit "the catalog is convoyed, come back" —
+        retrying the identical commit is what its own docs ask for)
+      * 408 / 429 — the two 4xx codes that mean "not now"
+      * a HoglakeError with NO status: the request never reached the
+        server, so nothing about it has been judged
       * anything unknown (assume transient — crashing the pod after the
         retry budget is the loud fallback either way)
 
     Not retryable — the request itself is wrong and will stay wrong:
       * `ValidationError` (422), `UnsupportedTypeError`,
-        `AlreadyExistsError` (409 on a create), `ExpiredError` (410),
-        `MalformedResponseError` (wire-contract violation).
-
-    NB: main.py's `_write_with_retry` retries EVERYTHING up to its
-    budget by design (the seam contract — semantics preserved from the
-    DuckLake-only era); this classifier drives metric labeling and
-    operator triage, not the retry decision. A permanent 4xx burns three
-    quick attempts, then crash-loops the pod — the loud failure mode.
+        `AlreadyExistsError` (409 on a create), `ExpiredError` (410 — a
+        read_snapshot below the catalog's expiry floor; only a fresh plan
+        fixes that), `MalformedResponseError` (wire-contract violation),
+        and any other 4xx.
     """
-    # Non-retryable HoglakeError subclasses first; CommitConflictError is
-    # the one subclass that declares itself retryable.
-    if isinstance(exc, CommitConflictError):
+    # Retryable subclasses first — both are 409s, and the generic 4xx
+    # rule below would otherwise swallow them.
+    if isinstance(exc, CommitConflictError | IncarnationChangedError):
         return True
-    if isinstance(exc, ValidationError | UnsupportedTypeError | AlreadyExistsError | ExpiredError):
+    if isinstance(
+        exc,
+        MalformedResponseError | ValidationError | UnsupportedTypeError | AlreadyExistsError | ExpiredError,
+    ):
         return False
     if isinstance(exc, HoglakeError):
-        status = getattr(exc, "status_code", None)
-        if status is not None and 400 <= status < 500:
+        status = exc.status_code
+        if status is None:
+            # Never reached the server (connection setup, body parse,
+            # client-side guard): nothing was judged, so retry.
+            return True
+        if status in _RETRYABLE_CLIENT_STATUS:
+            return True
+        if 400 <= status < 500:
             # 404 is the exception: a dropped table is re-ensured on retry.
             return isinstance(exc, NotFoundError)
-        if type(exc).__name__ == "MalformedResponseError":
-            return False
-        # NotFoundError / IncarnationChangedError without a status, 5xx,
-        # and the base class with no status (client-side failures).
         return True
     if isinstance(exc, httpx.HTTPError | OSError):
         return True
@@ -241,7 +276,24 @@ class HoglakeSink:
                 endpoint_override=cfg.hoglake_s3_endpoint,
                 region=cfg.hoglake_s3_region,
             ),
+            # Otherwise pyhoglake's hardcoded 30s applies to every
+            # request including the commit, and an operator with a
+            # convoyed catalog has no knob at all.
+            timeout=cfg.hoglake_request_timeout_s,
         )
+        # Retry-After, captured off the raw response: pyhoglake maps
+        # status codes to exception classes and discards headers, so the
+        # server's own backoff advice (503 `commit_queue_timeout` answers
+        # with `Retry-After: 1`) would be lost. Installed as an httpx
+        # event hook — a private attribute of the client, so the whole
+        # thing is best-effort: if pyhoglake restructures its transport
+        # we silently fall back to the exponential curve rather than
+        # failing to construct a sink.
+        self._retry_after: float | None = None
+        try:
+            self._client._http.event_hooks["response"].append(self._note_response)
+        except Exception:  # noqa: BLE001 - optional enhancement, never fatal
+            log.debug("Could not install the Retry-After hook; backoff falls back to the exponential curve")
         # Commit author recorded on every snapshot — the pipeline
         # identity plus the pod ordinal, for multi-writer forensics.
         self._author = f"millpond/{cfg.table_label}/{cfg.ordinal}"
@@ -295,6 +347,54 @@ class HoglakeSink:
 
     def close(self) -> None:
         self._client.close()
+
+    # -- retry policy (read by main._write_with_retry) ---------------------
+
+    @staticmethod
+    def is_retryable(exc: BaseException) -> bool:
+        """See the module-level `is_retryable`. Exposed on the sink so
+        the retry loop can consult it without main.py importing
+        pyhoglake for a DuckLake-only deployment."""
+        return is_retryable(exc)
+
+    def write_retry_budget(self) -> tuple[int, float]:
+        """(attempts, base backoff seconds) for this destination.
+
+        DuckLake's three attempts were always the OUTER ring of a retry
+        scheme whose inner loop runs `ducklake_max_retry_count` times
+        (100 by default here). Hoglake has no inner loop: pyhoglake
+        issues one request and raises. Three attempts against a catalog
+        under commit-admission backpressure — which answers
+        `Retry-After: 1` and expects to be asked again — is a crash
+        loop dressed as a retry policy. HOGLAKE_MAX_RETRY_COUNT sets it;
+        see config.py for how the default interacts with the liveness
+        deadline."""
+        return self._cfg.hoglake_max_retry_count, _WRITE_BASE_DELAY_S
+
+    def _note_response(self, response) -> None:
+        """httpx response hook: remember a Retry-After from a response
+        that is telling us to back off. Deliberately narrow — only
+        statuses that mean "not now" leave a hint, so a stray header on
+        a 200 cannot slow the pipeline down."""
+        if response.status_code not in _RETRY_AFTER_STATUS:
+            return
+        raw = response.headers.get("retry-after")
+        if raw is None:
+            return
+        try:
+            # Delta-seconds only. The HTTP-date form is legal but hoglake
+            # never sends it, and guessing at clock skew to honor one
+            # would be worse than falling back to our own curve.
+            self._retry_after = float(raw.strip())
+        except ValueError:
+            log.debug("Ignoring non-numeric Retry-After %r", raw)
+
+    def retry_after_hint(self) -> float | None:
+        """The server's own backoff advice for the most recent refusal,
+        consumed once. One-shot on purpose: a hint left over from a
+        failure two flushes ago must not govern an unrelated retry."""
+        hint, self._retry_after = self._retry_after, None
+        return hint
 
     # -- metadata column ---------------------------------------------------
 

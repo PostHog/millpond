@@ -377,7 +377,7 @@ def _retry_delay(sink, attempt: int, base: float) -> float:
     _RETRY_AFTER_MAX_S so a misbehaving/hostile header cannot park the
     consume loop past the liveness deadline.
     """
-    delay = base * (2**attempt)
+    delay = min(base * (2**attempt), _RETRY_AFTER_MAX_S)
     hint = getattr(sink, "retry_after_hint", None)
     if hint is not None:
         seconds = hint()

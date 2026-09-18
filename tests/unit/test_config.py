@@ -848,6 +848,47 @@ class TestHoglakeConfig:
         assert cfg.hoglake_s3_region is None
         assert cfg.hoglake_partition_by is None
 
+    def test_retry_and_timeout_defaults(self):
+        # The pair bounds the worst case a single flush can spend inside
+        # sink.write(); see the comment in _load_hoglake_fields.
+        cfg = load()
+        assert cfg.hoglake_max_retry_count == 8
+        assert cfg.hoglake_request_timeout_s == 30.0
+
+    def test_retry_and_timeout_overrides(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "3")
+        monkeypatch.setenv("HOGLAKE_REQUEST_TIMEOUT_S", "5.5")
+        cfg = load()
+        assert cfg.hoglake_max_retry_count == 3
+        assert cfg.hoglake_request_timeout_s == 5.5
+
+    @pytest.mark.parametrize(
+        ("var", "value"),
+        [
+            ("HOGLAKE_MAX_RETRY_COUNT", "0"),
+            ("HOGLAKE_MAX_RETRY_COUNT", "-1"),
+            ("HOGLAKE_MAX_RETRY_COUNT", "lots"),
+            ("HOGLAKE_REQUEST_TIMEOUT_S", "0"),
+            ("HOGLAKE_REQUEST_TIMEOUT_S", "soon"),
+        ],
+    )
+    def test_nonsense_retry_knobs_refused(self, var, value, monkeypatch):
+        monkeypatch.setenv(var, value)
+        with pytest.raises(RuntimeError, match=var):
+            load()
+
+    def test_retry_knobs_nulled_for_ducklake(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "ducklake")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+        monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "99")
+        cfg = load()
+        assert cfg.hoglake_max_retry_count is None
+        assert cfg.hoglake_request_timeout_s is None
+
     def test_optionals_pass_through(self, monkeypatch):
         monkeypatch.setenv("HOGLAKE_DATA_PATH", "s3://bucket/millpond/")
         monkeypatch.setenv("HOGLAKE_S3_ENDPOINT", "http://localhost:29000")

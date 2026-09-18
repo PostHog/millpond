@@ -6,6 +6,7 @@ import pytest
 from confluent_kafka import KafkaException
 
 from millpond.main import (
+    _RETRY_AFTER_MAX_S,
     _convert_batch,
     _flush,
     _update_lag_metrics,
@@ -1154,6 +1155,78 @@ class TestHoglakeErrorLabels:
         with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
             _write_with_retry(sink, table, destination="hoglake")
         assert mock_metrics.errors_total.labels.call_args_list[0].kwargs == {"type": "write_retry"}
+
+
+class TestSinkOwnedRetryPolicy:
+    """The retry budget was inherited from DuckLake, which carries its OWN
+    inner commit-retry loop (default 100), so three outer attempts were
+    never the real budget. Hoglake has none — one request, then raise. A
+    sink may therefore publish its own budget, a Retry-After hint, and a
+    veto on retrying at all."""
+
+    def test_sink_budget_overrides_the_default(self):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "write_retry_budget"])
+        sink.write_retry_budget.return_value = (5, 0.5)
+        sink.write.side_effect = [RuntimeError("boom")] * 4 + [7]
+        with patch("millpond.main.time"), patch("millpond.main.metrics"):
+            assert _write_with_retry(sink, pa.table({"a": [1]})) == 7
+        assert sink.write.call_count == 5
+
+    def test_default_budget_when_the_sink_publishes_none(self):
+        sink = _make_sink()
+        sink.write.side_effect = [RuntimeError("boom")] * 3
+        with patch("millpond.main.time"), patch("millpond.main.metrics"), pytest.raises(RuntimeError):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        assert sink.write.call_count == 3
+
+    def test_non_retryable_failure_is_not_retried(self):
+        # A permanent 422 does not become valid by waiting three seconds.
+        # Crash now so the operator sees it, instead of burning the budget.
+        sink = MagicMock(spec=["write", "reset_caches", "close", "is_retryable"])
+        sink.is_retryable.return_value = False
+        sink.write.side_effect = ValueError("permanently malformed")
+        with patch("millpond.main.time"), patch("millpond.main.metrics"), pytest.raises(ValueError):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        assert sink.write.call_count == 1
+        sink.reset_caches.assert_not_called()
+
+    def test_retry_after_hint_overrides_the_backoff_curve(self):
+        # Hoglake answers commit-admission backpressure with
+        # 503 + `Retry-After: 1`. The server knows how convoyed the
+        # catalog is; our doubling curve does not.
+        sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
+        sink.retry_after_hint.return_value = 1.0
+        sink.write.side_effect = [RuntimeError("503"), 3]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        mock_time.sleep.assert_called_once_with(1.0)
+
+    def test_retry_after_hint_is_clamped(self):
+        # The consume loop is single threaded, so a backoff is also a poll
+        # gap; a hostile or broken header must not park it past liveness.
+        sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
+        sink.retry_after_hint.return_value = 86400.0
+        sink.write.side_effect = [RuntimeError("503"), 3]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        mock_time.sleep.assert_called_once_with(_RETRY_AFTER_MAX_S)
+
+    def test_absent_hint_keeps_exponential_backoff(self):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
+        sink.retry_after_hint.return_value = None
+        sink.write.side_effect = [RuntimeError("boom"), RuntimeError("boom"), 3]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        assert [c.args[0] for c in mock_time.sleep.call_args_list] == [1.0, 2.0]
+
+    def test_exponential_backoff_is_capped(self):
+        # A long budget must not end in a multi-minute sleep.
+        sink = MagicMock(spec=["write", "reset_caches", "close", "write_retry_budget"])
+        sink.write_retry_budget.return_value = (9, 1.0)
+        sink.write.side_effect = [RuntimeError("boom")] * 8 + [1]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        assert max(c.args[0] for c in mock_time.sleep.call_args_list) == _RETRY_AFTER_MAX_S
 
 
 class TestOffsetSequencing:
