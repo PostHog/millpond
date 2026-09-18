@@ -258,14 +258,30 @@ _hoglake_commit_replays_total = Counter(
 # them. Every one sits under the `{idempotency_key}/` prefix of its
 # table's data path, which is what makes the sweep tractable.
 #
-# Counts every path that can leave one: a prepare that fails partway
-# through the fanout upload, a commit the server refuses (409/422), a
-# rebuilt flush the receipt declines, a payload superseded by the next
-# flush, and a payload still unpublished at close(). The partial-upload
-# count is an upper bound — pyhoglake does not report how far it got —
-# except in the single-file case, where a validation refusal is known to
-# have uploaded nothing. The one orphan nobody can count is the one a
-# SIGKILL leaves between prepare and commit.
+# It may MISS an orphan; it never reports one that does not exist. Every
+# object it counts came from a prepared payload, so the files are known
+# to be in object storage and known to number len(files): a commit the
+# server refuses (409/422), a rebuilt flush the receipt declines, a
+# payload superseded by the next flush, and a payload still unpublished
+# at close(). Retries do not inflate it — the held payload is re-sent,
+# not re-uploaded.
+#
+# A flush that fails INSIDE prepare counts nothing. Almost always that
+# is exactly right: pyhoglake validates file i before uploading file i
+# and a millpond fanout is homogeneous (one aligned table, one arity, no
+# empty groups), so a validation refusal fires at index 0; and its
+# catalog work (the key's UUID parse, the read-snapshot refresh, the
+# incarnation pre-flight) all precedes the upload loop, so a 503, a
+# timeout or a 404 wrote nothing either. The one real gap is an S3
+# failure partway through the fanout, where pyhoglake reports no
+# progress — millpond logs the fanout width and the
+# {idempotency_key}/ prefix to sweep rather than book a count it would
+# have to invent. The other gap is the orphan a SIGKILL leaves between
+# prepare and commit, which nothing can count.
+#
+# The direction is chosen: a phantom orphan sends an operator sweeping
+# for objects that were never written, which is worse than a missing
+# one, because the sweep has no way to conclude.
 _hoglake_orphaned_files_total = Counter(
     "millpond_hoglake_orphaned_files_total",
     "Parquet objects uploaded to the lake but never registered in a commit",
