@@ -13,6 +13,7 @@ Run explicitly:
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -728,6 +729,100 @@ class TestSpecChangeUnderAPreparedPayload:
         finally:
             sink2.close()
         assert _record_count(client, cfg) == 6
+
+
+class _FailNthUpload:
+    """The real S3 filesystem, with the Nth `open_output_stream` refused.
+
+    Wrapping the filesystem rather than mocking pyhoglake is the point:
+    every upload before the Nth is a real object really in MinIO, so the
+    count pyhoglake stamps can be checked against the bucket instead of
+    against another fake."""
+
+    def __init__(self, real, fail_on: int):
+        self._real = real
+        self._fail_on = fail_on
+        self.calls = 0
+
+    def open_output_stream(self, path, *a, **kw):
+        self.calls += 1
+        if self.calls == self._fail_on:
+            raise OSError(f"injected object-store failure on upload {self.calls}")
+        return self._real.open_output_stream(path, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestPrepareOrphanAccounting:
+    """What a failed `prepare_append_files` leaves behind, measured
+    against the bucket rather than deduced.
+
+    millpond used to reason about where in pyhoglake's upload loop a
+    given failure could fire, and book a number from that reasoning. It
+    was wrong twice. pyhoglake >=1.1.1 reports the truth on the
+    exception itself; these tests pin that contract against the real
+    library, the real server and real objects, because a unit test that
+    stamps the attributes itself can only prove millpond reads what a
+    fake wrote."""
+
+    def test_a_mid_fanout_failure_counts_and_names_the_objects_that_landed(self, hog_stack, client, caplog):
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3, teams=(1,)))  # bootstrap, so the table exists
+            before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+            real = sink._client._filesystem()
+            sink._client._fs = _FailNthUpload(real, fail_on=3)
+            with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError) as caught:
+                sink.write(_batch(9, teams=(1, 2, 3)))
+        finally:
+            sink._client._fs = real
+            sink.close()
+
+        # pyhoglake's own accounting: two uploads closed cleanly, the
+        # third raised and is in neither number.
+        assert caught.value.uploaded_files == 2
+        assert len(caught.value.uploaded_uris) == 2
+
+        # ...and those two really are in the bucket. This is the whole
+        # claim: the count is provable, not inferred.
+        after = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+        landed = after - before
+        assert {u.removeprefix("s3://") for u in caught.value.uploaded_uris} <= landed
+
+        # Nothing was registered, so every one of them is an orphan.
+        assert _record_count(client, cfg) == 3
+        assert "Orphaned 2 uploaded parquet file(s)" in caplog.text
+        for uri in caught.value.uploaded_uris:
+            assert uri in caplog.text
+        # The retracted advice: the shared prefix is not the sweep unit.
+        assert "never the prefix" in caplog.text
+        assert "truncated" in caplog.text
+
+    def test_a_pre_upload_refusal_really_does_carry_zero(self, hog_stack, client):
+        # The other half of the contract, and the one millpond used to
+        # assert from first principles: a refusal raised before the first
+        # upload reports 0 / (). Driven through a real drop+recreate
+        # under the sink's cached handle, so the real client pre-flight
+        # raises it.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+            before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+            ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
+            ns.table(cfg.hoglake_table).drop()
+            ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
+            with pytest.raises(IncarnationChangedError) as caught:
+                sink.write(_batch(2))
+        finally:
+            sink.close()
+        assert getattr(caught.value, "uploaded_files", None) == 0
+        assert getattr(caught.value, "uploaded_uris", None) == ()
+        # And the bucket agrees — no object was written for the refusal.
+        after = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+        assert after == before
 
 
 class TestAtLeastOnce:

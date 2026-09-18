@@ -254,34 +254,42 @@ _hoglake_commit_replays_total = Counter(
 # registered. Hoglake's cleanup reclaims only files the SERVER queued
 # for removal (snapshot expiry, table drop, compaction staging) — client
 # uploads are not in that set and no server-side reclamation exists for
-# them, so these objects are billed storage until an operator sweeps
-# them. Every one sits under the `{idempotency_key}/` prefix of its
-# table's data path, which is what makes the sweep tractable.
+# them, so these objects are billed storage until an operator deletes
+# them. millpond logs the full object URI of every one it counts, and
+# those URIs are the unit of cleanup.
 #
-# It may MISS an orphan; it never reports one that does not exist. Every
-# object it counts came from a prepared payload, so the files are known
-# to be in object storage and known to number len(files): a commit the
-# server refuses (409/422), a rebuilt flush the receipt declines, a
-# payload superseded by the next flush, and a payload still unpublished
-# at close(). Retries do not inflate it — the held payload is re-sent,
-# not re-uploaded.
+# NOT the `{idempotency_key}/` prefix they share, which earlier revisions
+# of this comment named as the sweep target. Object names are
+# `{uuid4}-{index}.parquet`, so a retry under the SAME key writes fresh
+# names beside the old ones: an operator who sweeps the prefix after a
+# later attempt succeeded deletes live, committed files.
 #
-# A flush that fails INSIDE prepare counts nothing. Almost always that
-# is exactly right: pyhoglake validates file i before uploading file i
-# and a millpond fanout is homogeneous (one aligned table, one arity, no
-# empty groups), so a validation refusal fires at index 0; and its
-# catalog work (the key's UUID parse, the read-snapshot refresh, the
-# incarnation pre-flight) all precedes the upload loop, so a 503, a
-# timeout or a 404 wrote nothing either. The one real gap is an S3
-# failure partway through the fanout, where pyhoglake reports no
-# progress — millpond logs the fanout width and the
-# {idempotency_key}/ prefix to sweep rather than book a count it would
-# have to invent. The other gap is the orphan a SIGKILL leaves between
-# prepare and commit, which nothing can count.
+# The count is exact for every path. A commit the server refuses
+# (409/422), a rebuilt flush the receipt declines, a payload superseded
+# by the next flush and a payload still unpublished at close() all have
+# the prepared payload in hand, so the files are known to be in object
+# storage and to number len(files). A flush that fails INSIDE prepare is
+# no longer the exception it once was: pyhoglake>=1.1.1 stamps
+# `uploaded_files`/`uploaded_uris` on whatever it raises, so millpond
+# books the uploads that really completed instead of deducing a number
+# from which failure it is looking at. Retries do not inflate any of it
+# — a held payload is re-sent, not re-uploaded.
 #
-# The direction is chosen: a phantom orphan sends an operator sweeping
-# for objects that were never written, which is worse than a missing
-# one, because the sweep has no way to conclude.
+# Two caveats survive, both in the same direction (an UNDERCOUNT, never
+# a phantom):
+#
+#   * The file a prepare failed ON is in neither number. Its upload may
+#     never have opened, or may have closed badly over a TRUNCATED
+#     object that really is in storage. The warning that carries the
+#     URIs says so; treat that one file as possibly present.
+#   * The stamp is best effort at the source — an older pyhoglake does
+#     not set it, and pyhoglake suppresses the AttributeError from an
+#     exception type whose __slots__ refuse it. millpond reads it with a
+#     getattr default of 0, so either case books nothing rather than
+#     raising over a live object-store failure.
+#
+# And, as before, nothing can count the orphan a SIGKILL leaves between
+# the upload and the commit.
 _hoglake_orphaned_files_total = Counter(
     "millpond_hoglake_orphaned_files_total",
     "Parquet objects uploaded to the lake but never registered in a commit",
