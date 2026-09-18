@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pyhoglake import (
     AlreadyExistsError,
@@ -114,6 +115,12 @@ def _wire_dynamic_alter(table, state: _FakeInfo):
 
     table.alter.side_effect = do_alter
 
+
+# Captured before the autouse fixture below replaces it: one test needs
+# the REAL serializer, because everything else in this file asserts on
+# the in-memory table that reaches `pq.write_table` and therefore never
+# exercises the cast or the file it produces.
+_REAL_WRITE_TABLE = pq.write_table
 
 _WRITTEN: list[pa.Table] = []
 
@@ -411,6 +418,29 @@ class TestRetryBudgetAndBackpressure:
         s, *_ = _sink()
         s._note_response(httpx.Response(503))
         assert s.retry_after_hint() is None
+
+    def test_the_hook_is_installed_on_a_real_client(self):
+        """Every other test in this class calls `_note_response` by hand,
+        and the sink they build has a MagicMock client — on which the
+        install (into `client._http.event_hooks`, a private attribute,
+        behind a bare except) succeeds no matter what it does. So the
+        one thing that can actually break — pyhoglake restructuring its
+        transport — was the one thing nothing checked."""
+        from pyhoglake import HoglakeClient
+
+        real = HoglakeClient("http://127.0.0.1:28080")
+        real.catalog = MagicMock(return_value=MagicMock())
+        try:
+            with patch("millpond.hoglake.HoglakeClient", return_value=real):
+                s = hoglake.HoglakeSink(_cfg())
+            assert s._note_response in real._http.event_hooks["response"]
+            # And it works end to end through the transport's own hook
+            # list, not just by being in it.
+            for hook in real._http.event_hooks["response"]:
+                hook(httpx.Response(503, headers={"Retry-After": "2"}))
+            assert s.retry_after_hint() == 2.0
+        finally:
+            real.close()
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +757,27 @@ class TestSpecDeclarationIsAtomicOrRecoverable:
         with pytest.raises(RuntimeError, match="partition spec"):
             s.write(_batch())
 
+    def test_post_condition_covers_the_sort_order_too(self):
+        # The sort order is advisory for writers and BINDING for hoglake
+        # compaction: a table that silently carries a different one gets
+        # every file this pod writes re-sorted. The declaration is
+        # checked, not assumed — for both halves of the alter.
+        cfg = _cfg(sort_by=("team_id",))
+        s, ns, table = self._create_flow(cfg)
+        table.alter.side_effect = lambda ops_list: _FakeInfo(columns=tuple(_EVENTS_COLUMNS), sort_spec=_sort("uuid"))
+        with pytest.raises(RuntimeError, match="sort order"):
+            s.write(_batch())
+
+    def test_post_condition_covers_a_sort_order_the_server_dropped(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),), sort_by=("team_id",))
+        s, ns, table = self._create_flow(cfg)
+        # Partition applied, sort silently absent.
+        table.alter.side_effect = lambda ops_list: _FakeInfo(
+            columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "identity"))
+        )
+        with pytest.raises(RuntimeError, match="sort order"):
+            s.write(_batch())
+
 
 class TestExistingTableReconciliation:
     """A spec is declared at CREATE. On every later resolve the live spec
@@ -927,6 +978,98 @@ class TestEvolution:
         s.write(pa.table({"uuid": ["a"], "team_id": pa.array([None], type=pa.string())}))
         assert table.alter.call_count == 0
         assert table.prepare_append_files.call_count == 1
+
+
+class TestRealSerialization:
+    """Every other test here reads the in-memory table handed to
+    `pq.write_table`, which the autouse fixture replaces with a no-op —
+    so the cast and the file it produces were never unit-exercised at
+    all. This one writes real parquet and reads it back."""
+
+    def test_the_file_written_is_the_table_cast_to_the_destination(self, monkeypatch):
+        monkeypatch.setattr(hoglake.pq, "write_table", _REAL_WRITE_TABLE)
+        s, client, catalog, ns, table = _sink()
+        captured: dict[str, list] = {}
+        prepared = table.prepare_append_files.side_effect
+
+        def prepare(files, **kwargs):
+            captured["files"] = [pq.read_table(path) for path, _ in files]
+            return prepared(files, **kwargs)
+
+        table.prepare_append_files.side_effect = prepare
+        # team_id arrives as int32; the live column is `long`.
+        s.write(pa.table({"uuid": ["a"], "team_id": pa.array([5], type=pa.int32())}))
+        written = captured["files"][0]
+        # Column ORDER is the destination's, not the batch's: the
+        # prepared path compares schemas position by position.
+        assert written.schema.names == [c.name for c in _EVENTS_COLUMNS]
+        assert written.column("team_id").type == pa.int64()
+        assert written.column("team_id").to_pylist() == [5]
+        assert written.column("_inserted_at").type == pa.timestamp("us", tz="UTC")
+        assert written.column("_inserted_at").null_count == 0
+        assert written.column("properties").null_count == 1  # absent upstream, null-filled
+
+    def test_a_partitioned_flush_writes_one_real_file_per_tuple(self, monkeypatch):
+        monkeypatch.setattr(hoglake.pq, "write_table", _REAL_WRITE_TABLE)
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        captured: dict[str, list] = {}
+        prepared = table.prepare_append_files.side_effect
+
+        def prepare(files, **kwargs):
+            captured["files"] = [(values, pq.read_table(path)) for path, values in files]
+            return prepared(files, **kwargs)
+
+        table.prepare_append_files.side_effect = prepare
+        s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [3, 1, 3]}))
+        assert [values for values, _ in captured["files"]] == [("3",), ("1",)]
+        assert [t.column("uuid").to_pylist() for _, t in captured["files"]] == [["a", "c"], ["b"]]
+
+
+class TestPartitionGrouping:
+    """The prepared path puts row-to-partition correctness on the client:
+    the server validates the SHAPE of what it is told and never opens a
+    data file, so a wrong value here mis-prunes reads of that file
+    forever."""
+
+    def _info(self, partition_spec):
+        return _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=partition_spec)
+
+    def test_groups_follow_first_occurrence_in_the_batch(self):
+        # File registration order IS row-id assignment order on the
+        # server (rows, then offset), and the batch arrives in the order
+        # MILLPOND_SORT_BY put it in. Grouping that reorders — by sort
+        # order, by hash order — silently breaks the correspondence
+        # between a table's row ids and its declared sort.
+        data = pa.table({"uuid": ["a", "b", "c", "d"], "team_id": [3, 1, 3, 2]})
+        groups = hoglake._partition_groups(data, self._info(_spec(("team_id", "identity"))))
+        assert [values for values, _ in groups] == [("3",), ("1",), ("2",)]
+        assert [part.column("uuid").to_pylist() for _, part in groups] == [["a", "c"], ["b"], ["d"]]
+
+    def test_every_row_lands_in_exactly_one_group(self):
+        data = pa.table({"uuid": [f"u{i}" for i in range(9)], "team_id": [1, 2, 3, 1, 2, 3, 1, 2, 3]})
+        groups = hoglake._partition_groups(data, self._info(_spec(("team_id", "identity"))))
+        assert sum(part.num_rows for _, part in groups) == 9
+        assert (
+            sorted(u for _, part in groups for u in part.column("uuid").to_pylist()) == data.column("uuid").to_pylist()
+        )
+
+    def test_a_null_source_value_forms_its_own_group(self):
+        data = pa.table({"uuid": ["a", "b", "c"], "team_id": pa.array([1, None, 1], type=pa.int64())})
+        groups = hoglake._partition_groups(data, self._info(_spec(("team_id", "identity"))))
+        assert [values for values, _ in groups] == [("1",), (None,)]
+
+    def test_an_unpartitioned_table_is_one_group(self):
+        data = pa.table({"uuid": ["a", "b"], "team_id": [1, 2]})
+        groups = hoglake._partition_groups(data, self._info(None))
+        assert len(groups) == 1 and groups[0][0] is None
+
+    def test_a_spec_referencing_a_dead_field_id_is_a_permanent_refusal(self):
+        data = pa.table({"uuid": ["a"], "team_id": [1]})
+        spec = PartitionSpec(spec_id=1, fields=(PartitionField(9999, "identity", None),))
+        with pytest.raises(RuntimeError) as caught:
+            hoglake._partition_groups(data, self._info(spec))
+        assert hoglake.is_retryable(caught.value) is False
 
 
 class TestFilesWrittenMetric:
