@@ -48,15 +48,28 @@ lint-fix:
 test:
     uv run python -m pytest tests/unit
 
-# Run integration tests
+# Run integration tests (in-memory DuckDB — no docker; the hoglake
+# suite is docker-gated and has its own recipe below)
 [group('test')]
 test-integration:
-    uv run python -m pytest tests/integration
+    uv run python -m pytest tests/integration --ignore=tests/integration/test_hoglake_integration.py
 
 # Run E2E test against the DuckLake stack (docker-compose.yaml).
 [group('test')]
 test-e2e:
     uv run python -m pytest tests/e2e/test_e2e.py -v -s
+
+# Run hoglake integration tests against a real hoglake server
+# (throwaway compose stack `millpond-hog-it`, high 127.0.0.1 ports;
+# skips cleanly without docker or the server image).
+[group('test')]
+test-hoglake-integration:
+    uv run python -m pytest tests/integration/test_hoglake_integration.py -v
+
+# Run the hoglake E2E (Kafka -> main.py -> hoglake, same throwaway stack).
+[group('test')]
+test-hoglake-e2e:
+    uv run python -m pytest tests/e2e/test_hoglake_e2e.py -v -s
 
 # Full CI check
 [group('test')]

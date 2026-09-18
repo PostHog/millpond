@@ -12,6 +12,15 @@ just test-integration  # in-memory DuckDB integration tests — no docker stack,
 just test-e2e          # full DuckLake stack (~1m)
 ```
 
+For changes touching the hoglake destination, also run the docker-gated
+hoglake suites (they skip cleanly without docker/the server image, so a
+green run without docker verifies nothing — say which you ran):
+
+```bash
+just test-hoglake-integration  # real hoglake server, throwaway stack `millpond-hog-it` (high ports)
+just test-hoglake-e2e          # Kafka -> main.py -> hoglake end to end
+```
+
 Note: `just lint` and `just fmt-check` only run against `millpond/` today; `tests/` remains uncovered by the recipes. Pre-commit hooks run ruff project-wide, so lint failures still surface — but the just recipes themselves are scope-narrow until they're updated.
 
 All must pass. Do not push with any lint, test, integration, or e2e failures — CI runs all of these on every push and PR (`.github/workflows/ci.yaml`), and the integration/e2e jobs are gating. Catch failures locally rather than on the runner.
@@ -207,7 +216,7 @@ Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 
 ### The Sink
 
-`main.py` constructs a `DuckLakeSink` directly (`millpond/ducklake.py`) and calls exactly three methods on it: `write(batch)`, `reset_caches()`, `close()`. One implementation, no abstraction layer.
+`main.py` constructs one sink via `sink.make_sink(cfg)` (`millpond/sink.py` — the seam recovered from the `final-iceberg` tag) and calls exactly three methods on it: `write(batch) -> int`, `reset_caches()`, `close()`. Two implementations: `DuckLakeSink` (`millpond/ducklake.py`) and `HoglakeSink` (`millpond/hoglake.py`, pyhoglake footer-shipping appends, text-only — VARIANT config is rejected at startup for this destination). Backend imports are lazy inside `make_sink` so each destination's pods skip the other's import cost; the dispatch and the protocol conformance are pinned in `tests/unit/test_sink.py`. `check_reserved_collision` and `SAFE_IDENTIFIER` live on the seam (schema.py re-exports the latter for its historical importers).
 
 Per-Sink instance state: the table-ensured cache and the SchemaManager both live on the Sink instance, not at module level. Two Sink instances in the same process correctly do not share cache — each owns its own connection handle too. `reset_caches()` is called only by the write-retry loop in `main.py` after a failed write; the sink does not self-reset on internal recovery, it surfaces the failure and lets the retry path drive cache invalidation.
 
@@ -566,7 +575,9 @@ millpond/
 │   ├── main.py               # Entry point, main loop, signal handling
 │   ├── config.py             # Env var → dataclass; startup validation
 │   ├── arrow_converter.py    # JSON → PyArrow Table (orjson + from_pylist + numeric normalization)
+│   ├── sink.py               # Sink protocol + make_sink dispatch (shared seam helpers)
 │   ├── ducklake.py           # DuckLake backend: connect, write, DuckLakeSink class
+│   ├── hoglake.py            # Hoglake backend: HoglakeSink over pyhoglake (text-only)
 │   ├── schema.py             # DuckLake SchemaManager
 │   ├── consumer.py           # Kafka consumer + AdminClient for partition discovery
 │   ├── backpressure.py       # Adaptive batch sizing
@@ -582,8 +593,9 @@ millpond/
 │   └── sizing-calculator.html      # Interactive flush/object sizing calculator
 ├── tests/
 │   ├── unit/                 # Fast, no external deps
-│   ├── integration/          # In-memory DuckDB write/metrics tests — no docker stack
-│   └── e2e/                  # Full docker-compose DuckLake stack via testcontainers
+│   ├── integration/          # In-memory DuckDB write/metrics tests (no docker) + docker-gated hoglake server suite
+│   ├── hoglake_stack/        # Throwaway hoglake compose stack (project millpond-hog-it, high 127.0.0.1 ports)
+│   └── e2e/                  # Full docker-compose DuckLake stack via testcontainers + hoglake pipeline e2e
 └── test/                     # Dev fixtures (producer.py, ducklake-init.sql)
 ```
 

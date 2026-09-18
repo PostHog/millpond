@@ -43,20 +43,24 @@ K8s StatefulSet (N replicas)
 
 ## Destination
 
-Millpond writes to DuckLake. A single deployment writes to exactly one table — there is no per-batch routing.
+Millpond writes to one of two destinations, selected by `MILLPOND_DESTINATION` (default `ducklake`). A single deployment writes to exactly one table — there is no per-batch routing, and a pod's destination is fixed for its lifetime.
 
-|  | DuckLake |
-|---|---|
-| Catalog | Postgres (via DuckDB ducklake extension) |
-| Storage | S3 / S3-compatible |
-| Reader ecosystem | DuckDB-native; growing third-party support |
-| Partitioning | Caller-supplied via `DUCKLAKE_PARTITION_BY`; arbitrary DDL expression |
-| Schema evolution | DuckDB DDL (`ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN SET DATA TYPE` with widening enforcement) |
-| Maintenance tooling | Bundled (`tools/ducklake_maintenance.py` CronJob CLI, `tools/ducklake_metrics.py` exporter — daemon or one-shot push) |
-| `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) |
-| Multi-pod concurrent writes | Native; idempotent DDL handles races |
+|  | DuckLake | Hoglake |
+|---|---|---|
+| Catalog | Postgres (via DuckDB ducklake extension) | The hoglake control plane (REST service over Postgres; clients never touch its database) |
+| Storage | S3 / S3-compatible | S3 / S3-compatible — millpond writes the parquet itself via pyhoglake and registers it in a footer-shipping commit; the server never opens data files |
+| Reader ecosystem | DuckDB-native; growing third-party support | hoglake duckdb-client, Trino connector, changefeed consumers (hedgerow) |
+| Partitioning | Caller-supplied via `DUCKLAKE_PARTITION_BY`; arbitrary DDL expression | `HOGLAKE_PARTITION_BY` mapped onto Iceberg-semantics transforms (`identity`, `year`, `month`, `day`, `hour`, `bucket(col, N)`) at table creation; one parquet file per partition tuple per flush, all in one atomic commit |
+| Sort order | Not declared (batches pre-sorted via `MILLPOND_SORT_BY`) | `MILLPOND_SORT_BY` additionally declared as the table's sort order at creation (advisory for writers, binding for hoglake compaction) |
+| Schema evolution | DuckDB DDL (`ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN SET DATA TYPE` with widening enforcement) | Typed alter ops (`add_column`; `promote_column` for `int→long`, `float→double`); same per-column degrade-and-metric posture |
+| VARIANT dual-write | Supported (`MILLPOND_VARIANT_COLUMNS`) | **Not supported — rejected at startup.** Events land as TEXT (`properties` stays a JSON string). Deferred until hoglake grows a variant path millpond can target. |
+| Maintenance tooling | Bundled (`tools/ducklake_maintenance.py` CronJob CLI, `tools/ducklake_metrics.py` exporter — daemon or one-shot push) | Server-side (hoglake expiry/cleanup/compaction loops) — nothing bundled here |
+| `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) | Stamped Arrow-side, one timestamptz value per flush (every row in a flush shares it) |
+| Multi-pod concurrent writes | Native; idempotent DDL handles races | Native; appends never conflict with appends, concurrent DDL 409s are absorbed by re-resolve, and the incarnation guard (`expected_table_uuid`) refuses cross-incarnation appends atomically |
 
-The sink (`millpond/ducklake.py`) exposes three methods to `main.py`: `write(batch)`, `reset_caches()`, `close()`.
+Both sinks (`millpond/ducklake.py`, `millpond/hoglake.py`) implement the `Sink` protocol (`millpond/sink.py`) and expose three methods to `main.py`: `write(batch) -> int`, `reset_caches()`, `close()`. `make_sink(cfg)` dispatches on the destination with lazy backend imports.
+
+Delivery semantics are identical across destinations: at-least-once, Kafka offsets commit only after a successful write. On the hoglake side, a commit the server refuses (409) registers zero rows atomically — a refused flush can orphan an uploaded parquet file (reclaimed by hoglake's cleanup), never a duplicate row.
 
 ## Record Handling
 
@@ -214,6 +218,8 @@ just lint              # lint code
 just test              # run unit tests
 just test-integration  # run integration tests (in-memory DuckDB — fast, no docker stack)
 just test-e2e          # run E2E tests (docker-compose, builds stack automatically)
+just test-hoglake-integration  # hoglake sink vs a real hoglake server (throwaway stack, high ports)
+just test-hoglake-e2e  # Kafka -> main.py -> hoglake end to end (same throwaway stack)
 just ci                # format check + lint + unit tests
 just up                # start docker-compose stack (DuckLake — plaintext Kafka)
 just up-ssl            # start docker-compose stack (DuckLake — SSL Kafka, closer to prod)
@@ -255,10 +261,10 @@ All configuration via environment variables.
 | `KAFKA_BOOTSTRAP_SERVERS` | yes | | Kafka broker addresses |
 | `KAFKA_TOPIC` | yes | | Topic to consume |
 | `REPLICA_COUNT` | yes | | Number of StatefulSet replicas (must match `spec.replicas`) |
-| `MILLPOND_DESTINATION` | no | `ducklake` | Destination — `ducklake` is the only accepted value; anything else raises at startup. Case-insensitive; empty/whitespace falls back to `ducklake`. |
+| `MILLPOND_DESTINATION` | no | `ducklake` | Destination — `ducklake` or `hoglake`; anything else raises at startup. Case-insensitive; empty/whitespace falls back to `ducklake`. Only the selected destination's env group is read (stray vars from the other backend are ignored). |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
-| `GROUP_ID` | no | `millpond-{topic}-{ducklake_table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
+| `GROUP_ID` | no | `millpond-{topic}-{table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
 | `KAFKA_AUTO_OFFSET_RESET` | no | `earliest` | Applied only when no offset is committed for a partition: `earliest` (backfill/catch-up) or `latest` (NRT consumers — don't replay the retention window). `KAFKA_CONSUMER_AUTO_OFFSET_RESET` is rejected at startup; use this var. |
 | `KAFKA_CONSUMER_*` | no | | Passthrough to librdkafka: `KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL` → `security.protocol=SASL_SSL`. `KAFKA_CONSUMER_QUEUED_MAX_MESSAGES_KBYTES` overrides the 16MB-per-partition fetch-buffer default. `sasl.mechanisms=OAUTHBEARER` enables the MSK IAM token callback. |
 | `BROKER_SOURCE` | no | | Broker label attached to every metric (e.g. `msk`, `warpstream`) |
@@ -267,6 +273,7 @@ All configuration via environment variables.
 | `FETCH_MAX_WAIT_MS` | no | `500` | Max broker wait when `fetch.min.bytes` not yet satisfied |
 | `STATS_INTERVAL_MS` | no | `5000` | librdkafka internal stats emission interval (0 to disable) |
 | `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
+| `MILLPOND_HTTP_PORT` | no | `8000` | Port for the /metrics + /healthz + /readyz HTTP server. Exists for test harnesses running millpond as a host process; charts and probes depend on the default. |
 
 ### DuckLake
 
@@ -290,6 +297,30 @@ All configuration via environment variables.
 | `DUCKDB_S3_USE_SSL` | no | | `true` / `false` |
 | `DUCKDB_S3_URL_STYLE` | no | | `vhost` / `path` |
 
+### Hoglake
+
+Read only when `MILLPOND_DESTINATION=hoglake`. Names are validated at startup against the server's identifier rules (catalog: `[a-z][a-z0-9_-]{0,62}`; namespace/table: `[A-Za-z_][A-Za-z0-9_-]{0,127}`).
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HOGLAKE_URL` | yes | | Control-plane base URL (`/v1` is appended by the client) |
+| `HOGLAKE_CATALOG` | yes | | Catalog name |
+| `HOGLAKE_NAMESPACE` | yes | | Namespace (created on first write if absent) |
+| `HOGLAKE_TABLE` | yes | | Table name (created on first write from the batch schema + `_inserted_at`) |
+| `HOGLAKE_DATA_PATH` | no | | When set, a missing catalog is created with this data path on first write. Unset: a missing catalog is a startup-shaped error (catalog provisioning stays an ops decision). |
+| `HOGLAKE_S3_ACCESS_KEY` | yes | | S3 access key for the parquet write path (pyhoglake writes the files; separate from the DuckLake `DUCKDB_S3_*` vars) |
+| `HOGLAKE_S3_SECRET_KEY` | yes | | S3 secret key |
+| `HOGLAKE_S3_ENDPOINT` | no | | S3 endpoint override (MinIO etc.); unset = AWS |
+| `HOGLAKE_S3_REGION` | no | | S3 region |
+| `HOGLAKE_PARTITION_BY` | no | | Comma-separated partition expression mapped to hoglake transforms at table creation: bare `col` (identity), `year(col)`/`month(col)`/`day(col)`/`hour(col)`, `bucket(col, N)`. Anything outside that vocabulary refuses startup with a clear error — never a per-batch failure. Typical: `team_id,month(_inserted_at)`. |
+
+Semantics on the hoglake path:
+
+- **Text only.** `properties` and every other JSON payload lands as a string column, exactly as the arrow converter produces it. `MILLPOND_VARIANT_COLUMNS` combined with `MILLPOND_DESTINATION=hoglake` is a startup error (hoglake has no VARIANT column type — deferred, not silently skipped).
+- **Bootstrap.** First write ensures catalog → namespace → table (concurrent creation by other pods is tolerated at every level) and declares the partition spec + sort order in one alter with field ids resolved from the created schema. A partition column missing from the schema is fatal; a missing sort field skips the sort-order declaration with a warning (batches are still pre-sorted on present fields).
+- **Evolution.** New batch columns → `add_column`; `int→long` / `float→double` live-type mismatches → `promote_column`; failures degrade per column (logged + `millpond_errors_total{type="schema"}`), and unsafe or `_hog`-prefixed payload keys are dropped per column (`millpond_records_skipped_total{reason="unsafe_field_name"}`) so one poison key cannot wedge a partition. Name matching is exact — hoglake identifiers are case-sensitive, unlike DuckDB's case-insensitive resolution.
+- **Metrics.** All existing counters work unchanged; `millpond_hoglake_files_written_total` additionally counts parquet files registered per append (with partitioned fanout this is the hoglake compaction-debt feed rate). `millpond_errors_total{type="hoglake_commit_contention"}` labels OCC 409s the way `ducklake_commit_contention` does for DuckLake.
+
 ### Optional record handling
 
 See [Record Handling](#record-handling) for context. All variables below are optional; unset means the corresponding stage is disabled.
@@ -310,7 +341,7 @@ See [Record Handling](#record-handling) for context. All variables below are opt
 | `MILLPOND_INCLUDE_VALUES_AUTH_TOKEN` | no | | Header value. Must be set together with the header name. |
 | `MILLPOND_SORT_BY` | no | | Comma-separated column names; the batch is sorted ascending by these in tuple order before each write. Missing fields cause the sort to be skipped (records still flow). |
 | `MILLPOND_TYPED_COLUMNS` | no | | Comma-separated `column:type` pairs pinning columns to a target type before write (types: `timestamptz`, `bigint`, `double`, `boolean`, `varchar`). Needed when writing into a table whose columns are already typed and JSON inference would diverge (date-times → `VARCHAR` vs `TIMESTAMPTZ`; all-null `project_id` → `VARCHAR` vs `BIGINT`). Column names validated as safe identifiers; types validated against the allowlist. |
-| `MILLPOND_VARIANT_COLUMNS` | no | | Comma-separated source column names to dual-write as DuckLake `VARIANT` companions (`properties` → `properties_variant`). Original string columns are kept. Malformed JSON nulls only the VARIANT side. Column names validated as safe identifiers; names ending in `_variant` are rejected (list the source, not the derived column). |
+| `MILLPOND_VARIANT_COLUMNS` | no | | DuckLake destination only (rejected at startup with `hoglake`). Comma-separated source column names to dual-write as DuckLake `VARIANT` companions (`properties` → `properties_variant`). Original string columns are kept. Malformed JSON nulls only the VARIANT side. Column names validated as safe identifiers; names ending in `_variant` are rejected (list the source, not the derived column). |
 
 ### Log export (optional)
 
@@ -372,6 +403,8 @@ DUCKLAKE_PARTITION_BY="year(_inserted_at),month(_inserted_at),day(_inserted_at),
 ```
 
 Partition on `_inserted_at` (always a real TIMESTAMP), not source `timestamp` fields (typically VARCHAR). Applied via `ALTER TABLE SET PARTITIONED BY` on first write — idempotent, safe for multiple pods and restarts. If added to an existing unpartitioned table, new files get HSP layout while old files remain flat; DuckLake queries both transparently via metadata.
+
+For the hoglake destination, set `HOGLAKE_PARTITION_BY` instead (same expression style, restricted to hoglake's transform vocabulary — see the [Hoglake config](#hoglake)). Partition tuples are computed client-side by pyhoglake under the table's live spec; the batch fans out into one parquet file per tuple, registered in one atomic commit, and each file carries its `partition_values`. The temporal transforms are Iceberg-semantics epoch-relative ints, not Hive `key=value` directories.
 
 ## Object Sizing
 
