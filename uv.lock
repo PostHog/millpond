@@ -360,7 +360,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pyarrow", specifier = ">=18.0" },
     { name = "pyducklake", specifier = ">=1.0.17" },
-    { name = "pyhoglake", specifier = ">=1.1.0" },
+    { name = "pyhoglake", specifier = ">=1.1.1" },
     { name = "pytz", specifier = ">=2024.1" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
@@ -704,16 +704,16 @@ wheels = [
 
 [[package]]
 name = "pyhoglake"
-version = "1.1.0"
+version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pyarrow" },
     { name = "thrift" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b9/c4/392401206da3b01a561b956ac62e8debc956fc65086d3b2d5d8e2f532941/pyhoglake-1.1.0.tar.gz", hash = "sha256:ccdd8809566d1644cfb9f24867bbf0526ca40e66d633f0efc7b06edb9e9b92a0", size = 149049, upload-time = "2026-09-18T00:31:20.061Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8f/fe/9682771231071837b17fa6109dee0dfc44d7146d7b49bc13cfae2c736d47/pyhoglake-1.1.1.tar.gz", hash = "sha256:ff749fea687660e1d276f6f6d01f3ca3165de7a0c7bf7fa0d3e8381f55d14b80", size = 157865, upload-time = "2026-09-18T16:24:26.892Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/07/d326745123812ac3e1212c995c18009e226e052ad777b25c3614f3acd31b/pyhoglake-1.1.0-py3-none-any.whl", hash = "sha256:ee62b8db603aaa734ba1f1a791cee3187807cfc27361bfc3911feb186cbfc91a", size = 61508, upload-time = "2026-09-18T00:31:18.402Z" },
+    { url = "https://files.pythonhosted.org/packages/15/df/903e51584c60f9cd89f0385b13d4e26c0ba3b625e24bcef8ddaeee797ee6/pyhoglake-1.1.1-py3-none-any.whl", hash = "sha256:b1402531ab14562443c89fedd5b8a7cd163af20a381104d6663d3ec948b49915", size = 62573, upload-time = "2026-09-18T16:24:25.379Z" },
 ]
 
 [[package]]

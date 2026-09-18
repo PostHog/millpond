@@ -39,10 +39,13 @@ dependencies = [
     "pyducklake>=1.0.17",
     # Hoglake destination client: owns the writer path (parquet with field
     # ids, footer-stat extraction, registration via footer-shipping
-    # commits). 1.1.0 is the first release with partitioned fanout appends
-    # and the atomic expected_table_uuid commit guard, both of which the
-    # HoglakeSink relies on.
-    "pyhoglake>=1.1.0",
+    # commits). 1.1.0 brought partitioned fanout appends and the atomic
+    # expected_table_uuid commit guard, both of which the HoglakeSink
+    # relies on. 1.1.1 is the floor because it stamps `uploaded_files` and
+    # `uploaded_uris` on every exception leaving `prepare_append_files` —
+    # the difference between millpond counting the orphans of a failed
+    # prepare and guessing at them.
+    "pyhoglake>=1.1.1",
     "pyarrow>=18.0",
     "orjson>=3.10",
     # Direct libpq for the drop-partitions maintenance op (postgres_execute
@@ -112,10 +115,11 @@ exclude-newer = "7 days"
 # channel. Fixed date, not a rolling window — future pyducklake releases
 # re-enter the cooldown until this date is bumped alongside an intentional
 # version bump.
-# Same carve-out shape for pyhoglake: 1.1.0 was published 2026-09-18 and
-# is needed now for the hoglake destination. Fixed date, not a rolling
-# window — future pyhoglake releases re-enter the cooldown until this
-# date is bumped alongside an intentional version bump.
+# Same carve-out shape for pyhoglake: 1.1.1 was published 2026-09-18 and
+# is needed now for the hoglake destination's orphan accounting. Fixed
+# date, not a rolling window — future pyhoglake releases re-enter the
+# cooldown until this date is bumped alongside an intentional version
+# bump.
 exclude-newer-package = { pyducklake = "2026-08-14T00:00:00Z", pyhoglake = "2026-09-19T00:00:00Z" }
 constraint-dependencies = [
     "pygments>=2.20.0",
