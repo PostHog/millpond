@@ -63,10 +63,21 @@ from millpond.sink import SAFE_IDENTIFIER, check_reserved_collision
 
 log = logging.getLogger(__name__)
 
-# Same set as ducklake.RESERVED_COLUMNS, deliberately: a deployment-time
-# destination switch must not change collision behavior (see sink.py).
-# Hoglake itself only writes `_inserted_at`.
-RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at", "year", "month", "day", "hour"})
+# Deliberately NARROWER than ducklake.RESERVED_COLUMNS, which also holds
+# `year/month/day/hour`. Those names are load-bearing for DuckLake's
+# Hive-style partitioning, which materializes a derived column per
+# partition key. Hoglake partitions by Iceberg-semantics transforms
+# recorded in the catalog: `month(_inserted_at)` produces a partition
+# VALUE on the data file, never a `month` column. So for this backend
+# those four are ordinary payload keys and reserving them would be
+# fatal for no reason — `check_reserved_collision` raises, main.py's
+# retry loop cannot make a ValueError go away, and one producer key
+# named `month` wedges the partition forever. (The contrast that makes
+# it indefensible: a WORSE-formed key, `month-of-year`, is merely
+# dropped.) The asymmetry is safe for a deployment-time destination
+# switch because it only runs one way: hoglake accepts every batch
+# DuckLake accepted, plus four names DuckLake refused. See sink.py.
+RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at"})
 
 _INSERTED_AT = "_inserted_at"
 _INSERTED_AT_TYPE = pa.timestamp("us", tz="UTC")
@@ -77,6 +88,17 @@ _INSERTED_AT_TYPE = pa.timestamp("us", tz="UTC")
 # prefix must be dropped, not sent — otherwise one poison producer key
 # wedges the partition forever (append fails, offsets never advance).
 _HOG_RESERVED_PREFIX = "_hog"
+
+# The server's column-name rule is `^[A-Za-z_][A-Za-z0-9_-]{0,127}$` —
+# 128 characters, total. millpond's shared SAFE_IDENTIFIER has no length
+# bound (DuckDB has no such limit), so the cap is applied here, on the
+# hoglake side only. Without it the two paths disagree: in steady state
+# an over-long name degrades (its `add_column` 422s and the column is
+# dropped for the flush), but BOOTSTRAP ships the whole schema in a
+# single `create_table` — one 129-character key in the first batch 422s
+# the create, so the table is never made, offsets never advance, and the
+# pod crash-loops on the same batch forever.
+_MAX_COLUMN_NAME_LEN = 128
 
 # Widenings mirroring SchemaManager's ALTER COLUMN path, restricted to
 # the promotions the hoglake server accepts (its matrix follows
@@ -157,8 +179,10 @@ def _drop_unwritable_columns(batch: pa.Table) -> pa.Table:
 
     Mirrors SchemaManager.evolve's unsafe-field-name skip (same metric
     reason, one bump per column per flush): records still land, minus
-    the field. Two gates:
+    the field. Three gates:
       * SAFE_IDENTIFIER — millpond's own generated-DDL posture;
+      * the server's 128-character column-name cap, which
+        SAFE_IDENTIFIER does not carry;
       * the server-reserved `_hog` prefix — a 422 at append time would
         otherwise wedge the partition on one poison key.
     """
@@ -168,6 +192,13 @@ def _drop_unwritable_columns(batch: pa.Table) -> pa.Table:
             log.warning("Skipping hoglake-reserved field name: %r (the _hog prefix is server-reserved)", name)
         elif not SAFE_IDENTIFIER.match(name):
             log.warning("Skipping unsafe field name: %r", name)
+        elif len(name) > _MAX_COLUMN_NAME_LEN:
+            log.warning(
+                "Skipping over-long field name (%d chars, hoglake allows %d): %r",
+                len(name),
+                _MAX_COLUMN_NAME_LEN,
+                name,
+            )
         else:
             continue
         metrics.records_skipped_total.labels(reason="unsafe_field_name").inc()

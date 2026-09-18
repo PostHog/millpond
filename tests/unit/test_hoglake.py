@@ -239,12 +239,24 @@ class TestTableSchemaForBatch:
 
 
 class TestReservedCollision:
-    @pytest.mark.parametrize("name", ["_inserted_at", "year", "month", "day", "hour"])
-    def test_reserved_column_raises_before_any_client_call(self, name):
+    def test_inserted_at_collision_raises_before_any_client_call(self):
         s, client, *_ = _sink()
         with pytest.raises(ValueError, match="Hoglake-reserved"):
-            s.write(pa.table({name: ["x"], "uuid": ["a"]}))
+            s.write(pa.table({"_inserted_at": ["x"], "uuid": ["a"]}))
         client.catalog.assert_not_called()
+
+    @pytest.mark.parametrize("name", ["year", "month", "day", "hour"])
+    def test_hive_names_are_ordinary_columns_for_hoglake(self, name):
+        # year/month/day/hour are load-bearing for DuckLake only (Hive
+        # directory keys). Hoglake partitions by Iceberg-semantics
+        # transforms and materializes no derived columns, so a payload
+        # key with one of those names is an ordinary column — it must
+        # land, not crash-loop the partition on a fatal ValueError.
+        assert name not in hoglake.RESERVED_COLUMNS
+        s, client, catalog, ns, table = _sink()
+        assert s.write(pa.table({name: ["x"], "uuid": ["a"]})) == 1
+        appended = table.append.call_args.args[0]
+        assert name in appended.column_names
 
 
 class TestColumnHygiene:
@@ -255,6 +267,27 @@ class TestColumnHygiene:
         appended = table.append.call_args.args[0]
         assert "bad-name" not in appended.column_names
         mock_metrics.records_skipped_total.labels.assert_any_call(reason="unsafe_field_name")
+
+    @patch("millpond.hoglake.metrics")
+    def test_overlong_field_name_dropped_with_metric(self, mock_metrics):
+        # The server caps column names at 128 chars
+        # (^[A-Za-z_][A-Za-z0-9_-]{0,127}$). Steady state would degrade
+        # (the add_column 422s and the column is dropped), but bootstrap
+        # ships the whole schema in one create_table — an over-long name
+        # there wedges the table forever. Drop it at the same gate as the
+        # other unwritable names so both paths degrade identically.
+        long_name = "x" * 129
+        s, *_, table = _sink()
+        assert s.write(pa.table({"uuid": ["a"], long_name: ["x"]})) == 1
+        appended = table.append.call_args.args[0]
+        assert long_name not in appended.column_names
+        mock_metrics.records_skipped_total.labels.assert_any_call(reason="unsafe_field_name")
+
+    def test_name_at_the_length_limit_is_kept(self):
+        s, *_, table = _sink()
+        name = "x" * 128
+        s.write(pa.table({"uuid": ["a"], name: ["x"]}))
+        assert name in table.append.call_args.args[0].column_names
 
     @patch("millpond.hoglake.metrics")
     def test_hog_prefixed_field_dropped_with_metric(self, mock_metrics):

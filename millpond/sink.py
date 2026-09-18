@@ -17,18 +17,31 @@ This module also exports two shared helpers the backends both use:
 
 * `SAFE_IDENTIFIER` — regex for column names that are safe to embed in
   generated SQL / send to the hoglake DDL surface. (schema.py re-exports
-  it so its historical importers keep working.)
+  it so its historical importers keep working.) It carries no LENGTH
+  bound; hoglake's 128-character cap is applied in `hoglake.py`, on the
+  drop path, because only that backend has one.
 * `check_reserved_collision(batch_schema, reserved, backend_name)` —
   raises early with a uniform `ValueError` when a source-schema column
-  collides with a backend-managed metadata column (`_inserted_at`,
-  `year`, `month`, `day`, `hour`). Each backend keeps its own
-  `RESERVED_COLUMNS` constant; both hold the same set today so a
-  deployment-time destination switch doesn't suddenly start accepting
-  or rejecting batches based on column-name collisions. DuckLake
-  reserves `year/month/day/hour` defensively even though it doesn't
-  produce them itself — that's the trade-off for deployment-swap
-  safety, and Hoglake inherits the same posture. Sinks call this at
-  the top of `write()` so the validation produces a clear error
+  collides with a backend-managed metadata column. Each backend keeps
+  its own `RESERVED_COLUMNS` constant, and the two sets DIFFER:
+
+    - DuckLake reserves `_inserted_at` plus `year/month/day/hour`,
+      because its Hive-style partitioning materializes a derived column
+      per partition key, so a payload key with one of those names really
+      does collide.
+    - Hoglake reserves `_inserted_at` only. Its partitioning is
+      Iceberg-semantics transforms recorded in the catalog —
+      `month(_inserted_at)` yields a partition value on the data file,
+      not a `month` column — so those four names carry no meaning for
+      it. See the comment on `hoglake.RESERVED_COLUMNS`.
+
+  The sets were identical originally, to keep a deployment-time
+  destination switch from changing which batches are accepted. The
+  asymmetry is deliberate and safe because it runs one way only: every
+  batch DuckLake accepted, hoglake also accepts. A swap can therefore
+  never turn a working pipeline into a crash loop; it can only stop
+  refusing four names that were never hoglake's to refuse. Sinks call
+  this at the top of `write()` so the validation produces a clear error
   instead of a failure deep in the backend's append stack.
 """
 
