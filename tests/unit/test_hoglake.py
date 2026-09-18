@@ -6,6 +6,7 @@ server round-trips live in tests/integration/test_hoglake_integration.py.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -20,9 +21,12 @@ from pyhoglake import (
     IncarnationChangedError,
     MalformedResponseError,
     NotFoundError,
+    PartitionField,
+    PartitionSpec,
     UnsupportedTypeError,
     ValidationError,
 )
+from pyhoglake.models import SortField, SortSpec
 
 from millpond import hoglake
 
@@ -57,13 +61,25 @@ def _col(name, type_, field_id, ordinal, **kw) -> Column:
     return Column(name=name, type=type_, field_id=field_id, ordinal=ordinal, **kw)
 
 
-def _wire_dynamic_alter(table):
-    """Make the mock table's alter() behave like the real client: apply
-    add_column/promote_column to the mock's live columns and return a
-    TableInfo-shaped object, exactly as pyhoglake's Table.alter does."""
+@dataclass
+class _FakeInfo:
+    """The TableInfo surface the sink reads. A MagicMock is wrong here:
+    `info.partition_spec` on a MagicMock is a truthy Mock, so a test
+    could never tell an unpartitioned table from a partitioned one — and
+    telling those apart is the whole point of the reconciliation path."""
+
+    columns: tuple
+    partition_spec: PartitionSpec | None = None
+    sort_spec: SortSpec | None = None
+
+
+def _wire_dynamic_alter(table, state: _FakeInfo):
+    """Make the mock table's alter() behave like the real server: apply
+    the ops to the live table state and return the post-alter info,
+    exactly as pyhoglake's Table.alter does (one atomic DDL commit)."""
 
     def do_alter(ops_list):
-        cols = list(table.columns)
+        cols = list(state.columns)
         for op in ops_list:
             if op.op == "add_column":
                 c = op.body["column"]
@@ -72,30 +88,40 @@ def _wire_dynamic_alter(table):
                 cols = [
                     _col(x.name, op.body["to"], x.field_id, x.ordinal) if x.name == op.body["name"] else x for x in cols
                 ]
-        table.columns = tuple(cols)
-        info = MagicMock()
-        info.columns = tuple(cols)
-        table.info.return_value = info
-        return info
+            elif op.op == "set_partition_spec":
+                fields = tuple(
+                    PartitionField(f["source_field_id"], f["transform"], f.get("transform_param"))
+                    for f in op.body["fields"]
+                )
+                state.partition_spec = PartitionSpec(spec_id=1, fields=fields) if fields else None
+            elif op.op == "set_sort_order":
+                fields = tuple(
+                    SortField(f["source_field_id"], f["direction"], f["null_order"]) for f in op.body["sort_fields"]
+                )
+                state.sort_spec = SortSpec(sort_id=1, fields=fields) if fields else None
+        state.columns = tuple(cols)
+        table.columns = state.columns
+        return state
 
     table.alter.side_effect = do_alter
 
 
-def _mock_stack(columns):
+def _mock_stack(columns, partition_spec=None, sort_spec=None):
     """(client, catalog, ns, table) MagicMocks wired the way pyhoglake
     resolves them. `columns` is the live table schema."""
     client = MagicMock()
     catalog = MagicMock()
     ns = MagicMock()
     table = MagicMock()
-    table.columns = tuple(columns)
-    info = MagicMock()
-    info.columns = tuple(columns)
-    table.info.return_value = info
-    _wire_dynamic_alter(table)
+    state = _FakeInfo(columns=tuple(columns), partition_spec=partition_spec, sort_spec=sort_spec)
+    table.columns = state.columns
+    table.info.return_value = state
+    table.state = state
+    _wire_dynamic_alter(table, state)
     client.catalog.return_value = catalog
     catalog.namespace.return_value = ns
     ns.table.return_value = table
+    ns.create_table.return_value = table
     append_result = MagicMock()
     append_result.snapshot_id = 7
     append_result.files = (MagicMock(),)
@@ -112,12 +138,27 @@ _EVENTS_COLUMNS = [
 ]
 
 
-def _sink(cfg=None, columns=_EVENTS_COLUMNS):
+def _sink(cfg=None, columns=_EVENTS_COLUMNS, partition_spec=None, sort_spec=None):
     cfg = cfg or _cfg()
-    client, catalog, ns, table = _mock_stack(columns)
+    client, catalog, ns, table = _mock_stack(columns, partition_spec, sort_spec)
     with patch("millpond.hoglake.HoglakeClient", return_value=client):
         s = hoglake.HoglakeSink(cfg)
     return s, client, catalog, ns, table
+
+
+def _spec(*fields) -> PartitionSpec:
+    """PartitionSpec from (column_name, transform[, param]) triples,
+    resolved against _EVENTS_COLUMNS field ids."""
+    fid = {c.name: c.field_id for c in _EVENTS_COLUMNS}
+    return PartitionSpec(
+        spec_id=1,
+        fields=tuple(PartitionField(fid[f[0]], f[1], f[2] if len(f) > 2 else None) for f in fields),
+    )
+
+
+def _sort(*names) -> SortSpec:
+    fid = {c.name: c.field_id for c in _EVENTS_COLUMNS}
+    return SortSpec(sort_id=1, fields=tuple(SortField(fid[n], "asc", "nulls_last") for n in names))
 
 
 def _batch(**cols) -> pa.Table:
@@ -305,11 +346,12 @@ class TestTableSchemaForBatch:
 
 
 class TestReservedCollision:
-    def test_inserted_at_collision_raises_before_any_client_call(self):
-        s, client, *_ = _sink()
+    def test_inserted_at_collision_raises_before_any_table_work(self):
+        s, client, catalog, ns, table = _sink()
         with pytest.raises(ValueError, match="Hoglake-reserved"):
             s.write(pa.table({"_inserted_at": ["x"], "uuid": ["a"]}))
-        client.catalog.assert_not_called()
+        ns.table.assert_not_called()
+        table.append.assert_not_called()
 
     @pytest.mark.parametrize("name", ["year", "month", "day", "hour"])
     def test_hive_names_are_ordinary_columns_for_hoglake(self, name):
@@ -371,26 +413,58 @@ class TestColumnHygiene:
 # ---------------------------------------------------------------------------
 
 
-class TestBootstrap:
-    def test_missing_catalog_without_data_path_is_clear_error(self):
-        s, client, *_ = _sink()
-        client.catalog.side_effect = NotFoundError("no catalog", status_code=404)
-        with pytest.raises(RuntimeError, match="HOGLAKE_DATA_PATH"):
-            s.write(_batch())
+class TestStartupResolution:
+    """The catalog is resolved in __init__, so a bad URL, bad credentials
+    or an absent catalog is a STARTUP failure — which is what config.py
+    and the README have always claimed. Resolving it lazily on the first
+    flush meant the pod passed its probes, joined the consumer group,
+    accumulated lag, and only then crash-looped."""
 
+    def _construct(self, client, cfg=None):
+        with patch("millpond.hoglake.HoglakeClient", return_value=client):
+            return hoglake.HoglakeSink(cfg or _cfg())
+
+    def test_catalog_resolved_at_construction(self):
+        client, *_ = _mock_stack(_EVENTS_COLUMNS)
+        self._construct(client)
+        client.catalog.assert_called_once_with("millpond")
+
+    def test_missing_catalog_without_data_path_refuses_at_construction(self):
+        client, *_ = _mock_stack(_EVENTS_COLUMNS)
+        client.catalog.side_effect = NotFoundError("not found", status_code=404)
+        with pytest.raises(RuntimeError, match="HOGLAKE_DATA_PATH"):
+            self._construct(client)
+
+    def test_unreachable_control_plane_names_the_url(self):
+        client, *_ = _mock_stack(_EVENTS_COLUMNS)
+        client.catalog.side_effect = httpx.ConnectError("connection refused")
+        with pytest.raises(RuntimeError, match="http://localhost:28080"):
+            self._construct(client)
+
+    def test_first_write_does_not_re_resolve_the_catalog(self):
+        s, client, catalog, ns, table = _sink()
+        s.write(_batch())
+        client.catalog.assert_called_once()
+
+
+class TestBootstrap:
     def test_missing_catalog_created_when_data_path_set(self):
-        s, client, catalog, ns, table = _sink(_cfg(hoglake_data_path="s3://bucket/millpond/"))
+        client, catalog, ns, table = _mock_stack(_EVENTS_COLUMNS)
         client.catalog.side_effect = [NotFoundError("no catalog", status_code=404)]
         created = MagicMock()
         created.namespace.return_value = ns
         client.create_catalog.return_value = created
-        s.write(_batch())
+        with patch("millpond.hoglake.HoglakeClient", return_value=client):
+            s = hoglake.HoglakeSink(_cfg(hoglake_data_path="s3://bucket/millpond/"))
         client.create_catalog.assert_called_once_with("millpond", "s3://bucket/millpond/")
+        assert s.write(_batch()) == 1
 
     def test_concurrent_catalog_creation_tolerated(self):
-        s, client, catalog, ns, table = _sink(_cfg(hoglake_data_path="s3://bucket/millpond/"))
+        client, catalog, ns, table = _mock_stack(_EVENTS_COLUMNS)
         client.catalog.side_effect = [NotFoundError("no catalog", status_code=404), catalog]
         client.create_catalog.side_effect = AlreadyExistsError("exists", status_code=409)
+        with patch("millpond.hoglake.HoglakeClient", return_value=client):
+            s = hoglake.HoglakeSink(_cfg(hoglake_data_path="s3://bucket/millpond/"))
         assert s.write(_batch()) == 1
 
     def test_missing_namespace_created(self):
@@ -426,7 +500,6 @@ class TestBootstrap:
         s, client, catalog, ns, table = _sink()
         s.write(_batch())
         s.write(_batch())
-        assert client.catalog.call_count == 1
         assert ns.table.call_count == 1
 
     def test_reset_caches_forces_reresolve(self):
@@ -434,7 +507,7 @@ class TestBootstrap:
         s.write(_batch())
         s.reset_caches()
         s.write(_batch())
-        assert client.catalog.call_count == 2
+        assert ns.table.call_count == 2
 
     def test_close_closes_client(self):
         s, client, *_ = _sink()
@@ -498,6 +571,118 @@ class TestBootstrapSpecs:
         s, ns, table = self._create_flow(_cfg())
         s.write(_batch())
         table.alter.assert_not_called()
+
+
+class TestSpecDeclarationIsAtomicOrRecoverable:
+    """Creation is two round trips — create_table, then one alter that
+    declares the partition spec and sort order. The window between them
+    is the hazard: if the alter fails for anything other than a
+    concurrent-DDL 409, the table EXISTS and is UNPARTITIONED, and the
+    next attempt used to take the 'table already exists' path and return
+    happily. The result was a permanently unpartitioned table, written
+    to forever, with no error after the first one."""
+
+    def _create_flow(self, cfg, **stack):
+        s, client, catalog, ns, table = _sink(cfg, **stack)
+        ns.table.side_effect = NotFoundError("not found", status_code=404)
+        return s, ns, table
+
+    def test_alter_failure_is_fatal_and_leaves_no_cached_table(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, ns, table = self._create_flow(cfg)
+        table.alter.side_effect = ValidationError("validation", status_code=422)
+        with pytest.raises(HoglakeError):
+            s.write(_batch())
+        assert s._table is None  # nothing cached: the next attempt re-checks
+
+    def test_a_bad_spec_keeps_failing_on_every_later_attempt(self):
+        # The config typo case (month(team_id), bucket(float_col, 16)):
+        # the server 422s the alter. Attempt 2 finds the table present
+        # and unpartitioned — it must re-declare and fail again, not
+        # silently accept an unpartitioned table.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "month", None),))
+        s, client, catalog, ns, table = _sink(cfg)
+        ns.table.side_effect = [NotFoundError("not found", status_code=404), table, table]
+        table.alter.side_effect = ValidationError(
+            "transform 'month' requires a date or timestamp column; 'team_id' is 'long'",
+            status_code=422,
+        )
+        for _ in range(3):
+            with pytest.raises(HoglakeError):
+                s.write(_batch())
+            s.reset_caches()
+        assert table.alter.call_count == 3
+        table.append.assert_not_called()
+
+    def test_post_condition_catches_a_spec_the_server_did_not_apply(self):
+        # Belt and braces: if the alter reports success but the live spec
+        # is not what config asked for, that is still a table millpond
+        # must not write to.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, ns, table = self._create_flow(cfg)
+        table.alter.side_effect = lambda ops_list: _FakeInfo(columns=tuple(_EVENTS_COLUMNS))
+        with pytest.raises(RuntimeError, match="partition spec"):
+            s.write(_batch())
+
+
+class TestExistingTableReconciliation:
+    """A spec is declared at CREATE. On every later resolve the live spec
+    was never looked at, so changing HOGLAKE_PARTITION_BY on a deployed
+    pipeline was a silent no-op — the pod logged nothing and kept writing
+    under the old layout."""
+
+    def test_matching_spec_is_accepted(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),), sort_by=("uuid",))
+        s, client, catalog, ns, table = _sink(
+            cfg, partition_spec=_spec(("team_id", "identity")), sort_spec=_sort("uuid")
+        )
+        assert s.write(_batch()) == 1
+        table.alter.assert_not_called()  # nothing to reconcile
+
+    def test_changed_partition_config_fails_loudly(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "bucket", 16),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+            s.write(_batch())
+
+    def test_changed_transform_param_fails_loudly(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "bucket", 32),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "bucket", 16)))
+        with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+            s.write(_batch())
+
+    def test_partitioned_table_with_no_configured_spec_fails_loudly(self):
+        # The MILLPOND_DESTINATION flip: DUCKLAKE_PARTITION_BY is nulled
+        # for hoglake, so the pod's config says 'unpartitioned' about a
+        # table that is partitioned. Refuse rather than write on under a
+        # layout nobody declared.
+        s, client, catalog, ns, table = _sink(_cfg(), partition_spec=_spec(("team_id", "identity")))
+        with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+            s.write(_batch())
+
+    def test_unpartitioned_table_with_configured_spec_is_declared(self):
+        # The recovery half of the create-then-alter window, and the
+        # reason the mismatch check cannot simply raise here: the table
+        # exists, the spec does not, config says it should. Declare it.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg)
+        assert s.write(_batch()) == 1
+        spec_op = next(o for o in table.alter.call_args.args[0] if o.op == "set_partition_spec")
+        assert spec_op.body["fields"][0]["source_field_id"] == 3
+
+    def test_changed_sort_config_fails_loudly(self):
+        cfg = _cfg(sort_by=("uuid",))
+        s, client, catalog, ns, table = _sink(cfg, sort_spec=_sort("team_id"))
+        with pytest.raises(RuntimeError, match="MILLPOND_SORT_BY"):
+            s.write(_batch())
+
+    def test_missing_sort_field_still_degrades_without_reconciling(self):
+        # A sort field absent from the table schema already degrades
+        # (warn, write unsorted). That must not turn into a hard failure
+        # via the new reconciliation path.
+        cfg = _cfg(sort_by=("not_there",))
+        s, client, catalog, ns, table = _sink(cfg, sort_spec=_sort("team_id"))
+        assert s.write(_batch()) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -60,6 +60,8 @@ class HogCfg:
     hoglake_s3_secret_key: str = stack.S3_SECRET_KEY
     hoglake_s3_region: str | None = None
     hoglake_partition_by: tuple[tuple[str, str, int | None], ...] | None = None
+    hoglake_max_retry_count: int = 8
+    hoglake_request_timeout_s: float = 30.0
     sort_by: tuple[str, ...] | None = None
     ordinal: int = 0
     table_label: str = field(default="events")
@@ -157,14 +159,18 @@ class TestBootstrap:
             "_inserted_at": "timestamptz",
         }
 
-    def test_missing_catalog_without_data_path_is_startup_shaped_error(self, hog_stack):
+    def test_missing_catalog_without_data_path_is_a_startup_error(self, hog_stack):
+        # Literally at startup now: the sink resolves its catalog in
+        # __init__, so this never reaches a flush (and never builds lag
+        # behind a pod that passes its probes).
         cfg = _fresh(hoglake_catalog="millpond-it-absent", hoglake_data_path=None)
-        sink = HoglakeSink(cfg)
-        try:
-            with pytest.raises(RuntimeError, match="HOGLAKE_DATA_PATH"):
-                sink.write(_batch())
-        finally:
-            sink.close()
+        with pytest.raises(RuntimeError, match="HOGLAKE_DATA_PATH"):
+            HoglakeSink(cfg)
+
+    def test_unreachable_control_plane_is_a_startup_error(self, hog_stack):
+        cfg = _fresh(hoglake_url="http://127.0.0.1:1")
+        with pytest.raises(RuntimeError, match="cannot reach the hoglake control plane"):
+            HoglakeSink(cfg)
 
     def test_partition_spec_and_sort_order_declared(self, hog_stack, client):
         cfg = _fresh(
@@ -200,6 +206,66 @@ class TestBootstrap:
         assert len(files) == 3
         assert sum(f.record_count for f in files) == 9
         assert sorted(f.partition_values[0] for f in files) == ["1", "2", "3"]
+
+    def test_changing_the_partition_spec_fails_loudly(self, hog_stack, client):
+        # A deployed pipeline whose HOGLAKE_PARTITION_BY changes used to
+        # keep writing under the old layout with nothing in the logs.
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3))
+        finally:
+            sink.close()
+        changed = _fresh(
+            hoglake_table=cfg.hoglake_table,
+            hoglake_partition_by=(("team_id", "bucket", 8),),
+        )
+        sink2 = HoglakeSink(changed)
+        try:
+            with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+                sink2.write(_batch(3))
+        finally:
+            sink2.close()
+        assert _record_count(client, cfg) == 3  # nothing written under the wrong layout
+
+    def test_spec_declaration_recovers_on_an_existing_unpartitioned_table(self, hog_stack, client):
+        # The create-then-alter window: the table exists, its spec does
+        # not. The next bootstrap must declare it, not shrug.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+        finally:
+            sink.close()
+        partitioned = _fresh(
+            hoglake_table=cfg.hoglake_table,
+            hoglake_partition_by=(("team_id", "identity", None),),
+        )
+        sink2 = HoglakeSink(partitioned)
+        try:
+            sink2.write(_batch(4, teams=(7, 8)))
+        finally:
+            sink2.close()
+        info = _table(client, cfg).info()
+        assert info.partition_spec is not None
+        assert [f.transform for f in info.partition_spec.fields] == ["identity"]
+
+    def test_a_typo_in_the_spec_keeps_failing(self, hog_stack, client):
+        # month() on a bigint is a 422 from the server. The failure must
+        # repeat on every attempt rather than leaving a permanently
+        # unpartitioned table behind after the first one.
+        cfg = _fresh(hoglake_partition_by=(("team_id", "month", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            for _ in range(2):
+                with pytest.raises(Exception):  # noqa: B017 - 422 from the server, then again
+                    sink.write(_batch(2))
+                sink.reset_caches()
+        finally:
+            sink.close()
+        # The table exists (create succeeded, the alter did not) and has
+        # no rows: the flush never got past the declaration.
+        assert _record_count(client, cfg) == 0
 
     def test_concurrent_create_tolerated(self, hog_stack, client):
         cfg = _fresh()

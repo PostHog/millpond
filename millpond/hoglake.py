@@ -7,9 +7,15 @@ path. pyhoglake owns that writer path (field-id-stamped parquet, footer
 stat extraction, one-commit registration, partitioned fanout appends);
 this module owns everything millpond-shaped around it:
 
-* first-write bootstrap (catalog/namespace/table ensure, concurrent-
-  creation tolerant), with the partition spec and sort order declared at
-  table creation from millpond's config;
+* startup catalog resolution (in `__init__`, so a bad URL or an absent
+  catalog fails before the pod claims readiness) and first-write
+  bootstrap of namespace/table, concurrent-creation tolerant at every
+  level;
+* the partition spec and sort order: declared from millpond's config at
+  table creation, VERIFIED afterwards, and reconciled against the live
+  table on every later resolve — a config that disagrees with the table
+  it writes to stops the pod rather than silently writing under a layout
+  nobody declared;
 * the `_inserted_at` metadata column (stamped once per flush — unlike
   DuckLake's SQL `NOW()`, every row in a flush carries the same value);
 * schema evolution mirroring schema.SchemaManager's semantics: new
@@ -241,6 +247,34 @@ def _drop_unwritable_columns(batch: pa.Table) -> pa.Table:
     return batch.drop_columns(drop) if drop else batch
 
 
+def _partition_tuples(spec) -> tuple[tuple[int, str, int | None], ...]:
+    """A live PartitionSpec as comparable (source_field_id, transform,
+    param) triples. An absent spec and an empty one are the same thing —
+    the server retires a spec by setting an empty field list."""
+    if spec is None or not spec.fields:
+        return ()
+    return tuple((f.source_field_id, f.transform, f.transform_param) for f in spec.fields)
+
+
+def _sort_tuples(spec) -> tuple[tuple[int, str, str], ...]:
+    """A live SortSpec as comparable (source_field_id, direction,
+    null_order) triples."""
+    if spec is None or not spec.fields:
+        return ()
+    return tuple((f.source_field_id, f.direction, f.null_order) for f in spec.fields)
+
+
+def _describe_partition(spec, live_columns) -> str:
+    """A live spec in HOGLAKE_PARTITION_BY's own grammar, so the operator
+    can paste the fix straight into the values file."""
+    names = {col.field_id: name for name, col in live_columns.items()}
+    return ", ".join(
+        f"{f.transform}({names.get(f.source_field_id, f'field_id={f.source_field_id}')}"
+        f"{', ' + str(f.transform_param) if f.transform_param is not None else ''})"
+        for f in (spec.fields if spec is not None else ())
+    )
+
+
 class HoglakeSink:
     """The hoglake sink: owns the pyhoglake client, the resolved
     catalog/namespace/table handles, and the live-schema cache.
@@ -302,6 +336,16 @@ class HoglakeSink:
         # table, or it may have been dropped+recreated).
         self._table = None
         self._live_columns: dict[str, Column] = {}
+        # STARTUP network validation. Everything else in this class is
+        # lazy, and that is fine — but the catalog is the one thing whose
+        # absence config.py and the README both describe as a "startup
+        # error", and resolving it here is what makes that true. Before
+        # this, a wrong HOGLAKE_URL, wrong S3-adjacent credentials or a
+        # catalog nobody had created surfaced on the FIRST FLUSH: the pod
+        # started, passed its probes, took its partitions, built lag, and
+        # only then began crash-looping. One request at construction
+        # turns all of that into a pod that never claims to be ready.
+        self._catalog = self._resolve_catalog()
 
     # -- Sink protocol -----------------------------------------------------
 
@@ -411,16 +455,13 @@ class HoglakeSink:
 
     # -- bootstrap ---------------------------------------------------------
 
-    def _ensure_table(self, batch_schema: pa.Schema):
-        """Resolve (or create) catalog -> namespace -> table, tolerating
-        concurrent creation by other pods at every level. Cached for the
-        sink's lifetime; reset_caches() drops the cache."""
-        if self._table is not None:
-            return self._table
-
+    def _resolve_catalog(self):
+        """Resolve (or create) the catalog. Called from __init__, so every
+        failure here is a startup failure with a message that says what to
+        fix."""
         cfg = self._cfg
         try:
-            catalog = self._client.catalog(cfg.hoglake_catalog)
+            return self._client.catalog(cfg.hoglake_catalog)
         except NotFoundError:
             if cfg.hoglake_data_path is None:
                 raise RuntimeError(
@@ -431,9 +472,34 @@ class HoglakeSink:
             try:
                 catalog = self._client.create_catalog(cfg.hoglake_catalog, cfg.hoglake_data_path)
                 log.info("Created hoglake catalog %s (data_path=%s)", cfg.hoglake_catalog, cfg.hoglake_data_path)
+                return catalog
             except AlreadyExistsError:
-                catalog = self._client.catalog(cfg.hoglake_catalog)
+                # Another pod created it between our GET and our POST.
+                return self._client.catalog(cfg.hoglake_catalog)
+        except (HoglakeError, httpx.HTTPError, OSError) as e:
+            # Bad URL, DNS, TLS, a control plane that is down, a proxy
+            # answering HTML: all of it lands here, and all of it is a
+            # deployment problem the operator can see from the message.
+            raise RuntimeError(
+                f"cannot reach the hoglake control plane at {cfg.hoglake_url!r} to resolve "
+                f"catalog {cfg.hoglake_catalog!r}: {e}"
+            ) from e
 
+    def _ensure_table(self, batch_schema: pa.Schema):
+        """Resolve (or create) namespace -> table, tolerating concurrent
+        creation by other pods at every level, and reconcile the live
+        partition spec / sort order against config. Cached for the sink's
+        lifetime; reset_caches() drops the cache.
+
+        `self._table` is assigned LAST, deliberately: any failure in here
+        — including a spec declaration the server refuses — must leave
+        the cache empty so the next attempt re-checks instead of
+        returning a table whose layout was never declared."""
+        if self._table is not None:
+            return self._table
+
+        cfg = self._cfg
+        catalog = self._catalog
         try:
             ns = catalog.namespace(cfg.hoglake_namespace)
         except NotFoundError:
@@ -447,6 +513,7 @@ class HoglakeSink:
             table = ns.table(cfg.hoglake_table)
             log.info("Hoglake table %s.%s already exists", cfg.hoglake_namespace, cfg.hoglake_table)
             self._adopt_columns(table.columns)
+            self._reconcile_specs(table)
         except NotFoundError:
             table = self._create_table(ns, batch_schema)
 
@@ -468,69 +535,207 @@ class HoglakeSink:
                 len(schema),
             )
         except AlreadyExistsError:
-            # Another pod won the race; the winner declares the specs.
+            # Another pod won the race. The winner declares the specs —
+            # but "the winner will do it" is exactly the assumption that
+            # made the old create-then-alter window permanent, so the
+            # loser verifies rather than trusting.
             log.info("Hoglake table %s created by another pod, continuing", cfg.hoglake_table)
             table = ns.table(cfg.hoglake_table)
             self._adopt_columns(table.columns)
+            self._reconcile_specs(table)
             return table
 
         self._adopt_columns(table.columns)
-        spec_ops = self._spec_ops()
-        if spec_ops:
-            try:
-                info = table.alter(spec_ops)
-                self._adopt_columns(info.columns)
-                log.info("Declared hoglake table specs: %s", ", ".join(op.op for op in spec_ops))
-            except CommitConflictError as e:
-                # Concurrent DDL (another pod racing the same specs).
-                # The specs are config-identical across the fleet, so the
-                # winner declared the same thing; refresh and continue.
-                log.info("Hoglake spec DDL raced another writer, continuing: %s", e)
-                self._adopt_columns(table.info().columns)
+        self._declare_specs(table)
         return table
 
-    def _spec_ops(self) -> list[AlterOp]:
-        """Partition-spec + sort-order alter ops with field ids resolved
-        against the live columns. Partition columns must exist (fatal —
-        data layout is load-bearing and the operator asked for it); sort
-        fields degrade non-fatally like main._apply_sort's missing-field
-        skip (the sort spec is advisory for writers, binding only for
-        compaction)."""
+    def _declare_specs(self, table) -> None:
+        """Declare the configured partition spec + sort order in ONE
+        alter, then VERIFY the result.
+
+        Creation is two round trips and the gap between them is the
+        hazard: the table exists before its layout does. Only a
+        concurrent-DDL 409 is absorbed here (another pod declaring the
+        same config-identical specs); anything else propagates, and
+        because `_ensure_table` has not cached the table yet, the next
+        attempt re-resolves, finds the table present and unspecced, and
+        tries again — failing identically for as long as the config is
+        wrong, which is the point. Silently writing to a table whose
+        partitioning the operator asked for and never got is the failure
+        mode this replaces."""
+        spec_ops = self._spec_ops()
+        if not spec_ops:
+            return
+        try:
+            info = table.alter(spec_ops)
+            log.info("Declared hoglake table specs: %s", ", ".join(op.op for op in spec_ops))
+        except CommitConflictError as e:
+            # Concurrent DDL (another pod racing the same specs). The
+            # specs are config-identical across the fleet, so the winner
+            # declared the same thing — which the verification below
+            # proves rather than assumes.
+            log.info("Hoglake spec DDL raced another writer, continuing: %s", e)
+            info = table.info()
+        self._adopt_columns(info.columns)
+        self._verify_specs(info)
+
+    def _reconcile_specs(self, table) -> None:
+        """Compare the live partition spec / sort order of an EXISTING
+        table against config.
+
+        The spec was only ever declared at CREATE, so a deployed pipeline
+        that changed HOGLAKE_PARTITION_BY silently kept the old layout,
+        and a pod whose config had lost its partitioning (the
+        MILLPOND_DESTINATION flip nulls the DuckLake partition var) wrote
+        on as if nothing had happened. Config is the declaration of what
+        this table's layout is; a pod that disagrees with the table it
+        writes to stops, loudly, the same way MILLPOND_VARIANT_COLUMNS
+        stops a hoglake pod at startup.
+
+        The one divergence that is NOT an error is an unspecced table
+        that config says should be specced: that is the create-then-alter
+        window reopening, and declaring the spec is the recovery."""
+        # No early out when both knobs are unset: "config says
+        # unpartitioned, the table is partitioned" is the destination-flip
+        # case, and it is the one this check exists for.
+        info = table.info()
+        self._adopt_columns(info.columns)
+        want_partition = self._want_partition_fields()
+        live_partition = _partition_tuples(info.partition_spec)
+        if live_partition and live_partition != want_partition:
+            raise RuntimeError(
+                f"live partition spec of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} "
+                f"{_describe_partition(info.partition_spec, self._live_columns)} does not match "
+                f"HOGLAKE_PARTITION_BY {self._describe_configured_partition()}. Hoglake never "
+                f"re-specs a table behind your back and millpond will not write under a layout "
+                f"nobody declared: set HOGLAKE_PARTITION_BY to the live spec, or point this "
+                f"pipeline at a new table."
+            )
+
+        want_sort = self._want_sort_fields()
+        live_sort = _sort_tuples(info.sort_spec)
+        sort_known = self._cfg.sort_by is None or want_sort is not None
+        if sort_known and live_sort and live_sort != (want_sort or ()):
+            raise RuntimeError(
+                f"live sort order of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} does "
+                f"not match MILLPOND_SORT_BY {self._cfg.sort_by!r}. The sort order is advisory for "
+                f"writers but BINDING for hoglake compaction, so a mismatch means compaction "
+                f"re-sorts every file this pod writes: set MILLPOND_SORT_BY to the live order, or "
+                f"point this pipeline at a new table."
+            )
+
+        if want_partition and not live_partition:
+            log.warning(
+                "Hoglake table %s.%s exists with no partition spec but HOGLAKE_PARTITION_BY is set; "
+                "declaring it now (a previous bootstrap created the table and failed before its "
+                "spec landed)",
+                self._cfg.hoglake_namespace,
+                self._cfg.hoglake_table,
+            )
+            self._declare_specs(table)
+        elif want_sort and not live_sort:
+            log.warning(
+                "Hoglake table %s.%s exists with no sort order but MILLPOND_SORT_BY is set; declaring it now",
+                self._cfg.hoglake_namespace,
+                self._cfg.hoglake_table,
+            )
+            self._declare_specs(table)
+
+    def _verify_specs(self, info) -> None:
+        """Post-condition on the declaration: the live layout IS what
+        config asked for. A server that accepted the alter and applied
+        something else, or a code path that skipped an op, both end here
+        rather than in a silently mis-laid-out table."""
+        want_partition = self._want_partition_fields()
+        if want_partition and _partition_tuples(info.partition_spec) != want_partition:
+            raise RuntimeError(
+                f"hoglake table {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} does not "
+                f"carry the partition spec that was just declared for it "
+                f"(HOGLAKE_PARTITION_BY {self._describe_configured_partition()}); refusing to "
+                f"write to an undeclared layout"
+            )
+        want_sort = self._want_sort_fields()
+        if want_sort and _sort_tuples(info.sort_spec) != want_sort:
+            raise RuntimeError(
+                f"hoglake table {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} does not "
+                f"carry the sort order that was just declared for it "
+                f"(MILLPOND_SORT_BY {self._cfg.sort_by!r})"
+            )
+
+    def _want_partition_fields(self) -> tuple[tuple[int, str, int | None], ...]:
+        """Configured partition spec as (source_field_id, transform,
+        param) triples, resolved against the live columns."""
         cfg = self._cfg
+        if not cfg.hoglake_partition_by:
+            return ()
         fid = {name: col.field_id for name, col in self._live_columns.items()}
-        spec_ops: list[AlterOp] = []
-
-        if cfg.hoglake_partition_by:
-            fields = []
-            for column, transform, param in cfg.hoglake_partition_by:
-                if column not in fid:
-                    raise RuntimeError(
-                        f"HOGLAKE_PARTITION_BY column {column!r} is not in the table schema "
-                        f"(columns: {sorted(fid)}); partition columns must exist in the source "
-                        f"events (or be _inserted_at)"
-                    )
-                fields.append(ops.partition_field(fid[column], transform, param))
-            spec_ops.append(ops.set_partition_spec(fields))
-
-        if cfg.sort_by:
-            missing = [c for c in cfg.sort_by if c not in fid]
-            if missing:
-                log.warning(
-                    "MILLPOND_SORT_BY field(s) %s missing from the hoglake table schema; "
-                    "skipping the sort-order declaration (batches are still pre-sorted on "
-                    "the fields present)",
-                    missing,
+        out = []
+        for column, transform, param in cfg.hoglake_partition_by:
+            if column not in fid:
+                raise RuntimeError(
+                    f"HOGLAKE_PARTITION_BY column {column!r} is not in the table schema "
+                    f"(columns: {sorted(fid)}); partition columns must exist in the source "
+                    f"events (or be _inserted_at)"
                 )
-            else:
-                sort_fields = [
-                    # asc + nulls_last mirrors main._apply_sort (ascending,
-                    # null_placement="at_end") so the declared order is the
-                    # order millpond actually writes.
-                    {"source_field_id": fid[c], "direction": "asc", "null_order": "nulls_last"}
-                    for c in cfg.sort_by
-                ]
-                spec_ops.append(AlterOp("set_sort_order", {"sort_fields": sort_fields}))
+            out.append((fid[column], transform, param))
+        return tuple(out)
 
+    def _want_sort_fields(self) -> tuple[tuple[int, str, str], ...] | None:
+        """Configured sort order as (source_field_id, direction,
+        null_order) triples, or None when a sort field is missing from the
+        table schema — the pre-existing non-fatal degrade (the batch is
+        still pre-sorted on the fields that ARE present)."""
+        cfg = self._cfg
+        if not cfg.sort_by:
+            return ()
+        fid = {name: col.field_id for name, col in self._live_columns.items()}
+        missing = [c for c in cfg.sort_by if c not in fid]
+        if missing:
+            log.warning(
+                "MILLPOND_SORT_BY field(s) %s missing from the hoglake table schema; "
+                "skipping the sort-order declaration (batches are still pre-sorted on "
+                "the fields present)",
+                missing,
+            )
+            return None
+        # asc + nulls_last mirrors main._apply_sort (ascending,
+        # null_placement="at_end") so the declared order is the order
+        # millpond actually writes.
+        return tuple((fid[c], "asc", "nulls_last") for c in cfg.sort_by)
+
+    def _describe_configured_partition(self) -> str:
+        return ", ".join(
+            f"{t}({c}{', ' + str(p) if p is not None else ''})" for c, t, p in (self._cfg.hoglake_partition_by or ())
+        )
+
+    def _spec_ops(self) -> list[AlterOp]:
+        """Partition-spec + sort-order alter ops, built from the same
+        resolved tuples the reconciliation and verification paths
+        compare against — so what is declared, what is checked and what
+        the error message names can never drift apart.
+
+        Partition columns must exist (fatal — data layout is load-bearing
+        and the operator asked for it); sort fields degrade non-fatally
+        like main._apply_sort's missing-field skip (the sort spec is
+        advisory for writers, binding only for compaction).
+        """
+        spec_ops: list[AlterOp] = []
+        partition = self._want_partition_fields()
+        if partition:
+            spec_ops.append(ops.set_partition_spec([ops.partition_field(*f) for f in partition]))
+        sort = self._want_sort_fields()
+        if sort:
+            spec_ops.append(
+                AlterOp(
+                    "set_sort_order",
+                    {
+                        "sort_fields": [
+                            {"source_field_id": fid, "direction": direction, "null_order": null_order}
+                            for fid, direction, null_order in sort
+                        ]
+                    },
+                )
+            )
         return spec_ops
 
     # -- schema evolution + alignment -------------------------------------

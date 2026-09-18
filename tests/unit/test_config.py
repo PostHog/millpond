@@ -943,6 +943,24 @@ class TestHoglakeConfig:
         with pytest.raises(RuntimeError, match="MILLPOND_VARIANT_COLUMNS"):
             load()
 
+    def test_ducklake_partitioning_without_a_hoglake_spec_refused(self, monkeypatch):
+        # Flipping MILLPOND_DESTINATION on an existing values file leaves
+        # DUCKLAKE_PARTITION_BY behind, and the hoglake block nulls it —
+        # so the pipeline that was partitioned yesterday creates an
+        # UNPARTITIONED hoglake table today and nothing says a word.
+        # Same treatment as MILLPOND_VARIANT_COLUMNS: refuse, and make
+        # the operator state the intent.
+        monkeypatch.setenv("DUCKLAKE_PARTITION_BY", "year(timestamp),month(timestamp)")
+        with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+            load()
+
+    def test_ducklake_partitioning_ignored_once_a_hoglake_spec_is_given(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_PARTITION_BY", "year(timestamp)")
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "month(_inserted_at)")
+        cfg = load()
+        assert cfg.hoglake_partition_by == (("_inserted_at", "month", None),)
+        assert cfg.partition_by is None
+
     def test_typed_columns_allowed_for_hoglake(self, monkeypatch):
         # Typed pins act upstream in arrow_converter — destination-neutral.
         monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "timestamp:timestamptz")

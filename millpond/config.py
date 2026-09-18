@@ -739,6 +739,25 @@ def _load_hoglake_fields() -> dict:
     timeout_s = _positive_float("HOGLAKE_REQUEST_TIMEOUT_S", 30.0)
 
     partition_raw = os.environ.get("HOGLAKE_PARTITION_BY", "").strip()
+    if not partition_raw and os.environ.get("DUCKLAKE_PARTITION_BY", "").strip():
+        # The destination-flip trap. Every other stray var from the
+        # inactive destination is genuinely harmless, which is why they
+        # are nulled — but this one changes the shape of the DATA. An
+        # operator who flips MILLPOND_DESTINATION on an existing values
+        # file keeps DUCKLAKE_PARTITION_BY, the hoglake block nulls it,
+        # and the pipeline that was partitioned yesterday creates an
+        # unpartitioned hoglake table today with nothing in the logs.
+        # Partitioning is also the one property that is painful to add
+        # afterwards (existing files keep their vintage forever), so the
+        # cost of the silent version is unusually high. Refuse and make
+        # the intent explicit, exactly as MILLPOND_VARIANT_COLUMNS does.
+        raise RuntimeError(
+            "DUCKLAKE_PARTITION_BY is set but MILLPOND_DESTINATION=hoglake reads "
+            "HOGLAKE_PARTITION_BY, which is unset — this pipeline would create an "
+            "UNPARTITIONED hoglake table. Set HOGLAKE_PARTITION_BY (the same expression "
+            "style, restricted to identity/year/month/day/hour/bucket), or remove "
+            "DUCKLAKE_PARTITION_BY to confirm the table is meant to be unpartitioned."
+        )
     return {
         "hoglake_max_retry_count": max_retries,
         "hoglake_request_timeout_s": timeout_s,

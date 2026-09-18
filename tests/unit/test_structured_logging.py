@@ -1,5 +1,6 @@
 """Unit tests for millpond/structured_logging.py — the building blocks
 millpond's logging_config composes from."""
+
 from __future__ import annotations
 
 import io
@@ -21,9 +22,7 @@ def _reset_root_logger():
 
 
 def _record(msg: str = "hello", extra: dict | None = None) -> logging.LogRecord:
-    r = logging.LogRecord(
-        name="t", level=logging.INFO, pathname="t.py", lineno=1, msg=msg, args=(), exc_info=None
-    )
+    r = logging.LogRecord(name="t", level=logging.INFO, pathname="t.py", lineno=1, msg=msg, args=(), exc_info=None)
     if extra:
         for k, v in extra.items():
             setattr(r, k, v)
@@ -162,9 +161,7 @@ def test_attach_otel_handler_applies_extra_filters():
                 return True
 
         root = sl.install_root_handlers(level="INFO", formatter=sl.JsonFormatter())
-        sl.attach_otel_handler(
-            provider=provider, root=root, level="INFO", extra_filters=[_Capture()]
-        )
+        sl.attach_otel_handler(provider=provider, root=root, level="INFO", extra_filters=[_Capture()])
         logging.getLogger("test.otel.path").info("emit me")
         assert any(r.getMessage() == "emit me" for r in seen)
     finally:
