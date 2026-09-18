@@ -150,7 +150,18 @@ def _wire_prepared_commit(table, catalog):
     commit request naming one file per partition group, and
     Catalog.commit_prepared publishes it."""
 
-    def prepare(files, *, idempotency_key, **kwargs):
+    def prepare(files, *, idempotency_key, expected_table_uuid=None, **kwargs):
+        # pyhoglake pins the guard to the incarnation the CALLER names
+        # (`expected = expected_table_uuid or self.table_uuid`) and then
+        # fast-fails, BEFORE the first upload, when the name now binds to
+        # a different table (`Table._check_incarnation`). `table_uuid` on
+        # the mock stands for what the name resolves to now, exactly as
+        # `self._info.table_uuid` does after a refresh.
+        expected = expected_table_uuid or table.table_uuid
+        if expected != table.table_uuid:
+            raise IncarnationChangedError(
+                f"table was recreated: expected table_uuid {expected}, name now resolves to {table.table_uuid}"
+            )
         return {
             "idempotency_key": idempotency_key,
             "read_snapshot": 41,
@@ -158,7 +169,7 @@ def _wire_prepared_commit(table, catalog):
                 {
                     "namespace": "analytics",
                     "table": "events",
-                    "expected_table_uuid": table.table_uuid,
+                    "expected_table_uuid": expected,
                     "files": [
                         {"path": f"s3://bucket/lake/{idempotency_key}/{i}.parquet", "partition_values": values}
                         for i, (_path, values) in enumerate(files)
@@ -199,13 +210,6 @@ _EVENTS_COLUMNS = [
     _col("properties", "string", 4, 4),
     _col("_inserted_at", "timestamptz", 5, 5),
 ]
-
-
-def _mock_table(table_uuid=TABLE_UUID):
-    """A bare table handle for key derivation (only `table_uuid` is read)."""
-    table = MagicMock()
-    table.table_uuid = table_uuid
-    return table
 
 
 def _sink(cfg=None, columns=_EVENTS_COLUMNS, partition_spec=None, sort_spec=None):
@@ -1113,33 +1117,33 @@ class TestIdempotentPublication:
 
     OFFSETS = (("events", 0, 30, 41), ("events", 1, 9, 17))
 
-    def _key(self, sink, offsets, table=None):
-        return sink._flush_key(table or _mock_table(), offsets)
+    def _key(self, sink, offsets, table_uuid=TABLE_UUID):
+        return sink._flush_key(table_uuid, offsets)
 
     def test_key_is_derived_from_the_offsets(self):
-        s, *_, table = _sink()
-        first = self._key(s, self.OFFSETS, table)
-        assert first == self._key(s, self.OFFSETS, table)
+        s, *_ = _sink()
+        first = self._key(s, self.OFFSETS)
+        assert first == self._key(s, self.OFFSETS)
         # Order-independent: the same range described differently is the
         # same flush.
-        assert first == self._key(s, tuple(reversed(self.OFFSETS)), table)
+        assert first == self._key(s, tuple(reversed(self.OFFSETS)))
         # A different range is a different publication...
-        assert first != self._key(s, (("events", 0, 30, 42), ("events", 1, 9, 17)), table)
+        assert first != self._key(s, (("events", 0, 30, 42), ("events", 1, 9, 17)))
         # ...including one that differs only in where it STARTED. A key
         # naming the high offset alone says "everything up to 41", which
         # a rewound partition re-flushing [0, 41] then collides with.
-        assert first != self._key(s, (("events", 0, 0, 41), ("events", 1, 9, 17)), table)
+        assert first != self._key(s, (("events", 0, 0, 41), ("events", 1, 9, 17)))
         # And a different table in the same catalog is a different one
         # too: receipts are scoped per CATALOG, not per table.
-        other, *_, other_table = _sink(_cfg(hoglake_table="other"))
-        assert first != self._key(other, self.OFFSETS, other_table)
+        other, *_ = _sink(_cfg(hoglake_table="other"))
+        assert first != self._key(other, self.OFFSETS)
 
     def test_key_names_the_namespace(self):
         # Two pipelines with the same table name in different namespaces
         # of one catalog share a receipt space.
-        s, *_, table = _sink()
-        other, *_, other_table = _sink(_cfg(hoglake_namespace="other_ns"))
-        assert self._key(s, self.OFFSETS, table) != self._key(other, self.OFFSETS, other_table)
+        s, *_ = _sink()
+        other, *_ = _sink(_cfg(hoglake_namespace="other_ns"))
+        assert self._key(s, self.OFFSETS) != self._key(other, self.OFFSETS)
 
     def test_key_names_the_table_incarnation(self):
         # Receipts survive a table drop — hoglake has no cascade from the
@@ -1147,9 +1151,9 @@ class TestIdempotentPublication:
         # dropped-and-recreated table answers a flush from its
         # PREDECESSOR's receipt and millpond advances offsets over rows
         # that are in a table which no longer exists.
-        s, *_, table = _sink()
-        recreated = _mock_table(table_uuid="99999999-0000-0000-0000-000000000009")
-        assert self._key(s, self.OFFSETS, table) != self._key(s, self.OFFSETS, recreated)
+        s, *_ = _sink()
+        recreated = "99999999-0000-0000-0000-000000000009"
+        assert self._key(s, self.OFFSETS) != self._key(s, self.OFFSETS, recreated)
 
     def test_key_keeps_each_offset_with_its_partition(self):
         # Partition 0's offsets 0-5 and partition 1's offsets 0-5 are
@@ -1157,26 +1161,69 @@ class TestIdempotentPublication:
         # partitions carrying the same range is the ordinary case, not a
         # contrived one. A key that names the range without the partition
         # it belongs to calls them the same flush.
-        s, *_, table = _sink()
-        a = self._key(s, (("events", 0, 0, 5),), table)
-        b = self._key(s, (("events", 1, 0, 5),), table)
+        s, *_ = _sink()
+        a = self._key(s, (("events", 0, 0, 5),))
+        b = self._key(s, (("events", 1, 0, 5),))
         assert a != b
         # And the same two ranges held by opposite partitions.
-        c = self._key(s, (("events", 0, 17, 17), ("events", 1, 41, 41)), table)
-        d = self._key(s, (("events", 0, 41, 41), ("events", 1, 17, 17)), table)
+        c = self._key(s, (("events", 0, 17, 17), ("events", 1, 41, 41)))
+        d = self._key(s, (("events", 0, 41, 41), ("events", 1, 17, 17)))
         assert c != d
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_stale_handle_refuses_rather_than_publishing_across_incarnations(self, mock_metrics):
+        # `_ensure_table` caches its resolved handle for the pod's life,
+        # and that handle is a NAME, not an incarnation. A drop+recreate
+        # underneath it used to be invisible to every guard at once:
+        # `_prepare`'s own `table.info()` rebases pyhoglake's pinned
+        # `_info` onto the new incarnation before `prepare_append_files`
+        # reads `self.table_uuid` off it, so the client's pre-flight, the
+        # server's `expected_table_uuid` and
+        # `_check_destination_still_ours` all compared fresh against
+        # fresh and passed. The commit landed on a table this pod had
+        # never reconciled, under a key naming the dead one.
+        #
+        # Unlike `test_a_recreated_table_does_not_answer_from_the_old_receipt`
+        # and `test_a_reused_key_against_a_recreated_table_is_not_accepted`,
+        # the sink here holds a STALE handle — which is the only state in
+        # which the window is open.
+        s, client, catalog, ns, table = _sink()
+        offsets = (("events", 0, 2, 3),)
+        assert s.write(_rows(2), kafka_offsets=(("events", 0, 0, 1),)) == 2
+
+        reborn = "deadbeef-0000-0000-0000-000000000000"
+        table.info.return_value = _FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid=reborn)
+        table.table_uuid = reborn
+
+        with pytest.raises(IncarnationChangedError):
+            s.write(_rows(2), kafka_offsets=offsets)
+        assert catalog.commit_prepared.call_count == 1  # nothing published across the seam
+        assert s._prepared is None
+        # The pre-flight refuses before the first upload, so there is no
+        # orphan to count and counting one would send an operator
+        # sweeping for an object that does not exist.
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+
+        # Retryable: main.py resets caches, the next attempt re-resolves
+        # — which is what finally puts the recreated table through
+        # `_reconcile_specs` — and the key then names the live one.
+        s.reset_caches()
+        assert s.write(_rows(2), kafka_offsets=offsets) == 2
+        published = catalog.commit_prepared.call_args.args[0]["idempotency_key"]
+        assert published == self._key(s, offsets, reborn)
+        assert published != self._key(s, offsets, TABLE_UUID)
 
     def test_key_is_random_without_offsets(self):
         # No identity to recognize a retry by: honest at-least-once
         # rather than a key that could collide across flushes.
-        s, *_, table = _sink()
-        assert self._key(s, None, table) != self._key(s, None, table)
+        s, *_ = _sink()
+        assert self._key(s, None) != self._key(s, None)
 
     def test_commit_carries_the_derived_key(self):
         s, client, catalog, ns, table = _sink()
         s.write(_batch(), kafka_offsets=self.OFFSETS)
         payload = catalog.commit_prepared.call_args.args[0]
-        assert payload["idempotency_key"] == self._key(s, self.OFFSETS, table)
+        assert payload["idempotency_key"] == self._key(s, self.OFFSETS)
         assert payload["author"] == "millpond/events/0"
 
     def test_payload_is_a_blind_append(self):
@@ -1251,7 +1298,7 @@ class TestIdempotentPublication:
         assert s.write(_rows(7), kafka_offsets=moved_on) == 7
         assert table.prepare_append_files.call_count == 2  # rebuilt, not replayed
         sent = catalog.commit_prepared.call_args.args[0]
-        assert sent["idempotency_key"] == self._key(s, moved_on, table)
+        assert sent["idempotency_key"] == self._key(s, moved_on)
         # The abandoned upload is an orphan and is counted as one.
         mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
 

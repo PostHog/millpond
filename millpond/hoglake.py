@@ -552,6 +552,14 @@ class HoglakeSink:
         # retry path re-resolves (another pod may have created/altered the
         # table, or it may have been dropped+recreated).
         self._table = None
+        # The incarnation `self._table` was resolved AND reconciled as.
+        # Held separately because the pyhoglake handle's own
+        # `table_uuid` is not a pin: `Table.info()` adopts whatever the
+        # name resolves to now, so any refresh silently rebases it onto a
+        # recreated table. Every guard in the flush — the idempotency
+        # key, the client pre-flight, the server's `expected_table_uuid`
+        # — is named from THIS value.
+        self._table_uuid: str | None = None
         self._live_columns: dict[str, Column] = {}
         # The in-flight flush's uploaded-and-not-yet-published commit
         # request, held IN MEMORY for the lifetime of the flush so a
@@ -644,7 +652,7 @@ class HoglakeSink:
 
         batch = self._stamp_inserted_at(batch)
         table = self._ensure_table(batch.schema)
-        key = self._flush_key(table, kafka_offsets)
+        key = self._flush_key(self._table_uuid, kafka_offsets)
         batch = self._evolve_and_align(table, batch)
         try:
             payload = self._prepare(table, batch, key)
@@ -690,6 +698,7 @@ class HoglakeSink:
         `_commit_prepared`, which drops it at the refusal rather than
         leaving a reset to do a job it cannot do from here."""
         self._table = None
+        self._table_uuid = None
         self._live_columns = {}
 
     def close(self) -> None:
@@ -750,7 +759,7 @@ class HoglakeSink:
 
     # -- idempotent publication --------------------------------------------
 
-    def _flush_key(self, table, kafka_offsets) -> str:
+    def _flush_key(self, table_uuid: str | None, kafka_offsets) -> str:
         """The commit's idempotency key: a UUIDv5 over the destination
         table INCARNATION and the complete Kafka offset range being
         flushed.
@@ -772,6 +781,15 @@ class HoglakeSink:
           a dropped-and-recreated table answers a flush from its
           PREDECESSOR's receipt, and millpond advances Kafka offsets over
           rows that are in a table that no longer exists.
+
+          It is `self._table_uuid` — the incarnation `_ensure_table`
+          resolved and reconciled — and never the pyhoglake handle's own
+          `table_uuid`, which any `Table.info()` rebases onto whatever
+          the name resolves to now. The distinction is the whole point:
+          the key must name the incarnation every other guard in this
+          flush is also named from, so that a drop+recreate under the
+          cached handle is REFUSED (see `_prepare`) rather than published
+          under a dead table's name.
         * BOTH ends of each partition's range, not just the high end.
           "Everything up to 41" is not a row set: after a rewind, a flush
           of [0, 41] and an earlier flush of [30, 41] share a name, and
@@ -794,7 +812,7 @@ class HoglakeSink:
         cfg = self._cfg
         name = "\n".join(
             [
-                f"{cfg.hoglake_catalog}/{cfg.hoglake_namespace}/{cfg.hoglake_table}/{table.table_uuid}",
+                f"{cfg.hoglake_catalog}/{cfg.hoglake_namespace}/{cfg.hoglake_table}/{table_uuid}",
                 *(f"{topic}:{partition}:{first}-{last}" for topic, partition, first, last in sorted(kafka_offsets)),
             ]
         )
@@ -841,7 +859,30 @@ class HoglakeSink:
                 pq.write_table(part, path)
                 files.append((path, partition_values))
             try:
-                payload = table.prepare_append_files(files, idempotency_key=key)
+                payload = table.prepare_append_files(
+                    files,
+                    idempotency_key=key,
+                    # PINNED, not defaulted. Left to its default,
+                    # pyhoglake reads `self.table_uuid` off its own
+                    # `_info` — which the `table.info()` at the top of
+                    # this method has just rebased onto whatever the name
+                    # resolves to NOW. The client's pre-flight, the
+                    # server's guard and `_check_destination_still_ours`
+                    # would then all compare fresh against fresh and pass
+                    # over a drop+recreate that happened under the cached
+                    # handle. Naming the resolved-and-reconciled
+                    # incarnation instead makes the pre-flight fire, and
+                    # `IncarnationChangedError` is retryable, so
+                    # reset_caches re-resolves and `_reconcile_specs`
+                    # finally runs against the table we are writing to.
+                    expected_table_uuid=self._table_uuid,
+                )
+            except IncarnationChangedError:
+                # The pre-flight re-resolve, which runs BEFORE the first
+                # upload. Nothing reached object storage, so counting an
+                # orphan here would send an operator sweeping for objects
+                # that were never written.
+                raise
             except ValidationError:
                 # pyhoglake validates file i and THEN uploads file i, so
                 # a validation refusal means at most the files before it
@@ -1135,6 +1176,7 @@ class HoglakeSink:
             table = self._create_table(ns, batch_schema)
 
         self._table = table
+        self._table_uuid = table.table_uuid
         return table
 
     def _create_table(self, ns, batch_schema: pa.Schema):
