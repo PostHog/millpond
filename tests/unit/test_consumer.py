@@ -132,6 +132,7 @@ class TestOnStats:
 
 def _make_cfg(**overrides) -> Config:
     defaults = dict(
+        destination="ducklake",
         bootstrap_servers="localhost:9092",
         topic="test-topic",
         group_id="test-group",

@@ -16,6 +16,12 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Config:
+    # Which backend this pod writes to for its lifetime. `make_sink`
+    # (millpond/sink.py) dispatches on it; load() validates membership in
+    # _DESTINATIONS so an unknown value fails at startup, never at the
+    # first flush.
+    destination: str
+
     # Kafka
     bootstrap_servers: str
     topic: str
@@ -519,21 +525,20 @@ def _load_ducklake_fields() -> dict[str, str | None]:
     }
 
 
+_DESTINATIONS = ("ducklake",)
+
+
 def load() -> Config:
     topic = _require("KAFKA_TOPIC")
 
-    # DuckLake is the only destination since the iceberg/icebox sink
-    # removal (see the `final-iceberg` tag for the last commit with it).
-    # Reject any other value loudly so a pod deployed with stale config
-    # fails at startup instead of silently writing to the wrong place.
+    # Reject unknown destinations loudly so a pod deployed with stale
+    # config fails at startup instead of silently writing to the wrong
+    # place (the iceberg/icebox sinks were removed at tag final-iceberg).
     # Empty/whitespace-only values fall back to the default to tolerate
     # the helm-template gotcha where unset renders as "".
-    destination_raw = os.environ.get("MILLPOND_DESTINATION", "").strip().lower() or "ducklake"
-    if destination_raw != "ducklake":
-        raise RuntimeError(
-            f"MILLPOND_DESTINATION {destination_raw!r} is not supported; "
-            f"the iceberg/icebox sinks were removed (last shipped at tag final-iceberg)"
-        )
+    destination = os.environ.get("MILLPOND_DESTINATION", "").strip().lower() or "ducklake"
+    if destination not in _DESTINATIONS:
+        raise RuntimeError(f"MILLPOND_DESTINATION {destination!r} must be one of: {', '.join(_DESTINATIONS)}")
 
     pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME", "millpond-0")
     ordinal = _parse_ordinal(pod_name)
@@ -571,6 +576,7 @@ def load() -> Config:
     variant_columns = _load_variant_columns()
 
     cfg = Config(
+        destination=destination,
         bootstrap_servers=_require("KAFKA_BOOTSTRAP_SERVERS"),
         topic=topic,
         group_id=group_id,

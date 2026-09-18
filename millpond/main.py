@@ -13,12 +13,12 @@ from millpond import (
     backpressure,
     config,
     consumer,
-    ducklake,
     include_values,
     logging_config,
     metrics,
     server,
 )
+from millpond import sink as sink_mod
 
 log = logging.getLogger(__name__)
 
@@ -506,8 +506,8 @@ def main():
         # No connection recovery logic — if the destination fails, the pod
         # crashes and K8s restarts it. Reconnection adds complexity for no
         # benefit when the restart path already handles offset replay correctly.
-        sink = ducklake.DuckLakeSink(cfg)
-        log.info("Sink ready: table=%s", cfg.table_label)
+        sink = sink_mod.make_sink(cfg)
+        log.info("Sink ready: destination=%s table=%s", cfg.destination, cfg.table_label)
         kafka = consumer.create(cfg)
         lag_admin = consumer.make_admin_client(cfg)
         log.info("Kafka consumer created, partitions assigned")

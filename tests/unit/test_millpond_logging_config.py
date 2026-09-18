@@ -36,6 +36,7 @@ def _minimal_config() -> Config:
     pass an explicit token via replace().
     """
     return Config(
+        destination="ducklake",
         bootstrap_servers="localhost:9092",
         topic="clickhouse_events_json",
         group_id="millpond-test",
