@@ -225,6 +225,30 @@ _hoglake_files_written_total = Counter(
     "Parquet files registered with the hoglake catalog",
     ["pipeline", "broker_source"],
 )
+# Hoglake destination only: commits resolved from the server's receipt
+# rather than by publishing. `outcome="already_published"` means this
+# flush's Kafka offset range was already in the lake under a different
+# registration — the pod died after the commit applied and before the
+# offsets committed, and the replay recognized it. Non-zero is healthy
+# (it is the duplicate that did NOT happen); a rising rate means pods
+# are dying mid-flush.
+_hoglake_commit_replays_total = Counter(
+    "millpond_hoglake_commit_replays_total",
+    "Hoglake commits resolved from an existing receipt instead of publishing",
+    ["pipeline", "broker_source", "outcome"],
+)
+# Hoglake destination only: parquet objects millpond uploaded and never
+# registered. Hoglake's cleanup reclaims only files the SERVER queued
+# for removal (snapshot expiry, table drop, compaction staging) — client
+# uploads are not in that set and no server-side reclamation exists for
+# them, so these objects are billed storage until an operator sweeps
+# them. Every one sits under the `{idempotency_key}/` prefix of its
+# table's data path, which is what makes the sweep tractable.
+_hoglake_orphaned_files_total = Counter(
+    "millpond_hoglake_orphaned_files_total",
+    "Parquet objects uploaded to the lake but never registered in a commit",
+    ["pipeline", "broker_source"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -278,6 +302,8 @@ variant_companion_columns_dropped_total = _variant_companion_columns_dropped_tot
 variant_write_fallback_total = _variant_write_fallback_total
 variant_values_coerced_total = _variant_values_coerced_total
 hoglake_files_written_total = _hoglake_files_written_total
+hoglake_commit_replays_total = _hoglake_commit_replays_total
+hoglake_orphaned_files_total = _hoglake_orphaned_files_total
 include_values_size = _include_values_size
 include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds
 include_values_pending_removals = _include_values_pending_removals
@@ -306,6 +332,7 @@ def init(pipeline: str, broker_source: str = ""):
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total, variant_companion_columns_dropped_total
     global variant_write_fallback_total, variant_values_coerced_total, hoglake_files_written_total
+    global hoglake_commit_replays_total, hoglake_orphaned_files_total
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
@@ -359,6 +386,8 @@ def init(pipeline: str, broker_source: str = ""):
     )
     variant_write_fallback_total = _variant_write_fallback_total.labels(pipeline=pipeline, broker_source=bs)
     hoglake_files_written_total = _hoglake_files_written_total.labels(pipeline=pipeline, broker_source=bs)
+    hoglake_commit_replays_total = _AutoCommonLabels(_hoglake_commit_replays_total, pipeline, bs)
+    hoglake_orphaned_files_total = _hoglake_orphaned_files_total.labels(pipeline=pipeline, broker_source=bs)
     variant_values_coerced_total = _variant_values_coerced_total.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)

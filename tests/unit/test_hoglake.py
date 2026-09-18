@@ -52,6 +52,7 @@ def _cfg(**overrides) -> MagicMock:
     cfg.hoglake_request_timeout_s = 30.0
     cfg.sort_by = None
     cfg.ordinal = 0
+    cfg.table_label = "events"
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg
@@ -71,6 +72,8 @@ class _FakeInfo:
     columns: tuple
     partition_spec: PartitionSpec | None = None
     sort_spec: SortSpec | None = None
+    namespace: str = "analytics"
+    name: str = "events"
 
 
 def _wire_dynamic_alter(table, state: _FakeInfo):
@@ -106,6 +109,55 @@ def _wire_dynamic_alter(table, state: _FakeInfo):
     table.alter.side_effect = do_alter
 
 
+_WRITTEN: list[pa.Table] = []
+
+
+@pytest.fixture(autouse=True)
+def _capture_parquet(monkeypatch):
+    """Capture what the sink serializes instead of writing it to disk.
+
+    The sink no longer hands pyarrow tables to `Table.append`: it writes
+    local parquet, uploads it, and registers the upload in a separate
+    idempotent commit. The batch that lands in the lake is therefore the
+    one that reaches `pq.write_table`, which is what these tests assert
+    on."""
+    _WRITTEN.clear()
+    monkeypatch.setattr(hoglake.pq, "write_table", lambda table, path, **kw: _WRITTEN.append(table))
+    return _WRITTEN
+
+
+def _published(_table=None) -> pa.Table:
+    """The (single) batch the last flush serialized for upload."""
+    assert _WRITTEN, "nothing was written"
+    return _WRITTEN[-1]
+
+
+def _wire_prepared_commit(table, catalog):
+    """Mock the prepared-append handshake: prepare_append_files returns a
+    commit request naming one file per partition group, and
+    Catalog.commit_prepared publishes it."""
+
+    def prepare(files, *, idempotency_key, **kwargs):
+        return {
+            "idempotency_key": idempotency_key,
+            "read_snapshot": 41,
+            "appends": [
+                {
+                    "namespace": "analytics",
+                    "table": "events",
+                    "expected_table_uuid": "0e0b6c8e-0000-0000-0000-000000000001",
+                    "files": [
+                        {"path": f"s3://bucket/lake/{idempotency_key}/{i}.parquet", "partition_values": values}
+                        for i, (_path, values) in enumerate(files)
+                    ],
+                }
+            ],
+        }
+
+    table.prepare_append_files.side_effect = prepare
+    catalog.commit_prepared.return_value = MagicMock(snapshot_id=7, schema_version=1)
+
+
 def _mock_stack(columns, partition_spec=None, sort_spec=None):
     """(client, catalog, ns, table) MagicMocks wired the way pyhoglake
     resolves them. `columns` is the live table schema."""
@@ -122,10 +174,7 @@ def _mock_stack(columns, partition_spec=None, sort_spec=None):
     catalog.namespace.return_value = ns
     ns.table.return_value = table
     ns.create_table.return_value = table
-    append_result = MagicMock()
-    append_result.snapshot_id = 7
-    append_result.files = (MagicMock(),)
-    table.append.return_value = append_result
+    _wire_prepared_commit(table, catalog)
     return client, catalog, ns, table
 
 
@@ -163,6 +212,11 @@ def _sort(*names) -> SortSpec:
 
 def _batch(**cols) -> pa.Table:
     return pa.table(cols) if cols else pa.table({"uuid": ["a"], "event": ["e"], "team_id": [1], "properties": ["{}"]})
+
+
+def _rows(n: int) -> pa.Table:
+    """An n-row events batch."""
+    return pa.table({"uuid": [f"u{i}" for i in range(n)], "team_id": list(range(n))})
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +405,7 @@ class TestReservedCollision:
         with pytest.raises(ValueError, match="Hoglake-reserved"):
             s.write(pa.table({"_inserted_at": ["x"], "uuid": ["a"]}))
         ns.table.assert_not_called()
-        table.append.assert_not_called()
+        table.prepare_append_files.assert_not_called()
 
     @pytest.mark.parametrize("name", ["year", "month", "day", "hour"])
     def test_hive_names_are_ordinary_columns_for_hoglake(self, name):
@@ -363,7 +417,7 @@ class TestReservedCollision:
         assert name not in hoglake.RESERVED_COLUMNS
         s, client, catalog, ns, table = _sink()
         assert s.write(pa.table({name: ["x"], "uuid": ["a"]})) == 1
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         assert name in appended.column_names
 
 
@@ -372,7 +426,7 @@ class TestColumnHygiene:
     def test_unsafe_field_name_dropped_with_metric(self, mock_metrics):
         s, *_, table = _sink()
         s.write(pa.table({"uuid": ["a"], "bad-name": ["x"]}))
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         assert "bad-name" not in appended.column_names
         mock_metrics.records_skipped_total.labels.assert_any_call(reason="unsafe_field_name")
 
@@ -387,7 +441,7 @@ class TestColumnHygiene:
         long_name = "x" * 129
         s, *_, table = _sink()
         assert s.write(pa.table({"uuid": ["a"], long_name: ["x"]})) == 1
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         assert long_name not in appended.column_names
         mock_metrics.records_skipped_total.labels.assert_any_call(reason="unsafe_field_name")
 
@@ -395,7 +449,7 @@ class TestColumnHygiene:
         s, *_, table = _sink()
         name = "x" * 128
         s.write(pa.table({"uuid": ["a"], name: ["x"]}))
-        assert name in table.append.call_args.args[0].column_names
+        assert name in _published(table).column_names
 
     @patch("millpond.hoglake.metrics")
     def test_hog_prefixed_field_dropped_with_metric(self, mock_metrics):
@@ -403,7 +457,7 @@ class TestColumnHygiene:
         # with that prefix must not be able to wedge the partition forever.
         s, *_, table = _sink()
         s.write(pa.table({"uuid": ["a"], "_hog_row_id": [5]}))
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         assert "_hog_row_id" not in appended.column_names
         mock_metrics.records_skipped_total.labels.assert_any_call(reason="unsafe_field_name")
 
@@ -612,7 +666,7 @@ class TestSpecDeclarationIsAtomicOrRecoverable:
                 s.write(_batch())
             s.reset_caches()
         assert table.alter.call_count == 3
-        table.append.assert_not_called()
+        table.prepare_append_files.assert_not_called()
 
     def test_post_condition_catches_a_spec_the_server_did_not_apply(self):
         # Belt and braces: if the alter reports success but the live spec
@@ -695,12 +749,12 @@ class TestSteadyStateWrite:
         s, *_, table = _sink()
         out = s.write(_batch())
         assert out == 1
-        table.append.assert_called_once()
+        assert table.prepare_append_files.call_count == 1
 
     def test_inserted_at_stamped_once_per_flush(self):
         s, *_, table = _sink()
         s.write(pa.table({"uuid": ["a", "b", "c"], "event": ["e", "e", "e"], "team_id": [1, 2, 3]}))
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         col = appended.column("_inserted_at")
         assert col.type == pa.timestamp("us", tz="UTC")
         vals = col.to_pylist()
@@ -711,7 +765,7 @@ class TestSteadyStateWrite:
         # mirror DuckLake's INSERT BY NAME null-fill.
         s, *_, table = _sink()
         s.write(pa.table({"uuid": ["a"], "event": ["e"], "team_id": [1]}))
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         assert appended.column("properties").null_count == 1
         assert appended.column("properties").type == pa.string()
 
@@ -732,7 +786,7 @@ class TestEvolution:
         s, *_, table = _sink()
         table.alter.side_effect = ValidationError("nope", status_code=422)
         s.write(pa.table({"uuid": ["a"], "new_col": ["x"]}))
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         assert "new_col" not in appended.column_names
         mock_metrics.errors_total.labels.assert_any_call(type="schema")
 
@@ -743,11 +797,9 @@ class TestEvolution:
         cols_after = _EVENTS_COLUMNS + [_col("new_col", "string", 6, 6)]
         s, client, catalog, ns, table = _sink()
         table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
-        info_after = MagicMock()
-        info_after.columns = tuple(cols_after)
-        table.info.return_value = info_after
+        table.info.return_value = _FakeInfo(columns=tuple(cols_after))
         s.write(pa.table({"uuid": ["a"], "new_col": ["x"]}))
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         assert "new_col" in appended.column_names
 
     @patch("millpond.hoglake.metrics")
@@ -782,7 +834,7 @@ class TestEvolution:
 
         table.alter.side_effect = alter
         s.write(pa.table({"uuid": ["a"], "good_col": ["x"], "bad_col": ["y"]}))
-        appended = table.append.call_args.args[0]
+        appended = _published(table)
         assert "good_col" in appended.column_names
         assert "bad_col" not in appended.column_names
         mock_metrics.errors_total.labels.assert_any_call(type="schema")
@@ -797,7 +849,7 @@ class TestEvolution:
         s.write(pa.table({"uuid": ["a"], "ok_col": ["x"]}).append_column("dur", unmappable.column("dur")))
         add_ops = [o for c in table.alter.call_args_list for o in c.args[0] if o.op == "add_column"]
         assert [o.body["column"]["name"] for o in add_ops] == ["ok_col"]
-        assert "dur" not in table.append.call_args.args[0].column_names
+        assert "dur" not in _published(table).column_names
 
     @patch("millpond.hoglake.metrics")
     def test_int_promoted_to_long(self, mock_metrics):
@@ -825,18 +877,127 @@ class TestEvolution:
         s, *_, table = _sink()
         s.write(pa.table({"uuid": ["a"], "team_id": pa.array([None], type=pa.string())}))
         assert table.alter.call_count == 0
-        table.append.assert_called_once()
+        assert table.prepare_append_files.call_count == 1
 
 
 class TestFilesWrittenMetric:
     @patch("millpond.hoglake.metrics")
     def test_files_per_flush_counted(self, mock_metrics):
         # Partitioned fanout registers one parquet per partition tuple in
-        # one commit; the file count is the compaction-debt feed rate.
-        s, *_, table = _sink()
-        table.append.return_value.files = (MagicMock(), MagicMock(), MagicMock())
-        s.write(_batch())
+        # one commit; the file count is the compaction-debt feed rate,
+        # and it is counted off the registration that was PUBLISHED — so
+        # a replayed commit cannot inflate it.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}))
         mock_metrics.hoglake_files_written_total.inc.assert_called_once_with(3)
+        assert len(_WRITTEN) == 3  # one parquet per tuple
+
+
+class TestIdempotentPublication:
+    """A commit whose response is lost is indistinguishable from one that
+    never happened. The key that makes the retry a REPLAY is derived from
+    the Kafka offset range, and the uploaded registration is held across
+    retries so the replay is the same request byte for byte."""
+
+    OFFSETS = (("events", 0, 41), ("events", 1, 17))
+
+    def test_key_is_derived_from_the_offsets(self):
+        s, *_ = _sink()
+        first = s._flush_key(self.OFFSETS)
+        assert first == s._flush_key(self.OFFSETS)
+        # Order-independent: the same range described differently is the
+        # same flush.
+        assert first == s._flush_key(tuple(reversed(self.OFFSETS)))
+        # A different range is a different publication.
+        assert first != s._flush_key((("events", 0, 42), ("events", 1, 17)))
+        # And a different table in the same catalog is a different one
+        # too: receipts are scoped per CATALOG, not per table.
+        other, *_ = _sink(_cfg(hoglake_table="other"))
+        assert first != other._flush_key(self.OFFSETS)
+
+    def test_key_is_random_without_offsets(self):
+        # No identity to recognize a retry by: honest at-least-once
+        # rather than a key that could collide across flushes.
+        s, *_ = _sink()
+        assert s._flush_key(None) != s._flush_key(None)
+
+    def test_commit_carries_the_derived_key(self):
+        s, client, catalog, ns, table = _sink()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        payload = catalog.commit_prepared.call_args.args[0]
+        assert payload["idempotency_key"] == s._flush_key(self.OFFSETS)
+        assert payload["author"] == "millpond/events/0"
+
+    def test_payload_is_a_blind_append(self):
+        # prepare_append_files pins read_snapshot to the catalog head,
+        # and the server then 409s the commit if ANY DDL touched this
+        # table since — which for millpond means "another pod added a
+        # column". A frozen payload can never clear that conflict.
+        # Appends never conflict with appends, so the field comes off.
+        s, client, catalog, ns, table = _sink()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        assert "read_snapshot" not in catalog.commit_prepared.call_args.args[0]
+
+    def test_retry_replays_the_same_payload_without_re_uploading(self):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [httpx.ReadTimeout("response lost"), MagicMock()]
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        # The retry path invalidates caches first, exactly as main.py does.
+        s.reset_caches()
+        assert s.write(_rows(3), kafka_offsets=self.OFFSETS) == 3
+        assert table.prepare_append_files.call_count == 1  # no second upload
+        first, second = (c.args[0] for c in catalog.commit_prepared.call_args_list)
+        assert first == second  # byte-identical replay
+
+    def test_reset_caches_keeps_the_prepared_payload(self):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [httpx.ConnectError("reset"), MagicMock()]
+        with pytest.raises(httpx.ConnectError):
+            s.write(_batch(), kafka_offsets=self.OFFSETS)
+        s.reset_caches()
+        assert s._prepared is not None
+
+    def test_a_different_flush_prepares_again(self):
+        s, client, catalog, ns, table = _sink()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        s.write(_batch(), kafka_offsets=(("events", 0, 99),))
+        assert table.prepare_append_files.call_count == 2
+        keys = {c.args[0]["idempotency_key"] for c in catalog.commit_prepared.call_args_list}
+        assert len(keys) == 2
+
+    @patch("millpond.hoglake.metrics")
+    def test_key_reused_with_a_different_payload_is_already_published(self, mock_metrics):
+        # The crash-restart case: the pod died after the commit applied
+        # and before the offsets committed, so Kafka replayed the range
+        # and the flush was rebuilt with fresh file names. The receipt
+        # says this range is already in the lake. Publishing the rebuilt
+        # copy would duplicate it; failing forever would wedge the
+        # partition on rows that are already there.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError(
+            "idempotency_key reused with a different request", status_code=422
+        )
+        assert s.write(_rows(5), kafka_offsets=self.OFFSETS) == 5
+        mock_metrics.hoglake_commit_replays_total.labels.assert_called_once_with(outcome="already_published")
+        # The upload we just made is unreferenced and nothing will
+        # reclaim it — say so in a metric rather than in nothing.
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        assert s._prepared is None
+
+    def test_other_validation_errors_are_not_swallowed(self):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError("path outside the catalog data path", status_code=422)
+        with pytest.raises(ValidationError):
+            s.write(_batch(), kafka_offsets=self.OFFSETS)
+
+    def test_zero_row_batch_never_reaches_the_commit(self):
+        # A commit must register at least one file with at least one row;
+        # a zero-row flush would be a 422 the retry loop could not clear.
+        s, client, catalog, ns, table = _sink()
+        assert s.write(_batch().slice(0, 0), kafka_offsets=self.OFFSETS) == 0
+        catalog.commit_prepared.assert_not_called()
 
 
 class TestConcurrentAddDuringAppend:
@@ -849,36 +1010,40 @@ class TestConcurrentAddDuringAppend:
         live schema, null-fill the new column, and re-append ONCE."""
         cols_after = _EVENTS_COLUMNS + [_col("other_writer_col", "string", 6, 6)]
         s, client, catalog, ns, table = _sink()
-        ok = MagicMock()
-        ok.files = (MagicMock(),)
-        table.append.side_effect = [
-            ValidationError("data is missing table columns: ['other_writer_col']", status_code=None),
-            ok,
-        ]
-        info_after = MagicMock()
-        info_after.columns = tuple(cols_after)
-        table.info.return_value = info_after
+        prepared = table.prepare_append_files.side_effect
+        calls = {"n": 0}
+
+        def prepare(files, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValidationError("data is missing table columns: ['other_writer_col']", status_code=None)
+            return prepared(files, **kwargs)
+
+        table.prepare_append_files.side_effect = prepare
+        table.info.return_value = _FakeInfo(columns=tuple(cols_after))
         assert s.write(_batch()) == 1
-        assert table.append.call_count == 2
-        retried = table.append.call_args.args[0]
+        assert table.prepare_append_files.call_count == 2
+        retried = _published(table)
         assert "other_writer_col" in retried.column_names
         assert retried.column("other_writer_col").null_count == retried.num_rows
 
     @patch("millpond.hoglake.metrics")
     def test_other_validation_errors_still_raise(self, mock_metrics):
         s, *_, table = _sink()
-        table.append.side_effect = ValidationError("prepared file must contain rows", status_code=None)
+        table.prepare_append_files.side_effect = ValidationError("prepared file must contain rows", status_code=None)
         with pytest.raises(ValidationError):
             s.write(_batch())
-        assert table.append.call_count == 1
+        assert table.prepare_append_files.call_count == 1
 
     @patch("millpond.hoglake.metrics")
     def test_persistent_align_refusal_raises_after_one_retry(self, mock_metrics):
         s, *_, table = _sink()
-        table.append.side_effect = ValidationError("data is missing table columns: ['x']", status_code=None)
+        table.prepare_append_files.side_effect = ValidationError(
+            "data is missing table columns: ['x']", status_code=None
+        )
         with pytest.raises(ValidationError):
             s.write(_batch())
-        assert table.append.call_count == 2
+        assert table.prepare_append_files.call_count == 2
 
 
 class TestWriteFailurePropagation:
@@ -886,12 +1051,12 @@ class TestWriteFailurePropagation:
         # At-least-once: a failed write must surface to main.py's retry
         # loop; offsets only commit after write() returns.
         s, *_, table = _sink()
-        table.append.side_effect = CommitConflictError("conflict", status_code=409)
+        table.prepare_append_files.side_effect = CommitConflictError("conflict", status_code=409)
         with pytest.raises(CommitConflictError):
             s.write(_batch())
 
     def test_incarnation_change_raises(self):
         s, *_, table = _sink()
-        table.append.side_effect = IncarnationChangedError("recreated")
+        table.prepare_append_files.side_effect = IncarnationChangedError("recreated")
         with pytest.raises(IncarnationChangedError):
             s.write(_batch())

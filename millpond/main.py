@@ -440,6 +440,31 @@ def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", writ
             time.sleep(delay)
 
 
+def _sink_write_kwargs(cfg, offsets: dict[tuple[str, int], int]) -> dict:
+    """Per-call arguments for backends that need to know WHICH batch this
+    is, not only what is in it.
+
+    `offsets` is the consume loop's (topic, partition) -> highest offset
+    map for everything in the pending buffer: the exact Kafka range this
+    flush is about to publish and then commit. Flattened to a sorted
+    tuple of `(topic, partition, offset)` so it is hashable and
+    order-independent, and so it is identical on every retry of the same
+    flush — HoglakeSink hashes it into the commit's idempotency key,
+    which is what turns a retry after a lost commit response into a
+    replay instead of a second publication.
+
+    DuckLake takes no per-call identity: its INSERT sits in a transaction
+    whose commit outcome the client always learns, so a retry there
+    cannot be ambiguous the way a lost HTTP response is. The seam stays
+    empty for it — the same shape the icebox sink used at tag
+    `final-iceberg`.
+    """
+    if cfg.destination != "hoglake":
+        return {}
+    flushed = tuple(sorted((topic, partition, offset) for (topic, partition), offset in offsets.items()))
+    return {"kafka_offsets": flushed}
+
+
 def _flush(
     sink,
     cfg,
@@ -455,7 +480,12 @@ def _flush(
     consolidated = _apply_sort(consolidated, cfg)
 
     t0 = time.monotonic()
-    records_written = _write_with_retry(sink, consolidated, destination=cfg.destination)
+    records_written = _write_with_retry(
+        sink,
+        consolidated,
+        destination=cfg.destination,
+        write_kwargs=_sink_write_kwargs(cfg, offsets),
+    )
     write_duration = time.monotonic() - t0
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded

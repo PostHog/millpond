@@ -43,10 +43,15 @@ row.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
+import uuid
 from datetime import UTC, datetime
 
 import httpx
 import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from pyhoglake import (
     AlreadyExistsError,
     AlterOp,
@@ -62,8 +67,9 @@ from pyhoglake import (
     UnsupportedTypeError,
     ValidationError,
     ops,
+    transforms,
 )
-from pyhoglake.types import arrow_type_to_coltype, column_to_arrow_field
+from pyhoglake.types import arrow_type_to_coltype, column_to_arrow_field, columns_to_arrow_schema
 
 from millpond import metrics
 from millpond.config import Config
@@ -137,6 +143,22 @@ _RETRY_AFTER_STATUS: frozenset[int] = frozenset({429, 503})
 # the attempt count is configurable, because that is the part DuckLake's
 # inner loop was silently providing.
 _WRITE_BASE_DELAY_S = 1.0
+
+# Namespace for the UUIDv5 commit idempotency keys. A fixed, private
+# namespace means the key for a given (table, offset range) is stable
+# across pods, restarts and releases — which is the only reason a retry
+# from a NEW process can still be recognized as the same publication.
+# Never change it: doing so re-randomizes every in-flight flush's
+# identity and reopens the duplicate window for exactly one restart.
+_IDEMPOTENCY_NAMESPACE = uuid.UUID("6f1b6d2e-4c5a-5f3e-9b7a-2d8c1e0a4f77")
+
+# The server's 422 when a key is replayed with a payload that is not the
+# one the receipt was written for: "idempotency_key reused with a
+# different request". Matched as a substring because it is a message,
+# not a code — but the condition it reports is unambiguous, and the
+# alternative (treating it as a generic 422) crash-loops the pod forever
+# on a flush whose rows are already in the lake.
+_REUSED_KEY_MARKER = "idempotency_key reused"
 
 
 def is_retryable(exc: BaseException) -> bool:
@@ -247,6 +269,64 @@ def _drop_unwritable_columns(batch: pa.Table) -> pa.Table:
     return batch.drop_columns(drop) if drop else batch
 
 
+def _partition_groups(data: pa.Table, info) -> list[tuple[tuple[str | None, ...] | None, pa.Table]]:
+    """Split an aligned batch by partition tuple under the table's live
+    spec: one (wire-string tuple, sub-table) per distinct tuple.
+
+    The prepared-commit path puts row-to-partition correctness on the
+    caller — the server validates the STRUCTURE of what it is told (spec
+    arity, key indexes) but never opens a data file at commit time, so a
+    wrong value here mis-prunes reads of that file forever. The transform
+    math is therefore pyhoglake's (`transforms.transform_strings`,
+    Iceberg semantics, arrow-native where it can be); only the grouping
+    is ours.
+
+    Groups come out ordered by first occurrence in the batch, so file
+    registration — and the server's rows-then-offset row-id assignment —
+    follows input order, which is also the order MILLPOND_SORT_BY put the
+    rows in. A null source value forms its own group, per Iceberg.
+    """
+    spec = info.partition_spec
+    if spec is None or not spec.fields:
+        return [(None, data)]
+    columns = {c.field_id: c for c in info.columns}
+    key_names = [f"__millpond_pk_{i}" for i in range(len(spec.fields))]
+    key_arrays = []
+    for field in spec.fields:
+        column = columns.get(field.source_field_id)
+        if column is None:
+            raise RuntimeError(
+                f"partition spec of {info.namespace}.{info.name} references field_id "
+                f"{field.source_field_id}, which is not a live column"
+            )
+        key_arrays.append(
+            transforms.transform_strings(
+                field.transform,
+                field.transform_param,
+                transforms.partition_source_array(data, [column]),
+                column.type,
+                column.type_params,
+            )
+        )
+    keyed = pa.table(
+        {
+            **dict(zip(key_names, key_arrays, strict=True)),
+            "__millpond_row": pa.array(range(data.num_rows), pa.int64()),
+        }
+    )
+    combos = keyed.group_by(key_names).aggregate([("__millpond_row", "min")]).sort_by("__millpond_row_min")
+    out: list[tuple[tuple[str | None, ...] | None, pa.Table]] = []
+    for i in range(combos.num_rows):
+        values = tuple(combos.column(k)[i].as_py() for k in key_names)
+        mask = None
+        for name, value in zip(key_names, values, strict=True):
+            key_column = keyed.column(name)
+            field_mask = pc.is_null(key_column) if value is None else pc.fill_null(pc.equal(key_column, value), False)
+            mask = field_mask if mask is None else pc.and_(mask, field_mask)
+        out.append((values, data.filter(mask)))
+    return out
+
+
 def _partition_tuples(spec) -> tuple[tuple[int, str, int | None], ...]:
     """A live PartitionSpec as comparable (source_field_id, transform,
     param) triples. An absent spec and an empty one are the same thing —
@@ -336,6 +416,13 @@ class HoglakeSink:
         # table, or it may have been dropped+recreated).
         self._table = None
         self._live_columns: dict[str, Column] = {}
+        # The in-flight flush's uploaded-and-not-yet-published commit
+        # request, held IN MEMORY for the lifetime of the flush so a
+        # retry replays it rather than building a second one. Survives
+        # reset_caches(); cleared when the commit resolves.
+        self._prepared: dict | None = None
+        self._prepared_key: str | None = None
+        self._prepared_rows: int = 0
         # STARTUP network validation. Everything else in this class is
         # lazy, and that is fine — but the catalog is the one thing whose
         # absence config.py and the README both describe as a "startup
@@ -349,7 +436,16 @@ class HoglakeSink:
 
     # -- Sink protocol -----------------------------------------------------
 
-    def write(self, batch: pa.Table) -> int:
+    def write(self, batch: pa.Table, *, kafka_offsets: tuple[tuple[str, int, int], ...] | None = None) -> int:
+        """Publish `batch` as ONE idempotent commit.
+
+        `kafka_offsets` is the flush's identity — the (topic, partition,
+        highest offset) triples main.py is about to commit — and it is
+        what makes a retry a REPLAY instead of a second write. See
+        `_flush_key`. Absent, the flush is anonymous and falls back to
+        at-least-once (a lost response duplicates); main.py always
+        supplies it, direct callers usually should not care.
+        """
         check_reserved_collision(batch.schema, RESERVED_COLUMNS, "Hoglake")
         had_columns = batch.num_columns > 0
         batch = _drop_unwritable_columns(batch)
@@ -363,29 +459,50 @@ class HoglakeSink:
             )
             metrics.records_skipped_total.labels(reason="unsafe_field_name").inc(batch.num_rows)
             return 0
+        if batch.num_rows == 0:
+            # The Sink contract says this never happens (main.py gates on
+            # pending_records > 0) — but a commit must register at least
+            # one file with at least one row, so a zero-row batch would be
+            # a 422 the retry loop could never clear.
+            return 0
+
+        key = self._flush_key(kafka_offsets)
+        if self._prepared is not None and self._prepared_key == key:
+            # A retry of a flush whose registration is already uploaded.
+            # Replay it byte-identically; never rebuild it.
+            return self._commit_prepared()
+
         batch = self._stamp_inserted_at(batch)
         table = self._ensure_table(batch.schema)
         batch = self._evolve_and_align(table, batch)
         try:
-            result = table.append(batch, author=self._author)
+            payload = self._prepare(table, batch, key)
         except ValidationError as e:
             # Concurrent-DDL race (found by the live integration suite):
             # another writer's add_column can land between this sink's
-            # alignment and append()'s own pre-flight resolve, and
-            # pyhoglake's strict _align_table then refuses the batch for
-            # lacking the brand-new column. Refresh, null-fill, and
-            # re-append ONCE; a second refusal is a real error.
-            if "missing table columns" not in str(e):
+            # alignment and the pre-flight resolve, and the strict
+            # alignment then refuses the batch for lacking the brand-new
+            # column. Refresh, null-fill, and retry ONCE; a second
+            # refusal is a real error.
+            if "missing table columns" not in str(e) and "differ from destination" not in str(e):
                 raise
             self._adopt_columns(table.info().columns)
             batch = self._null_fill_missing(batch)
-            result = table.append(batch, author=self._author)
-        # One parquet per partition tuple per flush (fanout appends) —
-        # the hoglake compaction-debt feed rate.
-        metrics.hoglake_files_written_total.inc(len(result.files))
-        return batch.num_rows
+            payload = self._prepare(table, batch, key)
+        self._prepared = payload
+        self._prepared_key = key
+        self._prepared_rows = batch.num_rows
+        return self._commit_prepared()
 
     def reset_caches(self) -> None:
+        """Drop the resolved table/schema handles so the next attempt
+        re-resolves.
+
+        The PREPARED PAYLOAD deliberately survives: it is the record of
+        an upload that already happened, and the whole point of holding
+        it is that the retry replays the same registration instead of
+        minting new paths. It is cleared when its commit is resolved —
+        published, or proven already published — and by close()."""
         self._table = None
         self._live_columns = {}
 
@@ -439,6 +556,145 @@ class HoglakeSink:
         failure two flushes ago must not govern an unrelated retry."""
         hint, self._retry_after = self._retry_after, None
         return hint
+
+    # -- idempotent publication --------------------------------------------
+
+    def _flush_key(self, kafka_offsets) -> str:
+        """The commit's idempotency key: a UUIDv5 over this table's
+        identity and the Kafka offset range being flushed.
+
+        DERIVED, not random, and that is the entire mechanism. A key is a
+        name for "these rows, published to this table", so the retry of a
+        flush whose response was lost carries the same name as the commit
+        that may already have landed, and the server answers from its
+        receipt instead of writing again.
+
+        Why the offset range is a sound identity: a flush only happens
+        with at least one new record buffered, so at least one partition's
+        highest offset has advanced since the last one, and main.py
+        clears the map after every flush. Two different flushes of the
+        same pipeline therefore cannot produce the same triple set. The
+        table identity is in the hash because receipts are scoped per
+        CATALOG, not per table — two pipelines writing different tables in
+        one catalog must not collide.
+
+        Without offsets (a direct caller, not main.py) the key is random,
+        which is honest: an anonymous batch has no identity to recognize
+        it by on a retry, so it keeps the old at-least-once behaviour
+        rather than pretending to more.
+        """
+        if not kafka_offsets:
+            log.debug("Flush has no Kafka identity; commit falls back to at-least-once")
+            return str(uuid.uuid4())
+        cfg = self._cfg
+        name = "\n".join(
+            [
+                f"{cfg.hoglake_catalog}/{cfg.hoglake_namespace}/{cfg.hoglake_table}",
+                *(f"{topic}:{partition}:{offset}" for topic, partition, offset in sorted(kafka_offsets)),
+            ]
+        )
+        return str(uuid.uuid5(_IDEMPOTENCY_NAMESPACE, name))
+
+    def _prepare(self, table, batch: pa.Table, key: str) -> dict:
+        """Write the batch's parquet, upload it, and return the commit
+        request — WITHOUT publishing it.
+
+        The split is what makes the retry safe: after this returns, the
+        files exist in object storage and the request that registers them
+        is a value we can hold and re-send verbatim. pyhoglake's
+        `prepare_append_files` owns the upload (streamed from disk in
+        chunks, so a 100MB flush never doubles in RAM the way an
+        in-memory serialize does) and the registration's stats/footer
+        conventions.
+
+        Partition fanout is ours to compute because the prepared path
+        puts row-to-partition correctness on the caller — transform math
+        still comes from pyhoglake.transforms, so the Iceberg semantics
+        have exactly one implementation.
+        """
+        info = table.info()
+        self._adopt_columns(info.columns)
+        target = columns_to_arrow_schema(info.columns)
+        aligned = batch.select(list(target.names)).cast(target)
+        groups = _partition_groups(aligned, info)
+        with tempfile.TemporaryDirectory(prefix="millpond-hoglake-") as tmp:
+            files = []
+            for index, (partition_values, part) in enumerate(groups):
+                path = os.path.join(tmp, f"part-{index}.parquet")
+                pq.write_table(part, path)
+                files.append((path, partition_values))
+            payload = table.prepare_append_files(files, idempotency_key=key)
+        # Blind append, exactly as `Table.append` does it.
+        # `prepare_append_files` pins `read_snapshot` to the catalog head
+        # at prepare time, and the server's conflict scan then fails the
+        # commit with a 409 if any DDL touched this table since — which
+        # for millpond means "another pod added a column", the single
+        # most likely thing to happen during a producer rollout. A
+        # prepared payload cannot survive that: its read_snapshot is
+        # frozen, so the conflict is permanent and the only way out is
+        # re-uploading under a new registration. Appends never conflict
+        # with appends, so dropping the field restores the semantics the
+        # non-idempotent path always had, and the incarnation guard
+        # (expected_table_uuid, which prepare_append_files puts on the
+        # entry) remains the real safety mechanism.
+        payload.pop("read_snapshot", None)
+        payload["author"] = self._author
+        return payload
+
+    def _commit_prepared(self) -> int:
+        """Publish the prepared request, or recognize that it is already
+        published.
+
+        Transport failures here are UNCERTAIN, never clean failures: a
+        timeout or a reset means the commit may have applied and the
+        answer was lost. The payload therefore stays cached and the
+        exception propagates, so main.py's retry loop sends THE SAME
+        request again — which the server resolves under the per-catalog
+        commit lock: a receipt for this key returns the original result
+        without writing, and no receipt means it really did not land.
+        Either way the rows publish exactly once.
+        """
+        payload = self._prepared
+        assert payload is not None  # only reached with a prepared payload  # noqa: S101
+        files = payload["appends"][0]["files"]
+        try:
+            self._catalog.commit_prepared(payload)
+        except ValidationError as e:
+            if _REUSED_KEY_MARKER not in f"{e}".lower():
+                raise
+            # The receipt exists and our request is not the one it was
+            # written for. That can only mean this offset range was
+            # already published under a DIFFERENT registration — the pod
+            # crashed after the commit applied but before the offsets
+            # committed, and the replay from Kafka rebuilt the flush.
+            # The rows are in the lake; publishing the rebuilt copy would
+            # duplicate them. Accept, and account for the upload we just
+            # orphaned.
+            log.warning(
+                "Kafka offsets for this flush were already published to %s.%s under a different "
+                "registration (idempotency key %s); treating the flush as done and orphaning %d "
+                "uploaded file(s)",
+                self._cfg.hoglake_namespace,
+                self._cfg.hoglake_table,
+                payload["idempotency_key"],
+                len(files),
+            )
+            metrics.hoglake_commit_replays_total.labels(outcome="already_published").inc()
+            metrics.hoglake_orphaned_files_total.inc(len(files))
+            rows = self._prepared_rows
+            self._clear_prepared()
+            return rows
+        # One parquet per partition tuple per flush (fanout appends) —
+        # the hoglake compaction-debt feed rate.
+        metrics.hoglake_files_written_total.inc(len(files))
+        rows = self._prepared_rows
+        self._clear_prepared()
+        return rows
+
+    def _clear_prepared(self) -> None:
+        self._prepared = None
+        self._prepared_key = None
+        self._prepared_rows = 0
 
     # -- metadata column ---------------------------------------------------
 

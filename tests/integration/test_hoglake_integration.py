@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
+import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -123,6 +124,18 @@ def _table(client, cfg):
 
 def _record_count(client, cfg) -> int:
     return sum(f.record_count for f in _table(client, cfg).files())
+
+
+def _list_objects(data_path: str, cfg) -> list[str]:
+    """Every object under this table's data prefix, bucket-relative."""
+    s3 = pafs.S3FileSystem(
+        access_key=stack.S3_ACCESS_KEY,
+        secret_key=stack.S3_SECRET_KEY,
+        endpoint_override=stack.MINIO_URL,
+    )
+    prefix = f"{data_path}data/{cfg.hoglake_namespace}/{cfg.hoglake_table}".removeprefix("s3://")
+    selector = pafs.FileSelector(prefix, recursive=True, allow_not_found=True)
+    return [f.path for f in s3.get_file_info(selector) if f.type == pafs.FileType.File]
 
 
 def _read_parquet(path: str) -> pa.Table:
@@ -422,6 +435,101 @@ class TestRestartAndReset:
         finally:
             sink.close()
         assert _record_count(client, cfg) == 3
+
+
+class TestLostCommitResponse:
+    """THE duplicate-publication hazard, against the real server.
+
+    A commit the server APPLIED whose response never reaches the client
+    is indistinguishable, at the client, from a commit that never
+    happened: both surface as a timeout. millpond retries; the retry
+    mints fresh parquet paths (uuid4) and commits again; hoglake permits
+    a path to be registered twice (there is no unique index on it, by
+    design); the rows publish a second time and the offsets advance over
+    both. No log, no metric, no way to know afterwards.
+
+    The fix is the commit's idempotency key, derived from the Kafka
+    offset range being flushed, plus a prepared payload the sink holds
+    across retries — so the retry is byte-identically the SAME request
+    and the server answers it from its receipt without writing.
+    """
+
+    def _drop_next_commit_response(self, sink):
+        """Let the commit reach the server and apply, then destroy the
+        response on its way back — exactly what a connection reset or a
+        gateway timeout does."""
+        http = sink._client._http
+        real = http.request
+        state = {"dropped": False}
+
+        def request(method, url, **kwargs):
+            response = real(method, url, **kwargs)
+            if not state["dropped"] and method == "POST" and "/commit" in str(url):
+                state["dropped"] = True
+                raise httpx.ReadTimeout("response lost in transit", request=response.request)
+            return response
+
+        http.request = request
+        return state
+
+    def _flush_once(self, sink, cfg, batch, offsets):
+        kafka = MagicMock()
+        _flush(sink, cfg, kafka, batch, batch.nbytes, batch.num_rows, offsets, 1.0)
+        return kafka
+
+    def test_lost_response_publishes_the_rows_exactly_once(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        offsets = {("events", 0): 41}
+        batch = _batch(6, teams=(1, 2))
+        try:
+            sink.write(_batch(1))  # bootstrap while healthy
+            state = self._drop_next_commit_response(sink)
+            kafka = self._flush_once(sink, cfg, batch, offsets)
+        finally:
+            sink.close()
+        assert state["dropped"], "the harness never dropped a commit response"
+        # The flush as a whole SUCCEEDED (the retry resolved it), so the
+        # offsets committed — which is the dangerous half: had the retry
+        # published a second copy, the offsets would have advanced over
+        # duplicated rows with nothing to show for it.
+        kafka.commit.assert_called_once()
+        assert _record_count(client, cfg) == 1 + 6
+
+    def test_lost_response_on_a_partitioned_table_too(self, hog_stack, client):
+        # The fanout path registers one file per partition tuple in one
+        # commit, so a replay has to reproduce the whole file SET.
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2, teams=(1,)))
+            state = self._drop_next_commit_response(sink)
+            self._flush_once(sink, cfg, _batch(9, teams=(1, 2, 3)), {("events", 0): 77})
+        finally:
+            sink.close()
+        assert state["dropped"]
+        assert _record_count(client, cfg) == 2 + 9
+        # And exactly one file per tuple from the retried flush — not two.
+        files = _table(client, cfg).files()
+        assert len(files) == 1 + 3
+
+    def test_replay_does_not_re_upload(self, hog_stack, client):
+        # A retry must replay the identical registration, not build a new
+        # one: re-uploading orphans the first set, and a payload that
+        # differs by so much as a file name is a 422 against the receipt.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(1))
+            self._drop_next_commit_response(sink)
+            self._flush_once(sink, cfg, _batch(4), {("events", 0): 12})
+            registered = {f.path for f in _table(client, cfg).files()}
+        finally:
+            sink.close()
+        objects = _list_objects(DATA_PATH, cfg)
+        # Every object under the table's data path is a registered file:
+        # no orphan from a second upload.
+        assert {o for o in objects if o.endswith(".parquet")} <= {p.removeprefix("s3://") for p in registered}
 
 
 class TestAtLeastOnce:
