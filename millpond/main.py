@@ -440,18 +440,25 @@ def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", writ
             time.sleep(delay)
 
 
-def _sink_write_kwargs(cfg, offsets: dict[tuple[str, int], int]) -> dict:
+def _sink_write_kwargs(cfg, offsets: dict[tuple[str, int], tuple[int, int]]) -> dict:
     """Per-call arguments for backends that need to know WHICH batch this
     is, not only what is in it.
 
-    `offsets` is the consume loop's (topic, partition) -> highest offset
-    map for everything in the pending buffer: the exact Kafka range this
-    flush is about to publish and then commit. Flattened to a sorted
-    tuple of `(topic, partition, offset)` so it is hashable and
-    order-independent, and so it is identical on every retry of the same
-    flush — HoglakeSink hashes it into the commit's idempotency key,
+    `offsets` is the consume loop's (topic, partition) -> (first, last)
+    offset map for everything in the pending buffer: the exact Kafka
+    range this flush is about to publish and then commit. Flattened to a
+    sorted tuple of `(topic, partition, first, last)` so it is hashable
+    and order-independent, and so it is identical on every retry of the
+    same flush — HoglakeSink hashes it into the commit's idempotency key,
     which is what turns a retry after a lost commit response into a
     replay instead of a second publication.
+
+    BOTH ends of the range, not just the high end. A key naming only the
+    high offset says "everything up to here", which is not the row set a
+    flush publishes: rewind a partition and re-consume, and a flush of
+    [0, 41] carries the name of an earlier flush of [30, 41], whose
+    receipt then reports it as already published — offsets advance over
+    rows that were never written.
 
     DuckLake takes no per-call identity: its INSERT sits in a transaction
     whose commit outcome the client always learns, so a retry there
@@ -461,7 +468,7 @@ def _sink_write_kwargs(cfg, offsets: dict[tuple[str, int], int]) -> dict:
     """
     if cfg.destination != "hoglake":
         return {}
-    flushed = tuple(sorted((topic, partition, offset) for (topic, partition), offset in offsets.items()))
+    flushed = tuple(sorted((topic, partition, first, last) for (topic, partition), (first, last) in offsets.items()))
     return {"kafka_offsets": flushed}
 
 
@@ -490,8 +497,8 @@ def _flush(
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded
     tp_offsets = [
-        TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
-        for (topic, partition), offset in offsets.items()
+        TopicPartition(topic, partition, last + 1)  # +1: committed offset is next-to-fetch
+        for (topic, partition), (_first, last) in offsets.items()
     ]
     for attempt in range(_COMMIT_MAX_RETRIES):
         try:
@@ -614,7 +621,12 @@ def main():
     pending: list[pa.Table] = []
     pending_bytes = 0
     pending_records = 0
-    offsets: dict[tuple[str, int], int] = {}  # (topic, partition) -> max offset
+    # (topic, partition) -> (first, last) offset held in the pending
+    # buffer. The high end is what gets committed to Kafka; BOTH ends are
+    # what name the flush for an idempotent destination (see
+    # _sink_write_kwargs — a name that omits the low end is a name a
+    # rewound partition can collide with).
+    offsets: dict[tuple[str, int], tuple[int, int]] = {}
     last_flush = time.monotonic()
     last_lag_sample = 0.0  # force immediate first sample
     last_heartbeat = time.monotonic()
@@ -690,7 +702,9 @@ def main():
                     if msg.value() is not None:
                         values.append(msg.value())
                         key = (msg.topic(), msg.partition())
-                        offsets[key] = max(offsets.get(key, -1), msg.offset())
+                        offset = msg.offset()
+                        first, last = offsets.get(key, (offset, offset))
+                        offsets[key] = (min(first, offset), max(last, offset))
 
                 if values:
                     skipped = 0
@@ -736,7 +750,8 @@ def main():
                 now = time.monotonic()
                 if now - last_lag_sample >= _LAG_SAMPLE_INTERVAL_S:
                     tp_offsets = [
-                        TopicPartition(topic, partition, offset + 1) for (topic, partition), offset in offsets.items()
+                        TopicPartition(topic, partition, last + 1)
+                        for (topic, partition), (_first, last) in offsets.items()
                     ]
                     _update_lag_metrics(kafka, lag_admin, tp_offsets, cfg.auto_offset_reset)
                     last_lag_sample = now

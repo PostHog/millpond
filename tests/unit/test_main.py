@@ -9,6 +9,7 @@ from millpond.main import (
     _RETRY_AFTER_MAX_S,
     _convert_batch,
     _flush,
+    _sink_write_kwargs,
     _update_lag_metrics,
     _write_with_retry,
 )
@@ -187,7 +188,7 @@ class TestFlushErrorDistinction:
         # Sinks return the count actually written; _flush feeds it to
         # records_written_total.
         sink.write.return_value = table.num_rows
-        offsets = {("topic", 0): 42}
+        offsets = {("topic", 0): (30, 42)}  # (first, last) in the pending buffer
         return sink, cfg, kafka, table, offsets
 
     @patch("millpond.main.time")
@@ -987,7 +988,7 @@ class TestFlushCommit:
         cfg.sort_by = None
         kafka = MagicMock()
         table = pa.table({"a": [1, 2]})
-        offsets = {("events", 0): 100}
+        offsets = {("events", 0): (88, 100)}
         _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
         kafka.commit.assert_called_once()
         # Committed offset is next-to-fetch (max consumed + 1).
@@ -1229,6 +1230,56 @@ class TestSinkOwnedRetryPolicy:
         assert max(c.args[0] for c in mock_time.sleep.call_args_list) == _RETRY_AFTER_MAX_S
 
 
+class TestFlushIdentity:
+    """`write_kwargs` carries WHICH flush this is, and the hoglake sink
+    hashes it into the commit's idempotency key. Nothing tested this
+    seam, and everything downstream of it depends on the value being the
+    same on every attempt and on naming the whole row set."""
+
+    def _cfg(self, destination="hoglake"):
+        cfg = MagicMock()
+        cfg.destination = destination
+        return cfg
+
+    def test_offsets_are_flattened_with_both_ends_of_each_range(self):
+        out = _sink_write_kwargs(self._cfg(), {("events", 1): (9, 17), ("events", 0): (30, 41)})
+        assert out == {"kafka_offsets": (("events", 0, 30, 41), ("events", 1, 9, 17))}
+
+    def test_the_flush_identity_is_order_independent(self):
+        a = _sink_write_kwargs(self._cfg(), {("events", 0): (30, 41), ("events", 1): (9, 17)})
+        b = _sink_write_kwargs(self._cfg(), {("events", 1): (9, 17), ("events", 0): (30, 41)})
+        assert a == b
+
+    def test_ducklake_gets_no_identity(self):
+        # Its INSERT sits in a transaction whose outcome the client always
+        # learns; there is no lost-response ambiguity to name away.
+        assert _sink_write_kwargs(self._cfg("ducklake"), {("events", 0): (30, 41)}) == {}
+
+    def test_the_same_kwargs_go_to_every_attempt(self):
+        # A retry must be recognizable as the SAME flush. Sending the
+        # identity on the first attempt only turns every retry into an
+        # anonymous (random-key) publication — which is exactly the
+        # duplicate the key exists to prevent.
+        sink = _make_sink()
+        sink.write.side_effect = [RuntimeError("lost"), RuntimeError("lost"), 4]
+        identity = {"kafka_offsets": (("events", 0, 30, 41),)}
+        with patch("millpond.main.time"), patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}), write_kwargs=identity)
+        assert sink.write.call_count == 3
+        assert all(c.kwargs == identity for c in sink.write.call_args_list)
+
+    def test_flush_hands_the_sink_its_identity(self):
+        sink = _make_sink()
+        sink.write.return_value = 2
+        cfg = MagicMock()
+        cfg.destination = "hoglake"
+        cfg.table_label = "events"
+        cfg.sort_by = None
+        with patch("millpond.main.time"), patch("millpond.main.server"), patch("millpond.main.metrics"):
+            _flush(sink, cfg, MagicMock(), pa.table({"a": [1, 2]}), 100, 2, {("events", 0): (30, 41)}, 1.0)
+        assert sink.write.call_args.kwargs == {"kafka_offsets": (("events", 0, 30, 41),)}
+
+
 class TestOffsetSequencing:
     """THE at-least-once contract: Kafka offsets commit only after the
     sink write succeeds. A write failure (through all retries) must
@@ -1242,7 +1293,7 @@ class TestOffsetSequencing:
         kafka = MagicMock()
         table = pa.table({"a": [1, 2, 3]})
         sink.write.return_value = table.num_rows
-        offsets = {("topic", 0): 41, ("topic", 2): 7}
+        offsets = {("topic", 0): (12, 41), ("topic", 2): (0, 7)}
         return sink, cfg, kafka, table, offsets
 
     @patch("millpond.main.time")

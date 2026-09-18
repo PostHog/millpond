@@ -62,18 +62,24 @@ def _col(name, type_, field_id, ordinal, **kw) -> Column:
     return Column(name=name, type=type_, field_id=field_id, ordinal=ordinal, **kw)
 
 
+TABLE_UUID = "0e0b6c8e-0000-0000-0000-000000000001"
+
+
 @dataclass
 class _FakeInfo:
     """The TableInfo surface the sink reads. A MagicMock is wrong here:
     `info.partition_spec` on a MagicMock is a truthy Mock, so a test
     could never tell an unpartitioned table from a partitioned one — and
-    telling those apart is the whole point of the reconciliation path."""
+    telling those apart is the whole point of the reconciliation path.
+    Same for `table_uuid`: the incarnation is half of the idempotency
+    key, and a Mock would compare unequal to itself across calls."""
 
     columns: tuple
     partition_spec: PartitionSpec | None = None
     sort_spec: SortSpec | None = None
     namespace: str = "analytics"
     name: str = "events"
+    table_uuid: str = TABLE_UUID
 
 
 def _wire_dynamic_alter(table, state: _FakeInfo):
@@ -145,7 +151,7 @@ def _wire_prepared_commit(table, catalog):
                 {
                     "namespace": "analytics",
                     "table": "events",
-                    "expected_table_uuid": "0e0b6c8e-0000-0000-0000-000000000001",
+                    "expected_table_uuid": table.table_uuid,
                     "files": [
                         {"path": f"s3://bucket/lake/{idempotency_key}/{i}.parquet", "partition_values": values}
                         for i, (_path, values) in enumerate(files)
@@ -167,6 +173,7 @@ def _mock_stack(columns, partition_spec=None, sort_spec=None):
     table = MagicMock()
     state = _FakeInfo(columns=tuple(columns), partition_spec=partition_spec, sort_spec=sort_spec)
     table.columns = state.columns
+    table.table_uuid = state.table_uuid
     table.info.return_value = state
     table.state = state
     _wire_dynamic_alter(table, state)
@@ -185,6 +192,13 @@ _EVENTS_COLUMNS = [
     _col("properties", "string", 4, 4),
     _col("_inserted_at", "timestamptz", 5, 5),
 ]
+
+
+def _mock_table(table_uuid=TABLE_UUID):
+    """A bare table handle for key derivation (only `table_uuid` is read)."""
+    table = MagicMock()
+    table.table_uuid = table_uuid
+    return table
 
 
 def _sink(cfg=None, columns=_EVENTS_COLUMNS, partition_spec=None, sort_spec=None):
@@ -931,37 +945,70 @@ class TestFilesWrittenMetric:
 
 class TestIdempotentPublication:
     """A commit whose response is lost is indistinguishable from one that
-    never happened. The key that makes the retry a REPLAY is derived from
-    the Kafka offset range, and the uploaded registration is held across
-    retries so the replay is the same request byte for byte."""
+    never happened. The key that makes the retry a REPLAY names the
+    destination INCARNATION and the complete Kafka offset range, and the
+    uploaded registration is held across retries so the replay is the
+    same request byte for byte."""
 
-    OFFSETS = (("events", 0, 41), ("events", 1, 17))
+    OFFSETS = (("events", 0, 30, 41), ("events", 1, 9, 17))
+
+    def _key(self, sink, offsets, table=None):
+        return sink._flush_key(table or _mock_table(), offsets)
 
     def test_key_is_derived_from_the_offsets(self):
-        s, *_ = _sink()
-        first = s._flush_key(self.OFFSETS)
-        assert first == s._flush_key(self.OFFSETS)
+        s, *_, table = _sink()
+        first = self._key(s, self.OFFSETS, table)
+        assert first == self._key(s, self.OFFSETS, table)
         # Order-independent: the same range described differently is the
         # same flush.
-        assert first == s._flush_key(tuple(reversed(self.OFFSETS)))
-        # A different range is a different publication.
-        assert first != s._flush_key((("events", 0, 42), ("events", 1, 17)))
+        assert first == self._key(s, tuple(reversed(self.OFFSETS)), table)
+        # A different range is a different publication...
+        assert first != self._key(s, (("events", 0, 30, 42), ("events", 1, 9, 17)), table)
+        # ...including one that differs only in where it STARTED. A key
+        # naming the high offset alone says "everything up to 41", which
+        # a rewound partition re-flushing [0, 41] then collides with.
+        assert first != self._key(s, (("events", 0, 0, 41), ("events", 1, 9, 17)), table)
         # And a different table in the same catalog is a different one
         # too: receipts are scoped per CATALOG, not per table.
-        other, *_ = _sink(_cfg(hoglake_table="other"))
-        assert first != other._flush_key(self.OFFSETS)
+        other, *_, other_table = _sink(_cfg(hoglake_table="other"))
+        assert first != self._key(other, self.OFFSETS, other_table)
+
+    def test_key_names_the_namespace(self):
+        # Two pipelines with the same table name in different namespaces
+        # of one catalog share a receipt space.
+        s, *_, table = _sink()
+        other, *_, other_table = _sink(_cfg(hoglake_namespace="other_ns"))
+        assert self._key(s, self.OFFSETS, table) != self._key(other, self.OFFSETS, other_table)
+
+    def test_key_names_the_table_incarnation(self):
+        # Receipts survive a table drop — hoglake has no cascade from the
+        # table to its receipts. Without the incarnation in the key, a
+        # dropped-and-recreated table answers a flush from its
+        # PREDECESSOR's receipt and millpond advances offsets over rows
+        # that are in a table which no longer exists.
+        s, *_, table = _sink()
+        recreated = _mock_table(table_uuid="99999999-0000-0000-0000-000000000009")
+        assert self._key(s, self.OFFSETS, table) != self._key(s, self.OFFSETS, recreated)
+
+    def test_key_keeps_each_offset_with_its_partition(self):
+        # (p0: 17, p1: 41) and (p0: 41, p1: 17) are different row sets.
+        # A key that sorts bare offset lines cannot tell them apart.
+        s, *_, table = _sink()
+        a = self._key(s, (("events", 0, 17, 17), ("events", 1, 41, 41)), table)
+        b = self._key(s, (("events", 0, 41, 41), ("events", 1, 17, 17)), table)
+        assert a != b
 
     def test_key_is_random_without_offsets(self):
         # No identity to recognize a retry by: honest at-least-once
         # rather than a key that could collide across flushes.
-        s, *_ = _sink()
-        assert s._flush_key(None) != s._flush_key(None)
+        s, *_, table = _sink()
+        assert self._key(s, None, table) != self._key(s, None, table)
 
     def test_commit_carries_the_derived_key(self):
         s, client, catalog, ns, table = _sink()
         s.write(_batch(), kafka_offsets=self.OFFSETS)
         payload = catalog.commit_prepared.call_args.args[0]
-        assert payload["idempotency_key"] == s._flush_key(self.OFFSETS)
+        assert payload["idempotency_key"] == self._key(s, self.OFFSETS, table)
         assert payload["author"] == "millpond/events/0"
 
     def test_payload_is_a_blind_append(self):
@@ -986,7 +1033,28 @@ class TestIdempotentPublication:
         first, second = (c.args[0] for c in catalog.commit_prepared.call_args_list)
         assert first == second  # byte-identical replay
 
-    def test_reset_caches_keeps_the_prepared_payload(self):
+    @patch("millpond.hoglake.metrics")
+    def test_a_resolved_replay_is_visible_to_operators(self, mock_metrics):
+        # A commit re-sent after an uncertain outcome that comes back 200
+        # is the mechanism WORKING. Previously it was indistinguishable
+        # from a first publish, so the only replay an operator could see
+        # was the already-published one.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [httpx.ReadTimeout("response lost"), MagicMock()]
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_commit_replays_total.labels.assert_not_called()
+        s.reset_caches()
+        assert s.write(_rows(3), kafka_offsets=self.OFFSETS) == 3
+        mock_metrics.hoglake_commit_replays_total.labels.assert_called_once_with(outcome="replayed")
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_first_publish_is_not_a_replay(self, mock_metrics):
+        s, client, catalog, ns, table = _sink()
+        s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_commit_replays_total.labels.assert_not_called()
+
+    def test_reset_caches_keeps_a_sendable_prepared_payload(self):
         s, client, catalog, ns, table = _sink()
         catalog.commit_prepared.side_effect = [httpx.ConnectError("reset"), MagicMock()]
         with pytest.raises(httpx.ConnectError):
@@ -997,35 +1065,232 @@ class TestIdempotentPublication:
     def test_a_different_flush_prepares_again(self):
         s, client, catalog, ns, table = _sink()
         s.write(_batch(), kafka_offsets=self.OFFSETS)
-        s.write(_batch(), kafka_offsets=(("events", 0, 99),))
+        s.write(_batch(), kafka_offsets=(("events", 0, 42, 99),))
         assert table.prepare_append_files.call_count == 2
         keys = {c.args[0]["idempotency_key"] for c in catalog.commit_prepared.call_args_list}
         assert len(keys) == 2
 
     @patch("millpond.hoglake.metrics")
-    def test_key_reused_with_a_different_payload_is_already_published(self, mock_metrics):
+    def test_a_held_payload_is_never_replayed_for_a_different_flush(self, mock_metrics):
+        # The cached payload belongs to ONE offset range. Replaying it
+        # for the next flush would publish the previous flush's rows
+        # under this flush's offsets and drop these rows on the floor.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [httpx.ReadTimeout("lost"), MagicMock()]
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        moved_on = (("events", 0, 42, 99),)
+        assert s.write(_rows(7), kafka_offsets=moved_on) == 7
+        assert table.prepare_append_files.call_count == 2  # rebuilt, not replayed
+        sent = catalog.commit_prepared.call_args.args[0]
+        assert sent["idempotency_key"] == self._key(s, moved_on, table)
+        # The abandoned upload is an orphan and is counted as one.
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+
+    @patch("millpond.hoglake.metrics")
+    def test_key_reused_with_a_different_payload_publishes_nothing(self, mock_metrics):
         # The crash-restart case: the pod died after the commit applied
         # and before the offsets committed, so Kafka replayed the range
-        # and the flush was rebuilt with fresh file names. The receipt
-        # says this range is already in the lake. Publishing the rebuilt
-        # copy would duplicate it; failing forever would wedge the
-        # partition on rows that are already there.
+        # and the flush was rebuilt with a fresh `_inserted_at` stamp and
+        # fresh file names. The key names this table incarnation and this
+        # complete offset range, and the server writes a receipt only in
+        # the transaction that publishes — so the rows are in the lake.
+        # Publishing the rebuilt copy would duplicate them; failing
+        # forever would wedge the partition on rows already there.
+        #
+        # The exception is built in the shape the SERVER produces:
+        # ApiError{error, detail} maps to message="validation" and the
+        # sentence in `detail`. A matcher reading `.message` alone sees
+        # "validation" and nothing else.
         s, client, catalog, ns, table = _sink()
         catalog.commit_prepared.side_effect = ValidationError(
-            "idempotency_key reused with a different request", status_code=422
+            "validation",
+            status_code=422,
+            detail="idempotency_key reused with a different request",
         )
-        assert s.write(_rows(5), kafka_offsets=self.OFFSETS) == 5
+        # ZERO, not 5: this process published nothing. Reporting the
+        # batch size here is how a writer came to claim 8 rows for a
+        # range that had 3 in the lake.
+        assert s.write(_rows(5), kafka_offsets=self.OFFSETS) == 0
         mock_metrics.hoglake_commit_replays_total.labels.assert_called_once_with(outcome="already_published")
         # The upload we just made is unreferenced and nothing will
         # reclaim it — say so in a metric rather than in nothing.
         mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
         assert s._prepared is None
 
-    def test_other_validation_errors_are_not_swallowed(self):
+    def test_a_reused_key_against_a_recreated_table_is_not_accepted(self):
+        # A receipt from the PREVIOUS incarnation must never stand in for
+        # a publication to this one. (The key names the incarnation, so
+        # this is belt and braces on the same invariant.)
         s, client, catalog, ns, table = _sink()
-        catalog.commit_prepared.side_effect = ValidationError("path outside the catalog data path", status_code=422)
+        catalog.commit_prepared.side_effect = ValidationError(
+            "validation", status_code=422, detail="idempotency_key reused with a different request"
+        )
+        infos = [_FakeInfo(columns=tuple(_EVENTS_COLUMNS)), _FakeInfo(columns=tuple(_EVENTS_COLUMNS))]
+        infos.append(_FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid="deadbeef-0000-0000-0000-000000000000"))
+        table.info.side_effect = infos
+        with pytest.raises(IncarnationChangedError):
+            s.write(_rows(5), kafka_offsets=self.OFFSETS)
+        assert s._prepared is None
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "idempotency_key must be a UUID",
+            "idempotency_key is required for prepared commits",
+        ],
+    )
+    def test_other_idempotency_errors_are_not_treated_as_published(self, detail):
+        # The marker is the whole sentence the server uses for a reuse,
+        # not the word "idempotency": every other 422 mentioning the key
+        # is a request that was REFUSED, with nothing in the lake.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError("validation", status_code=422, detail=detail)
         with pytest.raises(ValidationError):
             s.write(_batch(), kafka_offsets=self.OFFSETS)
+
+    def test_other_validation_errors_are_not_swallowed(self):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError(
+            "validation", status_code=422, detail="path outside the catalog data path"
+        )
+        with pytest.raises(ValidationError):
+            s.write(_batch(), kafka_offsets=self.OFFSETS)
+
+
+class TestRefusedCommitsDropThePayload:
+    """A refusal the server ANSWERED is one transaction that wrote
+    nothing, and it means the same thing to every identical resend.
+
+    Holding the payload across one of those made `reset_caches()` inert
+    (the replay short-circuits before the table is re-resolved), so a
+    409 repeated for the whole retry budget with ONE prepare behind it,
+    and the pod crashed having orphaned an upload per cycle."""
+
+    OFFSETS = (("events", 0, 30, 41),)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            IncarnationChangedError("table was recreated", status_code=409, detail="the table was recreated"),
+            CommitConflictError("commit_conflict", status_code=409, detail="removal queue collision"),
+            ValidationError("validation", status_code=422, detail="path outside the catalog data path"),
+        ],
+    )
+    @patch("millpond.hoglake.metrics")
+    def test_an_answered_refusal_drops_the_payload_and_re_resolves(self, mock_metrics, exc):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = exc
+        with pytest.raises(type(exc)):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert s._prepared is None
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        # The next attempt (main.py resets caches first) rebuilds rather
+        # than re-sending a request the server already judged.
+        catalog.commit_prepared.side_effect = None
+        s.reset_caches()
+        assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
+        assert table.prepare_append_files.call_count == 2
+        assert ns.table.call_count == 2  # the table WAS re-resolved
+
+    def test_transport_uncertainty_keeps_the_payload(self):
+        # The other half of the rule: no response means no verdict, so
+        # the same request must go again.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = httpx.ReadTimeout("no response")
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert s._prepared is not None
+
+    def test_server_side_5xx_keeps_the_payload(self):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = HoglakeError("commit_queue_timeout", status_code=503)
+        with pytest.raises(HoglakeError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert s._prepared is not None
+
+    @patch("millpond.hoglake.metrics")
+    def test_files_written_counts_only_what_the_commit_registered(self, mock_metrics):
+        # The counter is the compaction-debt feed rate. A refused commit
+        # registers nothing, so counting before the commit lands reports
+        # debt the catalog does not have (and hides an orphan).
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError("validation", status_code=422, detail="nope")
+        with pytest.raises(ValidationError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_files_written_total.inc.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_prepare_that_fails_mid_upload_is_counted(self, mock_metrics):
+        # Nothing on the server reclaims a client upload, so an
+        # uncounted orphan path is storage nobody can find.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        table.prepare_append_files.side_effect = OSError("S3 reset midway")
+        with pytest.raises(OSError):
+            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(3)
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_prepare_refused_before_its_upload_is_not_counted(self, mock_metrics):
+        # pyhoglake validates file i and THEN uploads file i: a
+        # validation refusal on a single-file flush uploaded nothing.
+        s, client, catalog, ns, table = _sink()
+        table.prepare_append_files.side_effect = ValidationError("prepared file must contain rows", status_code=None)
+        with pytest.raises(ValidationError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_close_counts_an_unpublished_payload(self, mock_metrics):
+        # SIGTERM between prepare and commit.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = httpx.ReadTimeout("no response")
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        s.close()
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+
+
+class TestSpecChangeUnderAPreparedPayload:
+    """A registered file carries the partition VALUES the client computed
+    and the spec_id the table has when the commit lands. The server never
+    opens the file, so a same-arity re-spec between prepare and commit
+    stamps identity values as bucket values — silent, permanent
+    mis-pruning of every future scan."""
+
+    OFFSETS = (("events", 0, 30, 41),)
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_same_arity_spec_change_refuses_the_commit(self, mock_metrics):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        prepared = table.prepare_append_files.side_effect
+
+        def prepare(files, **kwargs):
+            # The re-spec lands while the upload is in flight.
+            table.info.return_value = _FakeInfo(
+                columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "bucket", 16))
+            )
+            return prepared(files, **kwargs)
+
+        table.prepare_append_files.side_effect = prepare
+        with pytest.raises(RuntimeError, match="partition spec"):
+            s.write(pa.table({"uuid": ["a"], "team_id": [1]}), kafka_offsets=self.OFFSETS)
+        catalog.commit_prepared.assert_not_called()
+        assert s._prepared is None
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+
+    def test_the_refusal_is_retryable(self):
+        # Unlike the sink's other stops: a REBUILT flush computes its
+        # values under the new spec and publishes cleanly.
+        err = hoglake.HoglakeSinkError("partition spec ... changed", retryable=True)
+        assert hoglake.is_retryable(err) is True
+
+    def test_an_unchanged_spec_commits(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        assert s.write(pa.table({"uuid": ["a"], "team_id": [1]}), kafka_offsets=self.OFFSETS) == 1
 
     def test_zero_row_batch_never_reaches_the_commit(self):
         # A commit must register at least one file with at least one row;
@@ -1081,9 +1346,7 @@ class TestConcurrentAddDuringAppend:
         def prepare(files, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise ValidationError(
-                    "prepared Parquet schema/field IDs differ from destination", status_code=None
-                )
+                raise ValidationError("prepared Parquet schema/field IDs differ from destination", status_code=None)
             return prepared(files, **kwargs)
 
         table.prepare_append_files.side_effect = prepare

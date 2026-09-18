@@ -477,7 +477,7 @@ class TestLostCommitResponse:
     def test_lost_response_publishes_the_rows_exactly_once(self, hog_stack, client):
         cfg = _fresh()
         sink = HoglakeSink(cfg)
-        offsets = {("events", 0): 41}
+        offsets = {("events", 0): (36, 41)}
         batch = _batch(6, teams=(1, 2))
         try:
             sink.write(_batch(1))  # bootstrap while healthy
@@ -501,7 +501,7 @@ class TestLostCommitResponse:
         try:
             sink.write(_batch(2, teams=(1,)))
             state = self._drop_next_commit_response(sink)
-            self._flush_once(sink, cfg, _batch(9, teams=(1, 2, 3)), {("events", 0): 77})
+            self._flush_once(sink, cfg, _batch(9, teams=(1, 2, 3)), {("events", 0): (69, 77)})
         finally:
             sink.close()
         assert state["dropped"]
@@ -519,7 +519,7 @@ class TestLostCommitResponse:
         try:
             sink.write(_batch(1))
             self._drop_next_commit_response(sink)
-            self._flush_once(sink, cfg, _batch(4), {("events", 0): 12})
+            self._flush_once(sink, cfg, _batch(4), {("events", 0): (9, 12)})
             registered = {f.path for f in _table(client, cfg).files()}
         finally:
             sink.close()
@@ -539,7 +539,7 @@ class TestAtLeastOnce:
         cfg = _fresh()
         sink = HoglakeSink(cfg)
         kafka = MagicMock()
-        offsets = {("topic", 0): 10}
+        offsets = {("topic", 0): (7, 10)}
         batch = _batch(4)
         try:
             sink.write(_batch(1))  # bootstrap while healthy

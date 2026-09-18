@@ -287,6 +287,46 @@ def is_retryable(exc: BaseException) -> bool:
     return True
 
 
+def _error_text(exc: HoglakeError) -> str:
+    """Everything the server said, lower-cased.
+
+    Both halves, deliberately. hoglake's error body is
+    `{error, detail}` and `_raise` maps them to `.message` and
+    `.detail` — so for a 422 the message is the CODE ("validation") and
+    the sentence is in the detail. A matcher that reads only `.message`
+    matches nothing on a real response, and its unit test only passes if
+    the fixture has the two fields the wrong way round.
+    """
+    return f"{exc.message} {exc.detail or ''}".lower()
+
+
+def _is_answered_refusal(exc: BaseException) -> bool:
+    """Did the SERVER judge this request and refuse it?
+
+    A commit is one transaction, so a 409 or a 422 carried back in a
+    response means the server wrote nothing and will write nothing for
+    any identical resend. That is the rule for whether a prepared payload
+    is still worth holding: hold for transport-uncertain (no status, a
+    timeout, a reset) and for 5xx, drop for an answered 4xx refusal.
+    """
+    return isinstance(exc, HoglakeError) and exc.status_code in (409, 422)
+
+
+def _count_orphans(count: int, why: str) -> None:
+    """Record parquet objects uploaded to the lake that no commit
+    references.
+
+    Nothing on the server side reclaims a client's uploads, so this
+    counter is the whole observability story for them; an uncounted
+    orphan path is storage nobody can find. Every path that can leave one
+    routes through here.
+    """
+    if count <= 0:
+        return
+    log.warning("Orphaned %d uploaded parquet file(s) in the lake: %s", count, why)
+    metrics.hoglake_orphaned_files_total.inc(count)
+
+
 def _is_alignment_refusal(exc: BaseException) -> bool:
     """Is this a "the prepared file's columns are not the destination's"
     refusal, i.e. one a refresh-and-null-fill can actually clear?
@@ -498,6 +538,20 @@ class HoglakeSink:
         self._prepared: dict | None = None
         self._prepared_key: str | None = None
         self._prepared_rows: int = 0
+        # The Kafka identity the prepared payload was built for. A retry
+        # is recognized by THIS, not by re-deriving the key: the key
+        # depends on the live table incarnation, which the retry path
+        # deliberately does not re-resolve.
+        self._prepared_offsets: tuple | None = None
+        # The live partition spec `_prepare` computed its partition
+        # VALUES under. A spec change between prepare and commit would
+        # stamp those values with a spec_id they were not computed for.
+        self._prepared_spec: tuple[tuple[int, str, int | None], ...] = ()
+        # How many times this payload has been sent. >1 on success means
+        # the commit was RESOLVED BY REPLAY: the server either answered
+        # from its receipt or applied it now, and either way the rows
+        # published exactly once.
+        self._prepared_sends: int = 0
         # STARTUP network validation. Everything else in this class is
         # lazy, and that is fine — but the catalog is the one thing whose
         # absence config.py and the README both describe as a "startup
@@ -511,15 +565,22 @@ class HoglakeSink:
 
     # -- Sink protocol -----------------------------------------------------
 
-    def write(self, batch: pa.Table, *, kafka_offsets: tuple[tuple[str, int, int], ...] | None = None) -> int:
+    def write(self, batch: pa.Table, *, kafka_offsets: tuple[tuple[str, int, int, int], ...] | None = None) -> int:
         """Publish `batch` as ONE idempotent commit.
 
-        `kafka_offsets` is the flush's identity — the (topic, partition,
-        highest offset) triples main.py is about to commit — and it is
-        what makes a retry a REPLAY instead of a second write. See
-        `_flush_key`. Absent, the flush is anonymous and falls back to
-        at-least-once (a lost response duplicates); main.py always
-        supplies it, direct callers usually should not care.
+        `kafka_offsets` is the flush's identity — the
+        `(topic, partition, first, last)` quadruples covering everything
+        in the pending buffer — and it is what makes a retry a REPLAY
+        instead of a second write. See `_flush_key`. Absent, the flush is
+        anonymous and falls back to at-least-once (a lost response
+        duplicates); main.py always supplies it, direct callers usually
+        should not care.
+
+        Returns the number of rows THIS CALL published. That is normally
+        the batch's row count, and it is 0 when the batch was skipped
+        whole — or when the server answered from a receipt, because then
+        this process published nothing and `records_written_total` must
+        not claim otherwise.
         """
         check_reserved_collision(batch.schema, RESERVED_COLUMNS, "Hoglake")
         had_columns = batch.num_columns > 0
@@ -541,14 +602,27 @@ class HoglakeSink:
             # a 422 the retry loop could never clear.
             return 0
 
-        key = self._flush_key(kafka_offsets)
-        if self._prepared is not None and self._prepared_key == key:
+        identity = tuple(kafka_offsets) if kafka_offsets else None
+        if identity is not None and self._prepared is not None and self._prepared_offsets == identity:
             # A retry of a flush whose registration is already uploaded.
             # Replay it byte-identically; never rebuild it.
+            #
+            # Matched on the Kafka identity rather than on a re-derived
+            # key: the key is a function of the live table incarnation,
+            # and re-resolving that here would silently rebase a frozen
+            # payload's name onto a table it was not prepared for. The
+            # payload carries its own `expected_table_uuid`; the commit
+            # is where that gets judged.
             return self._commit_prepared()
+        # Anything still held at this point belongs to a flush that never
+        # resolved and never will — a different offset range, or an
+        # anonymous batch, which has no identity to replay under. Its
+        # upload is already in object storage with nothing referencing it.
+        self._discard_prepared("superseded by a new flush")
 
         batch = self._stamp_inserted_at(batch)
         table = self._ensure_table(batch.schema)
+        key = self._flush_key(table, kafka_offsets)
         batch = self._evolve_and_align(table, batch)
         try:
             payload = self._prepare(table, batch, key)
@@ -578,21 +652,30 @@ class HoglakeSink:
         self._prepared = payload
         self._prepared_key = key
         self._prepared_rows = batch.num_rows
+        self._prepared_offsets = identity
+        self._prepared_sends = 0
         return self._commit_prepared()
 
     def reset_caches(self) -> None:
         """Drop the resolved table/schema handles so the next attempt
         re-resolves.
 
-        The PREPARED PAYLOAD deliberately survives: it is the record of
-        an upload that already happened, and the whole point of holding
-        it is that the retry replays the same registration instead of
-        minting new paths. It is cleared when its commit is resolved —
-        published, or proven already published — and by close()."""
+        The PREPARED PAYLOAD survives a reset only while it is still
+        SENDABLE: it is the record of an upload that already happened,
+        and the whole point of holding it is that the retry replays the
+        same registration instead of minting new paths. A payload the
+        server has already refused with a response is not sendable — see
+        `_commit_prepared`, which drops it at the refusal rather than
+        leaving a reset to do a job it cannot do from here."""
         self._table = None
         self._live_columns = {}
 
     def close(self) -> None:
+        # A payload still held at shutdown is an upload nobody will ever
+        # reference: SIGTERM between prepare and commit. Nothing on the
+        # server reclaims client uploads, so the count is the only trace
+        # it leaves.
+        self._discard_prepared("the sink closed before its commit resolved")
         self._client.close()
 
     # -- retry policy (read by main._write_with_retry) ---------------------
@@ -645,9 +728,10 @@ class HoglakeSink:
 
     # -- idempotent publication --------------------------------------------
 
-    def _flush_key(self, kafka_offsets) -> str:
-        """The commit's idempotency key: a UUIDv5 over this table's
-        identity and the Kafka offset range being flushed.
+    def _flush_key(self, table, kafka_offsets) -> str:
+        """The commit's idempotency key: a UUIDv5 over the destination
+        table INCARNATION and the complete Kafka offset range being
+        flushed.
 
         DERIVED, not random, and that is the entire mechanism. A key is a
         name for "these rows, published to this table", so the retry of a
@@ -655,14 +739,27 @@ class HoglakeSink:
         that may already have landed, and the server answers from its
         receipt instead of writing again.
 
-        Why the offset range is a sound identity: a flush only happens
-        with at least one new record buffered, so at least one partition's
-        highest offset has advanced since the last one, and main.py
-        clears the map after every flush. Two different flushes of the
-        same pipeline therefore cannot produce the same triple set. The
-        table identity is in the hash because receipts are scoped per
-        CATALOG, not per table — two pipelines writing different tables in
-        one catalog must not collide.
+        A key that names something OTHER than the row set is worse than
+        no key at all, because the server's answer is then a statement
+        about a different publication. Both halves of this name exist for
+        that reason:
+
+        * `table_uuid`, not just the table NAME. Receipts live per
+          catalog and survive a table drop — hoglake has no cascade from
+          the table to the receipts. Without the incarnation in the key,
+          a dropped-and-recreated table answers a flush from its
+          PREDECESSOR's receipt, and millpond advances Kafka offsets over
+          rows that are in a table that no longer exists.
+        * BOTH ends of each partition's range, not just the high end.
+          "Everything up to 41" is not a row set: after a rewind, a flush
+          of [0, 41] and an earlier flush of [30, 41] share a name, and
+          the earlier one's receipt reports the larger flush as already
+          published.
+
+        `topic:partition:first-last` keeps the partition in each line so
+        two partitions cannot swap ranges and hash the same; the lines
+        are sorted so the same flush described in any order is the same
+        name.
 
         Without offsets (a direct caller, not main.py) the key is random,
         which is honest: an anonymous batch has no identity to recognize
@@ -675,8 +772,8 @@ class HoglakeSink:
         cfg = self._cfg
         name = "\n".join(
             [
-                f"{cfg.hoglake_catalog}/{cfg.hoglake_namespace}/{cfg.hoglake_table}",
-                *(f"{topic}:{partition}:{offset}" for topic, partition, offset in sorted(kafka_offsets)),
+                f"{cfg.hoglake_catalog}/{cfg.hoglake_namespace}/{cfg.hoglake_table}/{table.table_uuid}",
+                *(f"{topic}:{partition}:{first}-{last}" for topic, partition, first, last in sorted(kafka_offsets)),
             ]
         )
         return str(uuid.uuid5(_IDEMPOTENCY_NAMESPACE, name))
@@ -714,13 +811,30 @@ class HoglakeSink:
         batch = self._null_fill_missing(batch)
         aligned = batch.select(list(target.names)).cast(target)
         groups = _partition_groups(aligned, info)
+        self._prepared_spec = _partition_tuples(info.partition_spec)
         with tempfile.TemporaryDirectory(prefix="millpond-hoglake-") as tmp:
             files = []
             for index, (partition_values, part) in enumerate(groups):
                 path = os.path.join(tmp, f"part-{index}.parquet")
                 pq.write_table(part, path)
                 files.append((path, partition_values))
-            payload = table.prepare_append_files(files, idempotency_key=key)
+            try:
+                payload = table.prepare_append_files(files, idempotency_key=key)
+            except ValidationError:
+                # pyhoglake validates file i and THEN uploads file i, so
+                # a validation refusal means at most the files before it
+                # went up — never all of them. For the single-file case
+                # (an unpartitioned table, and the common one) that is
+                # exactly zero, which is why this is not simply
+                # `len(files)`.
+                _count_orphans(max(0, len(files) - 1), "prepare refused after partial upload")
+                raise
+            except Exception:
+                # A transport or S3 failure partway through the fanout:
+                # any of them may already be in object storage, and
+                # nothing references them.
+                _count_orphans(len(files), "prepare failed after partial upload")
+                raise
         # Blind append, exactly as `Table.append` does it.
         # `prepare_append_files` pins `read_snapshot` to the catalog head
         # at prepare time, and the server's conflict scan then fails the
@@ -750,49 +864,176 @@ class HoglakeSink:
         commit lock: a receipt for this key returns the original result
         without writing, and no receipt means it really did not land.
         Either way the rows publish exactly once.
+
+        A refusal the server ANSWERED is the opposite case, and the
+        payload must not survive it. One commit is one transaction: a
+        409 or a 422 means zero rows were written and means the same
+        thing to every identical resend, so holding the payload turned
+        `reset_caches()` into a no-op (the replay short-circuits before
+        the table is ever re-resolved) and burned the retry budget on a
+        request that could not change. Those clear the payload here, at
+        the refusal — the one place that knows the server judged it.
         """
         payload = self._prepared
         if payload is None:  # unreachable; an explicit raise, not an assert (python -O strips those)
             raise HoglakeSinkError("_commit_prepared called with no prepared payload")
         files = payload["appends"][0]["files"]
+        self._check_destination_still_ours(payload)
+        self._prepared_sends += 1
+        replayed = self._prepared_sends > 1
         try:
             self._catalog.commit_prepared(payload)
         except ValidationError as e:
-            if _REUSED_KEY_MARKER not in f"{e}".lower():
-                raise
-            # The receipt exists and our request is not the one it was
-            # written for. That can only mean this offset range was
-            # already published under a DIFFERENT registration — the pod
-            # crashed after the commit applied but before the offsets
-            # committed, and the replay from Kafka rebuilt the flush.
-            # The rows are in the lake; publishing the rebuilt copy would
-            # duplicate them. Accept, and account for the upload we just
-            # orphaned.
-            log.warning(
-                "Kafka offsets for this flush were already published to %s.%s under a different "
-                "registration (idempotency key %s); treating the flush as done and orphaning %d "
-                "uploaded file(s)",
-                self._cfg.hoglake_namespace,
-                self._cfg.hoglake_table,
-                payload["idempotency_key"],
-                len(files),
-            )
-            metrics.hoglake_commit_replays_total.labels(outcome="already_published").inc()
-            metrics.hoglake_orphaned_files_total.inc(len(files))
-            rows = self._prepared_rows
-            self._clear_prepared()
-            return rows
+            if _REUSED_KEY_MARKER in _error_text(e):
+                return self._accept_already_published(payload, files)
+            self._discard_prepared("the server refused the commit with a 422")
+            raise
+        except HoglakeError as e:
+            if _is_answered_refusal(e):
+                self._discard_prepared(f"the server refused the commit with a {e.status_code}")
+            raise
         # One parquet per partition tuple per flush (fanout appends) —
-        # the hoglake compaction-debt feed rate.
+        # the hoglake compaction-debt feed rate. Counted AFTER the commit
+        # returns: files this process uploaded but did not get registered
+        # are orphans, not writes.
         metrics.hoglake_files_written_total.inc(len(files))
+        if replayed:
+            # The healthy half of the replay story, and previously
+            # invisible: a commit that was re-sent after an uncertain
+            # outcome and came back 200. The server either answered from
+            # its receipt or applied it now; either way these rows
+            # published exactly once, and an operator watching a flapping
+            # network wants to see this rate rather than infer it.
+            metrics.hoglake_commit_replays_total.labels(outcome="replayed").inc()
         rows = self._prepared_rows
         self._clear_prepared()
         return rows
+
+    def _check_destination_still_ours(self, payload: dict) -> None:
+        """Re-read the destination immediately before publishing, and
+        refuse to publish into a table that moved under the payload.
+
+        Two things can move between prepare and commit, and the server
+        catches neither on the commit path:
+
+        * the INCARNATION — it does check `expected_table_uuid`, but it
+          answers with a bare 409, and by then the upload is spent. This
+          just says so earlier and in millpond's own words.
+        * the PARTITION SPEC. A file is registered with its partition
+          VALUES and stamped with the table's CURRENT spec_id; the server
+          validates the arity and nothing else, because it never opens
+          the file. Re-spec a table from `identity(team_id)` to
+          `bucket(team_id, 16)` — same arity — while a payload is in
+          flight, and the file lands stamped as bucketed while carrying
+          identity values. Every future scan prunes it wrongly, forever,
+          with nothing anywhere saying so.
+
+        The window this closes is prepare-to-commit, which is the wide
+        one (it contains the upload). The residual — a spec change
+        between this check and the server taking the commit lock — is not
+        closable from the client; it needs the server to validate values
+        it deliberately does not read.
+        """
+        expected = payload["appends"][0].get("expected_table_uuid")
+        info = self._live_table().info()
+        if expected is not None and info.table_uuid != expected:
+            self._discard_prepared("the destination table was recreated before the commit")
+            raise IncarnationChangedError(
+                f"table {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} was recreated "
+                f"while this flush was in flight: prepared against table_uuid {expected}, the "
+                f"name now resolves to {info.table_uuid}. The prepared upload is abandoned; the "
+                f"flush rebuilds against the live incarnation."
+            )
+        live_spec = _partition_tuples(info.partition_spec)
+        if live_spec != self._prepared_spec:
+            self._discard_prepared("the partition spec changed before the commit")
+            raise HoglakeSinkError(
+                f"partition spec of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} "
+                f"changed while this flush was in flight (prepared under {self._prepared_spec}, "
+                f"live {live_spec}); the prepared files carry values computed under the old spec "
+                f"and would be registered under the new spec_id. Rebuilding the flush.",
+                retryable=True,
+            )
+
+    def _accept_already_published(self, payload: dict, files: list) -> int:
+        """The receipt exists and our request is not the one it was
+        written for. Decide whether that means the rows are in the lake.
+
+        The key names (catalog, namespace, table, table_uuid, the full
+        offset range per partition), and the server writes a receipt only
+        in the same transaction that publishes. So a receipt under this
+        key is a statement that THIS range was published to THIS
+        incarnation — by a previous process, whose payload differed from
+        ours in the parts that cannot be reproduced (a fresh
+        `_inserted_at` stamp, fresh uuid4 object names). That is the
+        crash-restart case, and it is the case the receipt exists for:
+        failing on it would wedge the partition forever on rows that are
+        already there.
+
+        What this must never do is accept on the strength of a receipt
+        that belongs somewhere else, so the incarnation is checked
+        against the live table first (`_check_destination_still_ours`
+        already ran; this re-states the invariant it upholds).
+
+        Rows returned: ZERO. This process published nothing — some
+        earlier one did — and `records_written_total` counts rows this
+        process wrote. Reporting the batch size here is how a writer came
+        to claim eight rows for a range that had three in the lake.
+
+        The one divergence this cannot see: two writers over the same
+        offsets whose FILTERS differ, so the same range means different
+        rows. Their config disagrees about what the pipeline is; the
+        offsets advance over whichever publication landed first. That is
+        a deployment fault, not a recoverable state, and the warning
+        below names the key so it can be traced.
+        """
+        log.warning(
+            "Kafka offsets for this flush were already published to %s.%s under a different "
+            "registration (idempotency key %s); this process publishes nothing and orphans %d "
+            "uploaded file(s)",
+            self._cfg.hoglake_namespace,
+            self._cfg.hoglake_table,
+            payload["idempotency_key"],
+            len(files),
+        )
+        metrics.hoglake_commit_replays_total.labels(outcome="already_published").inc()
+        _count_orphans(len(files), "the offset range was already published")
+        self._clear_prepared()
+        return 0
+
+    def _live_table(self):
+        """The destination table handle, resolved if the cache is empty.
+
+        Deliberately NOT cached into `self._table`: that cache means
+        "resolved and reconciled by `_ensure_table`", and a handle
+        fetched here has been through neither.
+        """
+        if self._table is not None:
+            return self._table
+        return self._catalog.namespace(self._cfg.hoglake_namespace).table(self._cfg.hoglake_table)
+
+    def _discard_prepared(self, why: str) -> None:
+        """Drop a prepared payload that will never be published, and
+        account for the upload it leaves behind."""
+        if self._prepared is None:
+            return
+        files = self._prepared["appends"][0]["files"]
+        log.warning(
+            "Abandoning a prepared hoglake commit (idempotency key %s, %d file(s)): %s",
+            self._prepared.get("idempotency_key"),
+            len(files),
+            why,
+        )
+        _count_orphans(len(files), why)
+        self._clear_prepared()
 
     def _clear_prepared(self) -> None:
         self._prepared = None
         self._prepared_key = None
         self._prepared_rows = 0
+        self._prepared_offsets = None
+        self._prepared_spec = ()
+        self._prepared_sends = 0
 
     # -- metadata column ---------------------------------------------------
 
