@@ -330,6 +330,11 @@ def _is_answered_refusal(exc: BaseException) -> bool:
     any identical resend. That is the rule for whether a prepared payload
     is still worth holding: hold for transport-uncertain (no status, a
     timeout, a reset) and for 5xx, drop for an answered 4xx refusal.
+
+    BOTH codes reach here. pyhoglake maps every wire 422 to
+    `ValidationError` and every wire 409 to a conflict class, and
+    `_commit_prepared` catches their common base in one arm so this
+    function is the only place the rule is written down.
     """
     return isinstance(exc, HoglakeError) and exc.status_code in (409, 422)
 
@@ -946,12 +951,16 @@ class HoglakeSink:
         replayed = self._prepared_sends > 1
         try:
             self._catalog.commit_prepared(payload)
-        except ValidationError as e:
-            if _REUSED_KEY_MARKER in _error_text(e):
-                return self._accept_already_published(payload, files)
-            self._discard_prepared("the server refused the commit with a 422")
-            raise
         except HoglakeError as e:
+            # ONE arm, deliberately. Split across `except ValidationError`
+            # and `except HoglakeError` this read as two rules, but
+            # pyhoglake maps every 422 on the wire to `ValidationError`
+            # — so the first arm swallowed all of them and the second's
+            # 422 case could not execute. Two paths that state the same
+            # rule, one of them unreachable, is how the rule ends up
+            # stated differently in each.
+            if isinstance(e, ValidationError) and _REUSED_KEY_MARKER in _error_text(e):
+                return self._accept_already_published(payload, files)
             if _is_answered_refusal(e):
                 self._discard_prepared(f"the server refused the commit with a {e.status_code}")
             raise
