@@ -298,7 +298,9 @@ class TestIsRetryable:
             HoglakeError("request timeout", status_code=408),
             HoglakeError("client-side failure"),  # no status: never reached the server
             OSError("S3 flake"),  # pyarrow S3 upload failures
-            RuntimeError("unknown"),  # unknown → assume transient
+            Exception("unknown"),  # genuinely unknown → assume transient
+            # The one sink-raised stop a rebuilt flush really does clear.
+            hoglake.HoglakeSinkError("partition spec changed", retryable=True),
         ],
     )
     def test_retryable(self, exc):
@@ -313,10 +315,43 @@ class TestIsRetryable:
             ExpiredError("expired", status_code=410),
             MalformedResponseError("TableInfo: missing field 'columns'"),
             HoglakeError("bad_request", status_code=400),
+            # This sink's OWN refusals. Every one of them is a statement
+            # about the config or the code; eight attempts and 91 seconds
+            # of backoff cannot make any of them true.
+            hoglake.HoglakeSinkError("live partition spec does not match HOGLAKE_PARTITION_BY"),
+            ValueError("columns collide with Hoglake-reserved metadata column names"),
+            KeyError('Field "col_w1_0" does not exist in schema'),
+            TypeError("not a schema"),
         ],
     )
     def test_not_retryable(self, exc):
         assert hoglake.is_retryable(exc) is False
+
+    def test_sink_refusals_are_the_sinks_own_type(self):
+        """Every safety stop in this module must be classifiable. A plain
+        RuntimeError from here would be read as "unknown, assume
+        transient" — which is how the loudest stops became the slowest."""
+        import inspect
+        import re
+
+        src = inspect.getsource(hoglake)
+        stray = re.findall(r"raise RuntimeError", src)
+        assert not stray, "sink-raised refusals must be HoglakeSinkError so is_retryable can judge them"
+
+    @pytest.mark.parametrize(
+        ("raiser", "kwargs"),
+        [
+            ("spec mismatch", {"hoglake_partition_by": (("team_id", "bucket", 16),)}),
+        ],
+    )
+    def test_reconciliation_refusal_is_permanent(self, raiser, kwargs):
+        # End to end through write(): the refusal main.py sees must be
+        # classified permanent, so the pod crashes with the message
+        # instead of after the ladder.
+        s, client, catalog, ns, table = _sink(_cfg(**kwargs), partition_spec=_spec(("team_id", "identity")))
+        with pytest.raises(RuntimeError) as caught:
+            s.write(_batch())
+        assert hoglake.is_retryable(caught.value) is False
 
     def test_sink_exposes_the_classifier_to_the_retry_loop(self):
         # main._write_with_retry duck-types `is_retryable` off the sink;

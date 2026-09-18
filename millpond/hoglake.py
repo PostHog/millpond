@@ -180,6 +180,28 @@ _ALIGNMENT_REFUSALS: tuple[str, ...] = (
 )
 
 
+class HoglakeSinkError(RuntimeError):
+    """A refusal raised by THIS module, not by the server or the client.
+
+    Spec reconciliation, the partition-column checks, the declaration
+    post-condition and the prepared-payload invariants are millpond's own
+    safety stops: they are decisions about the CONFIG and the code, and
+    no amount of waiting changes either. They were previously plain
+    `RuntimeError`s, which `is_retryable` classed as "unknown, assume
+    transient" — so the loudest stops in the sink were also the slowest,
+    burning the whole retry ladder before the operator saw the message.
+
+    Subclasses `RuntimeError` so callers that catch the historical type
+    (and the tests that assert on it) keep working. `retryable=True` is
+    the one exception, for a stop a REBUILT flush really can clear — the
+    partition spec changing under an already-prepared payload.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def is_retryable(exc: BaseException) -> bool:
     """Classify a write-path failure: is a fresh attempt (after
     reset_caches) worth anything?
@@ -214,12 +236,26 @@ def is_retryable(exc: BaseException) -> bool:
         retry budget is the loud fallback either way)
 
     Not retryable — the request itself is wrong and will stay wrong:
+      * `HoglakeSinkError` — THIS sink's own safety stops (a spec that
+        disagrees with config, a partition column that is not in the
+        table, a declaration the server did not apply). They are
+        statements about the config or the code, and a retry cannot
+        change either. The one flagged `retryable=True` — the partition
+        spec moving under a prepared payload — is the exception, because
+        a REBUILT flush genuinely clears it.
+      * `ValueError` / `KeyError` / `TypeError` — millpond's own
+        validation (`check_reserved_collision`) and the pyarrow
+        misuse that a schema race can produce. Same argument: waiting
+        does not make a colliding column name stop colliding.
       * `ValidationError` (422), `UnsupportedTypeError`,
         `AlreadyExistsError` (409 on a create), `ExpiredError` (410 — a
         read_snapshot below the catalog's expiry floor; only a fresh plan
         fixes that), `MalformedResponseError` (wire-contract violation),
         and any other 4xx.
     """
+    # This sink's own refusals, first: they carry their own verdict.
+    if isinstance(exc, HoglakeSinkError):
+        return exc.retryable
     # Retryable subclasses first — both are 409s, and the generic 4xx
     # rule below would otherwise swallow them.
     if isinstance(exc, CommitConflictError | IncarnationChangedError):
@@ -243,6 +279,11 @@ def is_retryable(exc: BaseException) -> bool:
         return True
     if isinstance(exc, httpx.HTTPError | OSError):
         return True
+    # OSError is checked above (pyarrow's S3 upload raises it), so these
+    # are the in-process ones: a bad value, a missing key, a wrong type.
+    # Nothing about waiting fixes any of them.
+    if isinstance(exc, ValueError | KeyError | TypeError):
+        return False
     return True
 
 
@@ -329,7 +370,7 @@ def _partition_groups(data: pa.Table, info) -> list[tuple[tuple[str | None, ...]
     for field in spec.fields:
         column = columns.get(field.source_field_id)
         if column is None:
-            raise RuntimeError(
+            raise HoglakeSinkError(
                 f"partition spec of {info.namespace}.{info.name} references field_id "
                 f"{field.source_field_id}, which is not a live column"
             )
@@ -414,7 +455,7 @@ class HoglakeSink:
             "hoglake_s3_secret_key",
         ):
             if getattr(cfg, name) is None:
-                raise RuntimeError(f"HoglakeSink requires cfg.{name}; config.load() should have enforced this")
+                raise HoglakeSinkError(f"HoglakeSink requires cfg.{name}; config.load() should have enforced this")
         self._cfg = cfg
         self._client = HoglakeClient(
             cfg.hoglake_url,
@@ -712,7 +753,7 @@ class HoglakeSink:
         """
         payload = self._prepared
         if payload is None:  # unreachable; an explicit raise, not an assert (python -O strips those)
-            raise RuntimeError("_commit_prepared called with no prepared payload")
+            raise HoglakeSinkError("_commit_prepared called with no prepared payload")
         files = payload["appends"][0]["files"]
         try:
             self._catalog.commit_prepared(payload)
@@ -777,7 +818,7 @@ class HoglakeSink:
             return self._client.catalog(cfg.hoglake_catalog)
         except NotFoundError:
             if cfg.hoglake_data_path is None:
-                raise RuntimeError(
+                raise HoglakeSinkError(
                     f"hoglake catalog {cfg.hoglake_catalog!r} does not exist and HOGLAKE_DATA_PATH "
                     f"is not set; create the catalog first or set HOGLAKE_DATA_PATH to let "
                     f"millpond create it"
@@ -793,7 +834,7 @@ class HoglakeSink:
             # Bad URL, DNS, TLS, a control plane that is down, a proxy
             # answering HTML: all of it lands here, and all of it is a
             # deployment problem the operator can see from the message.
-            raise RuntimeError(
+            raise HoglakeSinkError(
                 f"cannot reach the hoglake control plane at {cfg.hoglake_url!r} to resolve "
                 f"catalog {cfg.hoglake_catalog!r}: {e}"
             ) from e
@@ -916,7 +957,7 @@ class HoglakeSink:
         want_partition = self._want_partition_fields()
         live_partition = _partition_tuples(info.partition_spec)
         if live_partition and live_partition != want_partition:
-            raise RuntimeError(
+            raise HoglakeSinkError(
                 f"live partition spec of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} "
                 f"{_describe_partition(info.partition_spec, self._live_columns)} does not match "
                 f"HOGLAKE_PARTITION_BY {self._describe_configured_partition()}. Hoglake never "
@@ -929,7 +970,7 @@ class HoglakeSink:
         live_sort = _sort_tuples(info.sort_spec)
         sort_known = self._cfg.sort_by is None or want_sort is not None
         if sort_known and live_sort and live_sort != (want_sort or ()):
-            raise RuntimeError(
+            raise HoglakeSinkError(
                 f"live sort order of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} does "
                 f"not match MILLPOND_SORT_BY {self._cfg.sort_by!r}. The sort order is advisory for "
                 f"writers but BINDING for hoglake compaction, so a mismatch means compaction "
@@ -961,7 +1002,7 @@ class HoglakeSink:
         rather than in a silently mis-laid-out table."""
         want_partition = self._want_partition_fields()
         if want_partition and _partition_tuples(info.partition_spec) != want_partition:
-            raise RuntimeError(
+            raise HoglakeSinkError(
                 f"hoglake table {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} does not "
                 f"carry the partition spec that was just declared for it "
                 f"(HOGLAKE_PARTITION_BY {self._describe_configured_partition()}); refusing to "
@@ -969,7 +1010,7 @@ class HoglakeSink:
             )
         want_sort = self._want_sort_fields()
         if want_sort and _sort_tuples(info.sort_spec) != want_sort:
-            raise RuntimeError(
+            raise HoglakeSinkError(
                 f"hoglake table {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} does not "
                 f"carry the sort order that was just declared for it "
                 f"(MILLPOND_SORT_BY {self._cfg.sort_by!r})"
@@ -985,7 +1026,7 @@ class HoglakeSink:
         out = []
         for column, transform, param in cfg.hoglake_partition_by:
             if column not in fid:
-                raise RuntimeError(
+                raise HoglakeSinkError(
                     f"HOGLAKE_PARTITION_BY column {column!r} is not in the table schema "
                     f"(columns: {sorted(fid)}); partition columns must exist in the source "
                     f"events (or be _inserted_at)"
