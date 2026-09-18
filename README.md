@@ -58,7 +58,7 @@ Millpond writes to one of two destinations, selected by `MILLPOND_DESTINATION` (
 | `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) | Stamped Arrow-side, one timestamptz value per flush (every row in a flush shares it) |
 | Multi-pod concurrent writes | Native; idempotent DDL handles races | Native; appends never conflict with appends, concurrent DDL 409s are absorbed by re-resolve, and the incarnation guard (`expected_table_uuid`) refuses cross-incarnation appends atomically |
 | Startup validation | Connects in the sink constructor | Resolves the catalog in the sink constructor, so a bad URL, bad credentials or a missing catalog fails before the pod claims readiness |
-| Commit retries | `DUCKLAKE_MAX_RETRY_COUNT` (inner loop, default 100) under millpond's 3 outer attempts | `HOGLAKE_MAX_RETRY_COUNT` outer attempts (default 8; there is no inner loop), honoring the server's `Retry-After` on 503 backpressure |
+| Commit retries | `DUCKLAKE_MAX_RETRY_COUNT` (inner loop, default 100) under millpond's 3 outer attempts | `HOGLAKE_MAX_RETRY_COUNT` outer attempts (default 8; there is no inner loop), honoring the server's `Retry-After` on 503 backpressure as a floor under the exponential curve |
 
 Both sinks (`millpond/ducklake.py`, `millpond/hoglake.py`) implement the `Sink` protocol (`millpond/sink.py`) and expose three methods to `main.py`: `write(batch) -> int`, `reset_caches()`, `close()`. `make_sink(cfg)` dispatches on the destination with lazy backend imports.
 
@@ -326,16 +326,16 @@ Read only when `MILLPOND_DESTINATION=hoglake`. Names are validated at startup ag
 | `HOGLAKE_CATALOG` | yes | | Catalog name |
 | `HOGLAKE_NAMESPACE` | yes | | Namespace (created on first write if absent) |
 | `HOGLAKE_TABLE` | yes | | Table name (created on first write from the batch schema + `_inserted_at`) |
-| `HOGLAKE_DATA_PATH` | no | | When set, a missing catalog is created with this data path on first write. Unset: a missing catalog is a startup-shaped error (catalog provisioning stays an ops decision). |
+| `HOGLAKE_DATA_PATH` | no | | When set, a missing catalog is created with this data path on first write. Unset: a missing catalog is a startup-shaped error (catalog provisioning stays an ops decision). Validated as an `s3://bucket/prefix` URI at startup: it is frozen into the catalog row at creation and hoglake has no delete-catalog route, so a typo mints a permanently unusable catalog under a name nobody can reuse. |
 | `HOGLAKE_S3_ACCESS_KEY` | yes | | S3 access key for the parquet write path (pyhoglake writes the files; separate from the DuckLake `DUCKDB_S3_*` vars) |
 | `HOGLAKE_S3_SECRET_KEY` | yes | | S3 secret key |
 | `HOGLAKE_S3_ENDPOINT` | no | | S3 endpoint override (MinIO etc.); unset = AWS |
 | `HOGLAKE_S3_REGION` | no | | S3 region |
 | `HOGLAKE_PARTITION_BY` | no | | Comma-separated partition expression mapped to hoglake transforms at table creation: bare `col` (identity), `year(col)`/`month(col)`/`day(col)`/`hour(col)`, `bucket(col, N)`. Anything outside that vocabulary refuses startup with a clear error — never a per-batch failure. Typical: `team_id,month(_inserted_at)`. |
-| `HOGLAKE_MAX_RETRY_COUNT` | no | `8` | Write-path retry attempts. The DuckLake counterpart tunes an *inner* loop under millpond's 3 outer attempts; hoglake has no inner loop, so this IS the budget. Must be positive. |
-| `HOGLAKE_REQUEST_TIMEOUT_S` | no | `30` | Per-request HTTP timeout for the catalog client (pyhoglake's own default, previously unreachable from config). |
+| `HOGLAKE_MAX_RETRY_COUNT` | no | `8` | Write-path retry attempts. The DuckLake counterpart tunes an *inner* loop under millpond's 3 outer attempts; hoglake has no inner loop, so this IS the budget. Must be positive, and bounded with the timeout below. |
+| `HOGLAKE_REQUEST_TIMEOUT_S` | no | `45` | Per-request HTTP timeout for the catalog client. Deliberately above pyhoglake's hardcoded 30s, which equals the server's own commit-lock admission bound: at an equal timeout the client gives up at the instant the server would have answered `503` + `Retry-After`, so its explicit backpressure signal is nearly unreachable and arrives as a transport failure instead. |
 
-`HOGLAKE_MAX_RETRY_COUNT` x `HOGLAKE_REQUEST_TIMEOUT_S` bounds how long one flush can sit inside `sink.write()`, and the consume loop is single-threaded: the liveness probe fails the pod after 480s without a poll. The defaults leave room; raise both together at your peril.
+`HOGLAKE_MAX_RETRY_COUNT` x `HOGLAKE_REQUEST_TIMEOUT_S` bounds how long one flush can sit inside `sink.write()`, and the consume loop is single-threaded: the liveness probe fails the pod after 480s without a poll. **`load()` refuses a combination that can exceed it** — the defaults come to ~474s of the 480s, which is deliberately close to the line (a catalog that has answered nothing in eight minutes is one the pod should die over) but leaves a raise of either knob nowhere to hide.
 
 **The catalog client has no authentication or TLS credential surface.** The hoglake control plane does not authenticate requests in this version, and `HoglakeClient` accepts no token, header, client certificate or verification setting — `HOGLAKE_URL` must therefore be a trusted-network endpoint (cluster-internal service DNS, not a public hostname). The `HOGLAKE_S3_*` credentials are object-store credentials only; they have nothing to do with reaching the catalog.
 
@@ -479,7 +479,7 @@ The flush path has two failure points, each with its own retry policy:
 | Operation | Attempts | Backoff between failures | On exhaustion |
 |-----------|----------|--------------------------|---------------|
 | Lake write (DuckLake) | 3 | 1s, 2s (last attempt raises immediately) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
-| Lake write (hoglake) | `HOGLAKE_MAX_RETRY_COUNT`, default 8 | 1s doubling, capped at 30s, overridden by the server's `Retry-After` when it sends one | as above |
+| Lake write (hoglake) | `HOGLAKE_MAX_RETRY_COUNT`, default 8 | 1s doubling, capped at 30s, jittered upward by up to 25%, floored by the server's `Retry-After` when it sends one | as above |
 | Offset commit | 3 | 0.5s, 1s (last attempt raises immediately) | Re-raise → pod crashes, replays from last committed offset (duplicates bounded by one flush batch) |
 
 The two write budgets differ because the backends do: DuckLake retries *internally* (`DUCKLAKE_MAX_RETRY_COUNT`, default 100) underneath millpond's three attempts, while pyhoglake issues one request and raises. Three attempts against a catalog whose backpressure signal is `503` + `Retry-After: 1` — an explicit "the commit queue is convoyed, ask again" — is a crash loop wearing a retry policy's clothes.
