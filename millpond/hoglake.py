@@ -573,7 +573,6 @@ class HoglakeSink:
         # retry replays it rather than building a second one. Survives
         # reset_caches(); cleared when the commit resolves.
         self._prepared: dict | None = None
-        self._prepared_key: str | None = None
         self._prepared_rows: int = 0
         # The Kafka identity the prepared payload was built for. A retry
         # is recognized by THIS, not by re-deriving the key: the key
@@ -685,7 +684,6 @@ class HoglakeSink:
             batch = self._null_fill_missing(batch)
             payload = self._prepare(table, batch, key)
         self._prepared = payload
-        self._prepared_key = key
         self._prepared_rows = batch.num_rows
         self._prepared_offsets = identity
         self._prepared_sends = 0
@@ -1101,7 +1099,6 @@ class HoglakeSink:
 
     def _clear_prepared(self) -> None:
         self._prepared = None
-        self._prepared_key = None
         self._prepared_rows = 0
         self._prepared_offsets = None
         self._prepared_spec = ()
