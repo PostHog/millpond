@@ -37,7 +37,10 @@ services:
       - /var/lib/postgresql/data
 
   minio:
-    image: minio/minio:latest
+    # quay.io: Docker Hub stopped serving the minio images anonymously
+    # ("pull access denied ... repository does not exist"). The same
+    # release tags stay public on quay.io.
+    image: quay.io/minio/minio:latest
     hostname: minio
     ports:
       - "127.0.0.1:9000:9000"
@@ -54,7 +57,7 @@ services:
       retries: 5
 
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     depends_on:
       minio:
         condition: service_healthy
