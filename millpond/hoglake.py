@@ -354,7 +354,7 @@ def _count_orphans(count: int, why: str) -> None:
     metrics.hoglake_orphaned_files_total.inc(count)
 
 
-def _is_alignment_refusal(exc: BaseException) -> bool:
+def _is_alignment_refusal(exc: ValidationError) -> bool:
     """Is this a "the prepared file's columns are not the destination's"
     refusal, i.e. one a refresh-and-null-fill can actually clear?
 
@@ -364,9 +364,13 @@ def _is_alignment_refusal(exc: BaseException) -> bool:
     `info.columns` and then selects names from that same object, so the
     select can only ever narrow and no KeyError can come out of it. See
     `_prepare`.
+
+    Narrowed to `ValidationError` in the signature rather than re-checked
+    in the body: the sole call site is an `except ValidationError` arm,
+    so an isinstance guard here was a branch no input could take — and a
+    guard that cannot fail is a guard nobody can test, which is how it
+    came to advertise a `BaseException` it never received.
     """
-    if not isinstance(exc, ValidationError):
-        return False
     message = str(exc)
     return any(marker in message for marker in _ALIGNMENT_REFUSALS)
 
@@ -788,11 +792,24 @@ class HoglakeSink:
           It is `self._table_uuid` — the incarnation `_ensure_table`
           resolved and reconciled — and never the pyhoglake handle's own
           `table_uuid`, which any `Table.info()` rebases onto whatever
-          the name resolves to now. The distinction is the whole point:
-          the key must name the incarnation every other guard in this
-          flush is also named from, so that a drop+recreate under the
-          cached handle is REFUSED (see `_prepare`) rather than published
-          under a dead table's name.
+          the name resolves to now.
+
+          That choice does NOT buy the refusal of a drop+recreate under
+          the cached handle: the refusal is entirely the
+          `expected_table_uuid` pin `_prepare` puts on the payload, and
+          any flush whose key ever reaches the server has already
+          cleared that pre-flight — so by then the key and the pin
+          necessarily name the same incarnation whichever source the key
+          was read from. Feeding this the rebasable `table.table_uuid`
+          would be caught by the pin, not by anything here.
+
+          What it buys is that they are named from ONE source by
+          construction, rather than by the pin happening to fire: a key
+          derived from the handle would name an incarnation the payload
+          was never prepared against, and the only thing standing
+          between that and a receipt lookup under the wrong name would
+          be a guard one layer down. The correct source is also the free
+          one, so there is no reason to take the other.
         * BOTH ends of each partition's range, not just the high end.
           "Everything up to 41" is not a row set: after a rewind, a flush
           of [0, 41] and an earlier flush of [30, 41] share a name, and
