@@ -12,6 +12,7 @@ import pyarrow.compute as pc
 from millpond import metrics, schema
 from millpond.config import Config
 from millpond.schema import variant_column_name
+from millpond.sink import check_reserved_collision
 
 log = logging.getLogger(__name__)
 
@@ -22,30 +23,15 @@ _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
 # expressions commonly derive them, and tables were created under a
 # regime that reserved them — accepting them now would silently change
 # collision behavior for replayed data.
+#
+# The collision check itself lives on the sink seam
+# (sink.check_reserved_collision) and is shared with the hoglake
+# backend; it stays deliberately fatal, unlike the non-fatal VARIANT
+# companion drops in _drop_protected_columns — silently dropping a
+# payload `_inserted_at` would re-stamp replayed data and change its
+# partition placement, which the reserved-columns contract predating
+# dual-write chose to surface loudly.
 RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at", "year", "month", "day", "hour"})
-
-
-def check_reserved_collision(batch_schema: pa.Schema, reserved: frozenset[str]) -> None:
-    """Raise early on source-schema collision with reserved metadata columns.
-
-    `_inserted_at` is appended at write time (with `year/month/day/hour`
-    reserved alongside it). If a source column has the same name, the
-    append step explodes deep in the stack (duplicate column on the
-    post-write projection). Catch it at the top of `write()` with a
-    clear message instead.
-
-    Deliberately fatal, unlike the non-fatal VARIANT companion drops in
-    _drop_protected_columns: silently dropping a payload `_inserted_at` would
-    re-stamp replayed data and change its partition placement, which the
-    reserved-columns contract predating dual-write chose to surface loudly.
-    """
-    collisions = sorted(name for name in batch_schema.names if name in reserved)
-    if collisions:
-        raise ValueError(
-            f"Source schema column(s) {collisions!r} collide with "
-            f"DuckLake-reserved metadata column names; rename them "
-            f"upstream or filter them out before write()."
-        )
 
 
 def _drop_protected_columns(batch: pa.Table, protected_lower: frozenset[str] | set[str]) -> pa.Table:
@@ -500,7 +486,7 @@ def write(
     Payload fields named like dual-write targets are stripped non-fatally so a
     poison key cannot crash-loop the partition or poison the table as VARCHAR.
     """
-    check_reserved_collision(batch.schema, RESERVED_COLUMNS)
+    check_reserved_collision(batch.schema, RESERVED_COLUMNS, "DuckLake")
     if variant_columns and schema_mgr is None:
         # Dual-write requires SchemaManager for ADD COLUMN + type checks.
         # DuckLakeSink always supplies one; module-level callers that enable

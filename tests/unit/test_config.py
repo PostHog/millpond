@@ -65,6 +65,26 @@ class TestLoad:
         assert cfg.service_namespace == "millpond"
         assert cfg.service_instance_id is None
 
+    def test_http_port_default(self):
+        # The health/metrics port lives on Config with every other knob —
+        # server.start() no longer reads the environment behind config's back.
+        assert load().http_port == 8000
+
+    def test_http_port_env_override(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_HTTP_PORT", "28000")
+        assert load().http_port == 28000
+
+    def test_http_port_non_numeric_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_HTTP_PORT", "eight thousand")
+        with pytest.raises((RuntimeError, ValueError)):
+            load()
+
+    def test_group_id_default_unchanged_for_ducklake(self):
+        # Deliberately NOT prefixed with the destination: every deployed
+        # DuckLake pipeline stores its offsets under this exact group id,
+        # and changing it would replay the whole retention window.
+        assert load().group_id == "millpond-test-topic-events"
+
     def test_posthog_otlp_env_overrides(self, monkeypatch):
         monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "phc_test")
         monkeypatch.setenv("POSTHOG_LOGS_ENDPOINT", "https://eu.i.posthog.com/i/v1/logs")
@@ -775,3 +795,331 @@ class TestDuckdbMemoryLimit:
         monkeypatch.setenv("DUCKDB_MEMORY_LIMIT", "")
         cfg = load()
         assert cfg.duckdb_memory_limit is None
+
+
+class TestHoglakeConfig:
+    """destination=hoglake config block: required fields, identifier rules,
+    partition-expression mapping. The DuckLake block must NOT be required
+    when hoglake is selected (and vice versa: stray HOGLAKE_* vars must
+    not affect a ducklake deployment)."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("MILLPOND_DESTINATION", "hoglake")
+        monkeypatch.setenv("HOGLAKE_URL", "http://localhost:28080")
+        monkeypatch.setenv("HOGLAKE_CATALOG", "millpond")
+        monkeypatch.setenv("HOGLAKE_NAMESPACE", "analytics")
+        monkeypatch.setenv("HOGLAKE_TABLE", "events")
+        monkeypatch.setenv("HOGLAKE_S3_ACCESS_KEY", "ak")
+        monkeypatch.setenv("HOGLAKE_S3_SECRET_KEY", "sk")
+
+    def test_loads_without_any_ducklake_vars(self):
+        cfg = load()
+        assert cfg.destination == "hoglake"
+        assert cfg.hoglake_url == "http://localhost:28080"
+        assert cfg.hoglake_catalog == "millpond"
+        assert cfg.hoglake_namespace == "analytics"
+        assert cfg.hoglake_table == "events"
+        assert cfg.hoglake_s3_access_key == "ak"
+        assert cfg.hoglake_s3_secret_key == "sk"
+        # DuckLake block untouched and unrequired.
+        assert cfg.ducklake_table is None
+        assert cfg.rds_host is None
+        assert cfg.partition_by is None
+
+    def test_table_label_and_group_id_use_hoglake_table(self):
+        # The destination is part of the default group id on the hoglake
+        # side: a shadow deployment (same topic, same table name, other
+        # destination) must not share an offset namespace with the
+        # DuckLake pipeline it shadows — they would split the partitions
+        # between them and each would write half the rows.
+        cfg = load()
+        assert cfg.table_label == "events"
+        assert cfg.group_id == "millpond-hoglake-test-topic-events"
+
+    def test_optionals_default_to_none(self):
+        cfg = load()
+        assert cfg.hoglake_data_path is None
+        assert cfg.hoglake_s3_endpoint is None
+        assert cfg.hoglake_s3_region is None
+        assert cfg.hoglake_partition_by is None
+
+    def test_retry_and_timeout_defaults(self):
+        # The pair bounds the worst case a single flush can spend inside
+        # sink.write(); see the comment in _load_hoglake_fields.
+        cfg = load()
+        assert cfg.hoglake_max_retry_count == 8
+        # 45, not pyhoglake's 30: the server's commit-lock admission
+        # bound is 30s, so an equal client timeout gave up at the same
+        # instant the server would have answered 503 + Retry-After, and
+        # its explicit backpressure signal surfaced as a
+        # transport-uncertain failure instead.
+        assert cfg.hoglake_request_timeout_s == 45.0
+
+    def test_a_retry_budget_that_outlives_liveness_is_refused(self, monkeypatch):
+        # HOGLAKE_MAX_RETRY_COUNT was unbounded while its interaction
+        # with the liveness deadline lived in a comment — so the
+        # documented trap was one values-file edit away, and springing it
+        # looks like a pod SIGKILLed mid-flush with nothing in its logs.
+        monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "40")
+        with pytest.raises(RuntimeError, match="liveness deadline"):
+            load()
+
+    def test_a_long_timeout_with_few_retries_is_also_refused(self, monkeypatch):
+        # It is the PRODUCT that matters, not either knob alone.
+        monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "4")
+        monkeypatch.setenv("HOGLAKE_REQUEST_TIMEOUT_S", "200")
+        with pytest.raises(RuntimeError, match="liveness deadline"):
+            load()
+
+    def test_the_defaults_fit_inside_the_liveness_budget(self):
+        from millpond.config import _LIVENESS_BUDGET_S, _hoglake_worst_case_flush_s
+
+        cfg = load()
+        worst = _hoglake_worst_case_flush_s(cfg.hoglake_max_retry_count, cfg.hoglake_request_timeout_s)
+        assert worst <= _LIVENESS_BUDGET_S
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "/bucket/millpond/",
+            "bucket/millpond/",
+            "https://bucket.s3.amazonaws.com/millpond/",
+            "s3:/bucket/millpond/",
+            "s3://",
+        ],
+    )
+    def test_a_data_path_that_is_not_an_s3_uri_is_refused(self, value, monkeypatch):
+        # Frozen into the catalog row at creation, and hoglake has no
+        # route to delete a catalog: a typo mints a permanently unusable
+        # catalog under a name nobody can reuse.
+        monkeypatch.setenv("HOGLAKE_DATA_PATH", value)
+        with pytest.raises(RuntimeError, match="HOGLAKE_DATA_PATH"):
+            load()
+
+    @pytest.mark.parametrize(
+        "value",
+        ["s3://bucket", "s3://bucket/", "s3://bucket/millpond/", "s3://my-lake.prod/a/b/c"],
+    )
+    def test_valid_s3_data_paths_are_accepted(self, value, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_DATA_PATH", value)
+        assert load().hoglake_data_path == value
+
+    def test_retry_and_timeout_overrides(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "3")
+        monkeypatch.setenv("HOGLAKE_REQUEST_TIMEOUT_S", "5.5")
+        cfg = load()
+        assert cfg.hoglake_max_retry_count == 3
+        assert cfg.hoglake_request_timeout_s == 5.5
+
+    @pytest.mark.parametrize(
+        ("var", "value"),
+        [
+            ("HOGLAKE_MAX_RETRY_COUNT", "0"),
+            ("HOGLAKE_MAX_RETRY_COUNT", "-1"),
+            ("HOGLAKE_MAX_RETRY_COUNT", "lots"),
+            ("HOGLAKE_REQUEST_TIMEOUT_S", "0"),
+            ("HOGLAKE_REQUEST_TIMEOUT_S", "soon"),
+        ],
+    )
+    def test_nonsense_retry_knobs_refused(self, var, value, monkeypatch):
+        monkeypatch.setenv(var, value)
+        with pytest.raises(RuntimeError, match=var):
+            load()
+
+    def test_retry_knobs_nulled_for_ducklake(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "ducklake")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+        monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "99")
+        cfg = load()
+        assert cfg.hoglake_max_retry_count is None
+        assert cfg.hoglake_request_timeout_s is None
+
+    def test_optionals_pass_through(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_DATA_PATH", "s3://bucket/millpond/")
+        monkeypatch.setenv("HOGLAKE_S3_ENDPOINT", "http://localhost:29000")
+        monkeypatch.setenv("HOGLAKE_S3_REGION", "us-east-1")
+        cfg = load()
+        assert cfg.hoglake_data_path == "s3://bucket/millpond/"
+        assert cfg.hoglake_s3_endpoint == "http://localhost:29000"
+        assert cfg.hoglake_s3_region == "us-east-1"
+
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            "HOGLAKE_URL",
+            "HOGLAKE_CATALOG",
+            "HOGLAKE_NAMESPACE",
+            "HOGLAKE_TABLE",
+            "HOGLAKE_S3_ACCESS_KEY",
+            "HOGLAKE_S3_SECRET_KEY",
+        ],
+    )
+    def test_missing_required_var_raises_naming_it(self, missing, monkeypatch):
+        monkeypatch.delenv(missing)
+        with pytest.raises(RuntimeError, match=missing):
+            load()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Millpond",  # catalog names must start lower-case
+            "9lake",
+            "bad.dot",
+            "x" * 64,  # catalog max 63
+        ],
+    )
+    def test_bad_catalog_name_rejected(self, name, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_CATALOG", name)
+        with pytest.raises(RuntimeError, match="HOGLAKE_CATALOG"):
+            load()
+
+    @pytest.mark.parametrize("var", ["HOGLAKE_NAMESPACE", "HOGLAKE_TABLE"])
+    @pytest.mark.parametrize("name", ["9abc", "a.b", "a b", "x" * 129])
+    def test_bad_namespace_or_table_rejected(self, var, name, monkeypatch):
+        monkeypatch.setenv(var, name)
+        with pytest.raises(RuntimeError, match=var):
+            load()
+
+    def test_variant_columns_refused_for_hoglake(self, monkeypatch):
+        # Hoglake has no VARIANT column type; a configured dual-write must
+        # refuse at startup rather than silently no-op (mixed fleets rot
+        # on silent config no-ops).
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        with pytest.raises(RuntimeError, match="MILLPOND_VARIANT_COLUMNS"):
+            load()
+
+    def test_ducklake_partitioning_without_a_hoglake_spec_refused(self, monkeypatch):
+        # Flipping MILLPOND_DESTINATION on an existing values file leaves
+        # DUCKLAKE_PARTITION_BY behind, and the hoglake block nulls it —
+        # so the pipeline that was partitioned yesterday creates an
+        # UNPARTITIONED hoglake table today and nothing says a word.
+        # Same treatment as MILLPOND_VARIANT_COLUMNS: refuse, and make
+        # the operator state the intent.
+        monkeypatch.setenv("DUCKLAKE_PARTITION_BY", "year(timestamp),month(timestamp)")
+        with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+            load()
+
+    def test_ducklake_partitioning_ignored_once_a_hoglake_spec_is_given(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_PARTITION_BY", "year(timestamp)")
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "month(_inserted_at)")
+        cfg = load()
+        assert cfg.hoglake_partition_by == (("_inserted_at", "month", None),)
+        assert cfg.partition_by is None
+
+    def test_typed_columns_allowed_for_hoglake(self, monkeypatch):
+        # Typed pins act upstream in arrow_converter — destination-neutral.
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "timestamp:timestamptz")
+        cfg = load()
+        assert cfg.typed_columns == (("timestamp", "timestamptz"),)
+
+    def test_hyphenated_table_accepted(self, monkeypatch):
+        # hoglake identifiers allow hyphens (unlike DuckLake's table regex).
+        monkeypatch.setenv("HOGLAKE_TABLE", "events-v2")
+        cfg = load()
+        assert cfg.hoglake_table == "events-v2"
+
+    def test_stray_hoglake_vars_ignored_for_ducklake(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "ducklake")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+        # Even a malformed hoglake partition expression must not matter.
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "truncate(")
+        cfg = load()
+        assert cfg.destination == "ducklake"
+        assert cfg.hoglake_url is None
+        assert cfg.hoglake_partition_by is None
+
+
+class TestHoglakePartitionBy:
+    """HOGLAKE_PARTITION_BY maps millpond's partition-expression grammar to
+    hoglake's transform vocabulary (identity, year, month, day, hour,
+    bucket) AT STARTUP. Unmappable expressions are refused with a clear
+    error — never deferred to a per-batch failure."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("MILLPOND_DESTINATION", "hoglake")
+        monkeypatch.setenv("HOGLAKE_URL", "http://localhost:28080")
+        monkeypatch.setenv("HOGLAKE_CATALOG", "millpond")
+        monkeypatch.setenv("HOGLAKE_NAMESPACE", "analytics")
+        monkeypatch.setenv("HOGLAKE_TABLE", "events")
+        monkeypatch.setenv("HOGLAKE_S3_ACCESS_KEY", "ak")
+        monkeypatch.setenv("HOGLAKE_S3_SECRET_KEY", "sk")
+
+    def test_bare_column_is_identity(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "team_id")
+        cfg = load()
+        assert cfg.hoglake_partition_by == (("team_id", "identity", None),)
+
+    def test_temporal_transforms(self, monkeypatch):
+        monkeypatch.setenv(
+            "HOGLAKE_PARTITION_BY",
+            "year(_inserted_at), month(_inserted_at), day(_inserted_at), hour(_inserted_at)",
+        )
+        cfg = load()
+        assert cfg.hoglake_partition_by == (
+            ("_inserted_at", "year", None),
+            ("_inserted_at", "month", None),
+            ("_inserted_at", "day", None),
+            ("_inserted_at", "hour", None),
+        )
+
+    def test_bucket_with_param(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "bucket(team_id, 16)")
+        cfg = load()
+        assert cfg.hoglake_partition_by == (("team_id", "bucket", 16),)
+
+    def test_mixed_expression(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "team_id,month(_inserted_at)")
+        cfg = load()
+        assert cfg.hoglake_partition_by == (
+            ("team_id", "identity", None),
+            ("_inserted_at", "month", None),
+        )
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "truncate(ts)",  # client-side-only transform; server refuses it
+            "void(ts)",
+            "date_trunc(day, ts)",
+        ],
+    )
+    def test_unknown_transform_refused_listing_vocabulary(self, expr, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", expr)
+        with pytest.raises(RuntimeError, match="identity, year, month, day, hour, bucket"):
+            load()
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "year(",  # unbalanced
+            "year()",  # no column
+            "year(a,b)",  # arity
+            "bucket(team_id)",  # bucket needs a param
+            "bucket(team_id, 0)",  # param must be positive
+            "bucket(team_id, x)",  # param must be an int
+            "hour(bad.col)",  # unsafe column name
+            ",",  # empty entries only
+        ],
+    )
+    def test_malformed_expression_refused(self, expr, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", expr)
+        with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+            load()

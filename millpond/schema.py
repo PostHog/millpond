@@ -10,27 +10,27 @@ Schema is cached per table to avoid repeated PRAGMA round-trips.
 """
 
 import logging
-import re
 
 import duckdb
 import pyarrow as pa
 
-from millpond import metrics
+from millpond import metrics, sink
 
 # Column names safe to embed in generated SQL. Field names that don't
 # match are skipped with a `records_skipped_total{reason="unsafe_field_name"}`
-# metric bump.
-SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+# metric bump. Owned by the sink seam (both backends apply it);
+# re-exported here because config.py and this module's historical
+# importers reference it as schema.SAFE_IDENTIFIER.
+SAFE_IDENTIFIER = sink.SAFE_IDENTIFIER
 
 # Dual-write suffix for VARIANT companion columns. Source `properties` →
 # sink `properties_variant`. Shared with ducklake.write so the ADD COLUMN
 # path and the INSERT projection never disagree on the derived name.
-VARIANT_COLUMN_SUFFIX = "_variant"
-
-
-def variant_column_name(source: str) -> str:
-    """Derived VARIANT companion name for a dual-written source column."""
-    return f"{source}{VARIANT_COLUMN_SUFFIX}"
+# Owned by the sink seam (config.py validates against it and must not
+# import duckdb to do so); re-exported here for this module's historical
+# importers.
+VARIANT_COLUMN_SUFFIX = sink.VARIANT_COLUMN_SUFFIX
+variant_column_name = sink.variant_column_name
 
 
 log = logging.getLogger(__name__)

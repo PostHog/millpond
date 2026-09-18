@@ -1,5 +1,6 @@
 import time
 
+from millpond import server
 from millpond.server import _HealthState
 
 
@@ -94,3 +95,25 @@ class TestStatusBody:
         body = h.status_body()
         assert "flush=" in body
         assert "flush=never" not in body
+
+
+class TestStartPort:
+    def test_explicit_port_honored(self):
+        # The port is a Config field (MILLPOND_HTTP_PORT is parsed there);
+        # server.start() takes it as an argument and reads no environment
+        # of its own.
+        srv = server.start(port=0)  # 0 = ephemeral
+        try:
+            assert srv.server_port != 8000
+        finally:
+            srv.shutdown()
+
+    def test_environment_is_not_consulted(self, monkeypatch):
+        # Two DIFFERENT values, so the assertion can actually fail: the
+        # env var must be inert, and the argument must be what binds.
+        monkeypatch.setenv("MILLPOND_HTTP_PORT", "28123")
+        srv = server.start(port=0)
+        try:
+            assert srv.server_port not in (8000, 28123)
+        finally:
+            srv.shutdown()
