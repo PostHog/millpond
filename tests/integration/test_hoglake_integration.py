@@ -70,10 +70,7 @@ class HogCfg:
 
 @pytest.fixture(scope="session")
 def hog_stack():
-    if not stack.docker_available():
-        pytest.skip("Docker is not available")
-    if not stack.ensure_image():
-        pytest.skip(f"hoglake server image unavailable: {stack.server_image()}")
+    stack.ensure_available()
     stack.up()
     try:
         stack.make_bucket(BUCKET)

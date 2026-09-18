@@ -45,10 +45,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture(scope="module")
 def e2e_stack():
-    if not stack.docker_available():
-        pytest.skip("Docker is not available")
-    if not stack.ensure_image():
-        pytest.skip(f"hoglake server image unavailable: {stack.server_image()}")
+    stack.ensure_available()
     stack.up(profile="e2e")
     try:
         stack.make_bucket(BUCKET)

@@ -61,7 +61,8 @@ test-e2e:
 
 # Run hoglake integration tests against a real hoglake server
 # (throwaway compose stack `millpond-hog-it`, high 127.0.0.1 ports;
-# skips cleanly without docker or the server image).
+# skips cleanly without docker or the pinned server image — in CI,
+# MILLPOND_REQUIRE_DOCKER_STACK=1 turns those skips into failures).
 [group('test')]
 test-hoglake-integration:
     uv run python -m pytest tests/integration/test_hoglake_integration.py -v
