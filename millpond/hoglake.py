@@ -160,6 +160,25 @@ _IDEMPOTENCY_NAMESPACE = uuid.UUID("6f1b6d2e-4c5a-5f3e-9b7a-2d8c1e0a4f77")
 # on a flush whose rows are already in the lake.
 _REUSED_KEY_MARKER = "idempotency_key reused"
 
+# The refusals pyhoglake raises when a PREPARED file's columns do not
+# match the destination's, quoted from its source so a re-align is
+# attempted for the cases a re-align can actually fix:
+#   * pyhoglake/client.py:901 — the strict schema/field-id comparison on
+#     the ordinary (non-variant) prepare path, which is the one millpond
+#     takes;
+#   * pyhoglake/parquet_schema.py:173 — the same refusal on the variant
+#     validation path.
+# Deliberately NOT here: "prepared file partition arity differs from
+# destination" (a spec change, which re-aligning columns cannot fix) and
+# "data is missing table columns", which only `_align_table` raises —
+# and this sink stopped calling `Table.append` when it moved to prepared
+# commits, so matching it was matching a string that can no longer
+# reach us.
+_ALIGNMENT_REFUSALS: tuple[str, ...] = (
+    "prepared Parquet schema/field IDs differ from destination",
+    "prepared Parquet columns differ from destination",
+)
+
 
 def is_retryable(exc: BaseException) -> bool:
     """Classify a write-path failure: is a fresh attempt (after
@@ -225,6 +244,21 @@ def is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPError | OSError):
         return True
     return True
+
+
+def _is_alignment_refusal(exc: BaseException) -> bool:
+    """Is this a "the prepared file's columns are not the destination's"
+    refusal, i.e. one a refresh-and-null-fill can actually clear?
+
+    A KeyError always qualifies: the only thing in `_prepare` that raises
+    one is the alignment's `select` reporting a name the batch lacks.
+    """
+    if isinstance(exc, KeyError):
+        return True
+    if not isinstance(exc, ValidationError):
+        return False
+    message = str(exc)
+    return any(marker in message for marker in _ALIGNMENT_REFUSALS)
 
 
 def table_schema_for_batch(batch_schema: pa.Schema) -> pa.Schema:
@@ -477,14 +511,25 @@ class HoglakeSink:
         batch = self._evolve_and_align(table, batch)
         try:
             payload = self._prepare(table, batch, key)
-        except ValidationError as e:
+        except (ValidationError, KeyError) as e:
             # Concurrent-DDL race (found by the live integration suite):
             # another writer's add_column can land between this sink's
             # alignment and the pre-flight resolve, and the strict
             # alignment then refuses the batch for lacking the brand-new
             # column. Refresh, null-fill, and retry ONCE; a second
             # refusal is a real error.
-            if "missing table columns" not in str(e) and "differ from destination" not in str(e):
+            #
+            # `_prepare` null-fills against its own freshly adopted
+            # columns, so this is the SECOND line of defence, not the
+            # first — it covers a column that appears between that
+            # null-fill and pyhoglake's own pre-flight resolve one round
+            # trip later. KeyError is caught with it because the
+            # alignment's `select` reports a missing column that way, and
+            # letting one out is worse than re-aligning once: KeyError is
+            # not a pyhoglake type, so the retry loop reads it as
+            # "unknown, assume transient" and spends the whole budget on
+            # it.
+            if not _is_alignment_refusal(e):
                 raise
             self._adopt_columns(table.info().columns)
             batch = self._null_fill_missing(batch)
@@ -615,6 +660,17 @@ class HoglakeSink:
         info = table.info()
         self._adopt_columns(info.columns)
         target = columns_to_arrow_schema(info.columns)
+        # Null-fill against THESE columns, not the ones the caller
+        # aligned to. `_evolve_and_align` filled against the schema it
+        # resolved a round trip ago; a concurrent writer's add_column
+        # since then puts a name in `target` that the batch does not
+        # carry, and `pa.Table.select` answers a missing name with a
+        # KeyError — which is not a ValidationError, so the self-heal in
+        # `write()` never saw it, and is not a pyhoglake type, so the
+        # retry loop called it transient and burned the whole budget
+        # before crashing the pod. Fill first, select second: the select
+        # can then only ever narrow.
+        batch = self._null_fill_missing(batch)
         aligned = batch.select(list(target.names)).cast(target)
         groups = _partition_groups(aligned, info)
         with tempfile.TemporaryDirectory(prefix="millpond-hoglake-") as tmp:

@@ -1001,13 +1001,43 @@ class TestIdempotentPublication:
 
 
 class TestConcurrentAddDuringAppend:
+    """The concurrent-`add_column` race, in both halves.
+
+    `_evolve_and_align` null-fills against the columns it resolved; a
+    beat later `_prepare` adopts a FRESH `table.info()`. Another writer's
+    add_column in that window puts a name in the target schema the batch
+    does not carry. The alignment must survive that on its own, and the
+    self-heal behind it must match the refusals pyhoglake ACTUALLY
+    raises.
+    """
+
+    def test_column_added_between_align_and_prepare_is_null_filled(self):
+        # The live-suite failure (`KeyError: Field "col_w1_0" does not
+        # exist in schema`): pa.Table.select raises KeyError, not a
+        # ValidationError, so the self-heal never fired for its own
+        # motivating case — and KeyError classifies as retryable, so the
+        # pod burned its whole budget and then crashed.
+        cols_after = _EVENTS_COLUMNS + [_col("other_writer_col", "string", 6, 6)]
+        s, client, catalog, ns, table = _sink()
+        before = _FakeInfo(columns=tuple(_EVENTS_COLUMNS))
+        after = _FakeInfo(columns=tuple(cols_after))
+        # _ensure_table resolves against the old schema; _prepare adopts
+        # the new one. The window is one round trip wide in production.
+        table.info.side_effect = [before, after, after, after]
+        assert s.write(_batch()) == 1
+        published = _published(table)
+        assert "other_writer_col" in published.column_names
+        assert published.column("other_writer_col").null_count == published.num_rows
+        assert table.prepare_append_files.call_count == 1  # no self-heal round needed
+
     @patch("millpond.hoglake.metrics")
     def test_align_refusal_refreshes_and_reappends_once(self, mock_metrics):
-        """Race found by the live integration suite: another writer's
-        add_column lands between this sink's alignment and append()'s
-        pre-flight resolve, so pyhoglake's strict _align_table refuses
-        with "data is missing table columns". The sink must refresh the
-        live schema, null-fill the new column, and re-append ONCE."""
+        """The self-heal behind the null-fill, on the message pyhoglake
+        really raises: `prepare_append_files` compares the parquet's
+        schema (field IDs included) against the destination and refuses
+        with "prepared Parquet schema/field IDs differ from destination"
+        (client.py:901). The sink must refresh the live schema,
+        null-fill, and prepare ONCE more."""
         cols_after = _EVENTS_COLUMNS + [_col("other_writer_col", "string", 6, 6)]
         s, client, catalog, ns, table = _sink()
         prepared = table.prepare_append_files.side_effect
@@ -1016,7 +1046,9 @@ class TestConcurrentAddDuringAppend:
         def prepare(files, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise ValidationError("data is missing table columns: ['other_writer_col']", status_code=None)
+                raise ValidationError(
+                    "prepared Parquet schema/field IDs differ from destination", status_code=None
+                )
             return prepared(files, **kwargs)
 
         table.prepare_append_files.side_effect = prepare
@@ -1026,6 +1058,36 @@ class TestConcurrentAddDuringAppend:
         retried = _published(table)
         assert "other_writer_col" in retried.column_names
         assert retried.column("other_writer_col").null_count == retried.num_rows
+
+    @patch("millpond.hoglake.metrics")
+    def test_variant_path_column_refusal_also_self_heals(self, mock_metrics):
+        # The other real refusal string (parquet_schema.py:173).
+        s, client, catalog, ns, table = _sink()
+        prepared = table.prepare_append_files.side_effect
+        calls = {"n": 0}
+
+        def prepare(files, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValidationError("prepared Parquet columns differ from destination", status_code=None)
+            return prepared(files, **kwargs)
+
+        table.prepare_append_files.side_effect = prepare
+        assert s.write(_batch()) == 1
+        assert table.prepare_append_files.call_count == 2
+
+    @patch("millpond.hoglake.metrics")
+    def test_partition_arity_refusal_is_not_an_alignment_refusal(self, mock_metrics):
+        # "prepared file partition arity differs from destination" is a
+        # spec problem, not a column problem: re-aligning cannot fix it,
+        # so it must not consume the one self-heal.
+        s, *_, table = _sink()
+        table.prepare_append_files.side_effect = ValidationError(
+            "prepared file partition arity differs from destination", status_code=None
+        )
+        with pytest.raises(ValidationError):
+            s.write(_batch())
+        assert table.prepare_append_files.call_count == 1
 
     @patch("millpond.hoglake.metrics")
     def test_other_validation_errors_still_raise(self, mock_metrics):
@@ -1039,7 +1101,7 @@ class TestConcurrentAddDuringAppend:
     def test_persistent_align_refusal_raises_after_one_retry(self, mock_metrics):
         s, *_, table = _sink()
         table.prepare_append_files.side_effect = ValidationError(
-            "data is missing table columns: ['x']", status_code=None
+            "prepared Parquet schema/field IDs differ from destination", status_code=None
         )
         with pytest.raises(ValidationError):
             s.write(_batch())
