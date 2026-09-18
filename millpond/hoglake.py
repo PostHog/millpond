@@ -358,11 +358,13 @@ def _is_alignment_refusal(exc: BaseException) -> bool:
     """Is this a "the prepared file's columns are not the destination's"
     refusal, i.e. one a refresh-and-null-fill can actually clear?
 
-    A KeyError always qualifies: the only thing in `_prepare` that raises
-    one is the alignment's `select` reporting a name the batch lacks.
+    Only pyhoglake's two column-comparison messages qualify. This used to
+    take a `KeyError` as well, for the alignment's `select` reporting a
+    name the batch lacks — but `_prepare` now null-fills against
+    `info.columns` and then selects names from that same object, so the
+    select can only ever narrow and no KeyError can come out of it. See
+    `_prepare`.
     """
-    if isinstance(exc, KeyError):
-        return True
     if not isinstance(exc, ValidationError):
         return False
     message = str(exc)
@@ -661,7 +663,7 @@ class HoglakeSink:
         batch = self._evolve_and_align(table, batch)
         try:
             payload = self._prepare(table, batch, key)
-        except (ValidationError, KeyError) as e:
+        except ValidationError as e:
             # Concurrent-DDL race (found by the live integration suite):
             # another writer's add_column can land between this sink's
             # alignment and the pre-flight resolve, and the strict
@@ -673,12 +675,10 @@ class HoglakeSink:
             # columns, so this is the SECOND line of defence, not the
             # first — it covers a column that appears between that
             # null-fill and pyhoglake's own pre-flight resolve one round
-            # trip later. KeyError is caught with it because the
-            # alignment's `select` reports a missing column that way, and
-            # letting one out is worse than re-aligning once: KeyError is
-            # not a pyhoglake type, so the retry loop reads it as
-            # "unknown, assume transient" and spends the whole budget on
-            # it.
+            # trip later. The refusal is always pyhoglake's, and always a
+            # 422: the `KeyError` this once also caught came from a
+            # `select` that the same null-fill made incapable of raising
+            # one.
             if not _is_alignment_refusal(e):
                 raise
             self._adopt_columns(table.info().columns)

@@ -1532,6 +1532,13 @@ class TestConcurrentAddDuringAppend:
         # ValidationError, so the self-heal never fired for its own
         # motivating case — and KeyError classifies as retryable, so the
         # pod burned its whole budget and then crashed.
+        #
+        # This test is also what retires the KeyError arm the self-heal
+        # once carried: `_prepare` null-fills against `info.columns` and
+        # then selects names from that same object, so the select can
+        # only ever narrow. The column below arriving between the two
+        # resolves is exactly the case that used to raise, and it is
+        # null-filled without the self-heal being consulted at all.
         cols_after = _EVENTS_COLUMNS + [_col("other_writer_col", "string", 6, 6)]
         s, client, catalog, ns, table = _sink()
         before = _FakeInfo(columns=tuple(_EVENTS_COLUMNS))
