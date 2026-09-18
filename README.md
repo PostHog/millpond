@@ -478,11 +478,13 @@ The flush path has two failure points, each with its own retry policy:
 
 | Operation | Attempts | Backoff between failures | On exhaustion |
 |-----------|----------|--------------------------|---------------|
-| Lake write (DuckLake) | 3 | 1s, 2s (last attempt raises immediately) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
+| Lake write (DuckLake) | 3 | 1s then 2s, each jittered upward by up to 25% (last attempt raises immediately) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
 | Lake write (hoglake) | `HOGLAKE_MAX_RETRY_COUNT`, default 8 | 1s doubling, capped at 30s, jittered upward by up to 25%, floored by the server's `Retry-After` when it sends one | as above |
 | Offset commit | 3 | 0.5s, 1s (last attempt raises immediately) | Re-raise → pod crashes, replays from last committed offset (duplicates bounded by one flush batch) |
 
 The two write budgets differ because the backends do: DuckLake retries *internally* (`DUCKLAKE_MAX_RETRY_COUNT`, default 100) underneath millpond's three attempts, while pyhoglake issues one request and raises. Three attempts against a catalog whose backpressure signal is `503` + `Retry-After: 1` — an explicit "the commit queue is convoyed, ask again" — is a crash loop wearing a retry policy's clothes.
+
+The *jitter* is shared by both, deliberately. It exists so a fleet of pods refused by one event does not wake in lockstep and re-form the convoy on every rung, and DuckLake pods contend for the same Postgres catalog commit lock, so they have the same problem. Scoping it to the hoglake path would mean two retry curves to keep in step for a spread of at most 25%: on DuckLake that is 3.75s of backoff across the ladder instead of 3s, well inside the liveness deadline, and it is clamped to the same 30s ceiling as everything else.
 
 The hoglake sink also gets to *veto* a retry: a failure it classifies as permanent (422 validation, 410 expired, an unsupported type) re-raises immediately instead of burning the ladder on a request that cannot become valid by waiting. 408, 429, every 5xx, transport errors, and a commit conflict stay retryable.
 

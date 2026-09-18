@@ -1050,12 +1050,33 @@ class HoglakeSink:
         process wrote. Reporting the batch size here is how a writer came
         to claim eight rows for a range that had three in the lake.
 
-        The one divergence this cannot see: two writers over the same
-        offsets whose FILTERS differ, so the same range means different
-        rows. Their config disagrees about what the pipeline is; the
-        offsets advance over whichever publication landed first. That is
-        a deployment fault, not a recoverable state, and the warning
-        below names the key so it can be traced.
+        What the key does NOT name, and therefore cannot tell apart:
+
+        * two writers over the same offsets whose FILTERS differ, so the
+          same range means different rows;
+        * two writers whose topic NAMES coincide on different Kafka
+          clusters. There is no broker or cluster identity in the key at
+          all, so `events:0:30-41` on one cluster and `events:0:30-41`
+          on another hash identically, and the second pipeline's flush
+          is answered by the first's receipt;
+        * two consumer groups on the same topic, for the same reason.
+
+        Broker identity is deliberately NOT in the key. millpond has no
+        stable cluster id to put there — `BROKER_SOURCE` is a free-text
+        metrics label and `KAFKA_BOOTSTRAP_SERVERS` is a rotated,
+        load-balanced address list, not an identity — so the only
+        candidates are config strings that change while the cluster does
+        not. Putting one in the key means every edit to it re-randomizes
+        the identity of every in-flight flush and reopens the duplicate
+        window for exactly one restart, which is the same hazard
+        `_IDEMPOTENCY_NAMESPACE` is pinned against. The residual it would
+        buy is small in exchange: every case above needs two pipelines
+        already writing one table with config that disagrees about what
+        that table contains.
+
+        All three are deployment faults, not recoverable states: the
+        offsets advance over whichever publication landed first, and the
+        warning below names the key so it can be traced.
         """
         log.warning(
             "Kafka offsets for this flush were already published to %s.%s under a different "

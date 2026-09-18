@@ -1252,6 +1252,25 @@ class TestSinkOwnedRetryPolicy:
         assert 1.0 <= slept[0] <= 1.25
         assert 2.0 <= slept[1] <= 2.5
 
+    def test_the_ducklake_ladder_is_jittered_too(self):
+        # The jitter lives in the SHARED `_retry_delay`, so it applies to
+        # a sink with none of the optional hooks — the DuckLake shape,
+        # and the deployed one. That is deliberate: DuckLake pods
+        # contend for the same Postgres catalog commit lock and wake in
+        # the same lockstep a 503'd hoglake fleet does. The cost is
+        # bounded to 25% upward, so the ladder is at most 3.75s instead
+        # of 3s; the README's retry table says the same.
+        delays = set()
+        for _ in range(20):
+            sink = _make_sink()
+            sink.write.side_effect = [RuntimeError("boom"), 3]
+            with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+                _write_with_retry(sink, pa.table({"a": [1]}), destination="ducklake")
+            delays.add(mock_time.sleep.call_args.args[0])
+        # Spread, not the bare 1.0 rung repeated.
+        assert len(delays) > 1
+        assert all(1.0 <= d <= 1.25 for d in delays)
+
     def test_exponential_backoff_is_capped(self):
         # A long budget must not end in a multi-minute sleep.
         sink = MagicMock(spec=["write", "reset_caches", "close", "write_retry_budget"])

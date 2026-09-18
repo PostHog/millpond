@@ -392,7 +392,13 @@ def _retry_delay(sink, attempt: int, base: float) -> float:
 
     Jitter is added upward (never below the floor) so that a fleet of
     pods refused by the same 503 does not wake in lockstep and re-form
-    the convoy on every rung.
+    the convoy on every rung. It applies to BOTH destinations, which is a
+    behaviour change to the deployed DuckLake path and an intended one:
+    DuckLake pods contend for the same Postgres catalog commit lock and
+    have the same lockstep problem, and the cost is bounded — its ladder
+    becomes 3.75s of backoff at worst instead of 3s, under the same
+    ceiling. A second, hoglake-only curve would be two things to keep in
+    step for a spread of 25%. See the retry table in README.md.
 
     Both are clamped to _RETRY_AFTER_MAX_S: the consume loop is single
     threaded, so a backoff is also a poll gap, and a misbehaving or
