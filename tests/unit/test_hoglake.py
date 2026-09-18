@@ -6,6 +6,7 @@ server round-trips live in tests/integration/test_hoglake_integration.py.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
@@ -1434,6 +1435,30 @@ class TestIdempotentPublication:
         with pytest.raises(ValidationError):
             s.write(_batch(), kafka_offsets=self.OFFSETS)
 
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            CommitConflictError("commit_conflict", status_code=409, detail="idempotency_key reused"),
+            HoglakeError("internal", status_code=500, detail="idempotency_key reused"),
+        ],
+    )
+    @patch("millpond.hoglake.metrics")
+    def test_the_marker_is_only_believed_on_a_422(self, mock_metrics, exc):
+        # "these rows are already in the lake" is the one answer that
+        # lets millpond advance Kafka offsets over rows it did not
+        # write, so it is only ever read off the response the server
+        # says it in: a 422. The marker is a SENTENCE in an error body,
+        # and `_commit_prepared` catches the whole HoglakeError family —
+        # so a 409 or a 5xx whose body happens to echo it (a conflict
+        # report quoting the request, a proxy folding a 422 into a 500)
+        # reaches this line too. Widening the guard to any HoglakeError
+        # trades a retryable failure for silent data loss.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = exc
+        with pytest.raises(type(exc)):
+            s.write(_rows(5), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_commit_replays_total.labels.assert_not_called()
+
 
 class TestRefusedCommitsDropThePayload:
     """A refusal the server ANSWERED is one transaction that wrote
@@ -1497,40 +1522,83 @@ class TestRefusedCommitsDropThePayload:
             s.write(_rows(2), kafka_offsets=self.OFFSETS)
         mock_metrics.hoglake_files_written_total.inc.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "prepared Parquet schema/field IDs differ from destination",
+            "prepared file partition arity differs from destination",
+            "prepared file must contain rows",
+        ],
+    )
+    @pytest.mark.parametrize("rows", [1, 3])
     @patch("millpond.hoglake.metrics")
-    def test_a_prepare_that_fails_mid_upload_is_counted(self, mock_metrics):
-        # Nothing on the server reclaims a client upload, so an
-        # uncounted orphan path is storage nobody can find.
+    def test_a_prepare_refusal_is_never_counted_whatever_the_fanout(self, mock_metrics, rows, detail):
+        # pyhoglake validates file i and THEN uploads file i, and every
+        # file millpond hands it is a slice of ONE aligned table: same
+        # schema and field ids, same partition arity, every group
+        # non-empty. So each of its three refusals is a property of the
+        # whole set and fires at index 0, before a byte goes up —
+        # whether the fanout is one file or three.
+        #
+        # The previous shape of this test asserted N-1 for a 3-file
+        # fanout, which is N-1 phantom orphans every time: a concurrent
+        # add_column trips this refusal, `write()` self-heals, the flush
+        # SUCCEEDS, and the operator is still sent sweeping for two
+        # objects that were never written.
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        table.prepare_append_files.side_effect = OSError("S3 reset midway")
-        with pytest.raises(OSError):
-            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(3)
-
-    @patch("millpond.hoglake.metrics")
-    def test_a_prepare_refused_before_its_upload_is_not_counted(self, mock_metrics):
-        # pyhoglake validates file i and THEN uploads file i: a
-        # validation refusal on a single-file flush uploaded nothing.
-        s, client, catalog, ns, table = _sink()
-        table.prepare_append_files.side_effect = ValidationError("prepared file must contain rows", status_code=None)
+        table.prepare_append_files.side_effect = ValidationError(detail, status_code=None)
         with pytest.raises(ValidationError):
-            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+            s.write(
+                pa.table({"uuid": [f"u{i}" for i in range(rows)], "team_id": list(range(rows))}),
+                kafka_offsets=self.OFFSETS,
+            )
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            HoglakeError("commit_queue_timeout", status_code=503),
+            NotFoundError("table not found", status_code=404),
+            IncarnationChangedError("table was recreated"),
+            httpx.ReadTimeout("no response"),
+            ValueError("badly formed hexadecimal UUID string"),
+        ],
+    )
+    @patch("millpond.hoglake.metrics")
+    def test_a_prepare_that_fails_before_the_first_byte_is_not_counted(self, mock_metrics, exc):
+        # Everything prepare_append_files does over the network or
+        # against the catalog — the key's UUID parse, the read-snapshot
+        # refresh, the incarnation pre-flight — runs BEFORE the upload
+        # loop, and the upload itself is pyarrow's, which raises OSError
+        # rather than any of these. So a 503 from a convoyed catalog, a
+        # 404 on a dropped table, or a read timeout wrote zero bytes,
+        # and the retry ladder (8 attempts x an 8-way fanout) turned
+        # that into up to 64 phantom orphans a flush.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        table.prepare_append_files.side_effect = exc
+        with pytest.raises(type(exc)):
+            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
         mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
 
     @patch("millpond.hoglake.metrics")
-    def test_a_multi_file_prepare_refusal_counts_the_uploads_behind_it(self, mock_metrics):
-        # The other half of the same rule, and the half the count is
-        # written for. Validate-then-upload means a refusal on an N-file
-        # fanout leaves at most N-1 objects in storage — never N, and
-        # never 0 once N > 1. The single-file case above collapses both
-        # of those to the same number, so on its own it pins nothing.
+    def test_a_prepare_that_may_have_failed_mid_fanout_warns_without_counting(self, mock_metrics, caplog):
+        # The one case where objects really may be in storage: pyarrow's
+        # S3 upload failing partway through the fanout. pyhoglake does
+        # not report how far it got, so any number recorded here is
+        # partly invented — and a counter that books storage nobody
+        # wrote sends operators sweeping for nothing. The uncertainty
+        # goes in the log, with the prefix that makes the sweep
+        # decidable; the metric stays sound.
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        table.prepare_append_files.side_effect = ValidationError("prepared file must contain rows", status_code=None)
-        with pytest.raises(ValidationError):
+        table.prepare_append_files.side_effect = OSError("S3 reset midway")
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(2)
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+        assert "up to 3" in caplog.text
+        assert "not counted" in caplog.text
 
     @patch("millpond.hoglake.metrics")
     def test_close_counts_an_unpublished_payload(self, mock_metrics):

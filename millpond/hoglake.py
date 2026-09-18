@@ -880,26 +880,62 @@ class HoglakeSink:
                     # finally runs against the table we are writing to.
                     expected_table_uuid=self._table_uuid,
                 )
-            except IncarnationChangedError:
-                # The pre-flight re-resolve, which runs BEFORE the first
-                # upload. Nothing reached object storage, so counting an
-                # orphan here would send an operator sweeping for objects
-                # that were never written.
-                raise
             except ValidationError:
-                # pyhoglake validates file i and THEN uploads file i, so
-                # a validation refusal means at most the files before it
-                # went up — never all of them. For the single-file case
-                # (an unpartitioned table, and the common one) that is
-                # exactly zero, which is why this is not simply
-                # `len(files)`.
-                _count_orphans(max(0, len(files) - 1), "prepare refused after partial upload")
+                # ZERO, and never `len(files) - 1`. pyhoglake validates
+                # file i and THEN uploads file i, and every file in this
+                # fanout is a slice of ONE aligned table: the same
+                # schema and field ids, the same partition arity (both
+                # come from the `info` this method resolved), and every
+                # group non-empty (each is the rows carrying one
+                # observed partition tuple). So each of pyhoglake's
+                # three prepare-side refusals — "schema/field IDs
+                # differ", "partition arity differs", "must contain
+                # rows" — is a property of the whole set rather than of
+                # one file, and can only fire at index 0, before a byte
+                # is uploaded.
+                #
+                # The concurrent-`add_column` race `write()` self-heals
+                # IS this refusal: it fires, the re-aligned flush then
+                # succeeds, and booking N-1 orphans for it sent an
+                # operator sweeping for objects that were never written.
+                raise
+            except (HoglakeError, httpx.HTTPError, ValueError):
+                # Also zero. Everything `prepare_append_files` does over
+                # the network or against the catalog happens before the
+                # upload loop — the idempotency key's UUID parse
+                # (ValueError), the read-snapshot refresh, and the
+                # incarnation pre-flight (HoglakeError / httpx, and
+                # `IncarnationChangedError` among them) — and the
+                # uploads themselves go through pyarrow's filesystem,
+                # which reports failure as OSError, never as either of
+                # these. A 503 from a convoyed catalog, a read timeout
+                # or a 404 on a dropped table therefore wrote nothing,
+                # and counting them meant up to (retries x fanout)
+                # phantom orphans per flush.
                 raise
             except Exception:
-                # A transport or S3 failure partway through the fanout:
-                # any of them may already be in object storage, and
-                # nothing references them.
-                _count_orphans(len(files), "prepare failed after partial upload")
+                # The one genuinely unknown case: an OSError out of the
+                # local parquet read or the S3 upload, which may have
+                # left some of the fanout in object storage. pyhoglake
+                # reports no progress information, so every count
+                # available here is partly invented — and a counter that
+                # books storage nobody wrote is worse than one that
+                # misses some, because it sends operators sweeping for
+                # objects that do not exist. The uncertainty goes in the
+                # log, which can say "up to" and name the prefix that
+                # makes the sweep decidable; the metric does not move.
+                log.warning(
+                    "Prepared upload of %s.%s failed partway through a %d-file fanout: up to %d "
+                    "parquet object(s) may have been written and left unreferenced under the "
+                    "%s/ prefix of the table's data path. They are deliberately not counted in "
+                    "millpond_hoglake_orphaned_files_total, which never books storage that "
+                    "cannot be shown to have been written.",
+                    self._cfg.hoglake_namespace,
+                    self._cfg.hoglake_table,
+                    len(files),
+                    len(files),
+                    key,
+                )
                 raise
         # Blind append, exactly as `Table.append` does it.
         # `prepare_append_files` pins `read_snapshot` to the catalog head
