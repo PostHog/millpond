@@ -1302,6 +1302,68 @@ class TestIdempotentPublication:
         # The abandoned upload is an orphan and is counted as one.
         mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
 
+    def test_a_retry_is_recognized_by_its_kafka_identity_not_by_a_re_derived_key(self):
+        # The identity the payload was BUILT for is what makes a retry a
+        # retry. Re-deriving the key here instead would consult the live
+        # table incarnation — which the retry path deliberately has not
+        # re-resolved — so a drop+recreate under a held payload would
+        # read as "a different flush": the sink would abandon a
+        # registration whose commit may well have landed, upload a second
+        # copy of the same rows, and publish it under a name the server
+        # has no receipt for.
+        #
+        # Replayed instead, the frozen payload carries its own
+        # `expected_table_uuid`, and the commit is where that gets
+        # judged.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = httpx.ReadTimeout("response lost")
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        s.reset_caches()
+        reborn = "deadbeef-0000-0000-0000-000000000000"
+        table.info.return_value = _FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid=reborn)
+        table.table_uuid = reborn
+        with pytest.raises(IncarnationChangedError):
+            s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        assert table.prepare_append_files.call_count == 1  # replayed and judged, never rebuilt
+
+    def test_the_commit_time_lookup_never_becomes_the_reconciled_cache(self):
+        # `_live_table` resolves a bare handle for the pre-commit
+        # incarnation/spec check, and must not cache it: `self._table`
+        # means "resolved AND reconciled by `_ensure_table`", and a
+        # handle fetched here has been through neither. Caching it would
+        # let the next flush write under a layout this pod never checked
+        # against config.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [httpx.ReadTimeout("lost"), MagicMock(), MagicMock()]
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        # main.py's retry path: caches dropped, so the replay's
+        # destination check is what resolves the handle.
+        s.reset_caches()
+        assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
+        assert s._table is None
+        # ...and the consequence that makes it matter: the next ordinary
+        # flush still goes through `_ensure_table`'s resolve-and-reconcile.
+        resolves = ns.table.call_count
+        assert s.write(_rows(2), kafka_offsets=(("events", 0, 42, 43),)) == 2
+        assert ns.table.call_count > resolves
+
+    def test_an_empty_offset_tuple_is_not_an_identity(self):
+        # `()` names no rows, so it cannot recognize anything — and
+        # treating it as an identity is worse than having none: two
+        # consecutive anonymous flushes then match each other, and the
+        # second replays the first's payload and drops its own rows on
+        # the floor. main.py cannot produce one today (it gates on
+        # pending_records > 0), which is exactly why the guard needs a
+        # test rather than a caller.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [httpx.ReadTimeout("lost"), MagicMock()]
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(3), kafka_offsets=())
+        assert s.write(_rows(7), kafka_offsets=()) == 7
+        assert table.prepare_append_files.call_count == 2  # rebuilt, never replayed
+
     @patch("millpond.hoglake.metrics")
     def test_key_reused_with_a_different_payload_publishes_nothing(self, mock_metrics):
         # The crash-restart case: the pod died after the commit applied
@@ -1455,6 +1517,20 @@ class TestRefusedCommitsDropThePayload:
         with pytest.raises(ValidationError):
             s.write(_rows(2), kafka_offsets=self.OFFSETS)
         mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_multi_file_prepare_refusal_counts_the_uploads_behind_it(self, mock_metrics):
+        # The other half of the same rule, and the half the count is
+        # written for. Validate-then-upload means a refusal on an N-file
+        # fanout leaves at most N-1 objects in storage — never N, and
+        # never 0 once N > 1. The single-file case above collapses both
+        # of those to the same number, so on its own it pins nothing.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        table.prepare_append_files.side_effect = ValidationError("prepared file must contain rows", status_code=None)
+        with pytest.raises(ValidationError):
+            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(2)
 
     @patch("millpond.hoglake.metrics")
     def test_close_counts_an_unpublished_payload(self, mock_metrics):
