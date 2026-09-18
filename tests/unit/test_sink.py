@@ -47,6 +47,20 @@ class TestMakeSinkDispatch:
             sink = sink_mod.make_sink(_cfg("ducklake"))
             assert isinstance(sink, DuckLakeSink)
 
+    def test_returns_hoglake_sink_for_hoglake(self):
+        cfg = _cfg("hoglake")
+        cfg.hoglake_url = "http://localhost:28080"
+        cfg.hoglake_catalog = "millpond"
+        cfg.hoglake_namespace = "analytics"
+        cfg.hoglake_table = "events"
+        cfg.hoglake_s3_access_key = "ak"
+        cfg.hoglake_s3_secret_key = "sk"
+        with patch("millpond.hoglake.HoglakeClient"):
+            from millpond.hoglake import HoglakeSink
+
+            sink = sink_mod.make_sink(cfg)
+            assert isinstance(sink, HoglakeSink)
+
     def test_unknown_destination_raises(self):
         with pytest.raises(ValueError, match="Unknown destination"):
             sink_mod.make_sink(_cfg("snowflake"))
@@ -63,6 +77,7 @@ class TestSinkProtocolConformance:
         "class_path",
         [
             "millpond.ducklake.DuckLakeSink",
+            "millpond.hoglake.HoglakeSink",
         ],
     )
     def test_required_methods_exist(self, class_path):
@@ -129,6 +144,9 @@ class TestLazyImport:
         src = inspect.getsource(sink_mod.make_sink)
         assert re.search(r"^[ \t]+from millpond\.ducklake import", src, re.M), (
             "make_sink must import ducklake lazily (inside the function), not at module top"
+        )
+        assert re.search(r"^[ \t]+from millpond\.hoglake import", src, re.M), (
+            "make_sink must import hoglake lazily — httpx/pyhoglake shouldn't load for DuckLake-only deployments"
         )
 
 

@@ -129,6 +129,10 @@ def make_sink(cfg: Config) -> Sink:
         from millpond.ducklake import DuckLakeSink
 
         return DuckLakeSink(cfg)
+    if cfg.destination == "hoglake":
+        from millpond.hoglake import HoglakeSink
+
+        return HoglakeSink(cfg)
     # ValueError, not RuntimeError — this is an unknown-enum input, the
     # idiomatic Python exception for "the value I got isn't in the set
     # I accept." config.load() should have already rejected this at

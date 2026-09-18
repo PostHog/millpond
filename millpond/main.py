@@ -320,6 +320,24 @@ def _is_commit_contention(exc: BaseException) -> bool:
     )
 
 
+def _classify_write_error(exc: BaseException) -> str:
+    """errors_total label for a failed write attempt.
+
+    Hoglake commit conflicts are typed: pyhoglake's CommitConflictError
+    carries `retryable=True` on the class (the server's OCC 409 —
+    refresh the baseline and retry). Checked duck-typed by module name
+    so main.py never imports the hoglake backend for a ducklake-only
+    deployment. DuckLake contention stays the string-matching
+    classifier (_is_commit_contention). Everything else is a plain
+    write_retry.
+    """
+    if getattr(exc, "retryable", None) is True and type(exc).__module__.startswith("pyhoglake"):
+        return "hoglake_commit_contention"
+    if _is_commit_contention(exc):
+        return "ducklake_commit_contention"
+    return "write_retry"
+
+
 def _write_with_retry(sink, consolidated):
     """Write to the sink with exponential backoff on transient failures.
 
@@ -330,7 +348,7 @@ def _write_with_retry(sink, consolidated):
         try:
             return sink.write(consolidated)
         except Exception as exc:
-            error_type = "ducklake_commit_contention" if _is_commit_contention(exc) else "write_retry"
+            error_type = _classify_write_error(exc)
             metrics.errors_total.labels(type=error_type).inc()
             if attempt == _WRITE_MAX_RETRIES - 1:
                 raise
