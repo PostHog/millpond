@@ -21,6 +21,13 @@ just test-hoglake-integration  # real hoglake server, throwaway stack `millpond-
 just test-hoglake-e2e          # Kafka -> main.py -> hoglake end to end
 ```
 
+Both boot the server image pinned by digest in `tests/hoglake_stack/stack.py`
+(bump procedure is in the comment there; `HOGLAKE_SERVER_IMAGE` overrides it
+for a run against a locally built server). CI sets
+`MILLPOND_REQUIRE_DOCKER_STACK=1`, which turns "no docker" and "image
+unavailable" from skips into failures — locally it stays unset so a machine
+without docker still runs everything else.
+
 Note: `just lint` and `just fmt-check` only run against `millpond/` today; `tests/` remains uncovered by the recipes. Pre-commit hooks run ruff project-wide, so lint failures still surface — but the just recipes themselves are scope-narrow until they're updated.
 
 All must pass. Do not push with any lint, test, integration, or e2e failures — CI runs all of these on every push and PR (`.github/workflows/ci.yaml`), and the integration/e2e jobs are gating. Catch failures locally rather than on the runner.
@@ -218,7 +225,11 @@ Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 
 `main.py` constructs one sink via `sink.make_sink(cfg)` (`millpond/sink.py` — the seam recovered from the `final-iceberg` tag) and calls exactly three methods on it: `write(batch) -> int`, `reset_caches()`, `close()`. Two implementations: `DuckLakeSink` (`millpond/ducklake.py`) and `HoglakeSink` (`millpond/hoglake.py`, pyhoglake footer-shipping appends, text-only — VARIANT config is rejected at startup for this destination). Backend imports are lazy inside `make_sink` so each destination's pods skip the other's import cost; the dispatch and the protocol conformance are pinned in `tests/unit/test_sink.py`. `check_reserved_collision` and `SAFE_IDENTIFIER` live on the seam (schema.py re-exports the latter for its historical importers).
 
-Per-Sink instance state: the table-ensured cache and the SchemaManager both live on the Sink instance, not at module level. Two Sink instances in the same process correctly do not share cache — each owns its own connection handle too. `reset_caches()` is called only by the write-retry loop in `main.py` after a failed write; the sink does not self-reset on internal recovery, it surfaces the failure and lets the retry path drive cache invalidation.
+`HoglakeSink.write` takes one extra keyword the protocol does not require: `kafka_offsets`, supplied per call by `main._sink_write_kwargs` through the `write_kwargs` seam (the mechanism the icebox sink used at tag `final-iceberg`). It is the flush's identity — the `(topic, partition, highest offset)` triples about to be committed — and the sink hashes it into the commit's idempotency key. That is what makes a retry after a lost commit response a replay rather than a second publication; see the `_flush_key` / `_commit_prepared` docstrings for why the offset range is a sound identity and why transport failures are classified uncertain. `DuckLakeSink.write` takes the batch alone.
+
+The sink also publishes three optional hooks the retry loop duck-types off it, none of which `DuckLakeSink` implements: `is_retryable(exc)` (a veto — a permanent 422 re-raises immediately instead of burning the budget), `write_retry_budget()` and `retry_after_hint()`.
+
+Per-Sink instance state: the table-ensured cache and the SchemaManager both live on the Sink instance, not at module level. Two Sink instances in the same process correctly do not share cache — each owns its own connection handle too. `reset_caches()` is called only by the write-retry loop in `main.py` after a failed write; the sink does not self-reset on internal recovery, it surfaces the failure and lets the retry path drive cache invalidation. One deliberate exception to what `reset_caches()` clears: `HoglakeSink`'s prepared-but-unpublished commit request survives it, because it is the record of an upload that already happened and replaying it verbatim is the entire point.
 
 Empty-batch contract: callers must not invoke `write()` with a zero-row batch. `main.py` gates on `pending_records > 0` before flushing. Defensively, DuckLake creates the table eagerly on any call (including empty); the divergence from the gate isn't exercised in steady state, but the contract is documented on the `DuckLakeSink` docstring so any future caller knows it.
 
