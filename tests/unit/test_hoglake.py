@@ -1046,6 +1046,24 @@ class TestPartitionGrouping:
         assert [values for values, _ in groups] == [("3",), ("1",), ("2",)]
         assert [part.column("uuid").to_pylist() for _, part in groups] == [["a", "c"], ["b"], ["d"]]
 
+    def test_first_occurrence_order_survives_arrows_hash_order(self):
+        """The ordering is NOT free, and a handful of groups does not
+        prove it: pyarrow's `group_by` emits in hash order, which happens
+        to coincide with first-occurrence order for a few keys and stops
+        coinciding as soon as there are more. Eight partition values is
+        already enough — arrow returns them 0,1,2,3,4,5,7,6 — so this is
+        the size at which dropping the explicit ordering shows up."""
+        teams = list(range(8))
+        rows = 64
+        data = pa.table(
+            {
+                "uuid": [f"u{i}" for i in range(rows)],
+                "team_id": [teams[i % len(teams)] for i in range(rows)],
+            }
+        )
+        groups = hoglake._partition_groups(data, self._info(_spec(("team_id", "identity"))))
+        assert [values[0] for values, _ in groups] == [str(t) for t in teams]
+
     def test_every_row_lands_in_exactly_one_group(self):
         data = pa.table({"uuid": [f"u{i}" for i in range(9)], "team_id": [1, 2, 3, 1, 2, 3, 1, 2, 3]})
         groups = hoglake._partition_groups(data, self._info(_spec(("team_id", "identity"))))
@@ -1134,12 +1152,19 @@ class TestIdempotentPublication:
         assert self._key(s, self.OFFSETS, table) != self._key(s, self.OFFSETS, recreated)
 
     def test_key_keeps_each_offset_with_its_partition(self):
-        # (p0: 17, p1: 41) and (p0: 41, p1: 17) are different row sets.
-        # A key that sorts bare offset lines cannot tell them apart.
+        # Partition 0's offsets 0-5 and partition 1's offsets 0-5 are
+        # different rows — and at the head of a fresh topic, two
+        # partitions carrying the same range is the ordinary case, not a
+        # contrived one. A key that names the range without the partition
+        # it belongs to calls them the same flush.
         s, *_, table = _sink()
-        a = self._key(s, (("events", 0, 17, 17), ("events", 1, 41, 41)), table)
-        b = self._key(s, (("events", 0, 41, 41), ("events", 1, 17, 17)), table)
+        a = self._key(s, (("events", 0, 0, 5),), table)
+        b = self._key(s, (("events", 1, 0, 5),), table)
         assert a != b
+        # And the same two ranges held by opposite partitions.
+        c = self._key(s, (("events", 0, 17, 17), ("events", 1, 41, 41)), table)
+        d = self._key(s, (("events", 0, 41, 41), ("events", 1, 17, 17)), table)
+        assert c != d
 
     def test_key_is_random_without_offsets(self):
         # No identity to recognize a retry by: honest at-least-once
