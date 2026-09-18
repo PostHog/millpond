@@ -11,6 +11,7 @@ does at runtime.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
@@ -148,6 +149,33 @@ class TestLazyImport:
         assert re.search(r"^[ \t]+from millpond\.hoglake import", src, re.M), (
             "make_sink must import hoglake lazily — httpx/pyhoglake shouldn't load for DuckLake-only deployments"
         )
+
+    def test_a_hoglake_pod_never_loads_duckdb(self):
+        """The source inspection above checks `make_sink`'s two lines and
+        nothing else, which is false assurance: it passed the whole time
+        config.py was pulling duckdb in through `millpond.schema` for two
+        string constants, so every hoglake pod loaded DuckDB at startup
+        regardless of what make_sink did.
+
+        The honest check imports what a hoglake pod imports, in a fresh
+        interpreter, and asks sys.modules.
+        """
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys;"
+            "import millpond.config, millpond.main, millpond.sink, millpond.hoglake;"
+            "print('duckdb' in sys.modules)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
+        assert out.stdout.strip() == "False", "a hoglake pod's import graph pulls in duckdb"
 
 
 class TestDuckLakeWriteDelegation:

@@ -52,7 +52,9 @@ class TestWriteWithRetry:
         with patch("millpond.main.time") as mock_time:
             _write_with_retry(sink, table)
         assert sink.write.call_count == 2
-        mock_time.sleep.assert_called_once_with(1.0)
+        # One sleep, on the base step plus its upward jitter.
+        (slept,) = [c.args[0] for c in mock_time.sleep.call_args_list]
+        assert 1.0 <= slept <= 1.25
 
     @pytest.mark.parametrize(
         "exc_cls",
@@ -78,7 +80,22 @@ class TestWriteWithRetry:
         with patch("millpond.main.time") as mock_time:
             _write_with_retry(sink, table)
         calls = [c.args[0] for c in mock_time.sleep.call_args_list]
-        assert calls == [1.0, 2.0]
+        assert len(calls) == 2
+        assert 1.0 <= calls[0] <= 1.25
+        assert 2.0 <= calls[1] <= 2.5
+
+    def test_backoff_steps_are_jittered(self):
+        # A fleet refused by the same 503 must not wake in lockstep and
+        # re-form the convoy it was backing off from.
+        sink = _make_sink()
+        seen = set()
+        for _ in range(30):
+            sink.write.side_effect = [OSError(), None]
+            with patch("millpond.main.time") as mock_time:
+                _write_with_retry(sink, pa.table({"a": [1]}))
+            seen.add(mock_time.sleep.call_args.args[0])
+        assert len(seen) > 1, "every pod would sleep the same 1.0s"
+        assert all(1.0 <= d <= 1.25 for d in seen)
 
     @pytest.mark.parametrize("exc", _RETRYABLE_EXCEPTIONS)
     def test_resets_caches_on_retry(self, exc):
@@ -1191,16 +1208,29 @@ class TestSinkOwnedRetryPolicy:
         assert sink.write.call_count == 1
         sink.reset_caches.assert_not_called()
 
-    def test_retry_after_hint_overrides_the_backoff_curve(self):
+    def test_retry_after_hint_is_a_floor_not_a_replacement(self):
         # Hoglake answers commit-admission backpressure with
-        # 503 + `Retry-After: 1`. The server knows how convoyed the
-        # catalog is; our doubling curve does not.
+        # 503 + `Retry-After: 1` — a HARDCODED 1. Letting that replace
+        # the curve collapsed the ladder to one-second steps: the whole
+        # eight-attempt budget spent in about eight seconds against a
+        # convoyed catalog, then a crash, which adds a cold pod to the
+        # convoy. The larger of the two is honoured.
         sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
         sink.retry_after_hint.return_value = 1.0
+        sink.write.side_effect = [RuntimeError("503"), RuntimeError("503"), 3]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        slept = [c.args[0] for c in mock_time.sleep.call_args_list]
+        assert 1.0 <= slept[0] <= 1.25
+        assert 2.0 <= slept[1] <= 2.5  # the curve, not the hint
+
+    def test_a_hint_longer_than_the_curve_is_honoured(self):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
+        sink.retry_after_hint.return_value = 9.0
         sink.write.side_effect = [RuntimeError("503"), 3]
         with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
             _write_with_retry(sink, pa.table({"a": [1]}))
-        mock_time.sleep.assert_called_once_with(1.0)
+        assert mock_time.sleep.call_args.args[0] >= 9.0
 
     def test_retry_after_hint_is_clamped(self):
         # The consume loop is single threaded, so a backoff is also a poll
@@ -1218,7 +1248,9 @@ class TestSinkOwnedRetryPolicy:
         sink.write.side_effect = [RuntimeError("boom"), RuntimeError("boom"), 3]
         with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
             _write_with_retry(sink, pa.table({"a": [1]}))
-        assert [c.args[0] for c in mock_time.sleep.call_args_list] == [1.0, 2.0]
+        slept = [c.args[0] for c in mock_time.sleep.call_args_list]
+        assert 1.0 <= slept[0] <= 1.25
+        assert 2.0 <= slept[1] <= 2.5
 
     def test_exponential_backoff_is_capped(self):
         # A long budget must not end in a multi-minute sleep.

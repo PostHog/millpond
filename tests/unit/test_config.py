@@ -853,7 +853,61 @@ class TestHoglakeConfig:
         # sink.write(); see the comment in _load_hoglake_fields.
         cfg = load()
         assert cfg.hoglake_max_retry_count == 8
-        assert cfg.hoglake_request_timeout_s == 30.0
+        # 45, not pyhoglake's 30: the server's commit-lock admission
+        # bound is 30s, so an equal client timeout gave up at the same
+        # instant the server would have answered 503 + Retry-After, and
+        # its explicit backpressure signal surfaced as a
+        # transport-uncertain failure instead.
+        assert cfg.hoglake_request_timeout_s == 45.0
+
+    def test_a_retry_budget_that_outlives_liveness_is_refused(self, monkeypatch):
+        # HOGLAKE_MAX_RETRY_COUNT was unbounded while its interaction
+        # with the liveness deadline lived in a comment — so the
+        # documented trap was one values-file edit away, and springing it
+        # looks like a pod SIGKILLed mid-flush with nothing in its logs.
+        monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "40")
+        with pytest.raises(RuntimeError, match="liveness deadline"):
+            load()
+
+    def test_a_long_timeout_with_few_retries_is_also_refused(self, monkeypatch):
+        # It is the PRODUCT that matters, not either knob alone.
+        monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "4")
+        monkeypatch.setenv("HOGLAKE_REQUEST_TIMEOUT_S", "200")
+        with pytest.raises(RuntimeError, match="liveness deadline"):
+            load()
+
+    def test_the_defaults_fit_inside_the_liveness_budget(self):
+        from millpond.config import _LIVENESS_BUDGET_S, _hoglake_worst_case_flush_s
+
+        cfg = load()
+        worst = _hoglake_worst_case_flush_s(cfg.hoglake_max_retry_count, cfg.hoglake_request_timeout_s)
+        assert worst <= _LIVENESS_BUDGET_S
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "/bucket/millpond/",
+            "bucket/millpond/",
+            "https://bucket.s3.amazonaws.com/millpond/",
+            "s3:/bucket/millpond/",
+            "s3://",
+        ],
+    )
+    def test_a_data_path_that_is_not_an_s3_uri_is_refused(self, value, monkeypatch):
+        # Frozen into the catalog row at creation, and hoglake has no
+        # route to delete a catalog: a typo mints a permanently unusable
+        # catalog under a name nobody can reuse.
+        monkeypatch.setenv("HOGLAKE_DATA_PATH", value)
+        with pytest.raises(RuntimeError, match="HOGLAKE_DATA_PATH"):
+            load()
+
+    @pytest.mark.parametrize(
+        "value",
+        ["s3://bucket", "s3://bucket/", "s3://bucket/millpond/", "s3://my-lake.prod/a/b/c"],
+    )
+    def test_valid_s3_data_paths_are_accepted(self, value, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_DATA_PATH", value)
+        assert load().hoglake_data_path == value
 
     def test_retry_and_timeout_overrides(self, monkeypatch):
         monkeypatch.setenv("HOGLAKE_MAX_RETRY_COUNT", "3")

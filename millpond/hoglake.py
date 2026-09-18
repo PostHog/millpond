@@ -1166,9 +1166,15 @@ class HoglakeSink:
         self._declare_specs(table)
         return table
 
-    def _declare_specs(self, table) -> None:
+    def _declare_specs(self, table, *, partition: bool = True, sort: bool = True) -> None:
         """Declare the configured partition spec + sort order in ONE
         alter, then VERIFY the result.
+
+        `partition` / `sort` narrow the declaration to the halves that
+        are actually missing. Re-declaring a spec the table already
+        carries is not free: it is a DDL commit through the per-catalog
+        lock, it races every other writer's DDL, and it re-versions a
+        layout nobody asked to change.
 
         Creation is two round trips and the gap between them is the
         hazard: the table exists before its layout does. Only a
@@ -1180,7 +1186,7 @@ class HoglakeSink:
         wrong, which is the point. Silently writing to a table whose
         partitioning the operator asked for and never got is the failure
         mode this replaces."""
-        spec_ops = self._spec_ops()
+        spec_ops = self._spec_ops(partition=partition, sort=sort)
         if not spec_ops:
             return
         try:
@@ -1256,7 +1262,9 @@ class HoglakeSink:
                 self._cfg.hoglake_namespace,
                 self._cfg.hoglake_table,
             )
-            self._declare_specs(table)
+            # The sort alone: the partition spec is already live and
+            # already matches (the mismatch check above ran first).
+            self._declare_specs(table, partition=False)
 
     def _verify_specs(self, info) -> None:
         """Post-condition on the declaration: the live layout IS what
@@ -1325,7 +1333,7 @@ class HoglakeSink:
             f"{t}({c}{', ' + str(p) if p is not None else ''})" for c, t, p in (self._cfg.hoglake_partition_by or ())
         )
 
-    def _spec_ops(self) -> list[AlterOp]:
+    def _spec_ops(self, *, partition: bool = True, sort: bool = True) -> list[AlterOp]:
         """Partition-spec + sort-order alter ops, built from the same
         resolved tuples the reconciliation and verification paths
         compare against — so what is declared, what is checked and what
@@ -1337,18 +1345,18 @@ class HoglakeSink:
         advisory for writers, binding only for compaction).
         """
         spec_ops: list[AlterOp] = []
-        partition = self._want_partition_fields()
-        if partition:
-            spec_ops.append(ops.set_partition_spec([ops.partition_field(*f) for f in partition]))
-        sort = self._want_sort_fields()
-        if sort:
+        partition_fields = self._want_partition_fields() if partition else ()
+        if partition_fields:
+            spec_ops.append(ops.set_partition_spec([ops.partition_field(*f) for f in partition_fields]))
+        sort_fields = self._want_sort_fields() if sort else ()
+        if sort_fields:
             spec_ops.append(
                 AlterOp(
                     "set_sort_order",
                     {
                         "sort_fields": [
                             {"source_field_id": fid, "direction": direction, "null_order": null_order}
-                            for fid, direction, null_order in sort
+                            for fid, direction, null_order in sort_fields
                         ]
                     },
                 )

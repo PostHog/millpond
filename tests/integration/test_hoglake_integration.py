@@ -23,8 +23,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from pyarrow import fs as pafs
+from pyhoglake import IncarnationChangedError, NotFoundError, ValidationError
 
-from millpond.hoglake import HoglakeSink
+from millpond.hoglake import HoglakeSink, is_retryable
 from millpond.main import _flush
 from tests.hoglake_stack import stack
 
@@ -62,7 +63,7 @@ class HogCfg:
     hoglake_s3_region: str | None = None
     hoglake_partition_by: tuple[tuple[str, str, int | None], ...] | None = None
     hoglake_max_retry_count: int = 8
-    hoglake_request_timeout_s: float = 30.0
+    hoglake_request_timeout_s: float = 45.0
     sort_by: tuple[str, ...] | None = None
     ordinal: int = 0
     table_label: str = field(default="events")
@@ -268,8 +269,13 @@ class TestBootstrap:
         sink = HoglakeSink(cfg)
         try:
             for _ in range(2):
-                with pytest.raises(Exception):  # noqa: B017 - 422 from the server, then again
+                # A 422 the server returns for the alter, surfaced as the
+                # sink's own refusal — and a PERMANENT one, so main.py's
+                # retry loop crashes the pod with the message instead of
+                # spending eight attempts on a config typo.
+                with pytest.raises(ValidationError) as caught:
                     sink.write(_batch(2))
+                assert is_retryable(caught.value) is False
                 sink.reset_caches()
         finally:
             sink.close()
@@ -425,8 +431,13 @@ class TestRestartAndReset:
         try:
             sink.write(_batch(2))
             _table(client, cfg).drop()
-            with pytest.raises(Exception):  # noqa: B017 - incarnation/404, backend-typed
+            # The cached handle points at a dead incarnation: either the
+            # client's pre-flight re-resolve or the server's
+            # expected_table_uuid guard refuses it. Both are retryable —
+            # reset_caches adopts the live table on the next attempt.
+            with pytest.raises((IncarnationChangedError, NotFoundError)) as caught:
                 sink.write(_batch(2))
+            assert is_retryable(caught.value) is True
             sink.reset_caches()
             assert sink.write(_batch(3)) == 3
         finally:
@@ -523,10 +534,14 @@ class TestLostCommitResponse:
             registered = {f.path for f in _table(client, cfg).files()}
         finally:
             sink.close()
-        objects = _list_objects(DATA_PATH, cfg)
+        objects = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+        # Guard the subset assertion: an empty listing (a wrong prefix, a
+        # renamed layout) satisfies `<=` against anything and proves
+        # nothing.
+        assert len(objects) == len(registered) == 2  # the bootstrap write plus the retried flush
         # Every object under the table's data path is a registered file:
         # no orphan from a second upload.
-        assert {o for o in objects if o.endswith(".parquet")} <= {p.removeprefix("s3://") for p in registered}
+        assert objects <= {p.removeprefix("s3://") for p in registered}
 
 
 class TestNewProcessReplay:
@@ -604,6 +619,57 @@ class TestNewProcessReplay:
         assert _record_count(client, cfg) == 5, "the recreated table answered from its predecessor's receipt"
 
 
+class TestSpecChangeUnderAPreparedPayload:
+    """A registered file carries the partition VALUES the client computed
+    and is stamped with whatever spec_id the table has when the commit
+    lands. The server never opens the file, so if the spec changes to
+    another of the SAME ARITY between prepare and commit, the file is
+    registered as (say) bucketed while carrying identity values — and
+    every scan prunes it wrongly, forever, with nothing anywhere saying
+    so."""
+
+    def test_a_same_arity_respec_mid_flight_refuses_the_commit(self, hog_stack, client, monkeypatch):
+        from pyhoglake import ops
+
+        from millpond.hoglake import HoglakeSink as Sink
+
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = Sink(cfg)
+        original = Sink._prepare
+
+        def prepare_then_respec(self, table, batch, key):
+            payload = original(self, table, batch, key)
+            # Another operator re-specs the table while the upload is in
+            # flight. Same arity, so the server's commit-side validation
+            # (which checks arity and nothing else) would accept it.
+            live = _table(client, cfg)
+            fid = {c.name: c.field_id for c in live.info().columns}["team_id"]
+            live.alter([ops.set_partition_spec([ops.partition_field(fid, "bucket", 8)])])
+            return payload
+
+        try:
+            sink.write(_batch(3, teams=(1,)))
+            assert _record_count(client, cfg) == 3
+            monkeypatch.setattr(Sink, "_prepare", prepare_then_respec)
+            with pytest.raises(RuntimeError, match="partition spec") as caught:
+                sink.write(_batch(3, teams=(2,)))
+            # Retryable: a REBUILT flush computes its values under the new
+            # spec and publishes cleanly, unlike the sink's other stops.
+            assert is_retryable(caught.value) is True
+        finally:
+            monkeypatch.undo()
+            sink.close()
+        # Nothing was registered under the wrong spec.
+        assert _record_count(client, cfg) == 3
+        # And the rebuild, under the live spec, lands.
+        sink2 = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table, hoglake_partition_by=(("team_id", "bucket", 8),)))
+        try:
+            assert sink2.write(_batch(3, teams=(2,))) == 3
+        finally:
+            sink2.close()
+        assert _record_count(client, cfg) == 6
+
+
 class TestAtLeastOnce:
     def test_server_outage_no_offset_advance_then_clean_retry(self, hog_stack, client):
         """The at-least-once sequencing against a real outage: stop the
@@ -621,7 +687,9 @@ class TestAtLeastOnce:
 
             stack.compose("stop", "hoglake-server")
             try:
-                with pytest.raises(Exception):
+                # Connection refused, through the full retry budget: a
+                # transport failure, never a verdict on the request.
+                with pytest.raises(httpx.HTTPError):
                     _flush(sink, cfg, kafka, batch, batch.nbytes, 4, offsets, 1.0)
                 kafka.commit.assert_not_called()
             finally:

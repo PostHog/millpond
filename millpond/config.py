@@ -4,7 +4,11 @@ import re
 from dataclasses import dataclass
 
 from millpond import arrow_converter
-from millpond.schema import SAFE_IDENTIFIER, VARIANT_COLUMN_SUFFIX
+
+# Read from the sink seam, NOT from millpond.schema: schema.py imports
+# duckdb, and config.py is loaded by every pod including the hoglake
+# ones, which have no DuckDB in their world at all.
+from millpond.sink import SAFE_IDENTIFIER, VARIANT_COLUMN_SUFFIX
 
 _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -711,6 +715,71 @@ def _parse_hoglake_partition_by(raw: str) -> tuple[tuple[str, str, int | None], 
     return tuple(fields)
 
 
+# The liveness deadline the write path has to fit inside:
+# server.HealthState.max_poll_age_s. record_poll() runs only between
+# consume() calls, so every second a flush spends retrying is a second
+# the probe sees no poll.
+_LIVENESS_BUDGET_S = 480.0
+# main.py's backoff ladder: base 1s, doubling, capped at 30s a step,
+# plus up to 25% jitter on each step.
+_BACKOFF_BASE_S = 1.0
+_BACKOFF_CAP_S = 30.0
+_BACKOFF_JITTER = 0.25
+
+
+def _hoglake_worst_case_flush_s(max_retries: int, timeout_s: float) -> float:
+    """Longest a single sink.write() can take: every attempt spending its
+    full request timeout, with the whole backoff ladder between them."""
+    ladder = sum(min(_BACKOFF_BASE_S * (2**attempt), _BACKOFF_CAP_S) for attempt in range(max(0, max_retries - 1)))
+    return max_retries * timeout_s + ladder * (1 + _BACKOFF_JITTER)
+
+
+def _check_hoglake_liveness_budget(max_retries: int, timeout_s: float) -> None:
+    """Refuse a retry budget that can outlive the liveness deadline.
+
+    HOGLAKE_MAX_RETRY_COUNT was unbounded while its interaction with
+    liveness was documented in a comment — so the documented trap was
+    one values-file edit away, and springing it looks like a pod
+    SIGKILLed mid-flush with no explanation in its own logs. The
+    arithmetic that comment describes is now the check.
+    """
+    worst = _hoglake_worst_case_flush_s(max_retries, timeout_s)
+    if worst <= _LIVENESS_BUDGET_S:
+        return
+    raise RuntimeError(
+        f"HOGLAKE_MAX_RETRY_COUNT={max_retries} with HOGLAKE_REQUEST_TIMEOUT_S={timeout_s} allows a "
+        f"single flush to spend up to {worst:.0f}s inside sink.write(), past the {_LIVENESS_BUDGET_S:.0f}s "
+        f"liveness deadline (server.HealthState.max_poll_age_s): the consume loop is single threaded, so "
+        f"the pod would be killed mid-flush rather than crashing with an error. Lower either knob."
+    )
+
+
+_S3_URI = re.compile(r"^s3://[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9](/.*)?$")
+
+
+def _hoglake_data_path() -> str | None:
+    """HOGLAKE_DATA_PATH, validated as an s3:// URI.
+
+    This value is only read when the catalog does not exist yet, and
+    then it is FROZEN into the catalog row as the root every data file
+    of every table under it is written beneath. The server has no
+    delete-catalog route, so a typo does not fail — it mints a
+    permanently unusable catalog under a name the operator now cannot
+    reuse, and the first sign of it is an S3 error on the first flush.
+    Cheap to check here; impossible to undo there.
+    """
+    raw = os.environ.get("HOGLAKE_DATA_PATH", "").strip()
+    if not raw:
+        return None
+    if not _S3_URI.match(raw):
+        raise RuntimeError(
+            f"HOGLAKE_DATA_PATH {raw!r} is not an s3:// URI (expected s3://bucket/prefix/). It is "
+            f"frozen into the catalog when millpond creates it and hoglake has no route to delete a "
+            f"catalog, so a typo here mints a permanently unusable catalog under that name."
+        )
+    return raw
+
+
 def _load_hoglake_fields() -> dict:
     """Read the HOGLAKE_* env group; validate names against the server's
     identifier rules so misconfig fails at startup, not as a 422."""
@@ -728,15 +797,33 @@ def _load_hoglake_fields() -> dict:
             )
         names[env_name] = value
 
-    # Retry budget + request timeout. The product of the two is the
+    # Retry budget + request timeout. Their product is most of the
     # worst-case time a single flush can spend inside sink.write(), and
     # the consume loop is single threaded: server.health marks the
     # process dead at max_poll_age_s=480 and record_poll only runs
-    # between consume() calls. The defaults (8 x 30s of requests, plus a
-    # backoff ladder main.py caps at 30s a step, ~330s worst case) sit
-    # inside that with room to spare. Raise both together at your peril.
+    # between consume() calls. So the two knobs are not independent, and
+    # _check_hoglake_liveness_budget refuses a combination that could
+    # outlive the liveness deadline instead of leaving the pod to be
+    # SIGKILLed mid-flush.
+    #
+    # The timeout default is 45s, not pyhoglake's 30s, because the
+    # server's own commit-lock admission bound is 30s: at an equal
+    # timeout the client gives up at the same instant the server would
+    # have answered 503 + Retry-After, so its explicit backpressure
+    # signal was nearly unreachable and surfaced as a transport-uncertain
+    # failure instead — the one outcome that has to hold a prepared
+    # payload and resend it blind.
+    #
+    # The defaults (8 attempts x 45s, plus a jittered ladder main.py caps
+    # at 30s a step) come to ~474s of the 480s budget. That is the
+    # all-eight-attempts-black-hole case and it is deliberately close to
+    # the line: a catalog that has not answered a single request in eight
+    # minutes is one this pod should be dying over. What the check
+    # prevents is the same arithmetic going unnoticed when an operator
+    # raises either knob.
     max_retries = _positive_int("HOGLAKE_MAX_RETRY_COUNT", 8)
-    timeout_s = _positive_float("HOGLAKE_REQUEST_TIMEOUT_S", 30.0)
+    timeout_s = _positive_float("HOGLAKE_REQUEST_TIMEOUT_S", 45.0)
+    _check_hoglake_liveness_budget(max_retries, timeout_s)
 
     partition_raw = os.environ.get("HOGLAKE_PARTITION_BY", "").strip()
     if not partition_raw and os.environ.get("DUCKLAKE_PARTITION_BY", "").strip():
@@ -765,7 +852,7 @@ def _load_hoglake_fields() -> dict:
         "hoglake_catalog": catalog,
         "hoglake_namespace": names["HOGLAKE_NAMESPACE"],
         "hoglake_table": names["HOGLAKE_TABLE"],
-        "hoglake_data_path": os.environ.get("HOGLAKE_DATA_PATH", "").strip() or None,
+        "hoglake_data_path": _hoglake_data_path(),
         "hoglake_s3_endpoint": os.environ.get("HOGLAKE_S3_ENDPOINT", "").strip() or None,
         "hoglake_s3_access_key": _require("HOGLAKE_S3_ACCESS_KEY"),
         "hoglake_s3_secret_key": _require("HOGLAKE_S3_SECRET_KEY"),

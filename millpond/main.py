@@ -1,4 +1,5 @@
 import logging
+import random
 import signal
 import sys
 import time
@@ -50,6 +51,11 @@ _COMMIT_BASE_DELAY_S = 0.5
 # process dead at max_poll_age_s=480, and record_poll only runs between
 # consume() calls. 30s keeps the whole retry ladder well inside that.
 _RETRY_AFTER_MAX_S = 30.0
+# Upward spread on every backoff step, as a fraction of the step. A
+# fleet refused by one 503 otherwise wakes in lockstep and re-forms the
+# convoy it was backing off from, on every rung of the ladder. Applied
+# upward only, so a server-supplied Retry-After stays a floor.
+_RETRY_JITTER = 0.25
 
 # Module-level set tracking which "missing sort fields" patterns we've
 # already warned about. Without this, a misconfigured sort against a
@@ -368,22 +374,37 @@ def _write_retry_budget(sink) -> tuple[int, float]:
 
 
 def _retry_delay(sink, attempt: int, base: float) -> float:
-    """Exponential backoff, overridden by a server-supplied Retry-After.
+    """Exponential backoff, FLOORED by a server-supplied Retry-After and
+    spread by jitter.
 
     Hoglake's commit admission control answers 503 with `Retry-After`;
     the server knows how long the queue actually is and our doubling
     curve does not. A sink may expose the last hint via
-    `retry_after_hint()` (seconds, or None). Clamped to
-    _RETRY_AFTER_MAX_S so a misbehaving/hostile header cannot park the
-    consume loop past the liveness deadline.
+    `retry_after_hint()` (seconds, or None).
+
+    The hint is a floor, not a replacement. Hoglake's hint is the
+    hardcoded string "1", so letting it REPLACE the curve collapsed the
+    whole ladder to one-second steps: eight attempts against a convoyed
+    catalog, spent in about eight seconds, then a crash — which adds a
+    cold pod to the convoy it was backing off from. Taking the larger of
+    the two keeps the exponential shape under sustained backpressure and
+    still never returns before the server asked to be asked again.
+
+    Jitter is added upward (never below the floor) so that a fleet of
+    pods refused by the same 503 does not wake in lockstep and re-form
+    the convoy on every rung.
+
+    Both are clamped to _RETRY_AFTER_MAX_S: the consume loop is single
+    threaded, so a backoff is also a poll gap, and a misbehaving or
+    hostile header must not park it past the liveness deadline.
     """
     delay = min(base * (2**attempt), _RETRY_AFTER_MAX_S)
     hint = getattr(sink, "retry_after_hint", None)
     if hint is not None:
         seconds = hint()
         if seconds is not None:
-            delay = max(0.0, min(float(seconds), _RETRY_AFTER_MAX_S))
-    return delay
+            delay = max(delay, min(float(seconds), _RETRY_AFTER_MAX_S))
+    return min(delay + random.uniform(0.0, delay * _RETRY_JITTER), _RETRY_AFTER_MAX_S)
 
 
 def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", write_kwargs=None):

@@ -62,6 +62,19 @@ if TYPE_CHECKING:
 # with a `records_skipped_total{reason="unsafe_field_name"}` metric bump.
 SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
+# Dual-write suffix for VARIANT companion columns. Source `properties` →
+# sink `properties_variant`. DuckLake-only behaviour, but the NAME lives
+# here with the other shared vocabulary because config.py validates
+# against it: schema.py re-exports both, and schema.py imports duckdb, so
+# config.py reading them from there made every hoglake pod load duckdb at
+# startup for two string constants.
+VARIANT_COLUMN_SUFFIX = "_variant"
+
+
+def variant_column_name(source: str) -> str:
+    """Derived VARIANT companion name for a dual-written source column."""
+    return f"{source}{VARIANT_COLUMN_SUFFIX}"
+
 
 def check_reserved_collision(
     batch_schema: pa.Schema,

@@ -26,12 +26,11 @@ SAFE_IDENTIFIER = sink.SAFE_IDENTIFIER
 # Dual-write suffix for VARIANT companion columns. Source `properties` →
 # sink `properties_variant`. Shared with ducklake.write so the ADD COLUMN
 # path and the INSERT projection never disagree on the derived name.
-VARIANT_COLUMN_SUFFIX = "_variant"
-
-
-def variant_column_name(source: str) -> str:
-    """Derived VARIANT companion name for a dual-written source column."""
-    return f"{source}{VARIANT_COLUMN_SUFFIX}"
+# Owned by the sink seam (config.py validates against it and must not
+# import duckdb to do so); re-exported here for this module's historical
+# importers.
+VARIANT_COLUMN_SUFFIX = sink.VARIANT_COLUMN_SUFFIX
+variant_column_name = sink.variant_column_name
 
 
 log = logging.getLogger(__name__)
