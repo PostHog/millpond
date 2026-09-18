@@ -549,12 +549,12 @@ class HoglakeSink:
         equivalent). Name matching is EXACT — hoglake identifiers are
         case-sensitive, unlike DuckDB's case-insensitive resolution.
         """
-        failed: list[str] = []
+        failed: list[str] = list(
+            self._add_columns(table, [f for f in batch.schema if f.name not in self._live_columns])
+        )
         for field in batch.schema:
             live = self._live_columns.get(field.name)
             if live is None:
-                if not self._add_column(table, field):
-                    failed.append(field.name)
                 continue
             try:
                 want, _params = arrow_type_to_coltype(field.type)
@@ -591,6 +591,59 @@ class HoglakeSink:
                     pa.nulls(batch.num_rows, type=arrow_field.type),
                 )
         return batch
+
+    def _add_columns(self, table, fields: list[pa.Field]) -> list[str]:
+        """ADD every new column in ONE alter; return the names that are
+        still not live afterwards (the caller drops those from the batch).
+
+        `/alter` applies its op list in order, atomically, as a single
+        DDL commit — one snapshot, one schema-version bump, one trip
+        through the per-catalog commit lock. Issuing a commit per column
+        multiplied that traffic by the width of the schema drift, and
+        gave every column its own chance to lose the concurrent-DDL race
+        against another pod doing the same thing.
+
+        The batch is an optimization and never a semantics change: one
+        unacceptable column fails the whole transaction (nothing
+        applies), so a failure falls back to the per-column loop, where
+        each column degrades on its own exactly as before.
+        """
+        if not fields:
+            return []
+        add_ops: list[AlterOp] = []
+        addable: list[pa.Field] = []
+        failed: list[str] = []
+        for field in fields:
+            try:
+                type_name, _ = arrow_type_to_coltype(field.type)
+            except UnsupportedTypeError:
+                # Dropped before the alter is built: a column hoglake has
+                # no type for must not take the other columns' DDL down
+                # with it.
+                log.warning(
+                    "Column %r has no hoglake type mapping (%s); dropping it this flush", field.name, field.type
+                )
+                metrics.errors_total.labels(type="schema").inc()
+                failed.append(field.name)
+                continue
+            log.info("Schema evolution: adding hoglake column %s (%s)", field.name, type_name)
+            add_ops.append(ops.add_column(field.name, field.type))
+            addable.append(field)
+
+        if not add_ops:
+            return failed
+        if len(add_ops) > 1:
+            try:
+                info = table.alter(add_ops)
+                self._adopt_columns(info.columns)
+                metrics.schema_columns_added_total.inc(len(add_ops))
+                return failed
+            except HoglakeError as e:
+                log.info("Batched add of %d column(s) failed (%s); retrying per column", len(add_ops), e)
+        for field in addable:
+            if not self._add_column(table, field):
+                failed.append(field.name)
+        return failed
 
     def _add_column(self, table, field: pa.Field) -> bool:
         """ADD a new column; True when the column is live afterwards."""

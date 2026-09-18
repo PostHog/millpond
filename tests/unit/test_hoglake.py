@@ -566,6 +566,55 @@ class TestEvolution:
         assert "new_col" in appended.column_names
 
     @patch("millpond.hoglake.metrics")
+    def test_several_new_columns_share_one_alter(self, mock_metrics):
+        # /alter applies its op list in order, atomically, as ONE DDL
+        # commit. A column per commit multiplies the catalog's
+        # commit-lock traffic by the width of the schema drift, and each
+        # one is a separate chance to lose the concurrent-DDL race.
+        s, *_, table = _sink()
+        s.write(pa.table({"uuid": ["a"], "c1": ["x"], "c2": [1], "c3": [1.5]}))
+        add_calls = [c for c in table.alter.call_args_list if any(o.op == "add_column" for o in c.args[0])]
+        assert len(add_calls) == 1
+        assert [o.body["column"]["name"] for o in add_calls[0].args[0]] == ["c1", "c2", "c3"]
+        # One counter bump of 3, not three bumps of 1 — same total.
+        mock_metrics.schema_columns_added_total.inc.assert_called_once_with(3)
+
+    @patch("millpond.hoglake.metrics")
+    def test_batched_alter_failure_degrades_per_column(self, mock_metrics):
+        # The batch is an optimization, never a semantics change: if one
+        # column in the batch is unacceptable the whole alter fails
+        # (it is one transaction), so fall back to the per-column loop
+        # and keep the columns that CAN land.
+        s, *_, table = _sink()
+        applied = table.alter.side_effect  # the helper that mutates the mock's live columns
+
+        def alter(ops_list):
+            if len(ops_list) > 1:
+                raise ValidationError("validation", status_code=422)
+            if ops_list[0].body.get("column", {}).get("name") == "bad_col":
+                raise ValidationError("validation", status_code=422)
+            return applied(ops_list)
+
+        table.alter.side_effect = alter
+        s.write(pa.table({"uuid": ["a"], "good_col": ["x"], "bad_col": ["y"]}))
+        appended = table.append.call_args.args[0]
+        assert "good_col" in appended.column_names
+        assert "bad_col" not in appended.column_names
+        mock_metrics.errors_total.labels.assert_any_call(type="schema")
+
+    @patch("millpond.hoglake.metrics")
+    def test_unmappable_type_never_reaches_the_batch(self, mock_metrics):
+        # A column with no hoglake type mapping is dropped before the
+        # alter is built — it must not take the whole batched alter down
+        # with it.
+        s, *_, table = _sink()
+        unmappable = pa.table({"dur": pa.array([1], type=pa.duration("s"))})
+        s.write(pa.table({"uuid": ["a"], "ok_col": ["x"]}).append_column("dur", unmappable.column("dur")))
+        add_ops = [o for c in table.alter.call_args_list for o in c.args[0] if o.op == "add_column"]
+        assert [o.body["column"]["name"] for o in add_ops] == ["ok_col"]
+        assert "dur" not in table.append.call_args.args[0].column_names
+
+    @patch("millpond.hoglake.metrics")
     def test_int_promoted_to_long(self, mock_metrics):
         cols = [_col("uuid", "string", 1, 1), _col("count", "int", 2, 2), _col("_inserted_at", "timestamptz", 3, 3)]
         s, *_, table = _sink(columns=cols)
