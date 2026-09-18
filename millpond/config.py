@@ -777,6 +777,17 @@ def load() -> Config:
     sort_by = _load_sort_by()
     typed_columns = _load_typed_columns()
     variant_columns = _load_variant_columns()
+    if destination == "hoglake" and variant_columns is not None:
+        # Hoglake has no VARIANT column type; the DuckLake dual-write
+        # feature cannot port. Refuse loudly rather than silently
+        # skipping the companions — silent config no-ops are how mixed
+        # fleets rot. Revisit when hoglake grows a variant/json path
+        # millpond can target.
+        raise RuntimeError(
+            "MILLPOND_VARIANT_COLUMNS is not supported with MILLPOND_DESTINATION=hoglake "
+            "(hoglake has no VARIANT column type; events land as text). Remove the "
+            "variant config or use the ducklake destination."
+        )
 
     cfg = Config(
         destination=destination,

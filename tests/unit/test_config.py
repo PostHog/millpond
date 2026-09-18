@@ -869,6 +869,20 @@ class TestHoglakeConfig:
         with pytest.raises(RuntimeError, match=var):
             load()
 
+    def test_variant_columns_refused_for_hoglake(self, monkeypatch):
+        # Hoglake has no VARIANT column type; a configured dual-write must
+        # refuse at startup rather than silently no-op (mixed fleets rot
+        # on silent config no-ops).
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        with pytest.raises(RuntimeError, match="MILLPOND_VARIANT_COLUMNS"):
+            load()
+
+    def test_typed_columns_allowed_for_hoglake(self, monkeypatch):
+        # Typed pins act upstream in arrow_converter — destination-neutral.
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "timestamp:timestamptz")
+        cfg = load()
+        assert cfg.typed_columns == (("timestamp", "timestamptz"),)
+
     def test_hyphenated_table_accepted(self, monkeypatch):
         # hoglake identifiers allow hyphens (unlike DuckLake's table regex).
         monkeypatch.setenv("HOGLAKE_TABLE", "events-v2")

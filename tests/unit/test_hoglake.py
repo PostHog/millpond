@@ -96,6 +96,7 @@ def _mock_stack(columns):
     ns.table.return_value = table
     append_result = MagicMock()
     append_result.snapshot_id = 7
+    append_result.files = (MagicMock(),)
     table.append.return_value = append_result
     return client, catalog, ns, table
 
@@ -492,6 +493,17 @@ class TestEvolution:
         s.write(pa.table({"uuid": ["a"], "team_id": pa.array([None], type=pa.string())}))
         assert table.alter.call_count == 0
         table.append.assert_called_once()
+
+
+class TestFilesWrittenMetric:
+    @patch("millpond.hoglake.metrics")
+    def test_files_per_flush_counted(self, mock_metrics):
+        # Partitioned fanout registers one parquet per partition tuple in
+        # one commit; the file count is the compaction-debt feed rate.
+        s, *_, table = _sink()
+        table.append.return_value.files = (MagicMock(), MagicMock(), MagicMock())
+        s.write(_batch())
+        mock_metrics.hoglake_files_written_total.inc.assert_called_once_with(3)
 
 
 class TestWriteFailurePropagation:

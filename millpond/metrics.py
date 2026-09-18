@@ -216,6 +216,15 @@ _variant_write_fallback_total = Counter(
     "Flushes written string-only after the VARIANT projection failed",
     ["pipeline", "broker_source"],
 )
+# Hoglake destination only: parquet files registered per append commit.
+# Partitioned fanout writes one file per partition tuple per flush, so
+# this is the compaction-debt feed rate on the hoglake side. Stays at
+# zero for ducklake destinations (additive — no existing series change).
+_hoglake_files_written_total = Counter(
+    "millpond_hoglake_files_written_total",
+    "Parquet files registered with the hoglake catalog",
+    ["pipeline", "broker_source"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -268,6 +277,7 @@ columns_coerced_total = _columns_coerced_total
 variant_companion_columns_dropped_total = _variant_companion_columns_dropped_total
 variant_write_fallback_total = _variant_write_fallback_total
 variant_values_coerced_total = _variant_values_coerced_total
+hoglake_files_written_total = _hoglake_files_written_total
 include_values_size = _include_values_size
 include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds
 include_values_pending_removals = _include_values_pending_removals
@@ -295,7 +305,7 @@ def init(pipeline: str, broker_source: str = ""):
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total, variant_companion_columns_dropped_total
-    global variant_write_fallback_total, variant_values_coerced_total
+    global variant_write_fallback_total, variant_values_coerced_total, hoglake_files_written_total
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
@@ -348,6 +358,7 @@ def init(pipeline: str, broker_source: str = ""):
         pipeline=pipeline, broker_source=bs
     )
     variant_write_fallback_total = _variant_write_fallback_total.labels(pipeline=pipeline, broker_source=bs)
+    hoglake_files_written_total = _hoglake_files_written_total.labels(pipeline=pipeline, broker_source=bs)
     variant_values_coerced_total = _variant_values_coerced_total.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)

@@ -211,7 +211,9 @@ class HoglakeSink:
                 region=cfg.hoglake_s3_region,
             ),
         )
-        self._author = f"millpond-{cfg.ordinal}"
+        # Commit author recorded on every snapshot — the pipeline
+        # identity plus the pod ordinal, for multi-writer forensics.
+        self._author = f"millpond/{cfg.table_label}/{cfg.ordinal}"
         # Resolved lazily on first write; reset_caches() drops them so the
         # retry path re-resolves (another pod may have created/altered the
         # table, or it may have been dropped+recreated).
@@ -237,7 +239,10 @@ class HoglakeSink:
         batch = self._stamp_inserted_at(batch)
         table = self._ensure_table(batch.schema)
         batch = self._evolve_and_align(table, batch)
-        table.append(batch, author=self._author)
+        result = table.append(batch, author=self._author)
+        # One parquet per partition tuple per flush (fanout appends) —
+        # the hoglake compaction-debt feed rate.
+        metrics.hoglake_files_written_total.inc(len(result.files))
         return batch.num_rows
 
     def reset_caches(self) -> None:
