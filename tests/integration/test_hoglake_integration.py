@@ -591,6 +591,32 @@ class TestNewProcessReplay:
         # because of this process.
         kafka.commit.assert_called_once()
 
+    def test_the_reused_key_branch_reports_zero_rows_written(self, hog_stack, client):
+        """The reused-key branch, taken against the real server rather
+        than a fabricated exception.
+
+        This is the branch a unit fixture got backwards: hoglake answers
+        `{error: "validation", detail: "idempotency_key reused with a
+        different request"}`, so the sentence is in `detail` and the
+        message is the bare code. It is exercised here end to end, and
+        the thing asserted is the number that used to be wrong — a
+        writer reporting its whole batch for a range it did not publish
+        is how 8 reported rows became 3 in the lake.
+        """
+        cfg = _fresh()
+        batch = _batch(5)
+        offsets = {("events", 0): (12, 16)}
+        self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5
+
+        sink = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table))
+        try:
+            written = sink.write(batch, kafka_offsets=(("events", 0, 12, 16),))
+        finally:
+            sink.close()
+        assert written == 0, "reported rows this process did not publish"
+        assert _record_count(client, cfg) == 5
+
     def test_a_shifted_boundary_from_a_new_process_duplicates(self, hog_stack, client):
         # The honest half. The restart re-consumed the same records but
         # its flush cut at a different offset, so this is a different
