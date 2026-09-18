@@ -1134,8 +1134,26 @@ class TestHoglakeErrorLabels:
         sink.write.side_effect = [duckdb.Error("Exceeded the maximum retry count of 100"), None]
         table = pa.table({"a": [1]})
         with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
-            _write_with_retry(sink, table)
+            _write_with_retry(sink, table, destination="ducklake")
         assert mock_metrics.errors_total.labels.call_args_list[0].kwargs == {"type": "ducklake_commit_contention"}
+
+    def test_ducklake_wording_does_not_label_ducklake_on_a_hoglake_pod(self):
+        # The DuckLake contention classifier is string-matching, and a
+        # hoglake error is free to contain any of those substrings (a
+        # server-side Postgres error surfacing "duplicate key value", say).
+        # Gate it by destination so a hoglake pod can never raise a
+        # ducklake_commit_contention alert.
+        from pyhoglake import HoglakeError
+
+        sink = _make_sink()
+        sink.write.side_effect = [
+            HoglakeError("duplicate key value violates unique constraint", status_code=500),
+            None,
+        ]
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
+            _write_with_retry(sink, table, destination="hoglake")
+        assert mock_metrics.errors_total.labels.call_args_list[0].kwargs == {"type": "write_retry"}
 
 
 class TestOffsetSequencing:

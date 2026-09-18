@@ -65,6 +65,26 @@ class TestLoad:
         assert cfg.service_namespace == "millpond"
         assert cfg.service_instance_id is None
 
+    def test_http_port_default(self):
+        # The health/metrics port lives on Config with every other knob —
+        # server.start() no longer reads the environment behind config's back.
+        assert load().http_port == 8000
+
+    def test_http_port_env_override(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_HTTP_PORT", "28000")
+        assert load().http_port == 28000
+
+    def test_http_port_non_numeric_rejected(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_HTTP_PORT", "eight thousand")
+        with pytest.raises((RuntimeError, ValueError)):
+            load()
+
+    def test_group_id_default_unchanged_for_ducklake(self):
+        # Deliberately NOT prefixed with the destination: every deployed
+        # DuckLake pipeline stores its offsets under this exact group id,
+        # and changing it would replay the whole retention window.
+        assert load().group_id == "millpond-test-topic-events"
+
     def test_posthog_otlp_env_overrides(self, monkeypatch):
         monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "phc_test")
         monkeypatch.setenv("POSTHOG_LOGS_ENDPOINT", "https://eu.i.posthog.com/i/v1/logs")
@@ -812,9 +832,14 @@ class TestHoglakeConfig:
         assert cfg.partition_by is None
 
     def test_table_label_and_group_id_use_hoglake_table(self):
+        # The destination is part of the default group id on the hoglake
+        # side: a shadow deployment (same topic, same table name, other
+        # destination) must not share an offset namespace with the
+        # DuckLake pipeline it shadows — they would split the partitions
+        # between them and each would write half the rows.
         cfg = load()
         assert cfg.table_label == "events"
-        assert cfg.group_id == "millpond-test-topic-events"
+        assert cfg.group_id == "millpond-hoglake-test-topic-events"
 
     def test_optionals_default_to_none(self):
         cfg = load()

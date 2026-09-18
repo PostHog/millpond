@@ -45,6 +45,11 @@ _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
 _COMMIT_MAX_RETRIES = 3
 _COMMIT_BASE_DELAY_S = 0.5
+# Ceiling on a server-supplied Retry-After. The consume loop is single
+# threaded, so a backoff is also a poll gap: server.health marks the
+# process dead at max_poll_age_s=480, and record_poll only runs between
+# consume() calls. 30s keeps the whole retry ladder well inside that.
+_RETRY_AFTER_MAX_S = 30.0
 
 # Module-level set tracking which "missing sort fields" patterns we've
 # already warned about. Without this, a misconfigured sort against a
@@ -320,43 +325,111 @@ def _is_commit_contention(exc: BaseException) -> bool:
     )
 
 
-def _classify_write_error(exc: BaseException) -> str:
+def _classify_write_error(exc: BaseException, destination: str = "ducklake") -> str:
     """errors_total label for a failed write attempt.
 
     Hoglake commit conflicts are typed: pyhoglake's CommitConflictError
     carries `retryable=True` on the class (the server's OCC 409 —
     refresh the baseline and retry). Checked duck-typed by module name
     so main.py never imports the hoglake backend for a ducklake-only
-    deployment. DuckLake contention stays the string-matching
-    classifier (_is_commit_contention). Everything else is a plain
-    write_retry.
+    deployment.
+
+    DuckLake contention stays the string-matching classifier
+    (_is_commit_contention), GATED BY DESTINATION: those substrings are
+    generic Postgres/DuckLake wording, and a hoglake failure is free to
+    contain any of them (the hoglake control plane is a Postgres-backed
+    service too, so a 500 can carry "duplicate key value" straight
+    through). Labeling that `ducklake_commit_contention` would fire a
+    DuckLake alert from a pod that has no DuckLake. Everything else is a
+    plain write_retry.
     """
     if getattr(exc, "retryable", None) is True and type(exc).__module__.startswith("pyhoglake"):
         return "hoglake_commit_contention"
-    if _is_commit_contention(exc):
+    if destination == "ducklake" and _is_commit_contention(exc):
         return "ducklake_commit_contention"
     return "write_retry"
 
 
-def _write_with_retry(sink, consolidated):
+def _write_retry_budget(sink) -> tuple[int, float]:
+    """(max attempts, base backoff) for this sink.
+
+    The DuckLake defaults are 3 attempts / 1s base — inherited from a
+    backend that carries its OWN inner commit-retry loop
+    (`ducklake_max_retry_count`, default 100 here), so the outer three
+    attempts were never the real budget. Hoglake has no inner loop: the
+    pyhoglake client issues one request and raises. A sink may therefore
+    publish its own budget via `write_retry_budget()`; sinks that don't
+    keep the historical values.
+    """
+    budget = getattr(sink, "write_retry_budget", None)
+    if budget is None:
+        return _WRITE_MAX_RETRIES, _WRITE_BASE_DELAY_S
+    return budget()
+
+
+def _retry_delay(sink, attempt: int, base: float) -> float:
+    """Exponential backoff, overridden by a server-supplied Retry-After.
+
+    Hoglake's commit admission control answers 503 with `Retry-After`;
+    the server knows how long the queue actually is and our doubling
+    curve does not. A sink may expose the last hint via
+    `retry_after_hint()` (seconds, or None). Clamped to
+    _RETRY_AFTER_MAX_S so a misbehaving/hostile header cannot park the
+    consume loop past the liveness deadline.
+    """
+    delay = base * (2**attempt)
+    hint = getattr(sink, "retry_after_hint", None)
+    if hint is not None:
+        seconds = hint()
+        if seconds is not None:
+            delay = max(0.0, min(float(seconds), _RETRY_AFTER_MAX_S))
+    return delay
+
+
+def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", write_kwargs=None):
     """Write to the sink with exponential backoff on transient failures.
 
     Returns the record count the sink actually wrote (0 when it skipped the
     batch whole, e.g. every column was a VARIANT companion collision).
+
+    `write_kwargs` is the per-call escape hatch for backends that need to
+    know WHICH batch this is, not just what is in it (the icebox sink
+    took its Kafka offsets this way at tag `final-iceberg`).
+    DuckLakeSink.write takes the batch alone, so the default is empty.
+    The same kwargs go to every attempt — a retry must be recognizable as
+    the same flush, not merely a similar one.
+
+    A sink may also declare a failure non-retryable via `is_retryable()`
+    (a permanent 422 is not worth three attempts and a backoff; crash the
+    pod now and let the operator see it), and may publish its own retry
+    budget and Retry-After hint.
     """
-    for attempt in range(_WRITE_MAX_RETRIES):
+    write_kwargs = write_kwargs or {}
+    max_attempts, base_delay = _write_retry_budget(sink)
+    classify_retryable = getattr(sink, "is_retryable", None)
+    for attempt in range(max_attempts):
         try:
-            return sink.write(consolidated)
+            return sink.write(consolidated, **write_kwargs)
         except Exception as exc:
-            error_type = _classify_write_error(exc)
+            error_type = _classify_write_error(exc, destination)
             metrics.errors_total.labels(type=error_type).inc()
-            if attempt == _WRITE_MAX_RETRIES - 1:
+            permanent = classify_retryable is not None and not classify_retryable(exc)
+            if permanent:
+                log.error(
+                    "Write failed permanently (attempt %d/%d, type=%s); not retrying",
+                    attempt + 1,
+                    max_attempts,
+                    error_type,
+                    exc_info=True,
+                )
                 raise
-            delay = _WRITE_BASE_DELAY_S * (2**attempt)
+            if attempt == max_attempts - 1:
+                raise
+            delay = _retry_delay(sink, attempt, base_delay)
             log.warning(
                 "Write failed (attempt %d/%d, type=%s), retrying in %.1fs",
                 attempt + 1,
-                _WRITE_MAX_RETRIES,
+                max_attempts,
                 error_type,
                 delay,
                 exc_info=True,
@@ -382,7 +455,7 @@ def _flush(
     consolidated = _apply_sort(consolidated, cfg)
 
     t0 = time.monotonic()
-    records_written = _write_with_retry(sink, consolidated)
+    records_written = _write_with_retry(sink, consolidated, destination=cfg.destination)
     write_duration = time.monotonic() - t0
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded
@@ -517,7 +590,7 @@ def main():
     last_heartbeat = time.monotonic()
 
     try:
-        http = server.start()
+        http = server.start(cfg.http_port)
         server.health.mark_started()
         log.info("Health server started, probes passing")
 

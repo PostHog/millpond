@@ -179,6 +179,14 @@ class Config:
     # Extra librdkafka config (from KAFKA_CONSUMER_* env vars)
     kafka_config_overrides: tuple[tuple[str, str], ...]
 
+    # Port for the /metrics + /healthz + /readyz HTTP server. Lives here
+    # rather than being read from the environment inside server.start():
+    # a knob that bypasses config.py is invisible to the startup config
+    # log and to every caller holding a Config. Defaulted (rather than
+    # required) so the many Config(...) call sites in the tests keep
+    # working — 8000 is the historical port charts and probes expect.
+    http_port: int = 8000
+
     # Optional PostHog Logs export via OTLP/HTTP. ON when
     # ``posthog_project_token`` is set, OFF otherwise. Endpoint
     # defaults to the US PostHog Cloud ingress; override for EU or
@@ -721,6 +729,39 @@ def _load_hoglake_fields() -> dict:
     }
 
 
+def _load_http_port() -> int:
+    """MILLPOND_HTTP_PORT, 8000 by default (the historical port — charts
+    and probes depend on it). The override exists for test harnesses
+    running millpond as a host process next to other services."""
+    raw = os.environ.get("MILLPOND_HTTP_PORT", "").strip() or "8000"
+    try:
+        port = int(raw)
+    except ValueError:
+        raise RuntimeError(f"MILLPOND_HTTP_PORT {raw!r} is not an integer") from None
+    if not 0 <= port <= 65535:
+        raise RuntimeError(f"MILLPOND_HTTP_PORT {port} is out of range (0-65535; 0 = ephemeral)")
+    return port
+
+
+def _default_group_id(destination: str, topic: str, dest_table: str) -> str:
+    """Default Kafka group id (offset storage only — millpond assigns
+    partitions statically by pod ordinal).
+
+    The DuckLake form is frozen: `millpond-{topic}-{table}` is where every
+    deployed pipeline's offsets already live, and changing it would replay
+    the whole retention window on the next rollout. Every OTHER destination
+    carries its name in the id, so a shadow deployment — same topic, same
+    table name, different destination, which is exactly how a migration is
+    canaried — cannot share an offset namespace with the pipeline it
+    shadows. Sharing one would not duplicate work, it would SPLIT it: both
+    pods commit into the same `__consumer_offsets` keys and each ends up
+    writing part of the stream.
+    """
+    if destination == "ducklake":
+        return f"millpond-{topic}-{dest_table}"
+    return f"millpond-{destination}-{topic}-{dest_table}"
+
+
 _DESTINATIONS = ("ducklake", "hoglake")
 
 
@@ -751,7 +792,7 @@ def load() -> Config:
     else:
         destination_fields = {**_NONE_HOGLAKE_FIELDS, **_load_ducklake_fields()}
         dest_table = destination_fields["ducklake_table"]
-    group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{dest_table}")
+    group_id = os.environ.get("GROUP_ID") or _default_group_id(destination, topic, dest_table)
 
     # Collect KAFKA_CONSUMER_* env vars as librdkafka config overrides.
     # e.g. KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL -> security.protocol=SASL_SSL
@@ -805,6 +846,7 @@ def load() -> Config:
         stats_interval_ms=int(os.environ.get("STATS_INTERVAL_MS", "5000")),
         auto_offset_reset=_load_auto_offset_reset(),
         broker_source=os.environ.get("BROKER_SOURCE", "").strip().lower(),
+        http_port=_load_http_port(),
         filter_keep_field=filter_keep_field,
         filter_drop_field=filter_drop_field,
         filter_values=filter_values,
