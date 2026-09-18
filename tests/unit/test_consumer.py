@@ -133,6 +133,16 @@ class TestOnStats:
 def _make_cfg(**overrides) -> Config:
     defaults = dict(
         destination="ducklake",
+        hoglake_url=None,
+        hoglake_catalog=None,
+        hoglake_namespace=None,
+        hoglake_table=None,
+        hoglake_data_path=None,
+        hoglake_s3_endpoint=None,
+        hoglake_s3_access_key=None,
+        hoglake_s3_secret_key=None,
+        hoglake_s3_region=None,
+        hoglake_partition_by=None,
         bootstrap_servers="localhost:9092",
         topic="test-topic",
         group_id="test-group",

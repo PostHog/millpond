@@ -775,3 +775,199 @@ class TestDuckdbMemoryLimit:
         monkeypatch.setenv("DUCKDB_MEMORY_LIMIT", "")
         cfg = load()
         assert cfg.duckdb_memory_limit is None
+
+
+class TestHoglakeConfig:
+    """destination=hoglake config block: required fields, identifier rules,
+    partition-expression mapping. The DuckLake block must NOT be required
+    when hoglake is selected (and vice versa: stray HOGLAKE_* vars must
+    not affect a ducklake deployment)."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("MILLPOND_DESTINATION", "hoglake")
+        monkeypatch.setenv("HOGLAKE_URL", "http://localhost:28080")
+        monkeypatch.setenv("HOGLAKE_CATALOG", "millpond")
+        monkeypatch.setenv("HOGLAKE_NAMESPACE", "analytics")
+        monkeypatch.setenv("HOGLAKE_TABLE", "events")
+        monkeypatch.setenv("HOGLAKE_S3_ACCESS_KEY", "ak")
+        monkeypatch.setenv("HOGLAKE_S3_SECRET_KEY", "sk")
+
+    def test_loads_without_any_ducklake_vars(self):
+        cfg = load()
+        assert cfg.destination == "hoglake"
+        assert cfg.hoglake_url == "http://localhost:28080"
+        assert cfg.hoglake_catalog == "millpond"
+        assert cfg.hoglake_namespace == "analytics"
+        assert cfg.hoglake_table == "events"
+        assert cfg.hoglake_s3_access_key == "ak"
+        assert cfg.hoglake_s3_secret_key == "sk"
+        # DuckLake block untouched and unrequired.
+        assert cfg.ducklake_table is None
+        assert cfg.rds_host is None
+        assert cfg.partition_by is None
+
+    def test_table_label_and_group_id_use_hoglake_table(self):
+        cfg = load()
+        assert cfg.table_label == "events"
+        assert cfg.group_id == "millpond-test-topic-events"
+
+    def test_optionals_default_to_none(self):
+        cfg = load()
+        assert cfg.hoglake_data_path is None
+        assert cfg.hoglake_s3_endpoint is None
+        assert cfg.hoglake_s3_region is None
+        assert cfg.hoglake_partition_by is None
+
+    def test_optionals_pass_through(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_DATA_PATH", "s3://bucket/millpond/")
+        monkeypatch.setenv("HOGLAKE_S3_ENDPOINT", "http://localhost:29000")
+        monkeypatch.setenv("HOGLAKE_S3_REGION", "us-east-1")
+        cfg = load()
+        assert cfg.hoglake_data_path == "s3://bucket/millpond/"
+        assert cfg.hoglake_s3_endpoint == "http://localhost:29000"
+        assert cfg.hoglake_s3_region == "us-east-1"
+
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            "HOGLAKE_URL",
+            "HOGLAKE_CATALOG",
+            "HOGLAKE_NAMESPACE",
+            "HOGLAKE_TABLE",
+            "HOGLAKE_S3_ACCESS_KEY",
+            "HOGLAKE_S3_SECRET_KEY",
+        ],
+    )
+    def test_missing_required_var_raises_naming_it(self, missing, monkeypatch):
+        monkeypatch.delenv(missing)
+        with pytest.raises(RuntimeError, match=missing):
+            load()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Millpond",  # catalog names must start lower-case
+            "9lake",
+            "bad.dot",
+            "x" * 64,  # catalog max 63
+        ],
+    )
+    def test_bad_catalog_name_rejected(self, name, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_CATALOG", name)
+        with pytest.raises(RuntimeError, match="HOGLAKE_CATALOG"):
+            load()
+
+    @pytest.mark.parametrize("var", ["HOGLAKE_NAMESPACE", "HOGLAKE_TABLE"])
+    @pytest.mark.parametrize("name", ["9abc", "a.b", "a b", "x" * 129])
+    def test_bad_namespace_or_table_rejected(self, var, name, monkeypatch):
+        monkeypatch.setenv(var, name)
+        with pytest.raises(RuntimeError, match=var):
+            load()
+
+    def test_hyphenated_table_accepted(self, monkeypatch):
+        # hoglake identifiers allow hyphens (unlike DuckLake's table regex).
+        monkeypatch.setenv("HOGLAKE_TABLE", "events-v2")
+        cfg = load()
+        assert cfg.hoglake_table == "events-v2"
+
+    def test_stray_hoglake_vars_ignored_for_ducklake(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "ducklake")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+        # Even a malformed hoglake partition expression must not matter.
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "truncate(")
+        cfg = load()
+        assert cfg.destination == "ducklake"
+        assert cfg.hoglake_url is None
+        assert cfg.hoglake_partition_by is None
+
+
+class TestHoglakePartitionBy:
+    """HOGLAKE_PARTITION_BY maps millpond's partition-expression grammar to
+    hoglake's transform vocabulary (identity, year, month, day, hour,
+    bucket) AT STARTUP. Unmappable expressions are refused with a clear
+    error — never deferred to a per-batch failure."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("MILLPOND_DESTINATION", "hoglake")
+        monkeypatch.setenv("HOGLAKE_URL", "http://localhost:28080")
+        monkeypatch.setenv("HOGLAKE_CATALOG", "millpond")
+        monkeypatch.setenv("HOGLAKE_NAMESPACE", "analytics")
+        monkeypatch.setenv("HOGLAKE_TABLE", "events")
+        monkeypatch.setenv("HOGLAKE_S3_ACCESS_KEY", "ak")
+        monkeypatch.setenv("HOGLAKE_S3_SECRET_KEY", "sk")
+
+    def test_bare_column_is_identity(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "team_id")
+        cfg = load()
+        assert cfg.hoglake_partition_by == (("team_id", "identity", None),)
+
+    def test_temporal_transforms(self, monkeypatch):
+        monkeypatch.setenv(
+            "HOGLAKE_PARTITION_BY",
+            "year(_inserted_at), month(_inserted_at), day(_inserted_at), hour(_inserted_at)",
+        )
+        cfg = load()
+        assert cfg.hoglake_partition_by == (
+            ("_inserted_at", "year", None),
+            ("_inserted_at", "month", None),
+            ("_inserted_at", "day", None),
+            ("_inserted_at", "hour", None),
+        )
+
+    def test_bucket_with_param(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "bucket(team_id, 16)")
+        cfg = load()
+        assert cfg.hoglake_partition_by == (("team_id", "bucket", 16),)
+
+    def test_mixed_expression(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", "team_id,month(_inserted_at)")
+        cfg = load()
+        assert cfg.hoglake_partition_by == (
+            ("team_id", "identity", None),
+            ("_inserted_at", "month", None),
+        )
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "truncate(ts)",  # client-side-only transform; server refuses it
+            "void(ts)",
+            "date_trunc(day, ts)",
+        ],
+    )
+    def test_unknown_transform_refused_listing_vocabulary(self, expr, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", expr)
+        with pytest.raises(RuntimeError, match="identity, year, month, day, hour, bucket"):
+            load()
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "year(",  # unbalanced
+            "year()",  # no column
+            "year(a,b)",  # arity
+            "bucket(team_id)",  # bucket needs a param
+            "bucket(team_id, 0)",  # param must be positive
+            "bucket(team_id, x)",  # param must be an int
+            "hour(bad.col)",  # unsafe column name
+            ",",  # empty entries only
+        ],
+    )
+    def test_malformed_expression_refused(self, expr, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_PARTITION_BY", expr)
+        with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+            load()

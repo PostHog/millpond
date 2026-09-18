@@ -11,6 +11,19 @@ _SAFE_TABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 # Shared with ducklake._validate_partition_expr — keep in sync or import from here.
 SAFE_PARTITION_EXPR = re.compile(r"^[a-zA-Z0-9_(),\s]+$")
 
+# Hoglake identifier rules, mirrored from the server's OpenAPI spec /
+# schema CHECKs so a bad name fails at startup instead of as a 422 at
+# the first flush. Namespace/table: ^[A-Za-z_][A-Za-z0-9_-]{0,127}$.
+# Catalog names are stricter (lower-case start, max 63).
+_HOGLAKE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
+_HOGLAKE_CATALOG_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
+
+# The server's partition-transform vocabulary (PartitionField.transform in
+# the hoglake OpenAPI spec). NB: pyhoglake also implements `truncate`
+# client-side, but the server does not accept it yet — refuse it here
+# rather than 422 per commit.
+_HOGLAKE_TRANSFORMS = ("identity", "year", "month", "day", "hour", "bucket")
+
 log = logging.getLogger(__name__)
 
 
@@ -31,16 +44,21 @@ class Config:
     replica_count: int
     ordinal: int
 
-    # DuckLake destination
-    ducklake_schema: str
-    ducklake_table: str
-    ducklake_data_path: str
-    ducklake_connection: str
-    rds_host: str
-    rds_port: str
-    rds_database: str
-    rds_username: str
-    rds_password: str
+    # DuckLake destination — required when destination == "ducklake",
+    # else None. Kept as `str | None` rather than a tagged union because
+    # the load-time `if destination == ...` branch already enforces
+    # presence of the right subset, and the Sink constructors raise
+    # RuntimeError on missing fields (so `python -O` doesn't strip the
+    # guards).
+    ducklake_schema: str | None
+    ducklake_table: str | None
+    ducklake_data_path: str | None
+    ducklake_connection: str | None
+    rds_host: str | None
+    rds_port: str | None
+    rds_database: str | None
+    rds_username: str | None
+    rds_password: str | None
     partition_by: str | None  # e.g. "year(timestamp),month(timestamp),day(timestamp),hour(timestamp)"
 
     # DuckLake commit-retry budget. DuckLake's default is 10, which is not
@@ -49,7 +67,7 @@ class Config:
     # 10 retries quickly and surface as PK collisions on
     # ducklake_snapshot_pkey. Loaded from DUCKLAKE_MAX_RETRY_COUNT with a
     # 100 default (the value DuckLake's own error message suggests).
-    ducklake_max_retry_count: int
+    ducklake_max_retry_count: int | None
 
     # Optional DuckDB memory_limit (e.g. "6GB"). Unset, DuckDB budgets
     # ~80% of the cgroup limit and competes with the Arrow pending buffer
@@ -58,6 +76,28 @@ class Config:
     # on-disk database file (the /tmp emptyDir in k8s) instead. Loaded
     # from DUCKDB_MEMORY_LIMIT; None preserves the default behavior.
     duckdb_memory_limit: str | None
+
+    # Hoglake destination — required when destination == "hoglake",
+    # else None. The catalog control plane is addressed by URL; the
+    # writer path (pyhoglake) writes parquet to object storage itself,
+    # so it needs its own S3 credentials, independent of the DuckLake
+    # DUCKDB_S3_* env vars (which ducklake.connect reads directly).
+    hoglake_url: str | None
+    hoglake_catalog: str | None
+    hoglake_namespace: str | None
+    hoglake_table: str | None
+    # Optional: when set, a missing catalog is created with this data
+    # path at first write. When unset, a missing catalog is a startup
+    # error (catalog provisioning stays an ops decision).
+    hoglake_data_path: str | None
+    hoglake_s3_endpoint: str | None  # e.g. http://localhost:29000 for MinIO; None = AWS
+    hoglake_s3_access_key: str | None
+    hoglake_s3_secret_key: str | None
+    hoglake_s3_region: str | None
+    # Parsed HOGLAKE_PARTITION_BY: ordered (column, transform, param)
+    # triples, validated against the server's transform vocabulary at
+    # load() — an unmappable expression refuses startup, never a batch.
+    hoglake_partition_by: tuple[tuple[str, str, int | None], ...] | None
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
@@ -163,6 +203,8 @@ class Config:
     def table_label(self) -> str:
         """Single human-readable identifier for the destination table.
         Used in metrics pipeline labels and the Kafka client.id."""
+        if self.destination == "hoglake":
+            return self.hoglake_table or "unknown"
         return self.ducklake_table or "unknown"
 
 
@@ -525,7 +567,161 @@ def _load_ducklake_fields() -> dict[str, str | None]:
     }
 
 
-_DESTINATIONS = ("ducklake",)
+# The full env-var surface of the inactive destination is nulled rather
+# than loaded so stray vars from the other backend can never affect a
+# deployment (mirrors the stray-ICEBERG_* posture after that removal).
+_NONE_DUCKLAKE_FIELDS: dict = dict.fromkeys(
+    (
+        "ducklake_schema",
+        "ducklake_table",
+        "ducklake_data_path",
+        "ducklake_connection",
+        "rds_host",
+        "rds_port",
+        "rds_database",
+        "rds_username",
+        "rds_password",
+        "partition_by",
+        "ducklake_max_retry_count",
+        "duckdb_memory_limit",
+    )
+)
+_NONE_HOGLAKE_FIELDS: dict = dict.fromkeys(
+    (
+        "hoglake_url",
+        "hoglake_catalog",
+        "hoglake_namespace",
+        "hoglake_table",
+        "hoglake_data_path",
+        "hoglake_s3_endpoint",
+        "hoglake_s3_access_key",
+        "hoglake_s3_secret_key",
+        "hoglake_s3_region",
+        "hoglake_partition_by",
+    )
+)
+
+
+def _split_top_level_commas(raw: str) -> list[str]:
+    """Split on commas outside parentheses, so `bucket(team_id, 16)` stays
+    one entry. Blank entries are dropped (trailing commas tolerated)."""
+    entries: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in raw:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            entries.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    entries.append("".join(current).strip())
+    return [e for e in entries if e]
+
+
+_HOGLAKE_PARTITION_CALL = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(.*?)\s*\)$")
+
+
+def _parse_hoglake_partition_by(raw: str) -> tuple[tuple[str, str, int | None], ...]:
+    """Parse HOGLAKE_PARTITION_BY into ordered (column, transform, param)
+    triples against the server's transform vocabulary.
+
+    Grammar (comma-separated entries):
+      - `col`                → identity(col)
+      - `identity(col)`      → identity(col)
+      - `year(col)` / `month(col)` / `day(col)` / `hour(col)`
+      - `bucket(col, N)`     → bucket with a positive integer param
+
+    Everything else is refused HERE, at startup, with the vocabulary in
+    the message — a partition spec the server would 422 must never make
+    it to the first flush. Column names are held to SAFE_IDENTIFIER (the
+    same gate the write path applies per field).
+    """
+
+    def _bad(entry: str, why: str) -> RuntimeError:
+        return RuntimeError(
+            f"HOGLAKE_PARTITION_BY entry {entry!r} {why}; supported forms: "
+            f"col | transform(col) | bucket(col, N) with transforms "
+            f"{', '.join(_HOGLAKE_TRANSFORMS)}"
+        )
+
+    entries = _split_top_level_commas(raw)
+    if not entries:
+        raise RuntimeError("HOGLAKE_PARTITION_BY is set but contains no entries")
+
+    fields: list[tuple[str, str, int | None]] = []
+    seen: set[tuple[str, str, int | None]] = set()
+    for entry in entries:
+        call = _HOGLAKE_PARTITION_CALL.match(entry)
+        if call is None:
+            if "(" in entry or ")" in entry:
+                raise _bad(entry, "is malformed")
+            transform, column, param = "identity", entry, None
+        else:
+            transform = call.group(1).lower()
+            args = [a.strip() for a in call.group(2).split(",")] if call.group(2) else []
+            if transform not in _HOGLAKE_TRANSFORMS:
+                raise _bad(entry, f"uses unknown transform {transform!r}")
+            if transform == "bucket":
+                if len(args) != 2:
+                    raise _bad(entry, "must be bucket(col, N)")
+                column = args[0]
+                try:
+                    param = int(args[1])
+                except ValueError:
+                    raise _bad(entry, f"has non-integer bucket count {args[1]!r}") from None
+                if param <= 0:
+                    raise _bad(entry, f"has non-positive bucket count {param}")
+            else:
+                if len(args) != 1 or not args[0]:
+                    raise _bad(entry, f"must be {transform}(col)")
+                column, param = args[0], None
+        if not SAFE_IDENTIFIER.match(column):
+            raise _bad(entry, f"has unsafe column name {column!r} (must match [a-zA-Z_][a-zA-Z0-9_]*)")
+        triple = (column, transform, param)
+        if triple in seen:
+            raise _bad(entry, "is duplicated")
+        seen.add(triple)
+        fields.append(triple)
+    return tuple(fields)
+
+
+def _load_hoglake_fields() -> dict:
+    """Read the HOGLAKE_* env group; validate names against the server's
+    identifier rules so misconfig fails at startup, not as a 422."""
+    catalog = _require("HOGLAKE_CATALOG")
+    if not _HOGLAKE_CATALOG_NAME.match(catalog):
+        raise RuntimeError(
+            f"HOGLAKE_CATALOG {catalog!r} is not a valid hoglake catalog name (must match [a-z][a-z0-9_-]{{0,62}})"
+        )
+    names = {}
+    for env_name in ("HOGLAKE_NAMESPACE", "HOGLAKE_TABLE"):
+        value = _require(env_name)
+        if not _HOGLAKE_IDENTIFIER.match(value):
+            raise RuntimeError(
+                f"{env_name} {value!r} is not a valid hoglake identifier (must match [A-Za-z_][A-Za-z0-9_-]{{0,127}})"
+            )
+        names[env_name] = value
+
+    partition_raw = os.environ.get("HOGLAKE_PARTITION_BY", "").strip()
+    return {
+        "hoglake_url": _require("HOGLAKE_URL"),
+        "hoglake_catalog": catalog,
+        "hoglake_namespace": names["HOGLAKE_NAMESPACE"],
+        "hoglake_table": names["HOGLAKE_TABLE"],
+        "hoglake_data_path": os.environ.get("HOGLAKE_DATA_PATH", "").strip() or None,
+        "hoglake_s3_endpoint": os.environ.get("HOGLAKE_S3_ENDPOINT", "").strip() or None,
+        "hoglake_s3_access_key": _require("HOGLAKE_S3_ACCESS_KEY"),
+        "hoglake_s3_secret_key": _require("HOGLAKE_S3_SECRET_KEY"),
+        "hoglake_s3_region": os.environ.get("HOGLAKE_S3_REGION", "").strip() or None,
+        "hoglake_partition_by": _parse_hoglake_partition_by(partition_raw) if partition_raw else None,
+    }
+
+
+_DESTINATIONS = ("ducklake", "hoglake")
 
 
 def load() -> Config:
@@ -547,8 +743,15 @@ def load() -> Config:
     if ordinal >= replica_count:
         raise RuntimeError(f"Ordinal {ordinal} >= REPLICA_COUNT {replica_count}")
 
-    ducklake_fields = _load_ducklake_fields()
-    group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{ducklake_fields['ducklake_table']}")
+    # Load only the active destination's env group; the inactive one is
+    # all-None so stray vars from the other backend can never leak in.
+    if destination == "hoglake":
+        destination_fields = {**_NONE_DUCKLAKE_FIELDS, **_load_hoglake_fields()}
+        dest_table = destination_fields["hoglake_table"]
+    else:
+        destination_fields = {**_NONE_HOGLAKE_FIELDS, **_load_ducklake_fields()}
+        dest_table = destination_fields["ducklake_table"]
+    group_id = os.environ.get("GROUP_ID", f"millpond-{topic}-{dest_table}")
 
     # Collect KAFKA_CONSUMER_* env vars as librdkafka config overrides.
     # e.g. KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL -> security.protocol=SASL_SSL
@@ -582,7 +785,7 @@ def load() -> Config:
         group_id=group_id,
         replica_count=replica_count,
         ordinal=ordinal,
-        **ducklake_fields,
+        **destination_fields,
         flush_size=int(os.environ.get("FLUSH_SIZE", "104857600")),
         flush_interval_ms=int(os.environ.get("FLUSH_INTERVAL_MS", "60000")),
         fetch_min_bytes=int(os.environ.get("FETCH_MIN_BYTES", "1048576")),
@@ -615,14 +818,20 @@ def load() -> Config:
     )
 
     log.info(
-        "Config: topic=%s schema=%s table=%s ordinal=%d/%d group_id=%s",
+        "Config: destination=%s topic=%s schema=%s table=%s ordinal=%d/%d group_id=%s",
+        destination,
         topic,
-        cfg.ducklake_schema,
+        cfg.ducklake_schema if destination == "ducklake" else cfg.hoglake_namespace,
         cfg.table_label,
         ordinal,
         replica_count,
         cfg.group_id,
     )
+    if cfg.hoglake_partition_by is not None:
+        log.info(
+            "Hoglake partition spec: %s",
+            ", ".join(f"{t}({c}{', ' + str(p) if p is not None else ''})" for c, t, p in cfg.hoglake_partition_by),
+        )
     if cfg.filter_keep_field is not None:
         log.info("Filter (keep): %s in %s", cfg.filter_keep_field, cfg.filter_values)
     if cfg.filter_drop_field is not None:
