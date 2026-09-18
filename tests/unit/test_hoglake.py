@@ -506,6 +506,48 @@ class TestFilesWrittenMetric:
         mock_metrics.hoglake_files_written_total.inc.assert_called_once_with(3)
 
 
+class TestConcurrentAddDuringAppend:
+    @patch("millpond.hoglake.metrics")
+    def test_align_refusal_refreshes_and_reappends_once(self, mock_metrics):
+        """Race found by the live integration suite: another writer's
+        add_column lands between this sink's alignment and append()'s
+        pre-flight resolve, so pyhoglake's strict _align_table refuses
+        with "data is missing table columns". The sink must refresh the
+        live schema, null-fill the new column, and re-append ONCE."""
+        cols_after = _EVENTS_COLUMNS + [_col("other_writer_col", "string", 6, 6)]
+        s, client, catalog, ns, table = _sink()
+        ok = MagicMock()
+        ok.files = (MagicMock(),)
+        table.append.side_effect = [
+            ValidationError("data is missing table columns: ['other_writer_col']", status_code=None),
+            ok,
+        ]
+        info_after = MagicMock()
+        info_after.columns = tuple(cols_after)
+        table.info.return_value = info_after
+        assert s.write(_batch()) == 1
+        assert table.append.call_count == 2
+        retried = table.append.call_args.args[0]
+        assert "other_writer_col" in retried.column_names
+        assert retried.column("other_writer_col").null_count == retried.num_rows
+
+    @patch("millpond.hoglake.metrics")
+    def test_other_validation_errors_still_raise(self, mock_metrics):
+        s, *_, table = _sink()
+        table.append.side_effect = ValidationError("prepared file must contain rows", status_code=None)
+        with pytest.raises(ValidationError):
+            s.write(_batch())
+        assert table.append.call_count == 1
+
+    @patch("millpond.hoglake.metrics")
+    def test_persistent_align_refusal_raises_after_one_retry(self, mock_metrics):
+        s, *_, table = _sink()
+        table.append.side_effect = ValidationError("data is missing table columns: ['x']", status_code=None)
+        with pytest.raises(ValidationError):
+            s.write(_batch())
+        assert table.append.call_count == 2
+
+
 class TestWriteFailurePropagation:
     def test_append_failure_raises(self):
         # At-least-once: a failed write must surface to main.py's retry

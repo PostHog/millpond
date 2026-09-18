@@ -239,7 +239,20 @@ class HoglakeSink:
         batch = self._stamp_inserted_at(batch)
         table = self._ensure_table(batch.schema)
         batch = self._evolve_and_align(table, batch)
-        result = table.append(batch, author=self._author)
+        try:
+            result = table.append(batch, author=self._author)
+        except ValidationError as e:
+            # Concurrent-DDL race (found by the live integration suite):
+            # another writer's add_column can land between this sink's
+            # alignment and append()'s own pre-flight resolve, and
+            # pyhoglake's strict _align_table then refuses the batch for
+            # lacking the brand-new column. Refresh, null-fill, and
+            # re-append ONCE; a second refusal is a real error.
+            if "missing table columns" not in str(e):
+                raise
+            self._adopt_columns(table.info().columns)
+            batch = self._null_fill_missing(batch)
+            result = table.append(batch, author=self._author)
         # One parquet per partition tuple per flush (fanout appends) —
         # the hoglake compaction-debt feed rate.
         metrics.hoglake_files_written_total.inc(len(result.files))
@@ -433,8 +446,12 @@ class HoglakeSink:
         if failed:
             batch = batch.drop_columns(failed)
 
-        # Null-fill table columns absent from the batch (removed/renamed
-        # upstream, or added by another writer).
+        return self._null_fill_missing(batch)
+
+    def _null_fill_missing(self, batch: pa.Table) -> pa.Table:
+        """Null-fill live table columns absent from the batch (removed or
+        renamed upstream, or added by another writer) — the equivalent of
+        DuckLake's `INSERT BY NAME` filling unnamed columns with NULL."""
         for name, col in self._live_columns.items():
             if name not in batch.schema.names:
                 arrow_field = column_to_arrow_field(col)

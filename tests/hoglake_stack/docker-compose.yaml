@@ -1,0 +1,92 @@
+# Throwaway hoglake stack for millpond's hoglake integration/e2e tests.
+#
+# ALWAYS run under the compose project name `millpond-hog-it` (the test
+# fixtures do) and NEVER on the hoglake dev stack's default ports
+# (8080/9000/9001/5432/5173) — every published port here is a high port
+# bound to 127.0.0.1 so this stack can coexist with a live hoglake dev
+# environment on the same machine.
+#
+# Server image: ghcr.io/posthog/hoglake-server:latest by default;
+# override with HOGLAKE_SERVER_IMAGE (e.g. an image built from a local
+# hoglake checkout's server/Dockerfile).
+#
+# The `e2e` profile adds a single-node KRaft Kafka for the end-to-end
+# pipeline test; the integration tests don't boot it.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: hoglake
+      POSTGRES_USER: hoglake
+      POSTGRES_PASSWORD: hoglake
+    ports:
+      - "127.0.0.1:25432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hoglake"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  minio:
+    # quay.io: Docker Hub stopped serving minio/minio anonymously.
+    image: quay.io/minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: hoglake
+      MINIO_ROOT_PASSWORD: hoglake123
+    ports:
+      - "127.0.0.1:29000:9000"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  hoglake-server:
+    image: ${HOGLAKE_SERVER_IMAGE:-ghcr.io/posthog/hoglake-server:latest}
+    environment:
+      HOGLAKE_INSTANCE_NAME: millpond-hog-it
+      HOGLAKE_JDBC_URL: jdbc:postgresql://postgres:5432/hoglake
+      HOGLAKE_DB_USER: hoglake
+      HOGLAKE_DB_PASSWORD: hoglake
+      HOGLAKE_S3_ENDPOINT: http://minio:9000
+      HOGLAKE_S3_ACCESS_KEY: hoglake
+      HOGLAKE_S3_SECRET_KEY: hoglake123
+      # Keep the stack deterministic: no background compaction rewriting
+      # files while a test is counting them.
+      HOGLAKE_COMPACTION_INTERVAL_MS: "0"
+    ports:
+      - "127.0.0.1:28080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  kafka:
+    profiles: ["e2e"]
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093,HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://127.0.0.1:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: millpond-hog-it-cluster-0001
+    ports:
+      - "127.0.0.1:29092:29092"
+    healthcheck:
+      test: /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+      interval: 5s
+      timeout: 10s
+      retries: 12
