@@ -655,7 +655,8 @@ class HoglakeSink:
         Either way the rows publish exactly once.
         """
         payload = self._prepared
-        assert payload is not None  # only reached with a prepared payload  # noqa: S101
+        if payload is None:  # unreachable; an explicit raise, not an assert (python -O strips those)
+            raise RuntimeError("_commit_prepared called with no prepared payload")
         files = payload["appends"][0]["files"]
         try:
             self._catalog.commit_prepared(payload)
