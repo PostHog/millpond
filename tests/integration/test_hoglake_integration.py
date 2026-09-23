@@ -244,7 +244,7 @@ class TestBootstrap:
         with caplog.at_level(logging.INFO, logger="millpond.hoglake"):
             sink = HoglakeSink(_fresh())
             sink.close()
-        lines = [r.getMessage() for r in caplog.records if "object-store credentials" in r.getMessage()]
+        lines = [r.getMessage() for r in caplog.records if "object store auth source" in r.getMessage()]
         assert len(lines) == 1
         assert "static HOGLAKE_S3_* keys" in lines[0]
         assert f"{DATA_PATH}_millpond/probe" in lines[0]

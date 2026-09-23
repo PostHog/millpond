@@ -1399,7 +1399,7 @@ class HoglakeSink:
                 f"{_probe_hint(str(e), self._credential_source)}"
             ) from e
         log.info(
-            "hoglake object-store credentials: %s — probe wrote %s (endpoint=%s, region=%s)",
+            "hoglake object store auth source: %s — probe wrote %s (endpoint=%s, region=%s)",
             self._credential_source,
             uri,
             self._cfg.hoglake_s3_endpoint or "AWS default",
