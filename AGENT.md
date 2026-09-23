@@ -550,7 +550,7 @@ The upcoming hoglake integration consumes the catalog through
 `pyhoglake` (PyPI, our client — PostHog/hoglake, `pyhoglake/`). The
 wire contract is the server's OpenAPI spec, pinned per release tag:
 
-- v1.0.0: <https://raw.githubusercontent.com/PostHog/hoglake/v1.0.0/server/src/main/resources/openapi/hoglake.yaml>
+- v1.2.0: <https://raw.githubusercontent.com/PostHog/hoglake/v1.2.0/server/src/main/resources/openapi/hoglake.yaml>
 - A live server also serves its own copy at `/openapi.yaml`.
 
 When the `pyhoglake` dependency lands here, the `[tool.uv]`
