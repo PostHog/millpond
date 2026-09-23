@@ -95,6 +95,13 @@ class Config:
     # error (catalog provisioning stays an ops decision).
     hoglake_data_path: str | None
     hoglake_s3_endpoint: str | None  # e.g. http://localhost:29000 for MinIO; None = AWS
+    # Static object-store keys, or BOTH None for the AWS default
+    # credential chain. pyhoglake passes each key to pyarrow's
+    # S3FileSystem only when it is not None, so "neither" is how the pod
+    # authenticates with the ServiceAccount's web-identity token under
+    # IRSA — the same model the hoglake server itself uses. Static keys
+    # remain the MinIO shape (local dev, CI). load() refuses one without
+    # the other; the endpoint and the region stay independent of both.
     hoglake_s3_access_key: str | None
     hoglake_s3_secret_key: str | None
     hoglake_s3_region: str | None
@@ -780,6 +787,39 @@ def _hoglake_data_path() -> str | None:
     return raw
 
 
+def _hoglake_s3_keys() -> tuple[str | None, str | None]:
+    """HOGLAKE_S3_ACCESS_KEY / HOGLAKE_S3_SECRET_KEY — both, or neither.
+
+    Both set is the static-credential shape (MinIO in local dev and CI).
+    Neither set hands pyhoglake an S3Config with no keys, and pyhoglake
+    passes a key to pyarrow's S3FileSystem only when it is not None, so
+    pyarrow falls through to the AWS SDK's default credential chain —
+    which in Kubernetes is the ServiceAccount's web-identity token
+    (IRSA), the same way the hoglake server authenticates.
+
+    One without the other is refused HERE, at config load, because of
+    where and how — not because anything downstream would accept it.
+    pyarrow refuses half a pair on its own: `S3FileSystem(access_key=...)`
+    with no secret raises `ValueError: In order to initialize with
+    explicit credentials both access_key and secret_key must be
+    provided`. But that fires when pyhoglake first builds the
+    filesystem, names neither environment variable, and reaches the
+    operator as a pyarrow traceback from inside a third-party client.
+    This check costs no network, runs before anything else is built, and
+    names both variables plus the missing half.
+    """
+    access_key = os.environ.get("HOGLAKE_S3_ACCESS_KEY", "").strip() or None
+    secret_key = os.environ.get("HOGLAKE_S3_SECRET_KEY", "").strip() or None
+    if (access_key is None) != (secret_key is None):
+        missing = "HOGLAKE_S3_ACCESS_KEY" if access_key is None else "HOGLAKE_S3_SECRET_KEY"
+        raise RuntimeError(
+            f"HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY must be set together, and {missing} is "
+            f"not set. Set both for static object-store credentials (MinIO, local dev, CI), or neither "
+            f"to use the AWS default credential chain (IRSA in Kubernetes)."
+        )
+    return access_key, secret_key
+
+
 def _load_hoglake_fields() -> dict:
     """Read the HOGLAKE_* env group; validate names against the server's
     identifier rules so misconfig fails at startup, not as a 422."""
@@ -845,6 +885,7 @@ def _load_hoglake_fields() -> dict:
             "style, restricted to identity/year/month/day/hour/bucket), or remove "
             "DUCKLAKE_PARTITION_BY to confirm the table is meant to be unpartitioned."
         )
+    s3_access_key, s3_secret_key = _hoglake_s3_keys()
     return {
         "hoglake_max_retry_count": max_retries,
         "hoglake_request_timeout_s": timeout_s,
@@ -854,8 +895,10 @@ def _load_hoglake_fields() -> dict:
         "hoglake_table": names["HOGLAKE_TABLE"],
         "hoglake_data_path": _hoglake_data_path(),
         "hoglake_s3_endpoint": os.environ.get("HOGLAKE_S3_ENDPOINT", "").strip() or None,
-        "hoglake_s3_access_key": _require("HOGLAKE_S3_ACCESS_KEY"),
-        "hoglake_s3_secret_key": _require("HOGLAKE_S3_SECRET_KEY"),
+        "hoglake_s3_access_key": s3_access_key,
+        "hoglake_s3_secret_key": s3_secret_key,
+        # Independent of the credential source: the AWS SDK needs the
+        # region whether the keys are static or come from the chain.
         "hoglake_s3_region": os.environ.get("HOGLAKE_S3_REGION", "").strip() or None,
         "hoglake_partition_by": _parse_hoglake_partition_by(partition_raw) if partition_raw else None,
     }

@@ -116,6 +116,70 @@ log = logging.getLogger(__name__)
 # DuckLake accepted, plus four names DuckLake refused. See sink.py.
 RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at"})
 
+# How the object-store credentials were resolved — logged once at
+# startup and named in the probe's refusal, because the two shapes have
+# completely different remedies: a Secret versus an IAM role and bucket
+# policy. The values are prose, not identifiers; they appear verbatim in
+# an operator-facing message.
+_STATIC_KEYS = "static HOGLAKE_S3_* keys"
+_DEFAULT_CHAIN = "the AWS default credential chain (IRSA in Kubernetes)"
+
+# The startup probe's marker object, relative to the catalog data path.
+# FIXED, so every boot overwrites the same key: at most one object per
+# data path, and it is never registered in a table, so hoglake leaves it
+# alone (cleanup drains only server-queued paths; verify is
+# metadata-only).
+_PROBE_MARKER = "_millpond/probe"
+
+
+def _probe_marker_uri(data_path) -> str:
+    """The marker's full s3:// URI. The data path comes off the catalog
+    row as the operator typed it, so the trailing slash is normalised
+    here rather than trusted — otherwise the same catalog gets two
+    markers depending on how it was created."""
+    return f"{str(data_path).rstrip('/')}/{_PROBE_MARKER}"
+
+
+def _probe_hint(sdk_error: str, credential_source: str) -> str:
+    """The one sentence an operator needs after a failed probe.
+
+    The AWS SDK's text is precise and unhelpful in equal measure: the
+    failures that actually happen say nothing about the setting that
+    causes them, so each names its own.
+    """
+    if "NoSuchBucket" in sdk_error or "NO_SUCH_BUCKET" in sdk_error:
+        return (
+            "The bucket in that path does not exist, or this identity cannot see it. The data path "
+            "is the one frozen into the catalog row when the catalog was created — HOGLAKE_DATA_PATH "
+            "is read only at creation, so changing it now moves nothing; for an existing catalog the "
+            "fix is the bucket (create it, or grant this identity access to it). hoglake has no "
+            "delete-catalog route, so a catalog created against a typo needs a new catalog name."
+        )
+    if "AuthorizationHeaderMalformed" in sdk_error or "PermanentRedirect" in sdk_error:
+        return (
+            "That is a region mismatch: the request was signed for one region and the bucket lives "
+            "in another. Set HOGLAKE_S3_REGION to the bucket's region (under the default credential "
+            "chain the SDK otherwise takes AWS_REGION, which the IRSA webhook injects)."
+        )
+    if "INVALID_ACCESS_KEY_ID" in sdk_error or "SIGNATURE_DOES_NOT_MATCH" in sdk_error:
+        if credential_source == _STATIC_KEYS:
+            return (
+                "S3 rejected the key id or the signature, so the static HOGLAKE_S3_* keys are wrong "
+                "(stale Secret, wrong account, truncated value). This pair of errors is only "
+                "reachable with static keys set — unset both to use the default credential chain."
+            )
+        return (
+            "S3 rejected the key id or the signature of a credential the default chain resolved — "
+            "something in the pod's environment is supplying stale explicit credentials (AWS_* env "
+            "vars, a mounted profile) ahead of the web-identity token."
+        )
+    return (
+        "The write path needs s3:PutObject under this data path (plus s3:AbortMultipartUpload to "
+        "clean up an interrupted upload) and nothing else — check the bucket policy and the "
+        "identity it grants them to."
+    )
+
+
 _INSERTED_AT = "_inserted_at"
 _INSERTED_AT_TYPE = pa.timestamp("us", tz="UTC")
 
@@ -555,12 +619,26 @@ class HoglakeSink:
             "hoglake_catalog",
             "hoglake_namespace",
             "hoglake_table",
-            "hoglake_s3_access_key",
-            "hoglake_s3_secret_key",
         ):
             if getattr(cfg, name) is None:
                 raise HoglakeSinkError(f"HoglakeSink requires cfg.{name}; config.load() should have enforced this")
+        # The S3 keys are optional, but only TOGETHER. Both set is the
+        # static shape (MinIO in local dev and CI); both None lets
+        # pyhoglake hand pyarrow no keys at all, so the AWS SDK's
+        # default credential chain resolves them — in Kubernetes, the
+        # ServiceAccount's web-identity token (IRSA). Half a pair is
+        # refused here rather than left to pyarrow, which does reject it
+        # (`ValueError: ... both access_key and secret_key must be
+        # provided`) but only when pyhoglake first builds the
+        # filesystem, and in a message that names neither config field.
+        if (cfg.hoglake_s3_access_key is None) != (cfg.hoglake_s3_secret_key is None):
+            raise HoglakeSinkError(
+                "HoglakeSink requires cfg.hoglake_s3_access_key and cfg.hoglake_s3_secret_key together "
+                "(both for static keys, neither for the AWS default credential chain); config.load() "
+                "should have enforced this"
+            )
         self._cfg = cfg
+        self._credential_source = _STATIC_KEYS if cfg.hoglake_s3_access_key is not None else _DEFAULT_CHAIN
         self._client = HoglakeClient(
             cfg.hoglake_url,
             s3=S3Config(
@@ -633,6 +711,13 @@ class HoglakeSink:
         # only then began crash-looping. One request at construction
         # turns all of that into a pod that never claims to be ready.
         self._catalog = self._resolve_catalog()
+        # And the other half of "startup means startup": the catalog
+        # resolve proves the CONTROL PLANE is reachable, which says
+        # nothing about object storage. pyarrow resolves credentials
+        # lazily, so a role without the bucket grant surfaced as an S3
+        # 403 on the first upload — by which time the pod was ready,
+        # held partitions and had built lag.
+        self._probe_object_store(self._catalog)
 
     # -- Sink protocol -----------------------------------------------------
 
@@ -1240,6 +1325,86 @@ class HoglakeSink:
                 f"cannot reach the hoglake control plane at {cfg.hoglake_url!r} to resolve "
                 f"catalog {cfg.hoglake_catalog!r}: {e}"
             ) from e
+
+    def _probe_object_store(self, catalog) -> None:
+        """One authenticated object-store WRITE at startup. Called from
+        __init__, once, and never again.
+
+        A zero-byte upload of a fixed marker key under the catalog's
+        data path (`<data_path>/_millpond/probe`). Not literally a
+        PutObject: pyarrow's `open_output_stream` opens a multipart
+        upload eagerly, so closing an empty stream sends
+        CreateMultipartUpload -> UploadPart(1, 0 bytes) ->
+        CompleteMultipartUpload — one empty part, which both S3 and
+        MinIO accept. All three calls are authorised by `s3:PutObject`;
+        `s3:AbortMultipartUpload` is not exercised on this path, it is
+        what cleans up an upload that dies half-way.
+
+        The shape is chosen for three reasons:
+
+        * It is the SAME call the flush path makes. pyhoglake uploads
+          each parquet file with `_filesystem().open_output_stream(...)`
+          (client.py:971 in `prepare_append_files`, and `_upload` at
+          :1280, at the pinned 1.1.1), so what the probe proves at
+          startup is mechanically the request the write path will issue
+          — not a nearby operation chosen for being cheap.
+        * It proves the grant the sink actually needs. The role carries
+          write access under this prefix and nothing else — a LIST would
+          test `s3:ListBucket`, a permission the role is not meant to
+          have, and so would pass or fail for reasons unrelated to
+          writing.
+        * It cannot pass on a bucket that is not there. pyarrow's
+          `get_file_info(FileSelector(..., allow_not_found=True))` maps
+          a NoSuchBucket 404 to an empty listing, so a typo'd bucket in
+          HOGLAKE_DATA_PATH read as "empty prefix, all good" and failed
+          on the first flush — by which time the catalog row has frozen
+          the bad path and hoglake has no route to delete a catalog.
+          `allow_not_found=False` does not distinguish the two either.
+
+        The marker is FIXED, so a restart overwrites it: at most one
+        object per catalog data path, forever. It is not registered in
+        any table, and hoglake never touches unregistered objects —
+        `cleanup` drains only paths the server queued, and `verify` is
+        metadata-only — so the marker is inert, not orphan debt.
+
+        It is deliberately not retried and not a liveness check. A
+        credential chain that resolves nothing and a policy that grants
+        nothing are both config, and config does not heal by waiting.
+        """
+        # pyhoglake builds the S3FileSystem lazily and keeps it private.
+        # Unlike the `_http` Retry-After hook, an absent accessor here
+        # is FATAL rather than a shrug: this is the proof that the pod
+        # can write at all, and a guard that quietly stops guarding when
+        # an attribute is renamed is worse than no guard, because the
+        # deployment still reads as verified.
+        accessor = getattr(self._client, "_filesystem", None)
+        if accessor is None:
+            raise HoglakeSinkError(
+                "pyhoglake no longer exposes the filesystem; the startup probe cannot run, and "
+                "millpond will not start without proving it can write to the catalog's data path"
+            )
+        uri = _probe_marker_uri(catalog.data_path)
+        key = uri.removeprefix("s3://")
+        try:
+            with accessor().open_output_stream(key):
+                # Zero bytes: the upload itself is the entire question.
+                # The `with` is load-bearing — the request is only sent
+                # on close, and leaving that to the garbage collector
+                # would make the probe's verdict depend on refcounting.
+                pass
+        except Exception as e:  # noqa: BLE001 - every failure here is the same startup refusal
+            raise HoglakeSinkError(
+                f"cannot write the startup probe object {uri} for hoglake catalog "
+                f"{self._cfg.hoglake_catalog!r} using {self._credential_source}: {e}. "
+                f"{_probe_hint(str(e), self._credential_source)}"
+            ) from e
+        log.info(
+            "hoglake object-store credentials: %s — probe wrote %s (endpoint=%s, region=%s)",
+            self._credential_source,
+            uri,
+            self._cfg.hoglake_s3_endpoint or "AWS default",
+            self._cfg.hoglake_s3_region or "unset",
+        )
 
     def _ensure_table(self, batch_schema: pa.Schema):
         """Resolve (or create) namespace -> table, tolerating concurrent
