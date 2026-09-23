@@ -216,6 +216,85 @@ _variant_write_fallback_total = Counter(
     "Flushes written string-only after the VARIANT projection failed",
     ["pipeline", "broker_source"],
 )
+# Hoglake destination only: parquet files registered per append commit.
+# Partitioned fanout writes one file per partition tuple per flush, so
+# this is the compaction-debt feed rate on the hoglake side. Stays at
+# zero for ducklake destinations (additive — no existing series change).
+_hoglake_files_written_total = Counter(
+    "millpond_hoglake_files_written_total",
+    "Parquet files registered with the hoglake catalog",
+    ["pipeline", "broker_source"],
+)
+# Hoglake destination only: commits that went out more than once. Two
+# outcomes, and the difference is the whole story:
+#
+#   outcome="replayed" — this process re-sent an uncertain commit (a lost
+#     response, a reset, a 503) and got a 200. The server either answered
+#     from its receipt or applied it then; either way the rows published
+#     exactly once and the retry did its job. This is the IN-PROCESS
+#     guarantee working, and it was previously invisible — a resolved
+#     replay was indistinguishable from a first publish.
+#
+#   outcome="already_published" — a NEW process rebuilt a flush whose
+#     boundary matched one already in the lake (same table incarnation,
+#     same complete offset range), so the server refused the rebuilt
+#     payload against its receipt and millpond published nothing. The pod
+#     died after a commit applied and before the offsets committed, and
+#     the replayed boundary happened to repeat. This is a duplicate that
+#     did NOT happen, not a guarantee: the boundary is not reproducible
+#     in general, so the SAME crash with a boundary that shifts by one
+#     record duplicates instead. A rising rate means pods are dying
+#     mid-flush; a flat zero does not mean no duplicates.
+_hoglake_commit_replays_total = Counter(
+    "millpond_hoglake_commit_replays_total",
+    "Hoglake commits sent more than once, by how the resend resolved",
+    ["pipeline", "broker_source", "outcome"],
+)
+# Hoglake destination only: parquet objects millpond uploaded and never
+# registered. Hoglake's cleanup reclaims only files the SERVER queued
+# for removal (snapshot expiry, table drop, compaction staging) — client
+# uploads are not in that set and no server-side reclamation exists for
+# them, so these objects are billed storage until an operator deletes
+# them. millpond logs the full object URI of every one it counts, and
+# those URIs are the unit of cleanup.
+#
+# NOT the `{idempotency_key}/` prefix they share, which earlier revisions
+# of this comment named as the sweep target. Object names are
+# `{uuid4}-{index}.parquet`, so a retry under the SAME key writes fresh
+# names beside the old ones: an operator who sweeps the prefix after a
+# later attempt succeeded deletes live, committed files.
+#
+# The count is exact for every path. A commit the server refuses
+# (409/422), a rebuilt flush the receipt declines, a payload superseded
+# by the next flush and a payload still unpublished at close() all have
+# the prepared payload in hand, so the files are known to be in object
+# storage and to number len(files). A flush that fails INSIDE prepare is
+# no longer the exception it once was: pyhoglake>=1.1.1 stamps
+# `uploaded_files`/`uploaded_uris` on whatever it raises, so millpond
+# books the uploads that really completed instead of deducing a number
+# from which failure it is looking at. Retries do not inflate any of it
+# — a held payload is re-sent, not re-uploaded.
+#
+# Two caveats survive, both in the same direction (an UNDERCOUNT, never
+# a phantom):
+#
+#   * The file a prepare failed ON is in neither number. Its upload may
+#     never have opened, or may have closed badly over a TRUNCATED
+#     object that really is in storage. The warning that carries the
+#     URIs says so; treat that one file as possibly present.
+#   * The stamp is best effort at the source — an older pyhoglake does
+#     not set it, and pyhoglake suppresses the AttributeError from an
+#     exception type whose __slots__ refuse it. millpond reads it with a
+#     getattr default of 0, so either case books nothing rather than
+#     raising over a live object-store failure.
+#
+# And, as before, nothing can count the orphan a SIGKILL leaves between
+# the upload and the commit.
+_hoglake_orphaned_files_total = Counter(
+    "millpond_hoglake_orphaned_files_total",
+    "Parquet objects uploaded to the lake but never registered in a commit",
+    ["pipeline", "broker_source"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -268,6 +347,9 @@ columns_coerced_total = _columns_coerced_total
 variant_companion_columns_dropped_total = _variant_companion_columns_dropped_total
 variant_write_fallback_total = _variant_write_fallback_total
 variant_values_coerced_total = _variant_values_coerced_total
+hoglake_files_written_total = _hoglake_files_written_total
+hoglake_commit_replays_total = _hoglake_commit_replays_total
+hoglake_orphaned_files_total = _hoglake_orphaned_files_total
 include_values_size = _include_values_size
 include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds
 include_values_pending_removals = _include_values_pending_removals
@@ -295,7 +377,8 @@ def init(pipeline: str, broker_source: str = ""):
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total, variant_companion_columns_dropped_total
-    global variant_write_fallback_total, variant_values_coerced_total
+    global variant_write_fallback_total, variant_values_coerced_total, hoglake_files_written_total
+    global hoglake_commit_replays_total, hoglake_orphaned_files_total
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
@@ -348,6 +431,9 @@ def init(pipeline: str, broker_source: str = ""):
         pipeline=pipeline, broker_source=bs
     )
     variant_write_fallback_total = _variant_write_fallback_total.labels(pipeline=pipeline, broker_source=bs)
+    hoglake_files_written_total = _hoglake_files_written_total.labels(pipeline=pipeline, broker_source=bs)
+    hoglake_commit_replays_total = _AutoCommonLabels(_hoglake_commit_replays_total, pipeline, bs)
+    hoglake_orphaned_files_total = _hoglake_orphaned_files_total.labels(pipeline=pipeline, broker_source=bs)
     variant_values_coerced_total = _variant_values_coerced_total.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)

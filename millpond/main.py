@@ -1,4 +1,5 @@
 import logging
+import random
 import signal
 import sys
 import time
@@ -13,12 +14,12 @@ from millpond import (
     backpressure,
     config,
     consumer,
-    ducklake,
     include_values,
     logging_config,
     metrics,
     server,
 )
+from millpond import sink as sink_mod
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,16 @@ _WRITE_MAX_RETRIES = 3
 _WRITE_BASE_DELAY_S = 1.0
 _COMMIT_MAX_RETRIES = 3
 _COMMIT_BASE_DELAY_S = 0.5
+# Ceiling on a server-supplied Retry-After. The consume loop is single
+# threaded, so a backoff is also a poll gap: server.health marks the
+# process dead at max_poll_age_s=480, and record_poll only runs between
+# consume() calls. 30s keeps the whole retry ladder well inside that.
+_RETRY_AFTER_MAX_S = 30.0
+# Upward spread on every backoff step, as a fraction of the step. A
+# fleet refused by one 503 otherwise wakes in lockstep and re-forms the
+# convoy it was backing off from, on every rung of the ladder. Applied
+# upward only, so a server-supplied Retry-After stays a floor.
+_RETRY_JITTER = 0.25
 
 # Module-level set tracking which "missing sort fields" patterns we've
 # already warned about. Without this, a misconfigured sort against a
@@ -320,25 +331,132 @@ def _is_commit_contention(exc: BaseException) -> bool:
     )
 
 
-def _write_with_retry(sink, consolidated):
+def _classify_write_error(exc: BaseException, destination: str = "ducklake") -> str:
+    """errors_total label for a failed write attempt.
+
+    Hoglake commit conflicts are typed: pyhoglake's CommitConflictError
+    carries `retryable=True` on the class (the server's OCC 409 —
+    refresh the baseline and retry). Checked duck-typed by module name
+    so main.py never imports the hoglake backend for a ducklake-only
+    deployment.
+
+    DuckLake contention stays the string-matching classifier
+    (_is_commit_contention), GATED BY DESTINATION: those substrings are
+    generic Postgres/DuckLake wording, and a hoglake failure is free to
+    contain any of them (the hoglake control plane is a Postgres-backed
+    service too, so a 500 can carry "duplicate key value" straight
+    through). Labeling that `ducklake_commit_contention` would fire a
+    DuckLake alert from a pod that has no DuckLake. Everything else is a
+    plain write_retry.
+    """
+    if getattr(exc, "retryable", None) is True and type(exc).__module__.startswith("pyhoglake"):
+        return "hoglake_commit_contention"
+    if destination == "ducklake" and _is_commit_contention(exc):
+        return "ducklake_commit_contention"
+    return "write_retry"
+
+
+def _write_retry_budget(sink) -> tuple[int, float]:
+    """(max attempts, base backoff) for this sink.
+
+    The DuckLake defaults are 3 attempts / 1s base — inherited from a
+    backend that carries its OWN inner commit-retry loop
+    (`ducklake_max_retry_count`, default 100 here), so the outer three
+    attempts were never the real budget. Hoglake has no inner loop: the
+    pyhoglake client issues one request and raises. A sink may therefore
+    publish its own budget via `write_retry_budget()`; sinks that don't
+    keep the historical values.
+    """
+    budget = getattr(sink, "write_retry_budget", None)
+    if budget is None:
+        return _WRITE_MAX_RETRIES, _WRITE_BASE_DELAY_S
+    return budget()
+
+
+def _retry_delay(sink, attempt: int, base: float) -> float:
+    """Exponential backoff, FLOORED by a server-supplied Retry-After and
+    spread by jitter.
+
+    Hoglake's commit admission control answers 503 with `Retry-After`;
+    the server knows how long the queue actually is and our doubling
+    curve does not. A sink may expose the last hint via
+    `retry_after_hint()` (seconds, or None).
+
+    The hint is a floor, not a replacement. Hoglake's hint is the
+    hardcoded string "1", so letting it REPLACE the curve collapsed the
+    whole ladder to one-second steps: eight attempts against a convoyed
+    catalog, spent in about eight seconds, then a crash — which adds a
+    cold pod to the convoy it was backing off from. Taking the larger of
+    the two keeps the exponential shape under sustained backpressure and
+    still never returns before the server asked to be asked again.
+
+    Jitter is added upward (never below the floor) so that a fleet of
+    pods refused by the same 503 does not wake in lockstep and re-form
+    the convoy on every rung. It applies to BOTH destinations, which is a
+    behaviour change to the deployed DuckLake path and an intended one:
+    DuckLake pods contend for the same Postgres catalog commit lock and
+    have the same lockstep problem, and the cost is bounded — its ladder
+    becomes 3.75s of backoff at worst instead of 3s, under the same
+    ceiling. A second, hoglake-only curve would be two things to keep in
+    step for a spread of 25%. See the retry table in README.md.
+
+    Both are clamped to _RETRY_AFTER_MAX_S: the consume loop is single
+    threaded, so a backoff is also a poll gap, and a misbehaving or
+    hostile header must not park it past the liveness deadline.
+    """
+    delay = min(base * (2**attempt), _RETRY_AFTER_MAX_S)
+    hint = getattr(sink, "retry_after_hint", None)
+    if hint is not None:
+        seconds = hint()
+        if seconds is not None:
+            delay = max(delay, min(float(seconds), _RETRY_AFTER_MAX_S))
+    return min(delay + random.uniform(0.0, delay * _RETRY_JITTER), _RETRY_AFTER_MAX_S)
+
+
+def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", write_kwargs=None):
     """Write to the sink with exponential backoff on transient failures.
 
     Returns the record count the sink actually wrote (0 when it skipped the
     batch whole, e.g. every column was a VARIANT companion collision).
+
+    `write_kwargs` is the per-call escape hatch for backends that need to
+    know WHICH batch this is, not just what is in it (the icebox sink
+    took its Kafka offsets this way at tag `final-iceberg`).
+    DuckLakeSink.write takes the batch alone, so the default is empty.
+    The same kwargs go to every attempt — a retry must be recognizable as
+    the same flush, not merely a similar one.
+
+    A sink may also declare a failure non-retryable via `is_retryable()`
+    (a permanent 422 is not worth three attempts and a backoff; crash the
+    pod now and let the operator see it), and may publish its own retry
+    budget and Retry-After hint.
     """
-    for attempt in range(_WRITE_MAX_RETRIES):
+    write_kwargs = write_kwargs or {}
+    max_attempts, base_delay = _write_retry_budget(sink)
+    classify_retryable = getattr(sink, "is_retryable", None)
+    for attempt in range(max_attempts):
         try:
-            return sink.write(consolidated)
+            return sink.write(consolidated, **write_kwargs)
         except Exception as exc:
-            error_type = "ducklake_commit_contention" if _is_commit_contention(exc) else "write_retry"
+            error_type = _classify_write_error(exc, destination)
             metrics.errors_total.labels(type=error_type).inc()
-            if attempt == _WRITE_MAX_RETRIES - 1:
+            permanent = classify_retryable is not None and not classify_retryable(exc)
+            if permanent:
+                log.error(
+                    "Write failed permanently (attempt %d/%d, type=%s); not retrying",
+                    attempt + 1,
+                    max_attempts,
+                    error_type,
+                    exc_info=True,
+                )
                 raise
-            delay = _WRITE_BASE_DELAY_S * (2**attempt)
+            if attempt == max_attempts - 1:
+                raise
+            delay = _retry_delay(sink, attempt, base_delay)
             log.warning(
                 "Write failed (attempt %d/%d, type=%s), retrying in %.1fs",
                 attempt + 1,
-                _WRITE_MAX_RETRIES,
+                max_attempts,
                 error_type,
                 delay,
                 exc_info=True,
@@ -347,6 +465,38 @@ def _write_with_retry(sink, consolidated):
             # another pod may have created the table or changed columns.
             sink.reset_caches()
             time.sleep(delay)
+
+
+def _sink_write_kwargs(cfg, offsets: dict[tuple[str, int], tuple[int, int]]) -> dict:
+    """Per-call arguments for backends that need to know WHICH batch this
+    is, not only what is in it.
+
+    `offsets` is the consume loop's (topic, partition) -> (first, last)
+    offset map for everything in the pending buffer: the exact Kafka
+    range this flush is about to publish and then commit. Flattened to a
+    sorted tuple of `(topic, partition, first, last)` so it is hashable
+    and order-independent, and so it is identical on every retry of the
+    same flush — HoglakeSink hashes it into the commit's idempotency key,
+    which is what turns a retry after a lost commit response into a
+    replay instead of a second publication.
+
+    BOTH ends of the range, not just the high end. A key naming only the
+    high offset says "everything up to here", which is not the row set a
+    flush publishes: rewind a partition and re-consume, and a flush of
+    [0, 41] carries the name of an earlier flush of [30, 41], whose
+    receipt then reports it as already published — offsets advance over
+    rows that were never written.
+
+    DuckLake takes no per-call identity: its INSERT sits in a transaction
+    whose commit outcome the client always learns, so a retry there
+    cannot be ambiguous the way a lost HTTP response is. The seam stays
+    empty for it — the same shape the icebox sink used at tag
+    `final-iceberg`.
+    """
+    if cfg.destination != "hoglake":
+        return {}
+    flushed = tuple(sorted((topic, partition, first, last) for (topic, partition), (first, last) in offsets.items()))
+    return {"kafka_offsets": flushed}
 
 
 def _flush(
@@ -364,13 +514,18 @@ def _flush(
     consolidated = _apply_sort(consolidated, cfg)
 
     t0 = time.monotonic()
-    records_written = _write_with_retry(sink, consolidated)
+    records_written = _write_with_retry(
+        sink,
+        consolidated,
+        destination=cfg.destination,
+        write_kwargs=_sink_write_kwargs(cfg, offsets),
+    )
     write_duration = time.monotonic() - t0
 
     # Commit offsets synchronously — at-least-once requires knowing commit succeeded
     tp_offsets = [
-        TopicPartition(topic, partition, offset + 1)  # +1: committed offset is next-to-fetch
-        for (topic, partition), offset in offsets.items()
+        TopicPartition(topic, partition, last + 1)  # +1: committed offset is next-to-fetch
+        for (topic, partition), (_first, last) in offsets.items()
     ]
     for attempt in range(_COMMIT_MAX_RETRIES):
         try:
@@ -493,21 +648,26 @@ def main():
     pending: list[pa.Table] = []
     pending_bytes = 0
     pending_records = 0
-    offsets: dict[tuple[str, int], int] = {}  # (topic, partition) -> max offset
+    # (topic, partition) -> (first, last) offset held in the pending
+    # buffer. The high end is what gets committed to Kafka; BOTH ends are
+    # what name the flush for an idempotent destination (see
+    # _sink_write_kwargs — a name that omits the low end is a name a
+    # rewound partition can collide with).
+    offsets: dict[tuple[str, int], tuple[int, int]] = {}
     last_flush = time.monotonic()
     last_lag_sample = 0.0  # force immediate first sample
     last_heartbeat = time.monotonic()
 
     try:
-        http = server.start()
+        http = server.start(cfg.http_port)
         server.health.mark_started()
         log.info("Health server started, probes passing")
 
         # No connection recovery logic — if the destination fails, the pod
         # crashes and K8s restarts it. Reconnection adds complexity for no
         # benefit when the restart path already handles offset replay correctly.
-        sink = ducklake.DuckLakeSink(cfg)
-        log.info("Sink ready: table=%s", cfg.table_label)
+        sink = sink_mod.make_sink(cfg)
+        log.info("Sink ready: destination=%s table=%s", cfg.destination, cfg.table_label)
         kafka = consumer.create(cfg)
         lag_admin = consumer.make_admin_client(cfg)
         log.info("Kafka consumer created, partitions assigned")
@@ -569,7 +729,9 @@ def main():
                     if msg.value() is not None:
                         values.append(msg.value())
                         key = (msg.topic(), msg.partition())
-                        offsets[key] = max(offsets.get(key, -1), msg.offset())
+                        offset = msg.offset()
+                        first, last = offsets.get(key, (offset, offset))
+                        offsets[key] = (min(first, offset), max(last, offset))
 
                 if values:
                     skipped = 0
@@ -615,7 +777,8 @@ def main():
                 now = time.monotonic()
                 if now - last_lag_sample >= _LAG_SAMPLE_INTERVAL_S:
                     tp_offsets = [
-                        TopicPartition(topic, partition, offset + 1) for (topic, partition), offset in offsets.items()
+                        TopicPartition(topic, partition, last + 1)
+                        for (topic, partition), (_first, last) in offsets.items()
                     ]
                     _update_lag_metrics(kafka, lag_admin, tp_offsets, cfg.auto_offset_reset)
                     last_lag_sample = now

@@ -43,20 +43,52 @@ K8s StatefulSet (N replicas)
 
 ## Destination
 
-Millpond writes to DuckLake. A single deployment writes to exactly one table — there is no per-batch routing.
+Millpond writes to one of two destinations, selected by `MILLPOND_DESTINATION` (default `ducklake`). A single deployment writes to exactly one table — there is no per-batch routing, and a pod's destination is fixed for its lifetime.
 
-|  | DuckLake |
+|  | DuckLake | Hoglake |
+|---|---|---|
+| Catalog | Postgres (via DuckDB ducklake extension) | The hoglake control plane (REST service over Postgres; clients never touch its database) |
+| Storage | S3 / S3-compatible | S3 / S3-compatible — millpond writes the parquet itself via pyhoglake and registers it in a footer-shipping commit; the server never opens data files |
+| Reader ecosystem | DuckDB-native; growing third-party support | hoglake duckdb-client, Trino connector, changefeed consumers (hedgerow) |
+| Partitioning | Caller-supplied via `DUCKLAKE_PARTITION_BY`; arbitrary DDL expression | `HOGLAKE_PARTITION_BY` mapped onto Iceberg-semantics transforms (`identity`, `year`, `month`, `day`, `hour`, `bucket(col, N)`) at table creation, verified afterwards, and reconciled against the live table on every resolve; one parquet file per partition tuple per flush, all in one atomic commit |
+| Sort order | Not declared (batches pre-sorted via `MILLPOND_SORT_BY`) | `MILLPOND_SORT_BY` additionally declared as the table's sort order at creation (advisory for writers, binding for hoglake compaction), and reconciled like the partition spec |
+| Schema evolution | DuckDB DDL (`ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN SET DATA TYPE` with widening enforcement) | Typed alter ops (`add_column`; `promote_column` for `int→long`, `float→double`); same per-column degrade-and-metric posture |
+| VARIANT dual-write | Supported (`MILLPOND_VARIANT_COLUMNS`) | **Not supported — rejected at startup.** Events land as TEXT (`properties` stays a JSON string). Deferred until hoglake grows a variant path millpond can target. |
+| Maintenance tooling | Bundled (`tools/ducklake_maintenance.py` CronJob CLI, `tools/ducklake_metrics.py` exporter — daemon or one-shot push) | Server-side (hoglake expiry/cleanup/compaction loops) — nothing bundled here |
+| `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) | Stamped Arrow-side, one timestamptz value per flush (every row in a flush shares it) |
+| Multi-pod concurrent writes | Native; idempotent DDL handles races | Native; appends never conflict with appends, concurrent DDL 409s are absorbed by re-resolve, and the incarnation guard (`expected_table_uuid`) refuses cross-incarnation appends atomically |
+| Startup validation | Connects in the sink constructor | Resolves the catalog in the sink constructor, so a bad URL, bad credentials or a missing catalog fails before the pod claims readiness |
+| Commit retries | `DUCKLAKE_MAX_RETRY_COUNT` (inner loop, default 100) under millpond's 3 outer attempts | `HOGLAKE_MAX_RETRY_COUNT` outer attempts (default 8; there is no inner loop), honoring the server's `Retry-After` on 503 backpressure as a floor under the exponential curve |
+
+Both sinks (`millpond/ducklake.py`, `millpond/hoglake.py`) implement the `Sink` protocol (`millpond/sink.py`) and expose three methods to `main.py`: `write(batch) -> int`, `reset_caches()`, `close()`. `make_sink(cfg)` dispatches on the destination with lazy backend imports.
+
+Both destinations are at-least-once at the pipeline level: Kafka offsets commit only after a successful write, so a pod that dies between the write and the offset commit replays its last batch on restart.
+
+The hoglake path is stronger than that *within a process*, and it has to be. The catalog is reached over HTTP, so a commit the server applied whose response is lost looks exactly like a commit that never happened, and hoglake deliberately permits the same data-file path to be registered twice — a naive retry publishes the rows again. So each flush is published under an idempotency key naming the destination table incarnation and the complete Kafka offset range it covers, and the uploaded registration is held in memory across retries. The retry is then byte-identically the same request, and the server answers it from its receipt without writing.
+
+**What it does not buy is exactly-once across a restart.** Nothing is held across a process boundary: the rebuilt flush stamps a fresh `_inserted_at` and uploads under fresh object names, so the replayed request is never byte-identical. All the key can do there is recognize a repeated *boundary* and decline to publish over it twice — and the boundary is not reproducible in general, because it is wherever the size and time triggers happened to cut (the size trigger accumulates per poll batch, the time trigger is wall-clock, the allowlist is mutable, and every partition in the flush has to coincide). Across process boundaries this pipeline is at-least-once, with the duplicate opportunistically suppressed when the boundary does repeat.
+
+| Failure | Result |
 |---|---|
-| Catalog | Postgres (via DuckDB ducklake extension) |
-| Storage | S3 / S3-compatible |
-| Reader ecosystem | DuckDB-native; growing third-party support |
-| Partitioning | Caller-supplied via `DUCKLAKE_PARTITION_BY`; arbitrary DDL expression |
-| Schema evolution | DuckDB DDL (`ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN SET DATA TYPE` with widening enforcement) |
-| Maintenance tooling | Bundled (`tools/ducklake_maintenance.py` CronJob CLI, `tools/ducklake_metrics.py` exporter — daemon or one-shot push) |
-| `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) |
-| Multi-pod concurrent writes | Native; idempotent DDL handles races |
+| Commit response lost (timeout, reset, 502) | Retry replays the identical request; the rows publish **exactly once** (`millpond_hoglake_commit_replays_total{outcome="replayed"}`). |
+| Pod dies after the commit applied, before the offsets committed, and the rebuilt flush cuts at the *same* boundary | Recognized by its key and accepted without republishing (`…{outcome="already_published"}`); the flush reports **zero** rows written, because this process published none. The rebuilt upload is orphaned — see below. |
+| …and the rebuilt flush cuts at a *different* boundary | A different publication by every name anyone has: **the rows land twice**. At-least-once, as above. |
+| Commit refused (409 conflict, 422 validation) | Zero rows registered, atomically. The prepared payload is dropped (the server has judged it; an identical resend gets the identical answer) and the uploaded parquet is orphaned. |
+| Pod dies before the commit is sent | Nothing published; Kafka replays. The upload, if it happened, is orphaned. |
+| Table dropped and recreated under the same name | Refused, never published, in both halves of the window. A recreation the sink has not re-resolved (its cached handle is a *name*, not an incarnation) is caught by the client pre-flight, before anything is uploaded; one that lands after the upload is caught before the commit is sent, or by the server's own `expected_table_uuid` guard, and the prepared payload is dropped and orphaned. Retryable either way: the flush re-resolves, reconciles the recreated table against config, and rebuilds against it — under a key that names the live incarnation, so the new table can never answer from its predecessor's receipt. |
 
-The sink (`millpond/ducklake.py`) exposes three methods to `main.py`: `write(batch)`, `reset_caches()`, `close()`.
+**Orphaned objects are a real, unreclaimed cost.** Hoglake's `cleanup` reclaims only files the *server* queued for removal (snapshot expiry, table drop, compaction staging); files a client uploaded are not in that set, and automated cleanup for them is explicitly future work on the hoglake side. Every parquet millpond uploads without registering is therefore billed storage until somebody deletes it. `millpond_hoglake_orphaned_files_total` counts them, and the warning that accompanies every increment names the **full object URI of each one** (capped per line, with a count of any it left out).
+
+> **Delete those URIs, never the `…/{idempotency_key}/` prefix they share.** Object names under that prefix are `{uuid4}-{index}.parquet`, so a retry under the *same* key uploads fresh names beside the old ones. Sweeping the prefix after a later attempt succeeded deletes live, committed files. (An earlier revision of this document, and of the log line itself, advised exactly that sweep. It was wrong.)
+
+The counter is **exact**, on every path. Where a prepared payload exists the files are known to be in object storage and known to number `len(files)`: a commit the server refuses, a rebuilt flush the receipt declines, a payload superseded by the next flush, and a payload still unpublished at `close()`. A flush that fails *inside* `prepare` used to be the gap — millpond had no way to know how far the upload loop got, so it counted nothing and logged an invented upper bound. pyhoglake ≥ 1.1.1 closes it: every exception leaving `prepare_append_files` carries `uploaded_files` (uploads whose output stream closed cleanly) and `uploaded_uris` (their URIs), and a refusal raised before the first upload carries `0` / `()`. millpond reads those rather than reasoning about where in someone else's loop a given failure fires — a deduction that was wrong twice on this branch. Retries do not inflate anything: a held payload is re-sent, not re-uploaded.
+
+Two caveats remain, both pushing the same way — the counter can *undercount*, and still never invents an object:
+
+- **The file a `prepare` failed on is in neither number.** Its upload may never have opened, or may have closed badly over a *truncated* object that really is in storage. The count is therefore a lower bound on objects present, and that one file has to be treated as possibly-there. The warning says so.
+- **The stamp is best effort at the source.** An older pyhoglake does not set the attributes at all, and pyhoglake suppresses the `AttributeError` from an exception type whose `__slots__` refuse them. millpond reads with a `getattr` default of `0`, so either case books nothing rather than raising a second error over a live object-store failure.
+
+And, as before, nothing can count the orphan a `SIGKILL` leaves between the upload and the commit.
 
 ## Record Handling
 
@@ -214,6 +246,8 @@ just lint              # lint code
 just test              # run unit tests
 just test-integration  # run integration tests (in-memory DuckDB — fast, no docker stack)
 just test-e2e          # run E2E tests (docker-compose, builds stack automatically)
+just test-hoglake-integration  # hoglake sink vs a real hoglake server (throwaway stack, high ports)
+just test-hoglake-e2e  # Kafka -> main.py -> hoglake end to end (same throwaway stack)
 just ci                # format check + lint + unit tests
 just up                # start docker-compose stack (DuckLake — plaintext Kafka)
 just up-ssl            # start docker-compose stack (DuckLake — SSL Kafka, closer to prod)
@@ -255,10 +289,10 @@ All configuration via environment variables.
 | `KAFKA_BOOTSTRAP_SERVERS` | yes | | Kafka broker addresses |
 | `KAFKA_TOPIC` | yes | | Topic to consume |
 | `REPLICA_COUNT` | yes | | Number of StatefulSet replicas (must match `spec.replicas`) |
-| `MILLPOND_DESTINATION` | no | `ducklake` | Destination — `ducklake` is the only accepted value; anything else raises at startup. Case-insensitive; empty/whitespace falls back to `ducklake`. |
+| `MILLPOND_DESTINATION` | no | `ducklake` | Destination — `ducklake` or `hoglake`; anything else raises at startup. Case-insensitive; empty/whitespace falls back to `ducklake`. Only the selected destination's env group is read (stray vars from the other backend are ignored). |
 | `FLUSH_SIZE` | no | `104857600` | Flush after this many bytes of accumulated Arrow data (default 100MB) |
 | `FLUSH_INTERVAL_MS` | no | `60000` | Flush after this many ms |
-| `GROUP_ID` | no | `millpond-{topic}-{ducklake_table}` | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay. |
+| `GROUP_ID` | no | `millpond-{topic}-{table}` for `ducklake`, `millpond-{destination}-{topic}-{table}` otherwise | Kafka group.id — used for offset storage in `__consumer_offsets` only, no consumer group semantics. Changing this loses committed offsets and triggers full replay, which is why the DuckLake form is frozen. Non-DuckLake destinations carry the destination name so a shadow deployment (same topic, same table name, other destination) cannot share an offset namespace with the pipeline it shadows and split the partitions between them. |
 | `KAFKA_AUTO_OFFSET_RESET` | no | `earliest` | Applied only when no offset is committed for a partition: `earliest` (backfill/catch-up) or `latest` (NRT consumers — don't replay the retention window). `KAFKA_CONSUMER_AUTO_OFFSET_RESET` is rejected at startup; use this var. |
 | `KAFKA_CONSUMER_*` | no | | Passthrough to librdkafka: `KAFKA_CONSUMER_SECURITY_PROTOCOL=SASL_SSL` → `security.protocol=SASL_SSL`. `KAFKA_CONSUMER_QUEUED_MAX_MESSAGES_KBYTES` overrides the 16MB-per-partition fetch-buffer default. `sasl.mechanisms=OAUTHBEARER` enables the MSK IAM token callback. |
 | `BROKER_SOURCE` | no | | Broker label attached to every metric (e.g. `msk`, `warpstream`) |
@@ -267,6 +301,7 @@ All configuration via environment variables.
 | `FETCH_MAX_WAIT_MS` | no | `500` | Max broker wait when `fetch.min.bytes` not yet satisfied |
 | `STATS_INTERVAL_MS` | no | `5000` | librdkafka internal stats emission interval (0 to disable) |
 | `LOG_LEVEL` | no | `INFO` | Python log level (DEBUG, INFO, WARNING, ERROR) |
+| `MILLPOND_HTTP_PORT` | no | `8000` | Port for the /metrics + /healthz + /readyz HTTP server. Exists for test harnesses running millpond as a host process; charts and probes depend on the default. |
 
 ### DuckLake
 
@@ -290,6 +325,40 @@ All configuration via environment variables.
 | `DUCKDB_S3_USE_SSL` | no | | `true` / `false` |
 | `DUCKDB_S3_URL_STYLE` | no | | `vhost` / `path` |
 
+### Hoglake
+
+Read only when `MILLPOND_DESTINATION=hoglake`. Names are validated at startup against the server's identifier rules (catalog: `[a-z][a-z0-9_-]{0,62}`; namespace/table: `[A-Za-z_][A-Za-z0-9_-]{0,127}`).
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HOGLAKE_URL` | yes | | Control-plane base URL (`/v1` is appended by the client) |
+| `HOGLAKE_CATALOG` | yes | | Catalog name |
+| `HOGLAKE_NAMESPACE` | yes | | Namespace (created on first write if absent) |
+| `HOGLAKE_TABLE` | yes | | Table name (created on first write from the batch schema + `_inserted_at`) |
+| `HOGLAKE_DATA_PATH` | no | | When set, a missing catalog is created with this data path on first write. Unset: a missing catalog is a startup-shaped error (catalog provisioning stays an ops decision). Validated as an `s3://bucket/prefix` URI at startup: it is frozen into the catalog row at creation and hoglake has no delete-catalog route, so a typo mints a permanently unusable catalog under a name nobody can reuse. |
+| `HOGLAKE_S3_ACCESS_KEY` | yes | | S3 access key for the parquet write path (pyhoglake writes the files; separate from the DuckLake `DUCKDB_S3_*` vars) |
+| `HOGLAKE_S3_SECRET_KEY` | yes | | S3 secret key |
+| `HOGLAKE_S3_ENDPOINT` | no | | S3 endpoint override (MinIO etc.); unset = AWS |
+| `HOGLAKE_S3_REGION` | no | | S3 region |
+| `HOGLAKE_PARTITION_BY` | no | | Comma-separated partition expression mapped to hoglake transforms at table creation: bare `col` (identity), `year(col)`/`month(col)`/`day(col)`/`hour(col)`, `bucket(col, N)`. Anything outside that vocabulary refuses startup with a clear error — never a per-batch failure. Typical: `team_id,month(_inserted_at)`. |
+| `HOGLAKE_MAX_RETRY_COUNT` | no | `8` | Write-path retry attempts. The DuckLake counterpart tunes an *inner* loop under millpond's 3 outer attempts; hoglake has no inner loop, so this IS the budget. Must be positive, and bounded with the timeout below. |
+| `HOGLAKE_REQUEST_TIMEOUT_S` | no | `45` | Per-request HTTP timeout for the catalog client. Deliberately above pyhoglake's hardcoded 30s, which equals the server's own commit-lock admission bound: at an equal timeout the client gives up at the instant the server would have answered `503` + `Retry-After`, so its explicit backpressure signal is nearly unreachable and arrives as a transport failure instead. |
+
+`HOGLAKE_MAX_RETRY_COUNT` x `HOGLAKE_REQUEST_TIMEOUT_S` bounds how long one flush can sit inside `sink.write()`, and the consume loop is single-threaded: the liveness probe fails the pod after 480s without a poll. **`load()` refuses a combination that can exceed it** — the defaults come to ~474s of the 480s, which is deliberately close to the line (a catalog that has answered nothing in eight minutes is one the pod should die over) but leaves a raise of either knob nowhere to hide.
+
+**The catalog client has no authentication or TLS credential surface.** The hoglake control plane does not authenticate requests in this version, and `HoglakeClient` accepts no token, header, client certificate or verification setting — `HOGLAKE_URL` must therefore be a trusted-network endpoint (cluster-internal service DNS, not a public hostname). The `HOGLAKE_S3_*` credentials are object-store credentials only; they have nothing to do with reaching the catalog.
+
+Semantics on the hoglake path:
+
+- **Text only.** `properties` and every other JSON payload lands as a string column, exactly as the arrow converter produces it. `MILLPOND_VARIANT_COLUMNS` combined with `MILLPOND_DESTINATION=hoglake` is a startup error (hoglake has no VARIANT column type — deferred, not silently skipped).
+- **Startup.** The catalog is resolved when the sink is constructed, so a wrong `HOGLAKE_URL`, an unreachable control plane or a missing catalog (without `HOGLAKE_DATA_PATH`) fails at startup rather than on the first flush, after the pod has passed its probes and built lag.
+- **Bootstrap.** First write ensures namespace → table (concurrent creation by other pods is tolerated at every level) and declares the partition spec + sort order in one alter with field ids resolved from the created schema, then verifies the result. A partition column missing from the schema is fatal; a missing sort field skips the sort-order declaration with a warning (batches are still pre-sorted on present fields).
+- **Reconciliation.** Creation is two round trips, so a failure between them leaves a table that exists and has no layout. Every later resolve therefore compares the live partition spec and sort order against config: a match proceeds, an unspecced table that config says should be specced gets its declaration (the recovery), and any genuine divergence — a changed `HOGLAKE_PARTITION_BY`, a changed bucket count, a partitioned table under a config that says nothing — is fatal and stays fatal, with the live spec printed in `HOGLAKE_PARTITION_BY`'s own grammar. The intent is that a config typo can never leave a permanently unpartitioned table behind. Two consequences to plan for: **changing the partition spec of a live table is not supported by changing config** (point the pipeline at a new table), and a table whose sort order was declared by something else needs `MILLPOND_SORT_BY` set to match.
+- **Publication.** Each flush is a prepared upload plus one idempotent commit keyed on its Kafka offset range — see [Destination](#destination) for what that guarantees and what it orphans.
+- **Evolution.** New batch columns become a single batched `add_column` alter (one DDL commit for the whole drift, falling back to per-column if the batch is refused); `int→long` / `float→double` live-type mismatches → `promote_column`; failures degrade per column (logged + `millpond_errors_total{type="schema"}`). Name matching is exact — hoglake identifiers are case-sensitive, unlike DuckDB's case-insensitive resolution.
+- **Dropped payload keys.** Three classes of column name are dropped per column rather than sent, each counted on `millpond_records_skipped_total{reason="unsafe_field_name"}`, so one poison producer key cannot wedge a partition: names the server reserves (the `_hog` prefix), names longer than the server's 128-character limit, and names outside millpond's shared `SAFE_IDENTIFIER` (`[a-zA-Z_][a-zA-Z0-9_]*`). That last gate is millpond's, not hoglake's: **hyphenated keys like `utm-source` are dropped even though the hoglake server would accept them**, because `SAFE_IDENTIFIER` is shared with the DuckLake backend, where such a name has to be quoted into generated SQL. Rename the key upstream if you need it. (Reserved-name collisions are narrower here than on DuckLake: only `_inserted_at` is reserved. `year`/`month`/`day`/`hour` are ordinary columns for hoglake, which partitions by catalog transforms rather than Hive directories.)
+- **Metrics.** All existing counters work unchanged, plus three hoglake-only series: `millpond_hoglake_files_written_total` (parquet files registered per commit — with partitioned fanout, the compaction-debt feed rate), `millpond_hoglake_commit_replays_total{outcome}` (commits resolved from the server's receipt instead of publishing; non-zero is a duplicate that did not happen, a rising rate means pods are dying mid-flush), and `millpond_hoglake_orphaned_files_total` (uploads never registered — unreclaimed storage). `millpond_errors_total{type="hoglake_commit_contention"}` labels OCC 409s the way `ducklake_commit_contention` does for DuckLake; the DuckLake label is now gated by destination so a hoglake pod can never raise it.
+
 ### Optional record handling
 
 See [Record Handling](#record-handling) for context. All variables below are optional; unset means the corresponding stage is disabled.
@@ -310,7 +379,7 @@ See [Record Handling](#record-handling) for context. All variables below are opt
 | `MILLPOND_INCLUDE_VALUES_AUTH_TOKEN` | no | | Header value. Must be set together with the header name. |
 | `MILLPOND_SORT_BY` | no | | Comma-separated column names; the batch is sorted ascending by these in tuple order before each write. Missing fields cause the sort to be skipped (records still flow). |
 | `MILLPOND_TYPED_COLUMNS` | no | | Comma-separated `column:type` pairs pinning columns to a target type before write (types: `timestamptz`, `bigint`, `double`, `boolean`, `varchar`). Needed when writing into a table whose columns are already typed and JSON inference would diverge (date-times → `VARCHAR` vs `TIMESTAMPTZ`; all-null `project_id` → `VARCHAR` vs `BIGINT`). Column names validated as safe identifiers; types validated against the allowlist. |
-| `MILLPOND_VARIANT_COLUMNS` | no | | Comma-separated source column names to dual-write as DuckLake `VARIANT` companions (`properties` → `properties_variant`). Original string columns are kept. Malformed JSON nulls only the VARIANT side. Column names validated as safe identifiers; names ending in `_variant` are rejected (list the source, not the derived column). |
+| `MILLPOND_VARIANT_COLUMNS` | no | | DuckLake destination only (rejected at startup with `hoglake`). Comma-separated source column names to dual-write as DuckLake `VARIANT` companions (`properties` → `properties_variant`). Original string columns are kept. Malformed JSON nulls only the VARIANT side. Column names validated as safe identifiers; names ending in `_variant` are rejected (list the source, not the derived column). |
 
 ### Log export (optional)
 
@@ -373,6 +442,8 @@ DUCKLAKE_PARTITION_BY="year(_inserted_at),month(_inserted_at),day(_inserted_at),
 
 Partition on `_inserted_at` (always a real TIMESTAMP), not source `timestamp` fields (typically VARCHAR). Applied via `ALTER TABLE SET PARTITIONED BY` on first write — idempotent, safe for multiple pods and restarts. If added to an existing unpartitioned table, new files get HSP layout while old files remain flat; DuckLake queries both transparently via metadata.
 
+For the hoglake destination, set `HOGLAKE_PARTITION_BY` instead (same expression style, restricted to hoglake's transform vocabulary — see the [Hoglake config](#hoglake)). Partition tuples are computed client-side by pyhoglake under the table's live spec; the batch fans out into one parquet file per tuple, registered in one atomic commit, and each file carries its `partition_values`. The temporal transforms are Iceberg-semantics epoch-relative ints, not Hive `key=value` directories.
+
 ## Object Sizing
 
 S3 throughput scales with object size — small objects (<1MB) waste per-request overhead, while larger objects (128MB+) maximize GET/PUT throughput. Millpond flushes are triggered by whichever comes first: `FLUSH_SIZE` (Arrow bytes in memory) or `FLUSH_INTERVAL_MS` (wall clock). The resulting Parquet file is typically **3-4x smaller** than the Arrow representation due to columnar encoding and compression.
@@ -416,10 +487,17 @@ The flush path has two failure points, each with its own retry policy:
 
 | Operation | Attempts | Backoff between failures | On exhaustion |
 |-----------|----------|--------------------------|---------------|
-| Lake write | 3 | 1s, 2s (last attempt raises immediately) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
+| Lake write (DuckLake) | 3 | 1s then 2s, each jittered upward by up to 25% (last attempt raises immediately) | Re-raise → pod crashes, K8s restarts, replays from last committed offset |
+| Lake write (hoglake) | `HOGLAKE_MAX_RETRY_COUNT`, default 8 | 1s doubling, capped at 30s, jittered upward by up to 25%, floored by the server's `Retry-After` when it sends one | as above |
 | Offset commit | 3 | 0.5s, 1s (last attempt raises immediately) | Re-raise → pod crashes, replays from last committed offset (duplicates bounded by one flush batch) |
 
-Write failures are classified before counting: DuckLake catalog commit contention (retry-budget exhaustion, duplicate-key / serialization errors from Postgres) increments `errors_total{type="ducklake_commit_contention"}`; everything else increments `errors_total{type="write_retry"}`. Commit failures increment `errors_total{type="offset_commit"}`. Transient vs persistent failures stay distinguishable in dashboards.
+The two write budgets differ because the backends do: DuckLake retries *internally* (`DUCKLAKE_MAX_RETRY_COUNT`, default 100) underneath millpond's three attempts, while pyhoglake issues one request and raises. Three attempts against a catalog whose backpressure signal is `503` + `Retry-After: 1` — an explicit "the commit queue is convoyed, ask again" — is a crash loop wearing a retry policy's clothes.
+
+The *jitter* is shared by both, deliberately. It exists so a fleet of pods refused by one event does not wake in lockstep and re-form the convoy on every rung, and DuckLake pods contend for the same Postgres catalog commit lock, so they have the same problem. Scoping it to the hoglake path would mean two retry curves to keep in step for a spread of at most 25%: on DuckLake that is 3.75s of backoff across the ladder instead of 3s, well inside the liveness deadline, and it is clamped to the same 30s ceiling as everything else.
+
+The hoglake sink also gets to *veto* a retry: a failure it classifies as permanent (422 validation, 410 expired, an unsupported type) re-raises immediately instead of burning the ladder on a request that cannot become valid by waiting. 408, 429, every 5xx, transport errors, and a commit conflict stay retryable.
+
+Write failures are classified before counting: DuckLake catalog commit contention (retry-budget exhaustion, duplicate-key / serialization errors from Postgres) increments `errors_total{type="ducklake_commit_contention"}` — only on a DuckLake pod, since the match is on generic Postgres wording the hoglake control plane can produce too; hoglake OCC 409s increment `errors_total{type="hoglake_commit_contention"}`; everything else increments `errors_total{type="write_retry"}`. Commit failures increment `errors_total{type="offset_commit"}`. Transient vs persistent failures stay distinguishable in dashboards.
 
 The write-retry loop catches `Exception` broadly to cover the backend's failure modes — `duckdb.Error` for DuckLake; `OSError` for S3; `KafkaException` for broker disconnects. Each retry invokes `sink.reset_caches()` to drop cached table/schema state so the next attempt re-checks the catalog (covers the case where another pod evolved the schema or recreated the table between attempts).
 

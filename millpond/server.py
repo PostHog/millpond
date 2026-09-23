@@ -105,6 +105,12 @@ def _make_handler():
 
 
 def start(port: int = 8000) -> HTTPServer:
+    """Start the metrics/health HTTP server on `port`.
+
+    The caller supplies the port; `main()` passes `cfg.http_port`, which
+    is where MILLPOND_HTTP_PORT is parsed and validated. Nothing here
+    reads the environment — a knob that bypasses config.py is invisible
+    to the startup config log and to any caller holding a Config."""
     server = HTTPServer(("", port), _make_handler())
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
