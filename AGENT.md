@@ -544,6 +544,19 @@ Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTP
 | `opentelemetry-exporter-otlp-proto-http>=1.30` | OTLP/HTTP exporter — ships millpond logs to PostHog Logs when `POSTHOG_PROJECT_TOKEN` is set |
 | `opentelemetry-instrumentation-logging>=0.50b0,<0.64` | Ships the non-deprecated `LoggingHandler` (SDK 1.42 deprecated the `sdk._logs` one); ceiling bounds surprise since the handler's module path isn't the package's documented public surface |
 
+## hoglake Wire Contract
+
+The upcoming hoglake integration consumes the catalog through
+`pyhoglake` (PyPI, our client — PostHog/hoglake, `pyhoglake/`). The
+wire contract is the server's OpenAPI spec, pinned per release tag:
+
+- v1.2.0: <https://raw.githubusercontent.com/PostHog/hoglake/v1.2.0/server/src/main/resources/openapi/hoglake.yaml>
+- A live server also serves its own copy at `/openapi.yaml`.
+
+When the `pyhoglake` dependency lands here, the `[tool.uv]`
+`exclude-newer` cooldown will exclude a fresh release; add a fixed-date
+carve-out like the existing pyducklake one.
+
 ## Project Structure
 
 ```
