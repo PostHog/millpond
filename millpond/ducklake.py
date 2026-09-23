@@ -9,7 +9,7 @@ import orjson
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from millpond import metrics, schema
+from millpond import arrow_converter, metrics, schema
 from millpond.config import Config
 from millpond.schema import variant_column_name
 from millpond.sink import check_reserved_collision
@@ -461,6 +461,65 @@ def _ensure_table(
     tables_ensured.add(table_name)
 
 
+# Columns already warned about for the VARCHAR-batch/UUID-column rewrite, so a
+# permanent config/table mismatch logs once per column per pod lifetime rather
+# than once per flush. The metric is the always-on signal.
+_uuid_realign_warned: set[str] = set()
+
+
+def _align_uuid_columns(batch: pa.Table, schema_mgr: schema.SchemaManager) -> pa.Table:
+    """Parse plain-text batch columns whose LIVE DuckLake column is UUID.
+
+    The DuckLake half of the two-way uuid/string handling (the hoglake half is
+    `HoglakeSink._rewrite_column`). It covers the rollback direction, and only
+    that one:
+
+    * live UUID, batch VARCHAR — an operator REMOVING `<col>:uuid` from
+      MILLPOND_TYPED_COLUMNS, or one pod on a mixed fleet that has not taken
+      the new config yet. DuckDB's implicit VARCHAR->UUID cast on INSERT is
+      all-or-nothing: one unparseable value raises `ConversionException` for
+      the WHOLE insert, deterministically, on every retry, so the offsets
+      never commit and the restart re-consumes the same batch forever. It also
+      refuses `urn:uuid:...`, which `arrow_converter.uuid_bytes` accepts — so
+      the two disagree about what a UUID is even on clean data.
+    * live VARCHAR, batch `pa.uuid()` — the other direction needs nothing
+      here. DuckDB casts UUID->VARCHAR natively and losslessly on INSERT, and
+      the rows land as canonical text. It costs one refused
+      `ALTER ... SET DATA TYPE UUID` per flush (DuckLake's evolution is
+      widening-only and this is not a widening), logged and counted on
+      `errors_total{type="schema"}` like any other pinned-vs-live mismatch.
+
+    `coerce_typed_columns` does the parse, so the nulling of unparseable
+    values and the `columns_coerced_total` / `errors_total{type=
+    "column_coercion"}` accounting are the SAME code the pin itself runs —
+    there is no second opinion about which strings are UUIDs. On top of that,
+    each rewritten column bumps `errors_total{type="schema"}` every flush,
+    because a batch that disagrees with its table is a schema event whether or
+    not any value failed to parse.
+    """
+    live_uuid = schema_mgr.live_uuid_column_names()
+    if not live_uuid:
+        return batch
+    targets = tuple(
+        (field.name, "uuid")
+        for field in batch.schema
+        if field.name.lower() in live_uuid and (pa.types.is_string(field.type) or pa.types.is_large_string(field.type))
+    )
+    if not targets:
+        return batch
+    for name, _ in targets:
+        if name not in _uuid_realign_warned:
+            log.warning(
+                "Column %r arrives as text but the live DuckLake column is UUID; parsing it to "
+                "UUID for this and every following flush. DuckDB's own VARCHAR->UUID cast would "
+                "fail the whole INSERT on one unparseable value.",
+                name,
+            )
+            _uuid_realign_warned.add(name)
+        metrics.errors_total.labels(type="schema").inc()
+    return arrow_converter.coerce_typed_columns(batch, targets)
+
+
 def write(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
@@ -521,6 +580,9 @@ def write(
     _ensure_table(conn, table_name, batch, tables_ensured, partition_by, schema_name)
     ready_sources: tuple[str, ...] | None = None
     if schema_mgr is not None:
+        # BEFORE evolve: parsing the column here means evolve sees UUID == UUID
+        # and issues no ALTER at all, so the insert is a plain typed append.
+        batch = _align_uuid_columns(batch, schema_mgr)
         schema_mgr.evolve(batch.schema)
         if variant_columns:
             ready = schema_mgr.ensure_variant_columns(variant_columns, set(batch.schema.names))

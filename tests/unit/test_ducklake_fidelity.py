@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import datetime
 import time
+import uuid as uuid_mod
 import warnings
 
 import duckdb
 import pyarrow as pa
 import pytest
 
+from millpond import arrow_converter
 from millpond import ducklake as ducklake_mod
 from millpond import schema as schema_mod
 
@@ -256,3 +258,120 @@ class TestPathologicalColumnNames:
         batch = pa.table({long_name: pa.array([1, 2], pa.int64())})
         handle.write(batch)
         assert handle.read().column(long_name).to_pylist() == [1, 2]
+
+
+class TestUuidColumns:
+    """`MILLPOND_TYPED_COLUMNS=uuid:uuid` on the DuckLake destination.
+
+    The wire form the coercer emits is `pa.uuid()` (an extension over
+    `fixed_size_binary(16)`), NOT plain `pa.binary(16)` — DuckDB reads the
+    former as native `UUID` and the latter as `BLOB`, from bytes that are
+    identical either way. These lock that the destination column is the real
+    type and stays it across flushes.
+    """
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+
+    def _coerced(self, values):
+        return arrow_converter.coerce_typed_columns(
+            pa.table({"uuid": pa.array(values, pa.string())}), (("uuid", "uuid"),)
+        )
+
+    def _column_type(self, handle) -> str:
+        return handle.conn.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_catalog = 'lake' AND table_name = 'events' AND column_name = 'uuid'"
+        ).fetchone()[0]
+
+    def test_creates_a_uuid_column_not_a_blob(self, handle):
+        handle.write(self._coerced([self.CANONICAL]))
+        assert self._column_type(handle) == "UUID"
+
+    def test_value_round_trips(self, handle):
+        other = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+        handle.write(self._coerced([self.CANONICAL, None, other]))
+        # DuckDB exports a UUID column back to Arrow as its canonical string,
+        # so the assertion is on the text form the source produced.
+        assert handle.read().column("uuid").to_pylist() == [self.CANONICAL, None, other]
+
+    def test_second_flush_issues_no_alter(self, handle):
+        # `_arrow_type_to_duckdb` must answer UUID for the extension type, or
+        # every flush would try to narrow the column back to VARCHAR and burn
+        # an `errors_total{type="schema"}` per batch.
+        handle.write(self._coerced([self.CANONICAL]))
+        assert schema_mod._arrow_type_to_duckdb(pa.uuid()) == "UUID"
+        handle.write(self._coerced([self.CANONICAL]))
+        assert self._column_type(handle) == "UUID"
+        assert handle.read().num_rows == 2
+
+    def test_unpinned_string_batch_lands_on_a_uuid_column(self, handle):
+        # The rollback direction, DuckLake side: the pin comes off (or a pod on
+        # a mixed fleet still runs the old config) and a plain VARCHAR batch
+        # meets a live UUID column. DuckDB's implicit VARCHAR->UUID cast fails
+        # the WHOLE insert on one junk value, deterministically, every retry.
+        handle.write(self._coerced([self.CANONICAL]))
+        assert self._column_type(handle) == "UUID"
+        other = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+        handle.write(pa.table({"uuid": pa.array([other, None], pa.string())}))
+        assert self._column_type(handle) == "UUID"
+        assert sorted(v for v in handle.read().column("uuid").to_pylist() if v) == sorted([self.CANONICAL, other])
+
+    def test_unparseable_text_is_nulled_not_fatal(self, handle):
+        handle.write(self._coerced([self.CANONICAL]))
+        handle.write(pa.table({"uuid": pa.array(["not-a-uuid"], pa.string())}))
+        assert handle.read().column("uuid").to_pylist() == [self.CANONICAL, None]
+
+    def test_urn_form_that_duckdb_rejects_is_parsed_by_us(self, handle):
+        # `urn:uuid:...` is in the coercer's accepted grammar but DuckDB's own
+        # VARCHAR->UUID cast refuses it, so the rewrite is what makes the two
+        # agree.
+        handle.write(self._coerced([self.CANONICAL]))
+        other = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+        handle.write(pa.table({"uuid": pa.array(["urn:uuid:" + other], pa.string())}))
+        assert sorted(v for v in handle.read().column("uuid").to_pylist() if v) == sorted([self.CANONICAL, other])
+
+    def test_repeated_unpinned_flushes_keep_landing(self, handle):
+        handle.write(self._coerced([self.CANONICAL]))
+        other = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+        for _ in range(3):
+            handle.write(pa.table({"uuid": pa.array([other], pa.string())}))
+        assert handle.read().num_rows == 4
+
+    def test_duckdb_itself_would_have_failed_the_whole_insert(self, handle):
+        """The mechanism the rewrite exists to avoid, pinned directly.
+
+        DuckDB's implicit VARCHAR->UUID cast is all-or-nothing and refuses the
+        `urn:uuid:` form our own grammar accepts, so one bad value in a 27k-row
+        batch takes the entire insert down — and it does so identically on
+        every retry, which is what turns it into a permanent wedge rather than
+        a lost flush.
+        """
+        handle.conn.execute("CREATE TABLE lake.main.direct (uuid UUID)")
+        for bad in ("not-a-uuid", "urn:uuid:" + self.CANONICAL):
+            handle.conn.register("_probe", pa.table({"uuid": pa.array([self.CANONICAL, bad], pa.string())}))
+            with pytest.raises(duckdb.ConversionException):
+                handle.conn.execute("INSERT INTO lake.main.direct BY NAME SELECT * FROM _probe")
+            handle.conn.unregister("_probe")
+
+    def test_plain_binary_16_lands_as_blob_not_uuid(self, handle):
+        # The negative control for the choice of wire type: the same 16 bytes
+        # without the extension type are a BLOB, silently — which is why the
+        # coercer adopts a bare binary(16) into `pa.uuid()` rather than passing
+        # it through.
+        raw = uuid_mod.UUID(self.CANONICAL).bytes
+        handle.write(pa.table({"uuid": pa.array([raw], pa.binary(16))}))
+        assert self._column_type(handle) == "BLOB"
+
+    def test_plain_binary_16_does_not_re_alter_every_flush(self, handle):
+        # `_arrow_type_to_duckdb` used to have no fixed_size_binary entry, so
+        # the column fell to the VARCHAR default while CREATE TABLE AS had made
+        # it a BLOB: evolve() then attempted an always-refused BLOB -> VARCHAR
+        # narrowing on EVERY flush, one errors_total{type="schema"} per batch
+        # forever. Agreeing on BLOB is what stops that.
+        assert schema_mod._arrow_type_to_duckdb(pa.binary(16)) == "BLOB"
+        raw = uuid_mod.UUID(self.CANONICAL).bytes
+        batch = pa.table({"uuid": pa.array([raw], pa.binary(16))})
+        handle.write(batch)
+        handle.write(batch)
+        assert self._column_type(handle) == "BLOB"
+        assert handle.read().num_rows == 2

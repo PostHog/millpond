@@ -678,6 +678,266 @@ def _capture_sort_skip_calls(mock_metrics):
     return sort_calls
 
 
+class TestUuidPinnedColumnDownstream:
+    """A `uuid`-pinned column is `pa.uuid()`, an EXTENSION type, and pyarrow's
+    compute kernels refuse one. Every stage between the coercer and the sink
+    therefore has to work on its storage array — these pin that they do, and
+    that the failure mode each one used to have is gone."""
+
+    A = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    B = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+    C = "ffffffff-ffff-4fff-bfff-ffffffffffff"
+
+    def _table(self, values, **extra):
+        from millpond.arrow_converter import coerce_typed_columns
+
+        cols = {"uuid": pa.array(values, pa.string())}
+        cols.update(extra)
+        out = coerce_typed_columns(pa.table(cols), (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        return out
+
+    # -- B2: sort ---------------------------------------------------------
+
+    def _sort_cfg(self, sort_by):
+        cfg = MagicMock()
+        cfg.sort_by = sort_by
+        return cfg
+
+    @patch("millpond.main.metrics")
+    def test_sort_by_uuid_column_sorts_instead_of_crashing(self, mock_metrics):
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = self._table([self.C, self.A, self.B], event=["c", "a", "b"])
+        result = _apply_sort(table, self._sort_cfg(("uuid",)))
+
+        # Storage is the 16 big-endian bytes, so bytewise order IS canonical
+        # text order.
+        assert [str(v) for v in result.column("uuid").to_pylist()] == [self.A, self.B, self.C]
+        # Full-row reordering, and the declared type is untouched.
+        assert result.column("event").to_pylist() == ["a", "b", "c"]
+        assert result.schema.field("uuid").type == pa.uuid()
+        assert sort_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_sort_by_uuid_with_a_second_key_and_nulls(self, mock_metrics):
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = self._table([self.B, None, self.A], team_id=[1, 1, 1])
+        result = _apply_sort(table, self._sort_cfg(("team_id", "uuid")))
+        assert [None if v is None else str(v) for v in result.column("uuid").to_pylist()] == [
+            self.A,
+            self.B,
+            None,
+        ]
+        assert sort_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_unsortable_type_skips_the_sort_and_keeps_the_rows(self, mock_metrics):
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        # A list column has no sort kernel and is not an extension type, so it
+        # reaches the backstop arm. The rows must still flow through, unsorted.
+        table = pa.table({"s": pa.array([[2], [1]], pa.list_(pa.int64()))})
+        result = _apply_sort(table, self._sort_cfg(("s",)))
+        assert result.num_rows == 2
+        assert result.column("s").to_pylist() == [[2], [1]]
+        assert sort_calls == [("unsortable_type", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_unsortable_warning_is_deduped(self, mock_metrics, caplog):
+        import logging as _logging
+
+        from millpond.main import _apply_sort
+
+        _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"s": pa.array([[1]], pa.list_(pa.int64()))})
+        with caplog.at_level(_logging.WARNING, logger="millpond.main"):
+            _apply_sort(table, self._sort_cfg(("s",)))
+            _apply_sort(table, self._sort_cfg(("s",)))
+        assert len([r for r in caplog.records if "sort kernel" in r.message]) == 1
+
+    # -- S1: keep filter ---------------------------------------------------
+
+    def _keep_cfg(self):
+        cfg = MagicMock()
+        cfg.filter_keep_field = "uuid"
+        return cfg
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_on_uuid_column_matches_on_bytes(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B, self.C], event=["a", "b", "c"])
+        result = _apply_filter(table, self._keep_cfg(), (self.A, self.C))
+        assert result.num_rows == 2
+        assert result.column("event").to_pylist() == ["a", "c"]
+        assert skip_calls == [("filter_excluded", 1)]
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_accepts_unhyphenated_filter_values(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B])
+        result = _apply_filter(table, self._keep_cfg(), (self.A.replace("-", ""),))
+        assert result.num_rows == 1
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_counts_nulls_as_field_missing(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, None])
+        result = _apply_filter(table, self._keep_cfg(), (self.A,))
+        assert result.num_rows == 1
+        assert skip_calls == [("filter_field_missing", 1)]
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_ignores_one_bad_polled_value_and_keeps_the_rest(self, mock_metrics):
+        # Config load refuses a static non-UUID; a DYNAMIC include-values poll
+        # can still serve one. It cannot match a uuid column under any
+        # encoding, so it is dropped from the allowlist — condemning the whole
+        # batch would starve every team on the list for one bad entry.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B, self.C])
+        result = _apply_filter(table, self._keep_cfg(), (self.A, "not-a-uuid", self.C))
+        assert result.num_rows == 2
+        assert [str(v) for v in result.column("uuid").to_pylist()] == [self.A, self.C]
+        assert skip_calls == [("filter_excluded", 1)]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="filter_value_invalid")
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_fails_closed_when_no_value_is_a_uuid(self, mock_metrics):
+        # Nothing on the allowlist can match, so nothing is admitted — the
+        # allowlist's own failure direction, under its OWN reason label so a
+        # bad include set is not read as a renamed column.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B])
+        result = _apply_filter(table, self._keep_cfg(), ("not-a-uuid", "also-bad"))
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_value_invalid", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_drop_filter_ignores_one_bad_value_and_denies_the_rest(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B, self.C])
+        result = _apply_drop_filter(table, self._drop_cfg(("not-a-uuid", self.B)))
+        assert [str(v) for v in result.column("uuid").to_pylist()] == [self.A, self.C]
+        assert skip_calls == [("filter_dropped", 1)]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="filter_value_invalid")
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_matched_label_is_canonical_uuid_text(self, mock_metrics):
+        # The label has to be something an operator can match against a UUID.
+        # The default `str` renderer over the STORAGE array emits a Python
+        # bytes repr (b"\x01\x8f<~..."), which is neither greppable nor
+        # joinable to anything.
+        from millpond.main import _apply_filter
+
+        match_calls: list[tuple[str, int]] = []
+
+        def _counter_for(value):
+            counter = MagicMock()
+            counter.inc.side_effect = lambda n, v=value: match_calls.append((v, n))
+            return counter
+
+        mock_metrics.filter_matched_total.labels.side_effect = lambda value: _counter_for(value)
+        table = self._table([self.A, self.A, self.B, self.C])
+        result = _apply_filter(table, self._keep_cfg(), (self.A, self.B))
+
+        assert result.num_rows == 3
+        assert sorted(match_calls) == [(self.A, 2), (self.B, 1)]
+
+    @patch("millpond.main.metrics")
+    def test_non_uuid_polled_value_warns_once(self, mock_metrics, caplog):
+        # A dynamic poll keeps serving the same bad value, so the condition is
+        # permanent; the warning carries the whole values tuple and must not
+        # land once per flush.
+        import logging as _logging
+
+        from millpond.main import _apply_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = self._table([self.A])
+        with caplog.at_level(_logging.WARNING, logger="millpond.main"):
+            _apply_filter(table, self._keep_cfg(), (self.A, "nope"))
+            _apply_filter(table, self._keep_cfg(), (self.A, "nope"))
+            # A genuinely different bad value still gets its own line.
+            _apply_filter(table, self._keep_cfg(), (self.A, "other"))
+        assert len([r for r in caplog.records if "are not UUIDs" in r.message]) == 2
+
+    def test_warn_key_holds_no_reference_to_the_values(self):
+        # An authoritative include-values source rebuilds its list on every
+        # membership change; a dedup set keyed on the tuple would retain every
+        # historical one with nothing to evict it.
+        import millpond.main as _main
+
+        values = tuple(str(i) for i in range(50)) + ("bad",)
+        _main._warn_bad_uuid_filter_values("uuid", values, ("bad",), "ignored")
+        (key,) = _main._uuid_filter_values_warned
+        assert key == ("uuid", 51, "bad")
+
+    def test_parsed_filter_values_are_memoized(self):
+        import millpond.main as _main
+
+        values = (self.A, self.B)
+        first, _ = _main._parse_uuid_filter_values(values)
+        second, _ = _main._parse_uuid_filter_values(values)
+        # Same object back, not an equal rebuild: the memo is what keeps the
+        # parse off the per-batch path.
+        assert first is second
+        third, _ = _main._parse_uuid_filter_values((self.C,))
+        assert third is not first
+
+    # -- S1: drop filter ---------------------------------------------------
+
+    def _drop_cfg(self, drop_values):
+        cfg = MagicMock()
+        cfg.filter_drop_field = "uuid"
+        cfg.filter_drop_values = drop_values
+        return cfg
+
+    @patch("millpond.main.metrics")
+    def test_drop_filter_on_uuid_column_denies_on_bytes(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B, self.C], event=["a", "b", "c"])
+        result = _apply_drop_filter(table, self._drop_cfg((self.B,)))
+        assert result.column("event").to_pylist() == ["a", "c"]
+        assert skip_calls == [("filter_dropped", 1)]
+
+    @patch("millpond.main.metrics")
+    def test_drop_filter_keeps_nulls(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, None])
+        result = _apply_drop_filter(table, self._drop_cfg((self.A,)))
+        assert result.num_rows == 1
+        assert result.column("uuid").to_pylist() == [None]
+
+    @patch("millpond.main.metrics")
+    def test_drop_filter_fails_open_on_a_non_uuid_value(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B])
+        result = _apply_drop_filter(table, self._drop_cfg(("not-a-uuid",)))
+        assert result.num_rows == 2
+
+
 class TestApplyDropFilter:
     """Drop-direction (denylist) filter. Composes AFTER the keep-filter;
     fail-open on anything unevaluable (the opposite of keep — see the

@@ -331,6 +331,41 @@ def _load_filter_fields() -> tuple[
     )
 
 
+def _require_uuid_filter_values(
+    typed_columns: tuple[tuple[str, str], ...] | None,
+    field: str | None,
+    values: tuple[int, ...] | tuple[str, ...] | None,
+    values_var: str,
+) -> None:
+    """Refuse a filter value that is not a UUID when its field is pinned `uuid`.
+
+    A uuid-pinned filter column is compared on its 16 storage bytes, so every
+    configured value has to parse as a UUID to become a comparable one. If one
+    does not, the keep-filter drops the WHOLE batch every flush (an allowlist
+    that cannot be evaluated fails closed) and the drop-filter stops denying
+    anything (a denylist fails open) — both silent, both permanent, neither
+    visible as anything but a throughput cliff. Startup is where that belongs.
+
+    Only the STATIC values are reachable here. A dynamic include-values poll
+    can still serve a non-UUID; `main._apply_filter` handles that at runtime
+    the same way it handles any unusable value array, failing closed with
+    `records_skipped_total{reason="filter_field_missing"}`.
+    """
+    if typed_columns is None or field is None or values is None:
+        return
+    if dict(typed_columns).get(field) != "uuid":
+        return
+    for value in values:
+        try:
+            arrow_converter.uuid_bytes(value)
+        except ValueError as e:
+            raise RuntimeError(
+                f"{values_var} entry {value!r} is not a UUID, but MILLPOND_TYPED_COLUMNS pins "
+                f"{field!r} to uuid — the filter compares UUID bytes, so an unparseable value "
+                f"would silently disable the filter ({e})"
+            ) from None
+
+
 def _load_include_values_config(
     filter_keep_field: str | None,
     filter_values: tuple[int, ...] | tuple[str, ...] | None,
@@ -469,10 +504,18 @@ def _load_typed_columns() -> tuple[tuple[str, str], ...] | None:
     twice with the same type is de-duplicated; listed twice with conflicting
     types is a startup error. Returns None when the env var is absent/whitespace.
 
+    No target is destination-restricted, `uuid` included: the wire form it
+    produces (`pa.uuid()`) is a native `UUID` column on DuckLake AND the
+    `uuid` column type on hoglake, so there is no per-destination refusal to
+    make here (unlike MILLPOND_VARIANT_COLUMNS, which load() rejects for
+    hoglake). See arrow_converter's coercer registry for why that one wire
+    form, and not `pa.binary(16)`.
+
     For re-pointing a consumer at the duckling backfill's events table, pin the
     eight TIMESTAMPTZ columns and project_id:
     timestamp,created_at,person_created_at,group0..4_created_at -> timestamptz;
-    project_id -> bigint.
+    project_id -> bigint. For the hoglake `events_raw` table, add the two
+    ClickHouse `UUID` columns: uuid,person_id -> uuid.
     """
     raw = os.environ.get("MILLPOND_TYPED_COLUMNS", "").strip()
     if not raw:
@@ -1022,6 +1065,8 @@ def load() -> Config:
     filter_keep_field, filter_drop_field, filter_values, filter_drop_values = _load_filter_fields()
     sort_by = _load_sort_by()
     typed_columns = _load_typed_columns()
+    _require_uuid_filter_values(typed_columns, filter_keep_field, filter_values, "MILLPOND_FILTER_VALUES")
+    _require_uuid_filter_values(typed_columns, filter_drop_field, filter_drop_values, "MILLPOND_FILTER_DROP_VALUES")
     variant_columns = _load_variant_columns()
     if destination == "hoglake" and variant_columns is not None:
         # Hoglake has no VARIANT column type; the DuckLake dual-write

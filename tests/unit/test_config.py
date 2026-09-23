@@ -590,6 +590,51 @@ class TestTypedColumnsConfig:
         with pytest.raises(RuntimeError, match="unsafe characters"):
             load()
 
+    def test_uuid_accepted_on_ducklake(self, monkeypatch):
+        # The uuid target carries no destination restriction: `pa.uuid()` lands
+        # as a native DuckDB `UUID` column, so there is nothing for the loader
+        # to refuse. The rule is pinned as a test because the obvious
+        # alternative wire form (`pa.binary(16)`) would have made it a BLOB and
+        # forced a ducklake refusal here instead.
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "uuid:uuid,person_id:uuid")
+        cfg = load()
+        assert cfg.destination == "ducklake"
+        assert cfg.typed_columns == (("uuid", "uuid"), ("person_id", "uuid"))
+
+    def test_uuid_accepted_on_hoglake(self, monkeypatch):
+        monkeypatch.delenv("DUCKLAKE_TABLE", raising=False)
+        monkeypatch.setenv("MILLPOND_DESTINATION", "hoglake")
+        monkeypatch.setenv("HOGLAKE_URL", "http://localhost:28080")
+        monkeypatch.setenv("HOGLAKE_CATALOG", "millpond")
+        monkeypatch.setenv("HOGLAKE_NAMESPACE", "analytics")
+        monkeypatch.setenv("HOGLAKE_TABLE", "events_raw")
+        monkeypatch.setenv("HOGLAKE_S3_ACCESS_KEY", "ak")
+        monkeypatch.setenv("HOGLAKE_S3_SECRET_KEY", "sk")
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "uuid:uuid")
+        cfg = load()
+        assert cfg.destination == "hoglake"
+        assert cfg.typed_columns == (("uuid", "uuid"),)
+
+    def test_events_raw_pin_set(self, monkeypatch):
+        # The README's hoglake `events_raw` recipe, verbatim.
+        spec = (
+            "uuid:uuid,person_id:uuid,team_id:bigint,project_id:bigint,"
+            "timestamp:timestamptz,created_at:timestamptz,captured_at:timestamptz,"
+            "person_created_at:timestamptz"
+        )
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", spec)
+        cfg = load()
+        assert cfg.typed_columns == (
+            ("uuid", "uuid"),
+            ("person_id", "uuid"),
+            ("team_id", "bigint"),
+            ("project_id", "bigint"),
+            ("timestamp", "timestamptz"),
+            ("created_at", "timestamptz"),
+            ("captured_at", "timestamptz"),
+            ("person_created_at", "timestamptz"),
+        )
+
     def test_log_lists_pairs(self, monkeypatch, caplog):
         import logging
 
@@ -598,6 +643,78 @@ class TestTypedColumnsConfig:
             load()
         msgs = [r.message for r in caplog.records]
         assert any("Coerce typed columns: timestamp:timestamptz, project_id:bigint" in m for m in msgs)
+
+
+class TestUuidFilterValuesConfig:
+    """A filter field pinned `uuid` is compared on its 16 storage bytes, so
+    every static filter value has to parse as a UUID. One that does not
+    silently disables the filter — the keep direction drops every batch, the
+    drop direction denies nothing — so it is refused at load."""
+
+    UUID_A = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    UUID_B = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "1")
+        monkeypatch.setenv("POD_NAME", "millpond-events-0")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+
+    def test_uuid_keep_values_accepted(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "person_id:uuid")
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "person_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", f"{self.UUID_A},{self.UUID_B}")
+        cfg = load()
+        assert cfg.filter_values == (self.UUID_A, self.UUID_B)
+
+    def test_unhyphenated_keep_value_accepted(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "person_id:uuid")
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "person_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", self.UUID_A.replace("-", ""))
+        assert load().filter_values == (self.UUID_A.replace("-", ""),)
+
+    def test_non_uuid_keep_value_refused(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "person_id:uuid")
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "person_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", f"{self.UUID_A},nonsense")
+        with pytest.raises(RuntimeError, match="MILLPOND_FILTER_VALUES entry 'nonsense' is not a UUID"):
+            load()
+
+    def test_non_uuid_drop_value_refused(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "person_id:uuid")
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_FIELD_NAME", "person_id")
+        monkeypatch.setenv("MILLPOND_FILTER_DROP_VALUES", "nonsense")
+        with pytest.raises(RuntimeError, match="MILLPOND_FILTER_DROP_VALUES entry 'nonsense' is not a UUID"):
+            load()
+
+    def test_numeric_filter_values_on_a_uuid_pin_are_refused(self, monkeypatch):
+        # `_parse_filter_values` types an all-numeric list as ints; those can
+        # never be UUID bytes, and this is the shape an operator gets by
+        # pinning uuid on a field whose filter was written for team_id.
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "person_id:uuid")
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "person_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1,2")
+        with pytest.raises(RuntimeError, match="is not a UUID"):
+            load()
+
+    def test_unpinned_field_is_not_checked(self, monkeypatch):
+        # The rule is scoped to the pin: a non-UUID value on a plain string
+        # filter field stays perfectly legal.
+        monkeypatch.setenv("MILLPOND_TYPED_COLUMNS", "person_id:uuid")
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "team_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "1,2")
+        assert load().filter_values == (1, 2)
+
+    def test_no_typed_columns_means_no_check(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_FILTER_KEEP_FIELD_NAME", "person_id")
+        monkeypatch.setenv("MILLPOND_FILTER_VALUES", "nonsense")
+        assert load().filter_values == ("nonsense",)
 
 
 class TestVariantColumnsConfig:

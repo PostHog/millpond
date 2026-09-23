@@ -67,11 +67,49 @@ _ARROW_TO_DUCKDB: dict[str, str] = {
 }
 
 
+#: Arrow extension types with a native DuckDB type, by extension name.
+#: `pa.uuid()` is what `MILLPOND_TYPED_COLUMNS=<col>:uuid` produces, and DuckDB
+#: reads it as a native UUID column. Keyed by `extension_name` rather than by
+#: `str(type)` like the table above: the printed form of an extension type
+#: ("extension<arrow.uuid>") is a repr, not a contract.
+_ARROW_EXTENSION_TO_DUCKDB: dict[str, str] = {
+    "arrow.uuid": "UUID",
+}
+
+
 def _arrow_type_to_duckdb(arrow_type: pa.DataType) -> str:
     """Map a PyArrow type to a DuckDB SQL type string."""
+    if isinstance(arrow_type, pa.BaseExtensionType):
+        duckdb_type = _ARROW_EXTENSION_TO_DUCKDB.get(arrow_type.extension_name)
+        if duckdb_type is not None:
+            return duckdb_type
     type_str = str(arrow_type)
     if type_str in _ARROW_TO_DUCKDB:
         return _ARROW_TO_DUCKDB[type_str]
+    # Fixed-width binary is BLOB, like the variable-width kinds above. The
+    # width is in the Arrow type name (`fixed_size_binary[16]`), so a lookup
+    # table cannot carry it and this needs its own branch.
+    #
+    # DEFENSIVE, not a live fix: nothing millpond produces has this type. The
+    # arrow_converter infers only int64/float64/bool/string/timestamp from
+    # JSON, and the one coercer that deals in 16 raw bytes emits the EXTENSION
+    # type handled above (a real DuckDB UUID column), adopting a bare
+    # `fixed_size_binary(16)` into it rather than passing one through. Only a
+    # caller constructing such a batch by hand reaches here.
+    #
+    # It is still the right answer for that caller: `CREATE TABLE AS` gives
+    # the column BLOB, so agreeing on BLOB means evolve() issues no ALTER,
+    # where the VARCHAR default meant an always-refused BLOB -> VARCHAR
+    # narrowing on every flush and one errors_total{type="schema"} per batch.
+    # The opposite direction is the cost, and it is the smaller one: against a
+    # pre-existing VARCHAR column, such a batch now attempts a refused
+    # VARCHAR -> BLOB ALTER per flush where it previously agreed and attempted
+    # none. Both are the same metric on the same cadence; the difference is
+    # that the table millpond itself created is the common case and is now the
+    # quiet one, and a VARCHAR column receiving raw bytes is a mismatch worth
+    # a signal either way.
+    if pa.types.is_fixed_size_binary(arrow_type):
+        return "BLOB"
     # Structs, lists, maps → JSON
     if pa.types.is_struct(arrow_type) or pa.types.is_list(arrow_type) or pa.types.is_map(arrow_type):
         return "JSON"
@@ -285,6 +323,21 @@ class SchemaManager:
         if not self._ensure_schema_loaded():
             return frozenset()
         return frozenset(name.lower() for name, typ in self._known_columns.items() if typ == "VARIANT")
+
+    def live_uuid_column_names(self) -> frozenset[str]:
+        """Lowercased names of UUID columns in the live table schema.
+
+        `ducklake.write` uses this to parse a plain VARCHAR batch column into
+        real UUID values before the INSERT. DuckDB's own implicit VARCHAR->UUID
+        cast is all-or-nothing: ONE unparseable value fails the whole insert
+        with a ConversionException, deterministically, on every retry — and it
+        also refuses the `urn:uuid:` form the coercer accepts. Lowercased
+        because DuckDB identifiers are case-insensitive, same as
+        `live_variant_column_names`.
+        """
+        if not self._ensure_schema_loaded():
+            return frozenset()
+        return frozenset(name.lower() for name, typ in self._known_columns.items() if typ == "UUID")
 
     def ensure_variant_columns(
         self,

@@ -209,11 +209,161 @@ def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
 # ISO-8601 parser accepts the space separator and 0/3/6 fractional digits the
 # Node/ClickHouse producers emit — see rust `ClickHouseEvent` in
 # `rust/common/types/src/event.rs`), then stamp it UTC with `assume_timezone`.
+#
+# uuid is the one target whose Arrow type is an EXTENSION type rather than a
+# plain one. The events topic carries `uuid` and `person_id` as UUID strings
+# (ClickHouse `UUID`); both destinations have a real UUID type for them, and
+# `pa.uuid()` — canonical since pyarrow 18, an extension over
+# `fixed_size_binary(16)` holding the 16 big-endian bytes — is the ONE wire
+# form that lands correctly on both:
+#   - hoglake: pyhoglake maps `fixed_size_binary(16)` to its `uuid` column type
+#     and accepts `pa.uuid()` as the same thing (pyhoglake `types.py`
+#     `arrow_type_to_coltype`);
+#   - DuckLake: DuckDB reads an Arrow `pa.uuid()` column as native `UUID`. A
+#     plain `pa.binary(16)` lands as `BLOB` there instead — silently, because
+#     the bytes are identical — which is why the coercer emits the extension
+#     type and adopts a bare `binary(16)` into it rather than passing it
+#     through.
+# The extension type also carries to parquet: pyarrow stamps
+# FIXED_LEN_BYTE_ARRAY(16) + `LogicalTypeAnnotation.uuidType()` for `pa.uuid()`
+# and no annotation at all for `pa.binary(16)`, and that annotation is what the
+# Trino hoglake connector binds a uuid column through. That last property is
+# true of this column and NOT (yet) of the file the hoglake sink uploads:
+# `HoglakeSink._prepare` casts to the schema pyhoglake derives from the
+# catalog, where a `uuid` column is plain `pa.binary(16)`, and pyhoglake's
+# `prepare_append_files` compares the written parquet's arrow schema to that
+# one exactly — so the annotation needs a pyhoglake change, not a millpond one
+# (see the note in tests/unit/test_hoglake.py::TestUuidColumnWireForm).
 _TIMESTAMPTZ = pa.timestamp("us", tz="UTC")
+
+#: The `uuid` target's Arrow type. Public: main.py compares filter/sort columns
+#: against it, and hoglake.py recognises it when degrading against a live
+#: `string` column.
+UUID_TYPE = pa.uuid()
+UUID_STORAGE_TYPE = pa.binary(16)
+
+_URN_PREFIX = "urn:uuid:"
 
 
 def _to_timestamptz(col):
     return pc.assume_timezone(col.cast(pa.timestamp("us")), "UTC")
+
+
+def uuid_bytes(value: object) -> bytes:
+    """The 16 big-endian bytes of one UUID string. Raises `ValueError` otherwise.
+
+    The accepted shapes are ENUMERATED, deliberately narrower than
+    `uuid.UUID`'s grammar:
+
+      * canonical 8-4-4-4-12 hex, either case;
+      * 32 hex digits with no separators;
+      * either of those wrapped in `{...}`, or prefixed with `urn:uuid:`.
+
+    `uuid.UUID` was the fallback here and had to go: it strips `urn:` and
+    `uuid:` from ANYWHERE in the string, removes EVERY hyphen wherever it
+    sits, and hands what is left to `int(text, 16)` — which itself accepts a
+    `0x` prefix, a leading sign and PEP 515 underscores — so it silently
+    remaps values that are not UUIDs at all into plausible-looking ones
+    nobody can trace back (measured on CPython 3.13:
+    `0x0123456789abcdef0123456789abcd` becomes
+    `00012345-6789-abcd-ef01-23456789abcd`). A producer emitting one of those
+    is a defect worth a NULL and an
+    `errors_total{type="column_coercion"}`, not a made-up identifier.
+
+    Two things this deliberately does NOT do:
+
+      * It does not validate RFC 4122 variant/version bits. ClickHouse `UUID`
+        is an opaque 128-bit value and PostHog writes v4 and v7 both; rejecting
+        a "wrong" variant would drop real data.
+      * The `urn:uuid:` prefix is matched case-SENSITIVELY (`URN:UUID:` is
+        refused). The hex digits themselves are case-insensitive.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"not a UUID string: {type(value).__name__}")
+    text = value
+    if text.startswith(_URN_PREFIX):
+        text = text[len(_URN_PREFIX) :]
+    elif len(text) >= 2 and text[0] == "{" and text[-1] == "}":
+        text = text[1:-1]
+    if len(text) == 36:
+        # Hyphens at exactly the canonical offsets. An extra hyphen INSIDE a
+        # group survives this check and is caught by the length test below,
+        # because `replace` takes it out too and the result comes up short.
+        if text[8] != "-" or text[13] != "-" or text[18] != "-" or text[23] != "-":
+            raise ValueError(f"not a UUID: {value!r}")
+        text = text.replace("-", "")
+    if len(text) != 32:
+        raise ValueError(f"not a UUID: {value!r}")
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        raise ValueError(f"not a UUID: {value!r}") from None
+    if len(raw) != 16:
+        # `bytes.fromhex` skips ASCII whitespace, so "aabb ... ccdd" with two
+        # internal spaces is 32 characters and decodes to 15 bytes. This is the
+        # only guard against that silent short decode.
+        raise ValueError(f"not a UUID: {value!r}")
+    return raw
+
+
+def uuid_text(raw: object) -> str:
+    """Canonical hyphenated text for 16 big-endian UUID bytes.
+
+    The inverse of `uuid_bytes` for the shapes that round-trip, and the
+    rendering used wherever a uuid column's VALUE has to be human-readable
+    again: the `filter_matched_total` label, and the restringify degradation
+    in hoglake.py when the live column is `string`.
+    """
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) != 16:
+        raise ValueError(f"not 16 UUID bytes: {raw!r}")
+    hexed = bytes(raw).hex()
+    return f"{hexed[0:8]}-{hexed[8:12]}-{hexed[12:16]}-{hexed[16:20]}-{hexed[20:32]}"
+
+
+def _to_uuid(col):
+    """Coerce a column of UUID strings to `pa.uuid()`.
+
+    Already-`pa.uuid()` is returned untouched (the registry skips that case
+    before we get here; the guard keeps `_coerce_or_null`'s per-value retry
+    honest). A binary column whose values are already the 16 bytes —
+    `fixed_size_binary(16)`, or a variable-width `binary`/`large_binary` that
+    happens to hold 16-byte values — is adopted rather than re-parsed; the
+    fixed-width case is zero-copy, the variable-width one is one Arrow cast
+    that raises for any other width (and `_coerce_or_null` then nulls exactly
+    the wrong-width values).
+
+    Strings are decoded value-by-value: pyarrow compute has no hex-decode
+    kernel, so there is no vectorized route to the bytes. Measured at ~11.8 ms
+    per 27k-row column (~0.44 us/value; ~23 ms for the events pair
+    `uuid` + `person_id`) against a ~60 s flush interval — under
+    `_apply_sort`'s 50-200 ms per flush and far under the flush budget at both
+    the ~1.1k rec/s dev rate and 30k+ in prod. A bulk "join every value, one
+    `bytes.fromhex`, slice the buffer" variant measured 7.2 ms — 18% for a
+    decode that misaligns silently when two values' lengths compensate, so it
+    is not worth the correctness surface. `_coerce_or_null`'s per-value
+    fallback costs ~134 ms for a 27k-row batch that contains any unparseable
+    value; that is the cold path, and it is a batch that is already anomalous.
+    """
+    if col.type == UUID_TYPE:
+        return col
+    if pa.types.is_fixed_size_binary(col.type) and col.type.byte_width == 16:
+        storage = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
+        return pa.ExtensionArray.from_storage(UUID_TYPE, storage)
+    if pa.types.is_binary(col.type) or pa.types.is_large_binary(col.type):
+        storage = col.cast(UUID_STORAGE_TYPE)
+        if isinstance(storage, pa.ChunkedArray):
+            storage = storage.combine_chunks()
+        return pa.ExtensionArray.from_storage(UUID_TYPE, storage)
+    try:
+        decoded = [None if v is None else uuid_bytes(v) for v in col.to_pylist()]
+    except ValueError as e:
+        # The registry's contract is that a coercer signals an unconvertible
+        # value with an Arrow error; `_coerce_or_null` then nulls exactly the
+        # bad values via its per-value pass. `uuid_bytes` raises ValueError for
+        # a bad string AND for a non-string source column, so one arm covers
+        # both — translate rather than let it escape to the consume path.
+        raise pa.ArrowInvalid(str(e)) from e
+    return pa.ExtensionArray.from_storage(UUID_TYPE, pa.array(decoded, type=UUID_STORAGE_TYPE))
 
 
 _COERCERS: dict[str, tuple[pa.DataType, object]] = {
@@ -222,6 +372,7 @@ _COERCERS: dict[str, tuple[pa.DataType, object]] = {
     "double": (pa.float64(), lambda col: col.cast(pa.float64())),
     "boolean": (pa.bool_(), lambda col: col.cast(pa.bool_())),
     "varchar": (pa.string(), lambda col: col.cast(pa.string())),
+    "uuid": (UUID_TYPE, _to_uuid),
 }
 
 # Public allowlist for config validation (single source of truth).
@@ -243,11 +394,18 @@ def _coerce_or_null(col, coercer, arrow_type: pa.DataType) -> tuple[object, int]
     fallback batch are concatenated. Leaving the column as its source type would
     move the crash there instead of avoiding it. The per-value pass is a cold path
     — it runs only for a batch that actually contains an unparseable value.
+
+    An extension target (``uuid``) is rebuilt through its STORAGE type. The
+    per-value ``as_py()`` of an extension scalar is the logical Python object
+    (``uuid.UUID``), which ``pa.array`` has no way to lay back out; the storage
+    scalar is the 16 bytes, which it does.
     """
     try:
         return coercer(col), 0
     except (pa.ArrowInvalid, pa.ArrowTypeError):
         src_type = col.type
+        extension = arrow_type if isinstance(arrow_type, pa.BaseExtensionType) else None
+        build_type = extension.storage_type if extension is not None else arrow_type
         out: list = []
         failed = 0
         for v in col.to_pylist():
@@ -255,11 +413,16 @@ def _coerce_or_null(col, coercer, arrow_type: pa.DataType) -> tuple[object, int]
                 out.append(None)
                 continue
             try:
-                out.append(coercer(pa.array([v], type=src_type))[0].as_py())
+                one = coercer(pa.array([v], type=src_type))
             except (pa.ArrowInvalid, pa.ArrowTypeError):
                 out.append(None)
                 failed += 1
-        return pa.array(out, type=arrow_type), failed
+                continue
+            out.append((one.storage if extension is not None else one)[0].as_py())
+        built = pa.array(out, type=build_type)
+        if extension is not None:
+            built = pa.ExtensionArray.from_storage(extension, built)
+        return built, failed
 
 
 def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], ...]) -> pa.Table:

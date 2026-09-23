@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,7 @@ from pyhoglake import (
 from pyhoglake.models import SortField, SortSpec
 
 from millpond import hoglake
+from millpond.arrow_converter import coerce_typed_columns
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -689,6 +691,7 @@ class TestTableSchemaForBatch:
             (pa.float64(), "double"),  # ... and floats to float64
             (pa.bool_(), "boolean"),
             (pa.timestamp("us", tz="UTC"), "timestamptz"),  # MILLPOND_TYPED_COLUMNS timestamptz
+            (pa.uuid(), "uuid"),  # MILLPOND_TYPED_COLUMNS uuid
         ],
     )
     def test_millpond_types_map(self, arrow_type, hoglake_type):
@@ -697,6 +700,328 @@ class TestTableSchemaForBatch:
         out = hoglake.table_schema_for_batch(pa.schema([("c", arrow_type)]))
         defs = schema_to_column_defs(out)
         assert defs[0]["type"] == hoglake_type
+
+
+class TestUuidColumnWireForm:
+    """What a `uuid`-pinned column actually looks like in the file this sink
+    uploads — including the one thing it does NOT carry."""
+
+    RAW = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+
+    def _uuid_columns(self):
+        return [
+            _col("uuid", "uuid", 1, 1),
+            _col("event", "string", 2, 2),
+            _col("team_id", "long", 3, 3),
+            _col("properties", "string", 4, 4),
+            _col("_inserted_at", "timestamptz", 5, 5),
+        ]
+
+    def _written(self, monkeypatch):
+        monkeypatch.setattr(hoglake.pq, "write_table", _REAL_WRITE_TABLE)
+        s, client, catalog, ns, table = _sink(columns=self._uuid_columns())
+        captured: dict[str, list] = {}
+        prepared = table.prepare_append_files.side_effect
+
+        def prepare(files, **kwargs):
+            captured["files"] = [pq.ParquetFile(path) for path, _ in files]
+            return prepared(files, **kwargs)
+
+        table.prepare_append_files.side_effect = prepare
+        batch = coerce_typed_columns(
+            pa.table({"uuid": [self.RAW], "event": ["e"], "team_id": [1]}),
+            (("uuid", "uuid"),),
+        )
+        s.write(batch)
+        return captured["files"][0]
+
+    def test_coerced_column_aligns_to_the_live_uuid_column(self, monkeypatch):
+        # No add_column, no promote: `pa.uuid()` already IS the live type.
+        pf = self._written(monkeypatch)
+        assert pf.schema.column(0).name == "uuid"
+        assert pf.schema.column(0).physical_type == "FIXED_LEN_BYTE_ARRAY"
+        assert pf.schema.column(0).length == 16
+        assert pf.read().column("uuid").to_pylist() == [uuid.UUID(self.RAW).bytes]
+
+    def test_no_uuid_logical_annotation_yet_pyhoglake_forbids_it(self, monkeypatch):
+        """The file carries the right 16 bytes and NOT the parquet
+        `LogicalTypeAnnotation.uuidType()`, which a Trino/Iceberg reader binds a
+        uuid column through.
+
+        Not an oversight and not fixable here. `_prepare` casts the batch to
+        `columns_to_arrow_schema(info.columns)`, and pyhoglake answers a `uuid`
+        column with plain `pa.binary(16)` (`types.py` `coltype_to_arrow`) —
+        pyarrow stamps the annotation only for `pa.uuid()`. Casting to
+        `pa.uuid()` here instead does produce the annotation, and then
+        `prepare_append_files` REFUSES the file: it compares
+        `parquet.schema_arrow.equals(columns_to_arrow_schema(...))` exactly, so
+        an extension-typed column reads as "prepared Parquet schema/field IDs
+        differ from destination" (verified against a real server). The fix is
+        pyhoglake returning `pa.uuid()` from `coltype_to_arrow("uuid")`, which
+        moves both sides at once. This test is the canary for that landing.
+        """
+        pf = self._written(monkeypatch)
+        assert pf.schema.column(0).logical_type.type == "NONE"
+        assert pf.schema_arrow.field("uuid").type == pa.binary(16)
+
+
+class TestUuidAgainstStringColumn:
+    """B1: pinning `uuid` on a table whose live column is `string`.
+
+    This is the state every existing table is in — `events_raw` in dev today —
+    because the column was created from unpinned string batches. Before the
+    degradation arm, `_evolve_and_align` found no ("string", "uuid") promotion,
+    left the column alone, and `_prepare`'s `.cast(target)` raised
+    `ArrowInvalid: Invalid UTF8 payload` on every flush: offsets never commit,
+    the restart re-consumes the same batch, the partition is wedged for good.
+    """
+
+    RAW = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+
+    def _batch(self):
+        return coerce_typed_columns(
+            pa.table({"uuid": [self.RAW], "event": ["e"], "team_id": [1]}),
+            (("uuid", "uuid"),),
+        )
+
+    def test_degrades_to_text_instead_of_wedging(self):
+        # _EVENTS_COLUMNS types `uuid` as string — the unpinned-table shape.
+        s, client, catalog, ns, table = _sink()
+        assert s.write(self._batch()) == 1
+        written = _published()
+        assert written.schema.field("uuid").type == pa.string()
+        assert written.column("uuid").to_pylist() == [self.RAW]
+        # No DDL was attempted: string cannot be promoted to uuid.
+        assert table.alter.call_count == 0
+
+    @patch("millpond.hoglake.metrics")
+    def test_degradation_is_metricked_and_logged_once(self, mock_metrics, caplog):
+        s, client, catalog, ns, table = _sink()
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            s.write(self._batch())
+            s.write(self._batch())
+        mock_metrics.errors_total.labels.assert_any_call(type="schema")
+        warnings = [r.message for r in caplog.records if "promotion" in r.message]
+        assert len(warnings) == 1
+
+    def test_nulls_survive_the_restringify(self):
+        s, client, catalog, ns, table = _sink()
+        batch = coerce_typed_columns(
+            pa.table({"uuid": pa.array([self.RAW, None], pa.string()), "team_id": [1, 2]}),
+            (("uuid", "uuid"),),
+        )
+        s.write(batch)
+        assert _published().column("uuid").to_pylist() == [self.RAW, None]
+
+    def test_live_uuid_column_is_not_restringified(self):
+        # The control: when the table really is uuid-typed, nothing degrades.
+        columns = [
+            _col("uuid", "uuid", 1, 1),
+            _col("event", "string", 2, 2),
+            _col("team_id", "long", 3, 3),
+            _col("properties", "string", 4, 4),
+            _col("_inserted_at", "timestamptz", 5, 5),
+        ]
+        s, client, catalog, ns, table = _sink(columns=columns)
+        s.write(self._batch())
+        assert _published().schema.field("uuid").type == pa.binary(16)
+
+
+class TestStringAgainstUuidColumn:
+    """B1's mirror: a live `uuid` column and a plain `string` batch column.
+
+    Two ways to land here, both ordinary: an operator removes `<col>:uuid`
+    from MILLPOND_TYPED_COLUMNS as a rollback, or one pod on a mixed fleet has
+    not picked the pin up yet and writes to a table another pod created with
+    it. Before the rewrite arm this fell to `_prepare`'s cast and raised
+    `ArrowInvalid: Failed casting from string to fixed_size_binary[16]`, which
+    `is_retryable` correctly calls permanent — so it crashed on attempt 1 with
+    the offsets uncommitted, every time.
+    """
+
+    RAW = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    OTHER = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    def _uuid_table(self):
+        return [
+            _col("uuid", "uuid", 1, 1),
+            _col("event", "string", 2, 2),
+            _col("team_id", "long", 3, 3),
+            _col("properties", "string", 4, 4),
+            _col("_inserted_at", "timestamptz", 5, 5),
+        ]
+
+    def test_unpinned_string_batch_is_parsed_instead_of_crashing(self):
+        s, client, catalog, ns, table = _sink(columns=self._uuid_table())
+        assert s.write(pa.table({"uuid": [self.RAW], "event": ["e"], "team_id": [1]})) == 1
+        written = _published()
+        assert written.schema.field("uuid").type == pa.binary(16)
+        assert written.column("uuid").to_pylist() == [uuid.UUID(self.RAW).bytes]
+        assert table.alter.call_count == 0
+
+    @patch("millpond.hoglake.metrics")
+    def test_unparseable_text_is_nulled_and_metricked(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(columns=self._uuid_table())
+        s.write(pa.table({"uuid": [self.RAW, "not-a-uuid", None], "team_id": [1, 2, 3]}))
+        assert _published().column("uuid").to_pylist() == [uuid.UUID(self.RAW).bytes, None, None]
+        mock_metrics.errors_total.labels.assert_any_call(type="schema")
+        mock_metrics.errors_total.labels.assert_any_call(type="column_coercion")
+
+    def test_large_string_batch_column_is_parsed_too(self):
+        s, client, catalog, ns, table = _sink(columns=self._uuid_table())
+        s.write(pa.table({"uuid": pa.array([self.RAW], pa.large_string()), "team_id": [1]}))
+        assert _published().column("uuid").to_pylist() == [uuid.UUID(self.RAW).bytes]
+
+
+class TestUuidRewriteShapes:
+    """Shapes the rewrite has to survive that the single-column, single-chunk
+    happy paths above do not exercise."""
+
+    A = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    B = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+    C = "ffffffff-ffff-4fff-bfff-ffffffffffff"
+
+    def _string_table(self):
+        # `uuid` and `person_id` both string-typed live: the pre-pin shape of
+        # the real events table.
+        return [
+            _col("uuid", "string", 1, 1),
+            _col("person_id", "string", 2, 2),
+            _col("team_id", "long", 3, 3),
+            _col("_inserted_at", "timestamptz", 4, 4),
+        ]
+
+    def _uuid_table(self):
+        return [
+            _col("uuid", "uuid", 1, 1),
+            _col("person_id", "uuid", 2, 2),
+            _col("team_id", "long", 3, 3),
+            _col("_inserted_at", "timestamptz", 4, 4),
+        ]
+
+    def _multichunk(self, values, type_):
+        # What `pa.concat_tables` hands `_flush` when MILLPOND_SORT_BY is
+        # unset: one chunk per consumed batch, never combined.
+        half = len(values) // 2
+        return pa.chunked_array([pa.array(values[:half], type_), pa.array(values[half:], type_)])
+
+    def test_multichunk_two_columns_uuid_batch_to_string_table(self):
+        s, client, catalog, ns, table = _sink(columns=self._string_table())
+        text = [self.A, self.B, self.C, self.A]
+        pins = (("uuid", "uuid"), ("person_id", "uuid"))
+        # The production shape exactly: coercion runs per CONSUMED batch, and
+        # `_flush`'s `pa.concat_tables` leaves one chunk per batch behind when
+        # MILLPOND_SORT_BY is unset (a sort would combine them).
+        batch = pa.concat_tables(
+            [
+                coerce_typed_columns(
+                    pa.table(
+                        {
+                            "uuid": pa.array(text[i : i + 2], pa.string()),
+                            "person_id": pa.array(list(reversed(text))[i : i + 2], pa.string()),
+                            "team_id": pa.array([i, i + 1], pa.int64()),
+                        }
+                    ),
+                    pins,
+                )
+                for i in (0, 2)
+            ]
+        )
+        assert batch.column("uuid").num_chunks == 2
+        s.write(batch)
+        written = _published()
+        # Every chunk and BOTH columns: a rewrite that stopped after the first
+        # of either would pass a single-chunk single-column assertion.
+        assert written.column("uuid").to_pylist() == text
+        assert written.column("person_id").to_pylist() == list(reversed(text))
+
+    def test_rewritten_column_is_the_uuid_extension_type(self):
+        # NOT bare `fixed_size_binary(16)`: pyhoglake maps both to "uuid", so
+        # the wrong one still appends — and then the column is the one thing
+        # that cannot carry the parquet UUID annotation if pyhoglake ever
+        # stops stripping it, and disagrees with what the coercer emits.
+        s, client, catalog, ns, table = _sink(columns=self._uuid_table())
+        batch = pa.table({"uuid": [self.A], "team_id": pa.array([1], pa.int64())})
+        out = s._rewrite_column(batch, "uuid", "uuid", "string")
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").combine_chunks().storage.to_pylist() == [uuid.UUID(self.A).bytes]
+
+    @patch("millpond.hoglake.metrics")
+    def test_both_directions_of_one_column_each_warn(self, mock_metrics, caplog):
+        # The dedup key carries the DIRECTION: keyed on the name alone, a pod
+        # that rolls the pin back after applying it would never report the
+        # second mismatch.
+        s, client, catalog, ns, table = _sink(columns=self._string_table())
+        pinned = coerce_typed_columns(pa.table({"uuid": [self.A]}), (("uuid", "uuid"),))
+        text = pa.table({"uuid": [self.A]})
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            s._rewrite_column(pinned, "uuid", "string", "uuid")
+            s._rewrite_column(pinned, "uuid", "string", "uuid")
+            s._rewrite_column(text, "uuid", "uuid", "string")
+        messages = [r.message for r in caplog.records if "promotion" in r.message]
+        assert len(messages) == 2
+        # And each renders its own direction the right way round.
+        assert "hoglake has no string->uuid promotion" in messages[0]
+        assert "A real 'uuid' column needs the table created that way" in messages[0]
+        assert "hoglake has no uuid->string promotion" in messages[1]
+        assert "A real 'string' column needs the table created that way" in messages[1]
+
+    def test_multichunk_two_columns_string_batch_to_uuid_table(self):
+        s, client, catalog, ns, table = _sink(columns=self._uuid_table())
+        text = [self.A, self.B, self.C, self.A]
+        s.write(
+            pa.table(
+                {
+                    "uuid": self._multichunk(text, pa.string()),
+                    "person_id": self._multichunk(list(reversed(text)), pa.string()),
+                    "team_id": pa.array([1, 2, 3, 4], pa.int64()),
+                }
+            )
+        )
+        written = _published()
+        assert written.column("uuid").to_pylist() == [uuid.UUID(v).bytes for v in text]
+        assert written.column("person_id").to_pylist() == [uuid.UUID(v).bytes for v in reversed(text)]
+
+    def test_bare_fixed_size_binary_batch_against_a_string_column(self):
+        # pyhoglake maps a bare `fixed_size_binary(16)` to "uuid" too, and that
+        # array has no `.storage` — reading one unguarded raised AttributeError,
+        # which `is_retryable` calls transient, so it burned the whole ladder
+        # before the crash.
+        s, client, catalog, ns, table = _sink(columns=self._string_table())
+        s.write(
+            pa.table(
+                {
+                    "uuid": pa.array([uuid.UUID(self.A).bytes], pa.binary(16)),
+                    "team_id": pa.array([1], pa.int64()),
+                }
+            )
+        )
+        assert _published().column("uuid").to_pylist() == [self.A]
+
+    def test_unknown_column_name_raises_rather_than_rewriting_the_last_one(self):
+        # `get_field_index` answers -1 for a miss and `set_column(-1, ...)`
+        # would silently rewrite the LAST column.
+        s, client, catalog, ns, table = _sink(columns=self._string_table())
+        batch = pa.table({"uuid": [self.A], "team_id": [1]})
+        with pytest.raises(ValueError, match="not in the batch schema"):
+            s._rewrite_column(batch, "absent", "string", "uuid")
+
+
+class TestArrowErrorsAreNotRetryable:
+    """A pyarrow failure is deterministic on the batch in hand: the same cast
+    of the same bytes fails identically on every attempt, so the retry ladder
+    is pure delay before the crash the operator needs to see."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pa.ArrowInvalid("Invalid UTF8 payload"),
+            pa.ArrowTypeError("no kernel"),
+            pa.ArrowNotImplementedError("Sorting not supported for type extension<arrow.uuid>"),
+        ],
+    )
+    def test_arrow_errors_are_permanent(self, exc):
+        assert hoglake.is_retryable(exc) is False
 
 
 # ---------------------------------------------------------------------------
