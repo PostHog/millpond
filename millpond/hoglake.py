@@ -1754,10 +1754,11 @@ class HoglakeSink:
           `fixed_size_binary(16)` and pyarrow casts its storage to utf8 by
           REINTERPRETING the bytes, so 16 arbitrary bytes raise
           `ArrowInvalid: Invalid UTF8 payload`;
-        * live `uuid`, batch `string` — the cast is to
-          `fixed_size_binary(16)` and raises
-          `ArrowInvalid: Failed casting from string ...: widths must match`,
-          because 36 characters of text are not 16 bytes.
+        * live `uuid`, batch `string` — the cast is to `pa.uuid()` (plain
+          `fixed_size_binary(16)` before pyhoglake 1.3.0; either way pyarrow
+          reports the STORAGE type in the message) and raises
+          `ArrowInvalid: Failed casting from string to fixed_size_binary[16]:
+          widths must match`, because 36 characters of text are not 16 bytes.
 
         Both are deterministic on the batch, so both are non-retryable: the
         flush crashes on attempt 1 with the offsets uncommitted, the restart

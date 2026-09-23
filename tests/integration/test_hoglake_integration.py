@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import httpx
@@ -26,6 +29,7 @@ import pyarrow.parquet as pq
 import pytest
 from pyarrow import fs as pafs
 from pyhoglake import IncarnationChangedError, NotFoundError, ValidationError
+from pyhoglake.types import columns_to_arrow_schema
 
 from millpond.hoglake import HoglakeSink, HoglakeSinkError, is_retryable, table_schema_for_batch
 from millpond.main import _flush
@@ -1028,27 +1032,27 @@ class TestUuidColumnLive:
         assert types["event"] == "string"
         assert _record_count(client, cfg) == 3
 
-    def test_uploaded_parquet_is_16_raw_bytes_without_the_uuid_annotation(self, hog_stack, client):
-        """The bytes are right; the parquet `LogicalTypeAnnotation.uuidType()`
-        is absent, and pyhoglake is what forbids it.
+    def test_uploaded_parquet_carries_the_uuid_annotation(self, hog_stack, client):
+        """The commit lands AND the object's footer says UUID.
 
-        `_prepare` casts the batch to `columns_to_arrow_schema(info.columns)`,
-        and pyhoglake answers a `uuid` column with plain `pa.binary(16)`
-        (`types.py` `coltype_to_arrow`), for which pyarrow stamps no logical
-        type. Casting to `pa.uuid()` instead DOES stamp it — and then
-        `prepare_append_files` refuses the file outright:
+        Both halves matter and they used to be mutually exclusive. `_prepare`
+        casts each batch to `columns_to_arrow_schema(info.columns)`; before
+        pyhoglake 1.3.0 that named plain `pa.binary(16)`, for which pyarrow
+        stamps no logical type, and writing the annotated form anyway had
+        `prepare_append_files` refuse the file outright —
         `parquet.schema_arrow.equals(columns_to_arrow_schema(...))` is an exact
-        compare, so the extension-typed column comes back as "prepared Parquet
-        schema/field IDs differ from destination" (observed against this
-        server). So the annotation needs pyhoglake to move both sides; this
-        test is the canary for that landing.
+        compare, so the extension-typed column came back as "prepared Parquet
+        schema/field IDs differ from destination" (observed against this very
+        server). 1.3.0 moved both sides: the schema names `pa.uuid()` and
+        append accepts either spelling.
         """
         cfg = _fresh()
         sink = HoglakeSink(cfg)
         try:
-            sink.write(self._pinned_batch())
+            assert sink.write(self._pinned_batch()) == 3
         finally:
             sink.close()
+        assert _record_count(client, cfg) == 3
         paths = _list_objects(DATA_PATH, cfg)
         assert len(paths) == 1
         s3 = _minio()
@@ -1058,13 +1062,59 @@ class TestUuidColumnLive:
             for name in ("uuid", "person_id"):
                 assert by_name[name].physical_type == "FIXED_LEN_BYTE_ARRAY"
                 assert by_name[name].length == 16
-                assert by_name[name].logical_type.type == "NONE"
+                assert str(by_name[name].logical_type) == "UUID"
+            assert pf.schema_arrow.field("uuid").type == pa.uuid()
             table = pf.read()
         assert table.column("uuid").to_pylist() == [
-            uuid.UUID(self.CANONICAL).bytes,
-            uuid.UUID(self.OTHER).bytes,
+            uuid.UUID(self.CANONICAL),
+            uuid.UUID(self.OTHER),
             None,
         ]
+
+    def test_a_bare_fixed_size_binary_file_still_prepares(self, hog_stack, client):
+        """The mixed-fleet half of the 1.3.0 contract: append accepts BOTH
+        spellings, so a pod that predates this pin — one whose `_prepare` cast
+        named `pa.binary(16)` — keeps writing to the same table.
+
+        Driven at the pyhoglake boundary rather than through the sink, because
+        the sink can no longer produce the old spelling: the schema it casts to
+        comes from the installed pyhoglake.
+        """
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(self._pinned_batch())
+            table = _table(client, cfg)
+            bare = pa.schema(
+                [
+                    field.with_type(pa.binary(16)) if field.type == pa.uuid() else field
+                    for field in columns_to_arrow_schema(table.info().columns)
+                ]
+            )
+            assert bare.field("uuid").type == pa.binary(16)
+            rows = (
+                pa.table(
+                    {
+                        "uuid": pa.array([uuid.UUID(self.OTHER).bytes], pa.binary(16)),
+                        "person_id": pa.nulls(1, pa.binary(16)),
+                        "event": ["pageview"],
+                        "team_id": pa.array([1], pa.int64()),
+                        "_inserted_at": pa.array([datetime.now(UTC)], pa.timestamp("us", tz="UTC")),
+                    }
+                )
+                .select(list(bare.names))
+                .cast(bare)
+            )
+            with tempfile.TemporaryDirectory(prefix="millpond-bare-") as tmp:
+                path = os.path.join(tmp, "part-0.parquet")
+                pq.write_table(rows, path)
+                assert pq.ParquetFile(path).schema.column(0).logical_type.type == "NONE"
+                payload = table.prepare_append_files([(path, None)], idempotency_key=str(uuid.uuid4()))
+            payload.pop("read_snapshot", None)
+            client.catalog(cfg.hoglake_catalog).commit_prepared(payload)
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 4
 
     def test_second_flush_appends_without_schema_drift(self, hog_stack, client):
         # The coerced type must reconcile against the live `uuid` column, not
@@ -1218,9 +1268,9 @@ class TestUuidPinRollbackLive:
         )
         assert written == sorted(
             [
-                uuid.UUID(self.CANONICAL).bytes,
-                uuid.UUID(self.CANONICAL).bytes,
-                uuid.UUID(self.OTHER).bytes,
+                uuid.UUID(self.CANONICAL),
+                uuid.UUID(self.CANONICAL),
+                uuid.UUID(self.OTHER),
             ]
         )
 
@@ -1235,4 +1285,4 @@ class TestUuidPinRollbackLive:
         assert _record_count(client, cfg) == 3
         values = [v for path in _list_objects(DATA_PATH, cfg) for v in _read_parquet(path).column("uuid").to_pylist()]
         assert None in values
-        assert uuid.UUID(self.OTHER).bytes in values
+        assert uuid.UUID(self.OTHER) in values

@@ -41,12 +41,21 @@ dependencies = [
     # ids, footer-stat extraction, registration via footer-shipping
     # commits). 1.1.0 brought partitioned fanout appends and the atomic
     # expected_table_uuid commit guard, both of which the HoglakeSink
-    # relies on. 1.1.1 is the floor because it stamps `uploaded_files` and
-    # `uploaded_uris` on every exception leaving `prepare_append_files` —
-    # the difference between millpond counting the orphans of a failed
-    # prepare and guessing at them.
-    "pyhoglake>=1.1.1",
-    "pyarrow>=18.0",
+    # relies on. 1.1.1 stamps `uploaded_files` and `uploaded_uris` on every
+    # exception leaving `prepare_append_files` — the difference between
+    # millpond counting the orphans of a failed prepare and guessing at
+    # them. 1.3.0 is the floor because `coltype_to_arrow("uuid")` finally
+    # answers `pa.uuid()` rather than a bare `fixed_size_binary(16)`: the
+    # schema HoglakeSink._prepare casts the batch to is what decides
+    # whether the uploaded parquet carries `LogicalTypeAnnotation.uuidType()`,
+    # and an Iceberg reader (the Trino hoglake connector among them) binds a
+    # uuid column through that annotation. 1.3.0 also accepts BOTH spellings
+    # on append, so a mixed fleet writing either one keeps working.
+    "pyhoglake>=1.3.0",
+    # 21 because pyhoglake 1.3.0 requires it. Declared here rather than left
+    # to resolve transitively: millpond imports pyarrow directly on every
+    # path, so its floor is millpond's business to state.
+    "pyarrow>=21.0",
     "orjson>=3.10",
     # Direct libpq for the drop-partitions maintenance op (postgres_execute
     # imposes REPEATABLE READ, returns no result sets, and its duckdb
@@ -115,12 +124,12 @@ exclude-newer = "7 days"
 # channel. Fixed date, not a rolling window — future pyducklake releases
 # re-enter the cooldown until this date is bumped alongside an intentional
 # version bump.
-# Same carve-out shape for pyhoglake: 1.1.1 was published 2026-09-18 and
-# is needed now for the hoglake destination's orphan accounting. Fixed
+# Same carve-out shape for pyhoglake: 1.3.0 was published 2026-09-23 and
+# is needed now for the parquet UUID annotation on uuid columns. Fixed
 # date, not a rolling window — future pyhoglake releases re-enter the
 # cooldown until this date is bumped alongside an intentional version
 # bump.
-exclude-newer-package = { pyducklake = "2026-08-14T00:00:00Z", pyhoglake = "2026-09-19T00:00:00Z" }
+exclude-newer-package = { pyducklake = "2026-08-14T00:00:00Z", pyhoglake = "2026-09-23T22:00:00Z" }
 constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",

@@ -704,7 +704,7 @@ class TestTableSchemaForBatch:
 
 class TestUuidColumnWireForm:
     """What a `uuid`-pinned column actually looks like in the file this sink
-    uploads — including the one thing it does NOT carry."""
+    uploads."""
 
     RAW = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
 
@@ -736,33 +736,35 @@ class TestUuidColumnWireForm:
         return captured["files"][0]
 
     def test_coerced_column_aligns_to_the_live_uuid_column(self, monkeypatch):
-        # No add_column, no promote: `pa.uuid()` already IS the live type.
+        # No add_column, no promote: `pa.uuid()` already IS the live type,
+        # and since pyhoglake 1.3.0 it is also the type the destination schema
+        # names, so `_prepare`'s cast is a no-op rather than a downgrade.
         pf = self._written(monkeypatch)
         assert pf.schema.column(0).name == "uuid"
         assert pf.schema.column(0).physical_type == "FIXED_LEN_BYTE_ARRAY"
         assert pf.schema.column(0).length == 16
-        assert pf.read().column("uuid").to_pylist() == [uuid.UUID(self.RAW).bytes]
+        assert pf.read().column("uuid").to_pylist() == [uuid.UUID(self.RAW)]
 
-    def test_no_uuid_logical_annotation_yet_pyhoglake_forbids_it(self, monkeypatch):
-        """The file carries the right 16 bytes and NOT the parquet
-        `LogicalTypeAnnotation.uuidType()`, which a Trino/Iceberg reader binds a
-        uuid column through.
+    def test_uploaded_parquet_carries_the_uuid_logical_annotation(self, monkeypatch):
+        """The file carries the parquet `LogicalTypeAnnotation.uuidType()` an
+        Iceberg reader binds a uuid column through — the Trino hoglake
+        connector among them.
 
-        Not an oversight and not fixable here. `_prepare` casts the batch to
-        `columns_to_arrow_schema(info.columns)`, and pyhoglake answers a `uuid`
-        column with plain `pa.binary(16)` (`types.py` `coltype_to_arrow`) —
-        pyarrow stamps the annotation only for `pa.uuid()`. Casting to
-        `pa.uuid()` here instead does produce the annotation, and then
-        `prepare_append_files` REFUSES the file: it compares
-        `parquet.schema_arrow.equals(columns_to_arrow_schema(...))` exactly, so
-        an extension-typed column reads as "prepared Parquet schema/field IDs
-        differ from destination" (verified against a real server). The fix is
-        pyhoglake returning `pa.uuid()` from `coltype_to_arrow("uuid")`, which
-        moves both sides at once. This test is the canary for that landing.
+        It did not, until pyhoglake 1.3.0. `_prepare` casts the batch to
+        `columns_to_arrow_schema(info.columns)`, and pyhoglake used to answer a
+        `uuid` column with plain `pa.binary(16)` (`types.py`
+        `coltype_to_arrow`), for which pyarrow stamps no logical type at all.
+        Casting to `pa.uuid()` from the millpond side instead did produce the
+        annotation and then had the file REFUSED, because
+        `prepare_append_files` compared
+        `parquet.schema_arrow.equals(columns_to_arrow_schema(...))` exactly —
+        so the two spellings had to move together, which is what 1.3.0 did:
+        `coltype_to_arrow("uuid")` returns `pa.uuid()` and append accepts
+        either spelling. Nothing on this side changed; the pin did the work.
         """
         pf = self._written(monkeypatch)
-        assert pf.schema.column(0).logical_type.type == "NONE"
-        assert pf.schema_arrow.field("uuid").type == pa.binary(16)
+        assert pf.schema.column(0).logical_type.type == "UUID"
+        assert pf.schema_arrow.field("uuid").type == pa.uuid()
 
 
 class TestUuidAgainstStringColumn:
@@ -824,7 +826,7 @@ class TestUuidAgainstStringColumn:
         ]
         s, client, catalog, ns, table = _sink(columns=columns)
         s.write(self._batch())
-        assert _published().schema.field("uuid").type == pa.binary(16)
+        assert _published().schema.field("uuid").type == pa.uuid()
 
 
 class TestStringAgainstUuidColumn:
@@ -855,22 +857,22 @@ class TestStringAgainstUuidColumn:
         s, client, catalog, ns, table = _sink(columns=self._uuid_table())
         assert s.write(pa.table({"uuid": [self.RAW], "event": ["e"], "team_id": [1]})) == 1
         written = _published()
-        assert written.schema.field("uuid").type == pa.binary(16)
-        assert written.column("uuid").to_pylist() == [uuid.UUID(self.RAW).bytes]
+        assert written.schema.field("uuid").type == pa.uuid()
+        assert written.column("uuid").to_pylist() == [uuid.UUID(self.RAW)]
         assert table.alter.call_count == 0
 
     @patch("millpond.hoglake.metrics")
     def test_unparseable_text_is_nulled_and_metricked(self, mock_metrics):
         s, client, catalog, ns, table = _sink(columns=self._uuid_table())
         s.write(pa.table({"uuid": [self.RAW, "not-a-uuid", None], "team_id": [1, 2, 3]}))
-        assert _published().column("uuid").to_pylist() == [uuid.UUID(self.RAW).bytes, None, None]
+        assert _published().column("uuid").to_pylist() == [uuid.UUID(self.RAW), None, None]
         mock_metrics.errors_total.labels.assert_any_call(type="schema")
         mock_metrics.errors_total.labels.assert_any_call(type="column_coercion")
 
     def test_large_string_batch_column_is_parsed_too(self):
         s, client, catalog, ns, table = _sink(columns=self._uuid_table())
         s.write(pa.table({"uuid": pa.array([self.RAW], pa.large_string()), "team_id": [1]}))
-        assert _published().column("uuid").to_pylist() == [uuid.UUID(self.RAW).bytes]
+        assert _published().column("uuid").to_pylist() == [uuid.UUID(self.RAW)]
 
 
 class TestUuidRewriteShapes:
@@ -979,8 +981,8 @@ class TestUuidRewriteShapes:
             )
         )
         written = _published()
-        assert written.column("uuid").to_pylist() == [uuid.UUID(v).bytes for v in text]
-        assert written.column("person_id").to_pylist() == [uuid.UUID(v).bytes for v in reversed(text)]
+        assert written.column("uuid").to_pylist() == [uuid.UUID(v) for v in text]
+        assert written.column("person_id").to_pylist() == [uuid.UUID(v) for v in reversed(text)]
 
     def test_bare_fixed_size_binary_batch_against_a_string_column(self):
         # pyhoglake maps a bare `fixed_size_binary(16)` to "uuid" too, and that
@@ -2187,7 +2189,8 @@ class TestRefusedCommitsDropThePayload:
 
     @patch("millpond.hoglake.metrics")
     def test_an_older_client_without_the_attributes_counts_zero(self, mock_metrics, caplog):
-        # The floor is pyhoglake>=1.1.1, but the stamp is best effort at
+        # The stamp arrived in pyhoglake 1.1.1 (well under the 1.3.0
+        # floor), but it is best effort at
         # the source too: pyhoglake suppresses the AttributeError from an
         # exception type whose __slots__ refuse it. Either way the read
         # must degrade to zero, never to a second exception thrown over

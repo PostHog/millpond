@@ -213,7 +213,7 @@ def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
 # uuid is the one target whose Arrow type is an EXTENSION type rather than a
 # plain one. The events topic carries `uuid` and `person_id` as UUID strings
 # (ClickHouse `UUID`); both destinations have a real UUID type for them, and
-# `pa.uuid()` — canonical since pyarrow 18, an extension over
+# `pa.uuid()` — pyarrow's canonical uuid extension type, an extension over
 # `fixed_size_binary(16)` holding the 16 big-endian bytes — is the ONE wire
 # form that lands correctly on both:
 #   - hoglake: pyhoglake maps `fixed_size_binary(16)` to its `uuid` column type
@@ -226,14 +226,12 @@ def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
 #     through.
 # The extension type also carries to parquet: pyarrow stamps
 # FIXED_LEN_BYTE_ARRAY(16) + `LogicalTypeAnnotation.uuidType()` for `pa.uuid()`
-# and no annotation at all for `pa.binary(16)`, and that annotation is what the
-# Trino hoglake connector binds a uuid column through. That last property is
-# true of this column and NOT (yet) of the file the hoglake sink uploads:
-# `HoglakeSink._prepare` casts to the schema pyhoglake derives from the
-# catalog, where a `uuid` column is plain `pa.binary(16)`, and pyhoglake's
-# `prepare_append_files` compares the written parquet's arrow schema to that
-# one exactly — so the annotation needs a pyhoglake change, not a millpond one
-# (see the note in tests/unit/test_hoglake.py::TestUuidColumnWireForm).
+# and no annotation at all for `pa.binary(16)`, and that annotation is what an
+# Iceberg reader binds a uuid column through — the Trino hoglake connector
+# among them. It survives all the way into the uploaded object on the hoglake
+# path too, since the pyhoglake >= 1.3.0 pin: the schema `HoglakeSink._prepare`
+# casts to names `pa.uuid()` for a uuid column, so this column passes through
+# unchanged (tests/unit/test_hoglake.py::TestUuidColumnWireForm).
 _TIMESTAMPTZ = pa.timestamp("us", tz="UTC")
 
 #: The `uuid` target's Arrow type. Public: main.py compares filter/sort columns

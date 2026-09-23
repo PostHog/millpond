@@ -506,10 +506,10 @@ class TestCoerceUuidColumns:
         # The coerced column writes as FIXED_LEN_BYTE_ARRAY(16) WITH
         # LogicalTypeAnnotation.uuidType() — that annotation is what the Trino
         # hoglake connector reads a uuid column back through. A plain binary(16)
-        # column writes the same physical bytes with no annotation. (This is the
-        # column's own property; the hoglake sink's uploaded file loses it in
-        # pyhoglake's destination cast — see
-        # tests/unit/test_hoglake.py::TestUuidColumnWireForm.)
+        # column writes the same physical bytes with no annotation. This is the
+        # column's own property; that it survives into the object the hoglake
+        # sink uploads is pinned separately, in
+        # tests/unit/test_hoglake.py::TestUuidColumnWireForm.
         out = coerce_typed_columns(pa.table({"uuid": [self.CANONICAL]}), (("uuid", "uuid"),))
         buf = io.BytesIO()
         pq.write_table(out, buf)
