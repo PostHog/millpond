@@ -959,14 +959,76 @@ class TestHoglakeConfig:
             "HOGLAKE_CATALOG",
             "HOGLAKE_NAMESPACE",
             "HOGLAKE_TABLE",
-            "HOGLAKE_S3_ACCESS_KEY",
-            "HOGLAKE_S3_SECRET_KEY",
         ],
     )
     def test_missing_required_var_raises_naming_it(self, missing, monkeypatch):
         monkeypatch.delenv(missing)
         with pytest.raises(RuntimeError, match=missing):
             load()
+
+    def test_both_s3_keys_set_is_static_credentials(self):
+        # The MinIO/local-dev/CI shape: explicit keys reach pyarrow.
+        cfg = load()
+        assert cfg.hoglake_s3_access_key == "ak"
+        assert cfg.hoglake_s3_secret_key == "sk"
+
+    def test_neither_s3_key_set_is_the_default_credential_chain(self, monkeypatch):
+        # The Kubernetes shape: no keys at all, so pyhoglake passes none
+        # to pyarrow and the AWS SDK resolves the ServiceAccount's
+        # web-identity token (IRSA). Unset must not be a startup refusal.
+        monkeypatch.delenv("HOGLAKE_S3_ACCESS_KEY")
+        monkeypatch.delenv("HOGLAKE_S3_SECRET_KEY")
+        cfg = load()
+        assert cfg.hoglake_s3_access_key is None
+        assert cfg.hoglake_s3_secret_key is None
+
+    @pytest.mark.parametrize("present", ["HOGLAKE_S3_ACCESS_KEY", "HOGLAKE_S3_SECRET_KEY"])
+    def test_one_s3_key_without_the_other_is_refused_naming_both(self, present, monkeypatch):
+        # Half a static credential pair is never what anyone means.
+        # pyarrow does refuse it on its own — `S3FileSystem(access_key=...)`
+        # with no secret raises ValueError — but it does so at the first
+        # filesystem build, from inside pyhoglake, in a message that
+        # names neither environment variable. Refusing at config load
+        # costs no network, fires before anything else is built, and
+        # names BOTH vars so the operator can see which half is missing.
+        for var in ("HOGLAKE_S3_ACCESS_KEY", "HOGLAKE_S3_SECRET_KEY"):
+            if var != present:
+                monkeypatch.delenv(var)
+        with pytest.raises(RuntimeError) as excinfo:
+            load()
+        message = str(excinfo.value)
+        assert "HOGLAKE_S3_ACCESS_KEY" in message
+        assert "HOGLAKE_S3_SECRET_KEY" in message
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_empty_string_keys_count_as_unset(self, blank, monkeypatch):
+        # A chart rendering `value: ""` for an absent Secret must mean
+        # "use the credential chain", not "authenticate as the empty
+        # string" — and must not trip the pair rule either.
+        monkeypatch.setenv("HOGLAKE_S3_ACCESS_KEY", blank)
+        monkeypatch.setenv("HOGLAKE_S3_SECRET_KEY", blank)
+        cfg = load()
+        assert cfg.hoglake_s3_access_key is None
+        assert cfg.hoglake_s3_secret_key is None
+
+    def test_one_blank_key_is_still_refused(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_S3_ACCESS_KEY", "")
+        with pytest.raises(RuntimeError) as excinfo:
+            load()
+        assert "HOGLAKE_S3_ACCESS_KEY" in str(excinfo.value)
+        assert "HOGLAKE_S3_SECRET_KEY" in str(excinfo.value)
+
+    def test_region_still_loads_without_static_keys(self, monkeypatch):
+        # HOGLAKE_S3_REGION is independent of the credential source: the
+        # AWS SDK needs the region whether the keys are static or come
+        # from the chain.
+        monkeypatch.delenv("HOGLAKE_S3_ACCESS_KEY")
+        monkeypatch.delenv("HOGLAKE_S3_SECRET_KEY")
+        monkeypatch.setenv("HOGLAKE_S3_REGION", "us-east-1")
+        monkeypatch.setenv("HOGLAKE_S3_ENDPOINT", "http://localhost:29000")
+        cfg = load()
+        assert cfg.hoglake_s3_region == "us-east-1"
+        assert cfg.hoglake_s3_endpoint == "http://localhost:29000"
 
     @pytest.mark.parametrize(
         "name",

@@ -7,6 +7,7 @@ server round-trips live in tests/integration/test_hoglake_integration.py.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
@@ -197,6 +198,10 @@ def _mock_stack(columns, partition_spec=None, sort_spec=None):
     table.state = state
     _wire_dynamic_alter(table, state)
     client.catalog.return_value = catalog
+    # A real string, because the startup credential probe derives the
+    # object-store prefix from it: a MagicMock data_path would let a
+    # probe that never formed a usable path still look healthy.
+    catalog.data_path = "s3://bucket/lake/"
     catalog.namespace.return_value = ns
     ns.table.return_value = table
     ns.create_table.return_value = table
@@ -276,8 +281,6 @@ class TestHoglakeSinkInit:
             "hoglake_catalog",
             "hoglake_namespace",
             "hoglake_table",
-            "hoglake_s3_access_key",
-            "hoglake_s3_secret_key",
         ],
     )
     def test_missing_required_field_raises_runtimeerror(self, missing_field):
@@ -285,6 +288,36 @@ class TestHoglakeSinkInit:
         with pytest.raises(RuntimeError, match=missing_field):
             with patch("millpond.hoglake.HoglakeClient"):
                 hoglake.HoglakeSink(cfg)
+
+    def test_both_s3_keys_absent_is_accepted(self):
+        # The Kubernetes shape: pyhoglake passes no key to pyarrow, so
+        # the AWS SDK resolves the ServiceAccount's web-identity token.
+        cfg = _cfg(hoglake_s3_access_key=None, hoglake_s3_secret_key=None)
+        client, *_ = _mock_stack(_EVENTS_COLUMNS)
+        with patch("millpond.hoglake.HoglakeClient", return_value=client) as mock_client:
+            hoglake.HoglakeSink(cfg)
+        s3 = mock_client.call_args.kwargs["s3"]
+        assert s3.access_key is None
+        assert s3.secret_key is None
+        # Endpoint and region are independent of the credential source.
+        assert s3.endpoint_override == "http://localhost:29000"
+        assert s3.region == "us-east-1"
+
+    @pytest.mark.parametrize("present", ["hoglake_s3_access_key", "hoglake_s3_secret_key"])
+    def test_one_s3_key_without_the_other_raises_naming_both(self, present):
+        # pyarrow refuses half a pair itself — `S3FileSystem(access_key=...)`
+        # with no secret raises ValueError — so this guard is not about
+        # preventing a silent fallback. It is about WHERE and HOW: here,
+        # in the constructor, naming both config fields, rather than as
+        # a pyarrow ValueError raised from inside pyhoglake that names
+        # neither.
+        cfg = _cfg(**{f: None for f in ("hoglake_s3_access_key", "hoglake_s3_secret_key") if f != present})
+        with pytest.raises(hoglake.HoglakeSinkError) as excinfo:
+            with patch("millpond.hoglake.HoglakeClient"):
+                hoglake.HoglakeSink(cfg)
+        message = str(excinfo.value)
+        assert "hoglake_s3_access_key" in message
+        assert "hoglake_s3_secret_key" in message
 
     def test_runtimeerror_survives_python_optimize(self):
         # `python -O` strips asserts; verify the guard is an explicit raise
@@ -305,6 +338,172 @@ class TestHoglakeSinkInit:
         assert s3.secret_key == "sk"
         assert s3.endpoint_override == "http://localhost:29000"
         assert s3.region == "us-east-1"
+
+
+class TestStartupCredentialProbe:
+    """One authenticated object-store call at construction.
+
+    pyarrow resolves credentials lazily, so without this a role that
+    cannot write the bucket shows up as an S3 403 on the FIRST FLUSH —
+    after the pod passed its probes, took its partitions and built lag.
+    The probe is a zero-byte PUT because that is the grant the sink
+    actually needs; a LIST would prove a permission the IAM role is not
+    even meant to carry, and (with `allow_not_found`) would read a
+    missing bucket as an empty prefix."""
+
+    def _fs(self, client):
+        return client._filesystem.return_value
+
+    def _stream(self, client):
+        return self._fs(client).open_output_stream.return_value.__enter__.return_value
+
+    def test_probe_puts_the_marker_object_under_the_data_path(self):
+        _, client, *_ = _sink()
+        key = self._fs(client).open_output_stream.call_args.args[0]
+        # Bucket-relative, exactly as pyhoglake's own uploader passes it.
+        assert key == "bucket/lake/_millpond/probe"
+
+    def test_the_marker_key_is_the_same_with_or_without_a_trailing_slash(self):
+        # The data path comes off the catalog row, and hoglake stores it
+        # as the operator typed it. One marker per data path, not two.
+        for data_path in ("s3://bucket/lake/", "s3://bucket/lake"):
+            client, catalog, *_ = _mock_stack(_EVENTS_COLUMNS)
+            catalog.data_path = data_path
+            with patch("millpond.hoglake.HoglakeClient", return_value=client):
+                hoglake.HoglakeSink(_cfg())
+            assert self._fs(client).open_output_stream.call_args.args[0] == "bucket/lake/_millpond/probe"
+
+    def test_the_marker_is_zero_bytes(self):
+        # Nothing is written into the stream: the upload itself is the
+        # whole question, and an empty object is the cheapest thing to
+        # leave behind (overwritten on every boot, so at most one per
+        # path).
+        _, client, *_ = _sink()
+        self._stream(client).write.assert_not_called()
+
+    def test_the_stream_is_closed_by_the_context_manager(self):
+        # pyarrow only sends the upload on close, so a probe that opened
+        # the stream and dropped it would prove nothing — and would still
+        # pass every other assertion here, because CPython's refcount
+        # closes it a moment later. The `with` is the contract.
+        _, client, *_ = _sink()
+        assert self._fs(client).open_output_stream.return_value.__exit__.called
+
+    def test_probe_runs_exactly_once_at_construction_and_never_on_write(self):
+        s, client, _catalog, _ns, _table = _sink()
+        fs = self._fs(client)
+        assert fs.open_output_stream.call_count == 1
+        s.write(_batch())
+        s.write(_batch())
+        assert fs.open_output_stream.call_count == 1
+
+    def _refusing_sink(self, error_text, **cfg_overrides):
+        client, *_ = _mock_stack(_EVENTS_COLUMNS)
+        client._filesystem.return_value.open_output_stream.side_effect = OSError(error_text)
+        with pytest.raises(hoglake.HoglakeSinkError) as excinfo:
+            with patch("millpond.hoglake.HoglakeClient", return_value=client):
+                hoglake.HoglakeSink(_cfg(**cfg_overrides))
+        return excinfo.value
+
+    def test_access_denied_names_the_marker_path_the_catalog_and_the_static_keys(self):
+        e = self._refusing_sink("When creating key 'lake/_millpond/probe' in bucket 'bucket': AWS Error ACCESS_DENIED")
+        message = str(e)
+        assert "s3://bucket/lake/_millpond/probe" in message
+        assert "'millpond'" in message  # the catalog
+        assert "static HOGLAKE_S3_* keys" in message
+        # The SDK's own text, verbatim: it is the only thing that
+        # distinguishes one 403 from another.
+        assert "AWS Error ACCESS_DENIED" in message
+        # ... and the grant that would fix it, which is NOT ListBucket.
+        assert "s3:PutObject" in message
+        assert "s3:AbortMultipartUpload" in message
+        assert "ListBucket" not in message
+
+    def test_access_denied_names_the_default_credential_chain_without_keys(self):
+        # The message has to say WHICH credential source was in use:
+        # under IRSA the fix is a role/policy change, not a Secret.
+        e = self._refusing_sink(
+            "AWS Error ACCESS_DENIED",
+            hoglake_s3_access_key=None,
+            hoglake_s3_secret_key=None,
+        )
+        assert "the AWS default credential chain (IRSA in Kubernetes)" in str(e)
+
+    def test_a_missing_bucket_is_named_as_such(self):
+        # The case a LIST with allow_not_found could never catch: a typo
+        # in HOGLAKE_DATA_PATH's bucket read back as an empty prefix,
+        # and the catalog row has already frozen the bad path.
+        e = self._refusing_sink("When creating key '...' in bucket 'bukcet': AWS Error NO_SUCH_BUCKET: NoSuchBucket")
+        message = str(e)
+        assert "bucket" in message.lower()
+        assert "HOGLAKE_DATA_PATH" in message
+
+    @pytest.mark.parametrize("sdk_text", ["AuthorizationHeaderMalformed", "PermanentRedirect"])
+    def test_a_region_mismatch_points_at_the_region_settings(self, sdk_text):
+        # Signed for the wrong region: the SDK says so in two different
+        # ways depending on the operation, and neither says "region" in
+        # a way an operator can act on.
+        e = self._refusing_sink(f"AWS Error UNKNOWN: {sdk_text}")
+        message = str(e)
+        assert "HOGLAKE_S3_REGION" in message
+        assert "AWS_REGION" in message
+
+    @pytest.mark.parametrize("sdk_text", ["INVALID_ACCESS_KEY_ID", "SIGNATURE_DOES_NOT_MATCH"])
+    def test_rejected_credentials_point_at_the_static_keys(self, sdk_text):
+        # S3 refusing the key id or the signature is not a policy
+        # problem: the material itself is wrong (stale Secret, wrong
+        # account, truncated value), and under static keys that is the
+        # only thing it can be.
+        e = self._refusing_sink(f"AWS Error {sdk_text}: rejected")
+        message = str(e)
+        # The hint, not just the credential-source phrase the message
+        # always carries — and it says why this branch is static-only.
+        assert "the static HOGLAKE_S3_* keys are wrong" in message
+        assert "only reachable with static keys" in message
+        # Not the generic grant advice: the policy is not the problem.
+        assert "bucket policy" not in message
+
+    def test_probe_failure_is_permanent(self):
+        # Not retryable: a missing grant does not heal by waiting, and
+        # this fires at startup where there is no retry loop anyway.
+        e = self._refusing_sink("AWS Error ACCESS_DENIED")
+        assert e.retryable is False
+        assert hoglake.is_retryable(e) is False
+
+    def test_a_pyhoglake_without_a_filesystem_accessor_fails_loudly(self):
+        # A security-relevant guard must not degrade to a warning on an
+        # attribute rename: no probe means no proof, and no proof at
+        # startup is the whole failure mode this exists to close.
+        client, *_ = _mock_stack(_EVENTS_COLUMNS)
+        del client._filesystem
+        with pytest.raises(hoglake.HoglakeSinkError) as excinfo:
+            with patch("millpond.hoglake.HoglakeClient", return_value=client):
+                hoglake.HoglakeSink(_cfg())
+        assert "no longer exposes the filesystem" in str(excinfo.value)
+        assert excinfo.value.retryable is False
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            ({}, "static HOGLAKE_S3_* keys"),
+            (
+                {"hoglake_s3_access_key": None, "hoglake_s3_secret_key": None},
+                "the AWS default credential chain (IRSA in Kubernetes)",
+            ),
+        ],
+    )
+    def test_startup_logs_the_credential_source_and_the_probe_outcome(self, overrides, expected, caplog):
+        with caplog.at_level(logging.INFO, logger="millpond.hoglake"):
+            _sink(_cfg(**overrides))
+        messages = [r.getMessage() for r in caplog.records]
+        # ONE line, carrying the source and the fact that the probe
+        # passed against this path.
+        matching = [m for m in messages if expected in m]
+        assert len(matching) == 1
+        assert "s3://bucket/lake/_millpond/probe" in matching[0]
+        # The SOURCE, never the material: `ak`/`sk` are the fixture's
+        # key values, and a log line is the easiest place to leak one.
+        assert not re.search(r"\b(ak|sk)\b", " ".join(messages))
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +651,11 @@ class TestRetryBudgetAndBackpressure:
         from pyhoglake import HoglakeClient
 
         real = HoglakeClient("http://127.0.0.1:28080")
-        real.catalog = MagicMock(return_value=MagicMock())
+        real.catalog = MagicMock(return_value=MagicMock(data_path="s3://bucket/lake/"))
+        # This client was built with no S3Config (the sink always passes
+        # one), and the startup credential probe must not turn that into
+        # a real object-store call from a unit test.
+        real._filesystem = MagicMock()
         try:
             with patch("millpond.hoglake.HoglakeClient", return_value=real):
                 s = hoglake.HoglakeSink(_cfg())

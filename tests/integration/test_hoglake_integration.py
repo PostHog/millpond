@@ -13,6 +13,7 @@ Run explicitly:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import uuid
@@ -26,7 +27,7 @@ import pytest
 from pyarrow import fs as pafs
 from pyhoglake import IncarnationChangedError, NotFoundError, ValidationError
 
-from millpond.hoglake import HoglakeSink, is_retryable, table_schema_for_batch
+from millpond.hoglake import HoglakeSink, HoglakeSinkError, is_retryable, table_schema_for_batch
 from millpond.main import _flush
 from tests.hoglake_stack import stack
 
@@ -137,6 +138,25 @@ def _list_objects(data_path: str, cfg) -> list[str]:
     return [f.path for f in s3.get_file_info(selector) if f.type == pafs.FileType.File]
 
 
+def _minio() -> pafs.S3FileSystem:
+    return pafs.S3FileSystem(
+        access_key=stack.S3_ACCESS_KEY,
+        secret_key=stack.S3_SECRET_KEY,
+        endpoint_override=stack.MINIO_URL,
+    )
+
+
+def _object_exists(uri: str) -> bool:
+    """Whether one object is present in the stack MinIO, by full s3:// URI."""
+    return _minio().get_file_info(uri.removeprefix("s3://")).type == pafs.FileType.File
+
+
+def _delete_object(uri: str) -> None:
+    """Remove one object if it is there; a no-op if it is not."""
+    with contextlib.suppress(FileNotFoundError, OSError):
+        _minio().delete_file(uri.removeprefix("s3://"))
+
+
 def _read_parquet(path: str) -> pa.Table:
     s3 = pafs.S3FileSystem(
         access_key=stack.S3_ACCESS_KEY,
@@ -183,6 +203,72 @@ class TestBootstrap:
         cfg = _fresh(hoglake_url="http://127.0.0.1:1")
         with pytest.raises(RuntimeError, match="cannot reach the hoglake control plane"):
             HoglakeSink(cfg)
+
+    def test_object_store_credentials_are_probed_at_startup(self, hog_stack, monkeypatch):
+        # MinIO authenticates every request, so a sink with no static
+        # keys has nothing the AWS default chain can turn into a grant on
+        # this bucket — the same shape as an IRSA role whose policy
+        # misses the bucket. The point of the test is WHERE it fails:
+        # in the constructor, before a single row is offered, rather than
+        # as an S3 403 on the first flush behind a pod that is already
+        # consuming. (This is as close as the stack gets to the IRSA
+        # case; it cannot mint a web-identity token, so what is covered
+        # is the probe firing and refusing, not the chain succeeding.)
+        #
+        # IMDS off: with no credentials anywhere else, the SDK otherwise
+        # spends seconds knocking on 169.254.169.254 before giving up on
+        # a laptop.
+        monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+        cfg = _fresh(hoglake_s3_access_key=None, hoglake_s3_secret_key=None)
+        with pytest.raises(HoglakeSinkError) as excinfo:
+            HoglakeSink(cfg)
+        message = str(excinfo.value)
+        assert f"{DATA_PATH}_millpond/probe" in message
+        assert "the AWS default credential chain (IRSA in Kubernetes)" in message
+        # Permanent: no retry loop exists at startup, and a missing grant
+        # is not something waiting fixes.
+        assert excinfo.value.retryable is False
+
+    def test_static_keys_pass_the_probe_and_leave_the_marker(self, hog_stack, caplog):
+        # The other half of the pair: the probe must not refuse a sink
+        # that can in fact write, and the proof that it RAN is the marker
+        # object plus its one startup log line (a probe that silently
+        # no-ops would pass this test's first half on its own).
+        #
+        # Delete the marker first: every other sink in this session has
+        # already written it, so finding one afterwards would otherwise
+        # prove nothing about THIS construction.
+        marker = f"{DATA_PATH}_millpond/probe"
+        _delete_object(marker)
+        assert not _object_exists(marker)
+        with caplog.at_level(logging.INFO, logger="millpond.hoglake"):
+            sink = HoglakeSink(_fresh())
+            sink.close()
+        lines = [r.getMessage() for r in caplog.records if "object store auth source" in r.getMessage()]
+        assert len(lines) == 1
+        assert "static HOGLAKE_S3_* keys" in lines[0]
+        assert f"{DATA_PATH}_millpond/probe" in lines[0]
+        assert _object_exists(marker)
+
+    def test_a_bucket_typo_is_refused_at_construction(self, hog_stack):
+        # The failure the old LIST probe could not see: pyarrow's
+        # get_file_info maps a NoSuchBucket 404 onto an empty listing, so
+        # a typo'd bucket passed and then failed on the first flush —
+        # with the bad data path already frozen into the catalog row.
+        #
+        # This leaves a poisoned catalog row behind in the stack's
+        # Postgres (hoglake has no delete-catalog route, which is the
+        # very hazard under test). Harmless here: the stack is torn down
+        # with its volumes at session end.
+        cfg = _fresh(
+            hoglake_catalog="millpond-it-typo",
+            hoglake_data_path="s3://millpond-it-typpo/lake/",
+        )
+        with pytest.raises(HoglakeSinkError) as excinfo:
+            HoglakeSink(cfg)
+        message = str(excinfo.value)
+        assert "millpond-it-typpo" in message
+        assert excinfo.value.retryable is False
 
     def test_partition_spec_and_sort_order_declared(self, hog_stack, client):
         cfg = _fresh(
