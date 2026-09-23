@@ -1,10 +1,21 @@
+import io
+import uuid as uuid_mod
 from datetime import UTC, datetime
 from unittest.mock import patch
 
 import orjson
 import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
 
-from millpond.arrow_converter import _drop_null_typed_columns, coerce_typed_columns, convert
+from millpond.arrow_converter import (
+    _drop_null_typed_columns,
+    _to_uuid,
+    coerce_typed_columns,
+    convert,
+    uuid_bytes,
+    uuid_text,
+)
 
 
 class TestConvert:
@@ -379,3 +390,305 @@ class TestCoerceTypedColumns:
         assert table.schema.field("timestamp").type == pa.string()
         out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
         assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+
+
+class TestCoerceUuidColumns:
+    """`uuid:uuid` pins — the events topic carries `uuid`/`person_id` as UUID
+    strings against hoglake `uuid` / DuckLake `UUID` columns."""
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    # `pa.uuid()` scalars come back as `uuid.UUID`; the 16 big-endian bytes
+    # are what the extension actually stores.
+    VALUE = uuid_mod.UUID(CANONICAL)
+    BYTES = VALUE.bytes
+
+    def test_canonical_string_coerces_to_uuid(self):
+        table = pa.table({"uuid": [self.CANONICAL], "event": ["$pageview"]})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [self.VALUE]
+        assert out.column("uuid").combine_chunks().storage.to_pylist() == [self.BYTES]
+        # Untargeted columns are untouched.
+        assert out.schema.field("event").type == pa.string()
+
+    def test_unhyphenated_and_alternate_forms_parse(self):
+        # The full accepted grammar, which is ENUMERATED rather than
+        # delegated: canonical 8-4-4-4-12, 32 bare hex, either wrapped in
+        # braces or prefixed `urn:uuid:`, hex in either case. Deliberately
+        # NARROWER than `uuid.UUID`'s — see TestUuidBytesGrammar for the
+        # stdlib-accepted shapes this refuses and why.
+        forms = [
+            self.CANONICAL.replace("-", ""),
+            "{" + self.CANONICAL + "}",
+            "urn:uuid:" + self.CANONICAL,
+            self.CANONICAL.upper(),
+        ]
+        table = pa.table({"uuid": forms})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [self.VALUE] * len(forms)
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_invalid_value_is_nulled_and_metricked(self, mock_metrics):
+        table = pa.table({"uuid": ["not-a-uuid"]})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [None]
+        # assert_called_once_WITH: a bare MagicMock memoizes labels() to one
+        # child whatever kwargs it gets, so `labels(type=...).inc` asserts
+        # nothing about the label.
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")
+        # A column with ANY failed value is not also counted as cleanly coerced.
+        mock_metrics.columns_coerced_total.labels.assert_not_called()
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_mixed_good_and_bad_keeps_good_values(self, mock_metrics):
+        # Only the unconvertible values are nulled; the good ones survive.
+        table = pa.table({"uuid": [self.CANONICAL, "zzzz", None]})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.column("uuid").to_pylist() == [self.VALUE, None, None]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")
+        mock_metrics.columns_coerced_total.labels.assert_not_called()
+
+    def test_nulls_pass_through(self):
+        table = pa.table({"person_id": pa.array([self.CANONICAL, None], pa.string())})
+        out = coerce_typed_columns(table, (("person_id", "uuid"),))
+        assert out.column("person_id").to_pylist() == [self.VALUE, None]
+
+    def test_all_null_string_column_coerces_to_uuid(self):
+        # Mirrors project_id:bigint — an all-null batch infers VARCHAR and must
+        # still land as the target type so the destination column is right from
+        # the first flush.
+        table = pa.table({"person_id": pa.array([None, None], pa.string())})
+        out = coerce_typed_columns(table, (("person_id", "uuid"),))
+        assert out.schema.field("person_id").type == pa.uuid()
+        assert out.column("person_id").to_pylist() == [None, None]
+
+    def test_already_uuid_typed_left_alone(self):
+        storage = pa.array([self.BYTES], pa.binary(16))
+        table = pa.table({"uuid": pa.ExtensionArray.from_storage(pa.uuid(), storage)})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out is table
+
+    def test_fixed_size_binary_16_is_adopted_not_left_as_blob(self):
+        # A plain binary(16) column already holds the right bytes but is BLOB
+        # to DuckDB and carries no parquet UUID annotation, so it is wrapped
+        # (zero-copy) rather than passed through.
+        table = pa.table({"uuid": pa.array([self.BYTES], pa.binary(16))})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [self.VALUE]
+
+    def test_failed_and_clean_batches_concat(self):
+        # Type-consistency: a batch that fell back to the per-value path must
+        # still concat with a fully-coerced one at flush.
+        good = coerce_typed_columns(pa.table({"uuid": [self.CANONICAL]}), (("uuid", "uuid"),))
+        bad = coerce_typed_columns(pa.table({"uuid": ["garbage"]}), (("uuid", "uuid"),))
+        merged = pa.concat_tables([good, bad])
+        assert merged.column("uuid").to_pylist() == [self.VALUE, None]
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_roundtrips_through_convert(self, mock_metrics):
+        other = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+        messages = [orjson.dumps({"uuid": self.CANONICAL, "person_id": other, "event": "$pageview"})]
+        table = convert(messages)
+        assert table is not None
+        assert table.schema.field("uuid").type == pa.string()
+        out = coerce_typed_columns(table, (("uuid", "uuid"), ("person_id", "uuid")))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.schema.field("person_id").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [self.VALUE]
+        assert out.column("person_id").to_pylist() == [uuid_mod.UUID(other)]
+        assert out.column("event").to_pylist() == ["$pageview"]
+        assert mock_metrics.errors_total.labels.call_count == 0
+
+    def test_parquet_write_carries_the_uuid_logical_annotation(self):
+        # The coerced column writes as FIXED_LEN_BYTE_ARRAY(16) WITH
+        # LogicalTypeAnnotation.uuidType() — that annotation is what the Trino
+        # hoglake connector reads a uuid column back through. A plain binary(16)
+        # column writes the same physical bytes with no annotation. This is the
+        # column's own property; that it survives into the object the hoglake
+        # sink uploads is pinned separately, in
+        # tests/unit/test_hoglake.py::TestUuidColumnWireForm.
+        out = coerce_typed_columns(pa.table({"uuid": [self.CANONICAL]}), (("uuid", "uuid"),))
+        buf = io.BytesIO()
+        pq.write_table(out, buf)
+        buf.seek(0)
+        pf = pq.ParquetFile(buf)
+        column = pf.schema.column(0)
+        assert column.physical_type == "FIXED_LEN_BYTE_ARRAY"
+        assert column.length == 16
+        assert str(column.logical_type) == "UUID"
+
+
+class TestUuidBytesGrammar:
+    """`uuid_bytes` on its own — the accepted shapes are enumerated, not
+    delegated to `uuid.UUID`, whose grammar remaps things that are not UUIDs."""
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    BYTES = uuid_mod.UUID(CANONICAL).bytes
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            CANONICAL,
+            CANONICAL.upper(),
+            CANONICAL.replace("-", ""),
+            CANONICAL.replace("-", "").upper(),
+            "{" + CANONICAL + "}",
+            "urn:uuid:" + CANONICAL,
+        ],
+    )
+    def test_accepted_shapes(self, text):
+        assert uuid_bytes(text) == self.BYTES
+
+    @pytest.mark.parametrize(
+        ("text", "why"),
+        [
+            # `uuid.UUID` strips `urn:`/`uuid:` from ANYWHERE and removes EVERY
+            # hyphen, so all three of these parse there and silently become a
+            # UUID the producer never sent.
+            ("0123-4567-89ab-cdef-0123-4567-89ab-cdef", "hyphens outside the canonical offsets"),
+            ("urn:0123456789abcdef0123456789abcdef", "bare urn: prefix"),
+            ("0123456789abcdefuuid:0123456789abcdef", "uuid: buried mid-value"),
+            # Everything `int(text, 16)` accepts and a UUID does not. All
+            # three are 32 characters, so the stdlib's length check passes and
+            # it produces a different, plausible-looking UUID (verified on
+            # CPython 3.13: "0x0123456789abcdef0123456789abcd" ->
+            # 00012345-6789-abcd-ef01-23456789abcd).
+            ("0x0123456789abcdef0123456789abcd", "radix prefix"),
+            ("1_3456789abcdef0123456789abcdef0", "PEP 515 underscore"),
+            ("+0123456789abcdef0123456789abcde", "leading sign"),
+            # QE c2: the length guard is the ONLY thing standing between a
+            # whitespace-bearing 32-character string and a silent 15-byte
+            # decode, because `bytes.fromhex` skips ASCII whitespace.
+            ("0123456789abcdef  0123456789abcd", "32 chars with two internal spaces"),
+            ("0123456789abcdef0123456789abcd", "30 hex digits"),
+            ("0123456789abcdef0123456789abcdeff", "33 hex digits"),
+            ("URN:UUID:" + CANONICAL, "urn prefix is case-sensitive"),
+            ("", "empty"),
+            ("not-a-uuid", "not hex at all"),
+            ("018f3c7e6b2a-7c3d-9e4f-5a6b7c8d9e0f", "canonical length, wrong hyphen offsets"),
+            # One case per canonical hyphen offset, each 36 characters long and
+            # each tripping ONLY that offset's check — so deleting any single
+            # clause of the four fails exactly one of these.
+            ("012345678-9ab-cdef-0123-456789abcdef", "offset 8 only"),
+            ("0-123456-789abcdef-0123-456789abcdef", "offset 13 only"),
+            ("0-123456-789a-bcdef0123-456789abcdef", "offset 18 only"),
+            ("01234567-89ab-cdef-0123456789-abcdef", "offset 23 only"),
+        ],
+    )
+    def test_refused_shapes(self, text, why):
+        with pytest.raises(ValueError):
+            uuid_bytes(text)
+
+    @pytest.mark.parametrize("value", [None, 5, b"0123456789abcdef", 1.5, ["x"]])
+    def test_non_strings_refused(self, value):
+        with pytest.raises(ValueError):
+            uuid_bytes(value)
+
+    def test_rfc_variant_and_version_bits_are_not_validated(self):
+        # ClickHouse UUID is an opaque 128-bit value and PostHog writes v4 and
+        # v7 both; rejecting an "invalid" variant would drop real data.
+        assert uuid_bytes("00000000-0000-0000-0000-000000000000") == b"\x00" * 16
+        assert uuid_bytes("ffffffff-ffff-ffff-ffff-ffffffffffff") == b"\xff" * 16
+
+    def test_uuid_text_is_the_inverse(self):
+        assert uuid_text(self.BYTES) == self.CANONICAL
+        assert uuid_bytes(uuid_text(self.BYTES)) == self.BYTES
+
+    @pytest.mark.parametrize("raw", [b"short", b"", "text", None, b"0" * 17])
+    def test_uuid_text_refuses_non_16_byte_input(self, raw):
+        with pytest.raises(ValueError):
+            uuid_text(raw)
+
+
+class TestToUuidDirectly:
+    """`_to_uuid` itself. The tests above go through `coerce_typed_columns`,
+    which rebuilds the table from the declared field type — so a coercer that
+    returned bare `binary(16)` would still produce a `pa.uuid()` column there
+    and the bug would only surface at the sink."""
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    BYTES = uuid_mod.UUID(CANONICAL).bytes
+
+    def test_returns_the_extension_type_not_the_storage(self):
+        out = _to_uuid(pa.array([self.CANONICAL], pa.string()))
+        assert out.type == pa.uuid()
+        assert out.storage.type == pa.binary(16)
+        assert out.storage.to_pylist() == [self.BYTES]
+
+    def test_already_extension_typed_is_returned_as_is(self):
+        arr = pa.ExtensionArray.from_storage(pa.uuid(), pa.array([self.BYTES], pa.binary(16)))
+        assert _to_uuid(arr) is arr
+
+    def test_chunked_input_is_accepted(self):
+        chunked = pa.chunked_array([pa.array([self.CANONICAL], pa.string()), pa.array([None], pa.string())])
+        out = _to_uuid(chunked)
+        assert out.type == pa.uuid()
+        assert out.storage.to_pylist() == [self.BYTES, None]
+
+    def test_large_string_source_parses(self):
+        out = _to_uuid(pa.array([self.CANONICAL], pa.large_string()))
+        assert out.type == pa.uuid()
+        assert out.storage.to_pylist() == [self.BYTES]
+
+    def test_variable_width_binary_of_16_bytes_is_adopted(self):
+        out = _to_uuid(pa.array([self.BYTES], pa.binary()))
+        assert out.type == pa.uuid()
+        assert out.storage.to_pylist() == [self.BYTES]
+
+    @pytest.mark.parametrize(
+        "array",
+        [
+            pa.array([1, 2], pa.int64()),
+            pa.array([1.5], pa.float64()),
+            pa.array([True], pa.bool_()),
+            pa.array([b"01234567"], pa.binary(8)),
+            pa.array([b"short"], pa.binary()),
+        ],
+    )
+    def test_unusable_source_types_raise_arrow_invalid(self, array):
+        # ArrowInvalid specifically: that is what `_coerce_or_null` catches to
+        # run its per-value null-out pass.
+        with pytest.raises(pa.ArrowInvalid):
+            _to_uuid(array)
+
+
+class TestCoerceUuidFromNonStringColumns:
+    """Whole-table behaviour for source columns that are not UUID text."""
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    BYTES = uuid_mod.UUID(CANONICAL).bytes
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_int64_column_nulls_every_row(self, mock_metrics):
+        table = pa.table({"uuid": pa.array([1, 2], pa.int64())})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [None, None]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_binary_8_column_nulls_every_row(self, mock_metrics):
+        table = pa.table({"uuid": pa.array([b"01234567"], pa.binary(8))})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [None]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_large_string_column_parses(self, mock_metrics):
+        table = pa.table({"uuid": pa.array([self.CANONICAL], pa.large_string())})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [uuid_mod.UUID(self.CANONICAL)]
+        mock_metrics.columns_coerced_total.labels.assert_called_once_with(target_type="uuid")
+        mock_metrics.errors_total.labels.assert_not_called()
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_variable_binary_mixed_widths_nulls_only_the_wrong_ones(self, mock_metrics):
+        table = pa.table({"uuid": pa.array([self.BYTES, b"short"], pa.binary())})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.column("uuid").to_pylist() == [uuid_mod.UUID(self.CANONICAL), None]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")

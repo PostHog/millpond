@@ -94,7 +94,7 @@ from pyhoglake import (
 )
 from pyhoglake.types import arrow_type_to_coltype, column_to_arrow_field, columns_to_arrow_schema
 
-from millpond import metrics
+from millpond import arrow_converter, metrics
 from millpond.config import Config
 from millpond.sink import SAFE_IDENTIFIER, check_reserved_collision
 
@@ -201,6 +201,12 @@ _HOG_RESERVED_PREFIX = "_hog"
 # pod crash-loops on the same batch forever.
 _MAX_COLUMN_NAME_LEN = 128
 
+# Columns already warned about for a uuid/string rewrite below, keyed by
+# (column, live type, batch type), so a permanent config/table mismatch logs
+# once per column per direction per pod lifetime rather than once per flush.
+# The metric is the always-on signal.
+_uuid_rewrite_warned: set[tuple[str, str, str]] = set()
+
 # Widenings mirroring SchemaManager's ALTER COLUMN path, restricted to
 # the promotions the hoglake server accepts (its matrix follows
 # DuckLake's documented table): int -> long, float -> double. The
@@ -211,6 +217,13 @@ _PROMOTIONS: dict[tuple[str, str], str] = {
     ("int", "long"): "long",
     ("float", "double"): "double",
 }
+
+# (live catalog type, batch's mapped type) pairs whose batch column is
+# REWRITTEN before the append, because neither a promotion nor the append-side
+# cast can resolve them — both directions of the uuid/string mismatch, and
+# nothing else. See `_rewrite_column` for why these two and not the general
+# case.
+_UUID_REWRITES: frozenset[tuple[str, str]] = frozenset({("string", "uuid"), ("uuid", "string")})
 
 
 # 4xx codes that mean "not now" rather than "not ever". Everything else
@@ -366,6 +379,16 @@ def is_retryable(exc: BaseException) -> bool:
         return True
     if isinstance(exc, httpx.HTTPError | OSError):
         return True
+    # pyarrow, explicitly and BEFORE the ValueError/TypeError arm below.
+    # `ArrowInvalid` is a `ValueError` and `ArrowTypeError` a `TypeError`, so
+    # two of the three were already permanent — by inheritance, which is not a
+    # thing to depend on — while `ArrowNotImplementedError` is a
+    # `NotImplementedError` and fell through to the transient default. All
+    # three say the same thing: the kernel refused THESE bytes, and the retry
+    # replays the identical batch through the identical cast. Waiting cannot
+    # change the answer; it only delays the crash the operator needs.
+    if isinstance(exc, pa.ArrowInvalid | pa.ArrowTypeError | pa.ArrowNotImplementedError):
+        return False
     # OSError is checked above (pyarrow's S3 upload raises it), so these
     # are the in-process ones: a bad value, a missing key, a wrong type.
     # Nothing about waiting fixes any of them.
@@ -1687,6 +1710,7 @@ class HoglakeSink:
         failed: list[str] = list(
             self._add_columns(table, [f for f in batch.schema if f.name not in self._live_columns])
         )
+        rewrites: list[tuple[str, str, str]] = []
         for field in batch.schema:
             live = self._live_columns.get(field.name)
             if live is None:
@@ -1704,6 +1728,8 @@ class HoglakeSink:
                 promoted = _PROMOTIONS.get((live.type, want))
                 if promoted is not None:
                     self._promote_column(table, field.name, live.type, promoted)
+                elif (live.type, want) in _UUID_REWRITES:
+                    rewrites.append((field.name, live.type, want))
                 # Else: leave the column; append()'s cast to the live type
                 # decides (all-null wobble casts cleanly; genuine type
                 # garbage fails the flush loudly — same posture as
@@ -1711,8 +1737,113 @@ class HoglakeSink:
 
         if failed:
             batch = batch.drop_columns(failed)
+        for name, live_type, want in rewrites:
+            batch = self._rewrite_column(batch, name, live_type, want)
 
         return self._null_fill_missing(batch)
+
+    def _rewrite_column(self, batch: pa.Table, name: str, live_type: str, want: str) -> pa.Table:
+        """Convert a batch column between uuid bytes and uuid text, whichever
+        way the live hoglake column needs it.
+
+        The degradation the docstring above promises, for the two live/batch
+        pairs where "leave it to the append-side cast" is not a degradation at
+        all but a permanent wedge. Neither direction casts:
+
+        * live `string`, batch `uuid` — `pa.uuid()` is an extension over
+          `fixed_size_binary(16)` and pyarrow casts its storage to utf8 by
+          REINTERPRETING the bytes, so 16 arbitrary bytes raise
+          `ArrowInvalid: Invalid UTF8 payload`;
+        * live `uuid`, batch `string` — the cast is to `pa.uuid()` (plain
+          `fixed_size_binary(16)` before pyhoglake 1.3.0; either way pyarrow
+          reports the STORAGE type in the message) and raises
+          `ArrowInvalid: Failed casting from string to fixed_size_binary[16]:
+          widths must match`, because 36 characters of text are not 16 bytes.
+
+        Both are deterministic on the batch, so both are non-retryable: the
+        flush crashes on attempt 1 with the offsets uncommitted, the restart
+        re-consumes the same batch, and the partition stops forever.
+
+        Neither shape is hypothetical, and they are the two halves of the same
+        operation. Adding `<col>:uuid` to MILLPOND_TYPED_COLUMNS points a
+        `uuid` batch at a table whose column has been `string` since it was
+        created from unpinned batches; REMOVING the pin — a rollback, or one
+        pod on a mixed fleet that has not taken the new config yet — points a
+        `string` batch at a table another pod created as `uuid`. A pin an
+        operator cannot safely apply is bad; a pin they cannot safely roll
+        back is worse.
+
+        Hoglake has no `string <-> uuid` promotion in either direction (nor
+        does Iceberg), so no DDL is attempted and the LIVE column wins: the
+        rows land in whatever shape the table already has, byte-for-byte the
+        same value either way. Getting a real `uuid` column means creating the
+        table WITH the pin, or a recreate. The mismatch is loud while it
+        lasts: `errors_total{type="schema"}` every flush, plus one warning per
+        column per direction. Text that is not a UUID is nulled, exactly as
+        the coercer would have nulled it, and bumps
+        `errors_total{type="column_coercion"}` as well — a type mismatch and
+        dropped values are different events and read as different series.
+        """
+        index = batch.schema.get_field_index(name)
+        if index < 0:
+            # Unreachable: the caller only ever passes names it read off this
+            # batch's own schema. Asserted anyway, because `get_field_index`
+            # answers -1 for a miss and `set_column(-1, ...)` would silently
+            # rewrite the LAST column instead of failing.
+            raise ValueError(f"column {name!r} is not in the batch schema {batch.schema.names}")
+        column = batch.column(index)
+        combined = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+
+        if want == "uuid":
+            # Batch carries uuid bytes, live column is text. `.storage` only
+            # exists on the extension array: pyhoglake maps a BARE
+            # `fixed_size_binary(16)` to "uuid" as well, and that one is
+            # already its own storage.
+            storage = combined.storage if isinstance(combined, pa.ExtensionArray) else combined
+            values = pa.array(
+                [None if raw is None else arrow_converter.uuid_text(raw) for raw in storage.to_pylist()],
+                type=pa.string(),
+            )
+            field = pa.field(name, pa.string(), nullable=True)
+            nulled = 0
+        else:
+            # Batch carries uuid text, live column is uuid.
+            decoded: list[bytes | None] = []
+            nulled = 0
+            for text in combined.to_pylist():
+                if text is None:
+                    decoded.append(None)
+                    continue
+                try:
+                    decoded.append(arrow_converter.uuid_bytes(text))
+                except ValueError:
+                    decoded.append(None)
+                    nulled += 1
+            values = pa.ExtensionArray.from_storage(
+                arrow_converter.UUID_TYPE,
+                pa.array(decoded, type=arrow_converter.UUID_STORAGE_TYPE),
+            )
+            field = pa.field(name, arrow_converter.UUID_TYPE, nullable=True)
+
+        key = (name, live_type, want)
+        if key not in _uuid_rewrite_warned:
+            log.warning(
+                "Column %r arrives as hoglake type %r but the live column is %r; hoglake has no "
+                "%s->%s promotion, so it is rewritten to the live shape for this and every "
+                "following flush. A real %r column needs the table created that way (or recreated).",
+                name,
+                want,
+                live_type,
+                live_type,
+                want,
+                want,
+            )
+            _uuid_rewrite_warned.add(key)
+        metrics.errors_total.labels(type="schema").inc()
+        if nulled:
+            log.warning("Rewrite of column %s to %s nulled %d unparseable value(s) this batch", name, live_type, nulled)
+            metrics.errors_total.labels(type="column_coercion").inc()
+        return batch.set_column(index, field, values)
 
     def _null_fill_missing(self, batch: pa.Table) -> pa.Table:
         """Null-fill live table columns absent from the batch (removed or

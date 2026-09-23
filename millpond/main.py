@@ -66,6 +66,31 @@ _RETRY_JITTER = 0.25
 # process is intentional — operators get a fresh warning on each
 # restart, which signals a likely persistent misconfiguration).
 _sort_missing_fields_warned: set[str] = set()
+# Same dedup, for sort keys whose Arrow type has no usable sort kernel.
+_sort_unsortable_warned: set[str] = set()
+# Same dedup again, for a filter field pinned `uuid` whose configured values
+# are not all UUIDs. Static values are refused at config load, so this only
+# fires for a dynamic include-values poll — and the poll keeps serving the
+# same bad value, so the condition is permanent and the log would be one line
+# per flush carrying the whole values tuple.
+#
+# Keyed by (field, value count, first bad value) and deliberately NOT by the
+# values themselves: an authoritative include-values source rebuilds its list
+# on every membership change, so a set keyed on the tuple would retain a full
+# copy of every historical set with nothing to evict it — 100 changes at 10k
+# team ids is ~80 MiB of dead strings in a 512Mi pod. The count and the first
+# offender are what distinguish one report from the next; a new bad value, or
+# a changed list size, still gets its own line.
+_uuid_filter_values_warned: set[tuple[str, int, str]] = set()
+
+# One-entry memo for the parsed uuid filter values. `_apply_filter` runs per
+# CONSUMED batch, so re-parsing the include set each time is per-batch work
+# proportional to the set size (~2.3 ms at 10k values) for an input that
+# changes at most every few minutes. The include-values source swaps an
+# immutable tuple by attribute assignment and static config holds one forever,
+# so the common case is the SAME object every call and the identity check in
+# `_parse_uuid_filter_values` settles it without walking either tuple.
+_uuid_filter_values_memo: tuple | None = None
 
 
 def _convert_batch(values: list[bytes]) -> pa.Table | None:
@@ -86,6 +111,14 @@ def _coerce_columns(table: pa.Table, cfg: config.Config) -> pa.Table:
     through filtering, sorting, table creation, and schema evolution. See
     arrow_converter.coerce_typed_columns for why this is necessary when writing
     into a table with already-typed columns (TIMESTAMPTZ, BIGINT, …).
+
+    The `uuid` target is the one whose Arrow type is an EXTENSION type
+    (`pa.uuid()`), and pyarrow's compute kernels do not accept one: both
+    downstream stages therefore work on its STORAGE array rather than the
+    column — `_apply_filter`/`_apply_drop_filter` compare the 16 raw bytes,
+    `_apply_sort` sorts them (see `_sortable_key_projection`). "Flows through"
+    is true of a uuid-pinned column only because of those two allowances; it
+    is not automatic.
     """
     if cfg.typed_columns is None:
         return table
@@ -145,6 +178,31 @@ def _apply_filter(table: pa.Table, cfg: config.Config, values: tuple[int, ...] |
     # surfaces as `filter_field_missing` rather than a quiet, wrong match.
     # Bool, float, timestamp, date, decimal, struct, list, map, etc. all
     # land here.
+    if column.type == arrow_converter.UUID_TYPE:
+        # A uuid-pinned column is an extension type, which the allowlist below
+        # would refuse — and refusing an ALLOWLIST field drops the whole batch,
+        # silently, every flush. Compare on the storage bytes instead: the
+        # filter values are UUID text, `uuid_bytes` turns them into the same 16
+        # big-endian bytes the column holds, and `is_in` over the storage array
+        # is the identical membership test. Config load refuses a non-UUID
+        # filter value for a uuid-pinned field, so a bad value here came from a
+        # DYNAMIC include-values poll; it cannot match anything under any
+        # encoding, so it is dropped from the allowlist rather than used to
+        # condemn the batch — the good values still admit their rows.
+        value_array, invalid = _parse_uuid_filter_values(values)
+        if invalid:
+            _warn_bad_uuid_filter_values(field, values, invalid, "they cannot match and are ignored")
+            metrics.errors_total.labels(type="filter_value_invalid").inc()
+        if len(value_array) == 0:
+            # Nothing on the allowlist is a UUID, so nothing can match. Fail
+            # CLOSED, as the allowlist always does — but under its OWN reason,
+            # not `filter_field_missing`, which is about the batch's schema and
+            # would make a bad include set indistinguishable from a renamed
+            # column on the dashboards.
+            metrics.records_skipped_total.labels(reason="filter_value_invalid").inc(len(table))
+            return table.slice(0, 0)
+        return _finish_keep_filter(table, field, _uuid_storage(column), value_array, label=arrow_converter.uuid_text)
+
     if not (
         pa.types.is_integer(column.type) or pa.types.is_string(column.type) or pa.types.is_large_string(column.type)
     ):
@@ -175,6 +233,33 @@ def _apply_filter(table: pa.Table, cfg: config.Config, values: tuple[int, ...] |
         metrics.records_skipped_total.labels(reason="filter_field_missing").inc(len(table))
         return table.slice(0, 0)
 
+    return _finish_keep_filter(table, field, column, value_array)
+
+
+def _uuid_storage(column):
+    """The `fixed_size_binary(16)` storage behind a `pa.uuid()` column.
+
+    Zero copy, and it keeps the null mask — the extension array's validity
+    bitmap IS the storage array's, so `null_count` and `is_in`'s null handling
+    behave exactly as they do for the column itself.
+    """
+    combined = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+    return combined.storage
+
+
+def _finish_keep_filter(table: pa.Table, field: str, column, value_array, label=None) -> pa.Table:
+    """The keep-filter's shared tail: build the mask, count the two skip
+    reasons, return the filtered table. Factored out so the uuid path and the
+    integer/string path cannot drift on the accounting.
+
+    `column` is the array the membership test runs against — the table's own
+    column for integer/string fields, its STORAGE array for a uuid one.
+    `label` is None on the integer/string path, where `filtered[field]` is
+    already materialized and `str` is the right rendering; the uuid path passes
+    `uuid_text` and pays one extra filter pass over the STORAGE array, because
+    `value_counts` has no kernel for the extension type and a bytes repr is not
+    a label anybody can match against a UUID.
+    """
     # is_in returns null for null inputs; fill_null(False) excludes them
     # from the keep mask. Null rows are counted separately as
     # filter_field_missing below.
@@ -190,11 +275,70 @@ def _apply_filter(table: pa.Table, cfg: config.Config, values: tuple[int, ...] |
         metrics.records_skipped_total.labels(reason="filter_excluded").inc(n_excluded)
     if len(filtered) > 0:
         # Per-value match counts on the KEPT rows only (bounded by the
-        # include set). value_counts on the filtered column is one pass
-        # over the minority the filter retained.
-        for chunk in pc.value_counts(filtered[field]).to_pylist():
-            metrics.filter_matched_total.labels(value=str(chunk["values"])).inc(chunk["counts"])
+        # include set). value_counts is one pass over the minority the filter
+        # retained; on the default path that minority is already materialized
+        # as `filtered[field]`, so re-filtering `column` would be a second
+        # pass over the hot path for nothing.
+        counted = column.filter(keep_mask) if label is not None else filtered[field]
+        render = label or str
+        for chunk in pc.value_counts(counted).to_pylist():
+            metrics.filter_matched_total.labels(value=render(chunk["values"])).inc(chunk["counts"])
     return filtered
+
+
+def _parse_uuid_filter_values(values) -> tuple[pa.Array, tuple]:
+    """Split configured filter values into comparable bytes and the rejects.
+
+    Returns `(fixed_size_binary(16) array of the values that ARE UUIDs, tuple
+    of the ones that are not)`. A value that is not a UUID cannot match a uuid
+    column under any encoding, so it is dropped from the comparison rather
+    than used to condemn the whole batch: the allowlist still admits what it
+    can, the denylist still denies what it can, and only a set with NO usable
+    value left falls back to the filter's failure direction.
+
+    Memoized on the values object (see `_uuid_filter_values_memo`), identity
+    first: the include-values source hands back the same immutable tuple every
+    batch until the set actually changes, so the hit costs one pointer compare
+    rather than a walk of 10k strings.
+    """
+    global _uuid_filter_values_memo
+    memo = _uuid_filter_values_memo
+    if memo is not None and (memo[0] is values or memo[0] == values):
+        return memo[1], memo[2]
+    parsed: list[bytes] = []
+    invalid: list = []
+    for value in values:
+        try:
+            parsed.append(arrow_converter.uuid_bytes(value))
+        except ValueError:
+            invalid.append(value)
+    result = (values, pa.array(parsed, type=arrow_converter.UUID_STORAGE_TYPE), tuple(invalid))
+    _uuid_filter_values_memo = result
+    return result[1], result[2]
+
+
+def _warn_bad_uuid_filter_values(field: str, values, invalid: tuple, outcome: str) -> None:
+    """Warn once per (field, value count, first offender) that some configured
+    filter values are not UUIDs.
+
+    The static values are refused at config load, so this is always a dynamic
+    include-values poll serving a non-UUID — and the poll keeps serving it, so
+    the condition is permanent. One line per flush would be the loudest thing
+    in the log for the lifetime of the pod; the counters are the always-on
+    signal. See `_uuid_filter_values_warned` for why the key is not the values.
+    """
+    key = (field, len(values), str(invalid[0]))
+    if key in _uuid_filter_values_warned:
+        return
+    _uuid_filter_values_warned.add(key)
+    log.warning(
+        "%d of %d filter value(s) for uuid-typed column %r are not UUIDs (first: %r); %s",
+        len(invalid),
+        len(values),
+        field,
+        invalid[0],
+        outcome,
+    )
 
 
 def _apply_drop_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
@@ -223,7 +367,22 @@ def _apply_drop_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
         return table
 
     column = table[field]
-    if not (
+    if column.type == arrow_converter.UUID_TYPE:
+        # As in the keep-filter: compare the 16 storage bytes, because the
+        # allowlist below refuses an extension type and a denylist that stops
+        # denying leaks exactly the rows it exists to remove. Values that are
+        # not UUIDs cannot match and are dropped from the denylist; a denylist
+        # with none left denies nothing, matching this filter's direction.
+        value_array, invalid = _parse_uuid_filter_values(cfg.filter_drop_values)
+        if invalid:
+            _warn_bad_uuid_filter_values(field, cfg.filter_drop_values, invalid, "they cannot match and are ignored")
+            metrics.errors_total.labels(type="filter_value_invalid").inc()
+        if len(value_array) == 0:
+            # Nothing on the denylist is a UUID, so nothing is denied.
+            # Fail-open, as this filter always does.
+            return table
+        column = _uuid_storage(column)
+    elif not (
         pa.types.is_integer(column.type) or pa.types.is_string(column.type) or pa.types.is_large_string(column.type)
     ):
         log.warning(
@@ -232,18 +391,18 @@ def _apply_drop_filter(table: pa.Table, cfg: config.Config) -> pa.Table:
             column.type,
         )
         return table
-
-    try:
-        value_array = pa.array(cfg.filter_drop_values).cast(column.type)
-    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as e:
-        log.warning(
-            "Drop-filter values %r incompatible with column %r type %s (%s); keeping batch unchanged (fail-open)",
-            cfg.filter_drop_values,
-            field,
-            column.type,
-            e,
-        )
-        return table
+    else:
+        try:
+            value_array = pa.array(cfg.filter_drop_values).cast(column.type)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as e:
+            log.warning(
+                "Drop-filter values %r incompatible with column %r type %s (%s); keeping batch unchanged (fail-open)",
+                cfg.filter_drop_values,
+                field,
+                column.type,
+                e,
+            )
+            return table
 
     # is_in returns false-or-null for null inputs depending on pyarrow
     # version; fill_null(False) normalizes either way, keeping null rows
@@ -268,6 +427,20 @@ def _apply_sort(table: pa.Table, cfg: config.Config) -> pa.Table:
       - Increment `sort_skipped_total{reason="field_missing"}` by the
         record count so operators can detect missing-field sort gaps
         from metrics alone.
+
+    A sort key whose Arrow type has no sort kernel is the third skip case
+    (`sort_skipped_total{reason="unsortable_type"}`). Extension types are
+    handled before it rather than by it: `MILLPOND_TYPED_COLUMNS=<c>:uuid`
+    makes a column `pa.uuid()`, for which pyarrow raises "Sorting not
+    supported for type extension<arrow.uuid>" — so the key columns are
+    replaced by their STORAGE arrays for the duration of the sort. The
+    storage of `pa.uuid()` is `fixed_size_binary(16)` holding the UUID's
+    big-endian bytes, which sorts bytewise and therefore in exactly the same
+    order as the canonical text; the indices come back positional and apply
+    unchanged to the original table. The `unsortable_type` arm stays as the
+    backstop for a type with neither a kernel nor sortable storage — a flush
+    that loses its layout improvement, never one that dies with its offsets
+    uncommitted.
 
     Apply order matters: this runs in `_flush()` after `pa.concat_tables`
     consolidates the pending buffer but before `sink.write()`. Sink-side
@@ -295,8 +468,42 @@ def _apply_sort(table: pa.Table, cfg: config.Config) -> pa.Table:
     # write-side layout improvement; it's expected to be small relative
     # to the sink.write() that follows.
     sort_keys = [(field, "ascending") for field in cfg.sort_by]
-    indices = pc.sort_indices(table, sort_keys=sort_keys)
+    try:
+        indices = pc.sort_indices(_sortable_key_projection(table, cfg.sort_by), sort_keys=sort_keys)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as e:
+        key = ",".join(cfg.sort_by)
+        if key not in _sort_unsortable_warned:
+            log.warning(
+                "Sort field(s) %s have no usable sort kernel (%s); skipping sort for affected flushes",
+                cfg.sort_by,
+                e,
+            )
+            _sort_unsortable_warned.add(key)
+        metrics.sort_skipped_total.labels(reason="unsortable_type").inc(len(table))
+        return table
     return table.take(indices)
+
+
+def _sortable_key_projection(table: pa.Table, sort_by: tuple[str, ...]) -> pa.Table:
+    """`table` with every extension-typed sort key replaced by its storage.
+
+    Only the key columns are touched and only for the `sort_indices` call —
+    the indices it returns are positional, so the caller still takes from the
+    untouched table and the batch reaches the sink with its declared types
+    intact. Returns the input itself when no key is an extension type.
+    """
+    columns = None
+    for name in sort_by:
+        column = table[name]
+        if not isinstance(column.type, pa.BaseExtensionType):
+            continue
+        if columns is None:
+            columns = {n: table[n] for n in table.column_names}
+        combined = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+        columns[name] = combined.storage
+    if columns is None:
+        return table
+    return pa.table(columns)
 
 
 def _is_commit_contention(exc: BaseException) -> bool:

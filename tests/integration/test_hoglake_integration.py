@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import httpx
@@ -26,6 +29,7 @@ import pyarrow.parquet as pq
 import pytest
 from pyarrow import fs as pafs
 from pyhoglake import IncarnationChangedError, NotFoundError, ValidationError
+from pyhoglake.types import columns_to_arrow_schema
 
 from millpond.hoglake import HoglakeSink, HoglakeSinkError, is_retryable, table_schema_for_batch
 from millpond.main import _flush
@@ -983,3 +987,302 @@ class TestColumnHygieneLive:
         assert "_hog_row_id" not in names
         assert "bad-name" not in names
         assert _record_count(client, cfg) == 1
+
+
+class TestUuidColumnLive:
+    """`MILLPOND_TYPED_COLUMNS=uuid:uuid` end to end against the real server.
+
+    The coercer turns the ClickHouse-events UUID strings into `pa.uuid()`;
+    this pins that the server types the column `uuid` (not `string`, not
+    `binary`) and that the parquet the sink uploads carries the UUID logical
+    annotation an Iceberg reader binds the column through.
+    """
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    OTHER = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    def _pinned_batch(self) -> pa.Table:
+        from millpond.arrow_converter import coerce_typed_columns
+
+        raw = pa.table(
+            {
+                "uuid": pa.array([self.CANONICAL, self.OTHER, None], pa.string()),
+                "person_id": pa.array([None, None, None], pa.string()),
+                "event": ["pageview"] * 3,
+                "team_id": [1, 1, 1],
+            }
+        )
+        batch = coerce_typed_columns(raw, (("uuid", "uuid"), ("person_id", "uuid")))
+        assert batch.schema.field("uuid").type == pa.uuid()
+        # An all-null pinned column must still arrive typed, or the table is
+        # created with a string `person_id` that no later flush can narrow.
+        assert batch.schema.field("person_id").type == pa.uuid()
+        return batch
+
+    def test_server_types_the_column_uuid(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._pinned_batch()) == 3
+        finally:
+            sink.close()
+        types = {c.name: c.type for c in _table(client, cfg).columns}
+        assert types["uuid"] == "uuid"
+        assert types["person_id"] == "uuid"
+        assert types["event"] == "string"
+        assert _record_count(client, cfg) == 3
+
+    def test_uploaded_parquet_carries_the_uuid_annotation(self, hog_stack, client):
+        """The commit lands AND the object's footer says UUID.
+
+        Both halves matter and they used to be mutually exclusive. `_prepare`
+        casts each batch to `columns_to_arrow_schema(info.columns)`; before
+        pyhoglake 1.3.0 that named plain `pa.binary(16)`, for which pyarrow
+        stamps no logical type, and writing the annotated form anyway had
+        `prepare_append_files` refuse the file outright —
+        `parquet.schema_arrow.equals(columns_to_arrow_schema(...))` is an exact
+        compare, so the extension-typed column came back as "prepared Parquet
+        schema/field IDs differ from destination" (observed against this very
+        server). 1.3.0 moved both sides: the schema names `pa.uuid()` and
+        append accepts either spelling.
+        """
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._pinned_batch()) == 3
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+        paths = _list_objects(DATA_PATH, cfg)
+        assert len(paths) == 1
+        s3 = _minio()
+        with s3.open_input_file(paths[0]) as f:
+            pf = pq.ParquetFile(f)
+            by_name = {pf.schema.column(i).name: pf.schema.column(i) for i in range(pf.metadata.num_columns)}
+            for name in ("uuid", "person_id"):
+                assert by_name[name].physical_type == "FIXED_LEN_BYTE_ARRAY"
+                assert by_name[name].length == 16
+                assert str(by_name[name].logical_type) == "UUID"
+            assert pf.schema_arrow.field("uuid").type == pa.uuid()
+            table = pf.read()
+        assert table.column("uuid").to_pylist() == [
+            uuid.UUID(self.CANONICAL),
+            uuid.UUID(self.OTHER),
+            None,
+        ]
+
+    def test_a_bare_fixed_size_binary_file_still_prepares(self, hog_stack, client):
+        """The mixed-fleet half of the 1.3.0 contract: append accepts BOTH
+        spellings, so a pod that predates this pin — one whose `_prepare` cast
+        named `pa.binary(16)` — keeps writing to the same table.
+
+        Driven at the pyhoglake boundary rather than through the sink, because
+        the sink can no longer produce the old spelling: the schema it casts to
+        comes from the installed pyhoglake.
+        """
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(self._pinned_batch())
+            table = _table(client, cfg)
+            bare = pa.schema(
+                [
+                    field.with_type(pa.binary(16)) if field.type == pa.uuid() else field
+                    for field in columns_to_arrow_schema(table.info().columns)
+                ]
+            )
+            assert bare.field("uuid").type == pa.binary(16)
+            rows = (
+                pa.table(
+                    {
+                        "uuid": pa.array([uuid.UUID(self.OTHER).bytes], pa.binary(16)),
+                        "person_id": pa.nulls(1, pa.binary(16)),
+                        "event": ["pageview"],
+                        "team_id": pa.array([1], pa.int64()),
+                        "_inserted_at": pa.array([datetime.now(UTC)], pa.timestamp("us", tz="UTC")),
+                    }
+                )
+                .select(list(bare.names))
+                .cast(bare)
+            )
+            with tempfile.TemporaryDirectory(prefix="millpond-bare-") as tmp:
+                path = os.path.join(tmp, "part-0.parquet")
+                pq.write_table(rows, path)
+                assert pq.ParquetFile(path).schema.column(0).logical_type.type == "NONE"
+                payload = table.prepare_append_files([(path, None)], idempotency_key=str(uuid.uuid4()))
+            payload.pop("read_snapshot", None)
+            client.catalog(cfg.hoglake_catalog).commit_prepared(payload)
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 4
+
+    def test_second_flush_appends_without_schema_drift(self, hog_stack, client):
+        # The coerced type must reconcile against the live `uuid` column, not
+        # try to add or widen it every flush.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(self._pinned_batch())
+            sink.write(self._pinned_batch())
+        finally:
+            sink.close()
+        types = {c.name: c.type for c in _table(client, cfg).columns}
+        assert types["uuid"] == "uuid"
+        assert _record_count(client, cfg) == 6
+
+
+class TestUuidPinOnAStringColumnLive:
+    """B1 against the real server: the pin arriving at a table whose column is
+    already `string` — the state every existing table is in, `events_raw` in
+    dev included, because the column was created from unpinned batches.
+
+    Before the degradation arm this was a permanent wedge, not a degraded
+    flush: `cast(pa.uuid() -> string)` reinterprets the 16 bytes as UTF-8 and
+    raises `ArrowInvalid: Invalid UTF8 payload` on every attempt, so the
+    offsets never commit and the restart re-consumes the same batch forever.
+    """
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    OTHER = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    def _pinned(self, values):
+        from millpond.arrow_converter import coerce_typed_columns
+
+        batch = coerce_typed_columns(
+            pa.table(
+                {
+                    "uuid": pa.array(values, pa.string()),
+                    "event": ["pageview"] * len(values),
+                    "team_id": [1] * len(values),
+                }
+            ),
+            (("uuid", "uuid"),),
+        )
+        assert batch.schema.field("uuid").type == pa.uuid()
+        return batch
+
+    def test_pin_on_an_existing_string_column_degrades_to_text(self, hog_stack, client):
+        cfg = _fresh()
+
+        # 1. Unpinned flush creates the table with `uuid` as a string column —
+        #    exactly how every table that predates the pin was created.
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(_batch(2)) == 2
+        finally:
+            sink.close()
+        assert {c.name: c.type for c in _table(client, cfg).columns}["uuid"] == "string"
+
+        # 2. Now the operator adds `uuid:uuid`. The flush must land, not wedge.
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._pinned([self.CANONICAL, None, self.OTHER])) == 3
+        finally:
+            sink.close()
+
+        # The column is still `string` — hoglake has no string->uuid promotion,
+        # so no DDL was attempted — and the rows are canonical UUID text.
+        assert {c.name: c.type for c in _table(client, cfg).columns}["uuid"] == "string"
+        assert _record_count(client, cfg) == 5
+        written = sorted(
+            v for path in _list_objects(DATA_PATH, cfg) for v in _read_parquet(path).column("uuid").to_pylist() if v
+        )
+        assert self.CANONICAL in written
+        assert self.OTHER in written
+
+    def test_repeated_flushes_keep_landing(self, hog_stack, client):
+        # The wedge was permanent, so "it worked once" is not the property
+        # under test — every subsequent flush has to land too.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(1))
+            sink.write(self._pinned([self.CANONICAL]))
+            sink.write(self._pinned([self.OTHER]))
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+
+
+class TestUuidPinRollbackLive:
+    """B1's mirror against the real server: a live `uuid` column and an
+    UNPINNED string batch.
+
+    The rollback direction, and the mixed-fleet one — a pod that has not taken
+    the new config writes to a table another pod created with the pin. Before
+    the rewrite arm this raised `ArrowInvalid: Failed casting from string to
+    fixed_size_binary[16]: widths must match`, which the retry path correctly
+    calls permanent, so the flush died on attempt 1 with offsets uncommitted.
+    """
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    OTHER = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    def _pinned(self, values):
+        from millpond.arrow_converter import coerce_typed_columns
+
+        return coerce_typed_columns(
+            pa.table(
+                {
+                    "uuid": pa.array(values, pa.string()),
+                    "event": ["pageview"] * len(values),
+                    "team_id": [1] * len(values),
+                }
+            ),
+            (("uuid", "uuid"),),
+        )
+
+    def _unpinned(self, values):
+        return pa.table(
+            {
+                "uuid": pa.array(values, pa.string()),
+                "event": ["pageview"] * len(values),
+                "team_id": [1] * len(values),
+            }
+        )
+
+    def test_unpinned_batch_lands_on_a_uuid_column(self, hog_stack, client):
+        cfg = _fresh()
+
+        # 1. A pinned flush creates the table with a real `uuid` column.
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._pinned([self.CANONICAL])) == 1
+        finally:
+            sink.close()
+        assert {c.name: c.type for c in _table(client, cfg).columns}["uuid"] == "uuid"
+
+        # 2. The pin comes back off (or a stale pod flushes). Must land, and
+        #    keep landing — the wedge was permanent, not a one-off.
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._unpinned([self.OTHER, None])) == 2
+            assert sink.write(self._unpinned([self.CANONICAL])) == 1
+        finally:
+            sink.close()
+
+        assert {c.name: c.type for c in _table(client, cfg).columns}["uuid"] == "uuid"
+        assert _record_count(client, cfg) == 4
+        written = sorted(
+            v for path in _list_objects(DATA_PATH, cfg) for v in _read_parquet(path).column("uuid").to_pylist() if v
+        )
+        assert written == sorted(
+            [
+                uuid.UUID(self.CANONICAL),
+                uuid.UUID(self.CANONICAL),
+                uuid.UUID(self.OTHER),
+            ]
+        )
+
+    def test_non_uuid_text_is_nulled_not_fatal(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(self._pinned([self.CANONICAL]))
+            assert sink.write(self._unpinned([self.OTHER, "not-a-uuid"])) == 2
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+        values = [v for path in _list_objects(DATA_PATH, cfg) for v in _read_parquet(path).column("uuid").to_pylist()]
+        assert None in values
+        assert uuid.UUID(self.OTHER) in values
