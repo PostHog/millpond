@@ -58,6 +58,9 @@ def _cfg(**overrides) -> MagicMock:
     cfg.sort_by = None
     cfg.ordinal = 0
     cfg.table_label = "events"
+    # A real string: the sink reads it once at construction and writes it
+    # into every commit message, and a MagicMock would put its repr there.
+    cfg.service_version = "1.2.3"
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg
@@ -2419,3 +2422,353 @@ class TestWriteFailurePropagation:
         table.prepare_append_files.side_effect = IncarnationChangedError("recreated")
         with pytest.raises(IncarnationChangedError):
             s.write(_batch())
+
+
+# ---------------------------------------------------------------------------
+# Commit message
+# ---------------------------------------------------------------------------
+
+
+def _committed(catalog) -> dict:
+    """The payload the last flush published."""
+    assert catalog.commit_prepared.call_args is not None, "nothing was committed"
+    return catalog.commit_prepared.call_args[0][0]
+
+
+def _offsets_only(message: str) -> list[str]:
+    return message.split("\n")[1:]
+
+
+class TestCommitMessageFormat:
+    """`format_commit_message` is the whole format, as a pure function.
+
+    The snapshot's `message` is the ONLY record of which Kafka offsets a
+    snapshot contains: the author names the pipeline, the files name
+    object keys, and nothing anywhere else ties a published snapshot back
+    to a position in the topic. So the format is pinned by a fixed vector
+    here, not merely sampled for substrings.
+    """
+
+    VECTOR = dict(
+        records=26402,
+        files=31,
+        partitions=31,
+        arrow_bytes=268435456,
+        trigger="size",
+        version="1.2.3",
+        table_uuid=TABLE_UUID,
+        kafka_offsets=(
+            ("clickhouse_events_json", 3, 4128819, 4155470),
+            ("clickhouse_events_json", 19, 4130021, 4156802),
+        ),
+    )
+
+    def test_fixed_vector(self):
+        assert hoglake.format_commit_message(**self.VECTOR) == (
+            "records=26402 files=31 partitions=31 arrow_bytes=268435456 trigger=size "
+            f"millpond=1.2.3 table={TABLE_UUID}\n"
+            "offsets clickhouse_events_json p3:4128819-4155470 p19:4130021-4156802 (2)"
+        )
+
+    def test_the_summary_names_the_table_incarnation(self):
+        # A drop and recreate under the same name is a different table
+        # that receipts do not span. Two flushes of the same range into
+        # the two incarnations are different publications, and their
+        # messages must say so — without this the two snapshots are
+        # byte-identical and nothing in the catalog tells them apart.
+        other = dict(self.VECTOR, table_uuid="0e0b6c8e-0000-0000-0000-0000000000ff")
+        assert hoglake.format_commit_message(**self.VECTOR) != hoglake.format_commit_message(**other)
+        assert (
+            hoglake.format_commit_message(**other)
+            .split("\n")[0]
+            .endswith(" table=0e0b6c8e-0000-0000-0000-0000000000ff")
+        )
+
+    def test_an_unresolved_incarnation_is_named_unknown(self):
+        out = hoglake.format_commit_message(**dict(self.VECTOR, table_uuid=None))
+        assert out.split("\n")[0].endswith(" table=unknown")
+
+    def test_ranges_sort_by_partition_number_not_by_text(self):
+        # p9 after p10 is what a lexicographic sort gives; an operator
+        # scanning for a partition reads the numeric order.
+        out = hoglake.format_commit_message(
+            **dict(self.VECTOR, kafka_offsets=(("t", 10, 5, 6), ("t", 2, 1, 2), ("t", 9, 3, 4)))
+        )
+        assert _offsets_only(out) == ["offsets t p2:1-2 p9:3-4 p10:5-6 (3)"]
+
+    def test_one_line_per_topic_sorted_by_topic(self):
+        # Millpond consumes one topic today. The format does not depend
+        # on that: a second topic gets its own line rather than a second
+        # topic name inside the first.
+        out = hoglake.format_commit_message(
+            **dict(self.VECTOR, kafka_offsets=(("zulu", 0, 7, 8), ("alpha", 1, 1, 2), ("alpha", 0, 3, 4)))
+        )
+        assert _offsets_only(out) == [
+            "offsets alpha p0:3-4 p1:1-2 (2)",
+            "offsets zulu p0:7-8 (1)",
+        ]
+
+    def test_an_anonymous_flush_gets_the_summary_alone(self):
+        # A direct caller (never main.py) supplies no identity; there is
+        # nothing truthful to write on an offsets line.
+        out = hoglake.format_commit_message(**dict(self.VECTOR, kafka_offsets=()))
+        assert "\n" not in out
+        assert out.startswith("records=26402 files=31 partitions=31 ")
+
+    def test_an_unpartitioned_flush_says_zero_partitions(self):
+        # One file, no partition tuple at all — `partitions` is not a
+        # synonym for `files`, it is how many tuples the fanout produced.
+        out = hoglake.format_commit_message(**dict(self.VECTOR, files=1, partitions=0))
+        assert out.startswith("records=26402 files=1 partitions=0 ")
+
+    @pytest.mark.parametrize(
+        ("supplied", "written"),
+        [
+            ("size", "size"),
+            ("time", "interval"),  # the metric label's name for the interval trigger
+            ("interval", "interval"),
+            ("final", "final"),
+            (None, "unknown"),
+            ("", "unknown"),
+            ("something_else", "unknown"),
+        ],
+    )
+    def test_trigger_vocabulary(self, supplied, written):
+        out = hoglake.format_commit_message(**dict(self.VECTOR, trigger=supplied))
+        assert f"trigger={written} " in out
+
+    def test_a_version_with_a_space_stays_one_token(self):
+        # MILLPOND_SERVICE_VERSION takes any string an operator sets. A
+        # space in it would split the summary line's fixed key=value
+        # order for anything that reads the line by whitespace.
+        summary = hoglake.format_commit_message(**dict(self.VECTOR, version="v1 dirty")).split("\n")[0]
+        assert " millpond=v1_dirty " in summary
+        assert len(summary.split(" ")) == 7
+
+    def test_an_empty_version_is_named_unknown(self):
+        summary = hoglake.format_commit_message(**dict(self.VECTOR, version="")).split("\n")[0]
+        assert " millpond=unknown " in summary
+
+
+class TestCommitMessageTruncation:
+    """A pod that owns hundreds of partitions must not write an unbounded
+    message. The server stores `message` as unbounded text, so the bound
+    is ours."""
+
+    @staticmethod
+    def _ranges(n):
+        return tuple(("clickhouse_events_json", p, 4128819 + p, 4155470 + p) for p in range(n))
+
+    def _message(self, n, **kw):
+        return hoglake.format_commit_message(
+            **dict(TestCommitMessageFormat.VECTOR, kafka_offsets=self._ranges(n), **kw)
+        )
+
+    def _widest_that_fits(self) -> int:
+        """The most ranges that fit under the default limit UNTRUNCATED.
+
+        Measured with the bound lifted, because a truncated line is
+        always under the limit — measuring the bounded output would say
+        every width fits.
+        """
+        n = 1
+        while len(_offsets_only(self._message(n, limit=10**9))[0].encode()) <= hoglake._MESSAGE_OFFSETS_LIMIT:
+            n += 1
+        return n - 1
+
+    def test_a_whole_topic_assignment_is_never_truncated(self):
+        # The case the limit is sized for: ONE pod owning every
+        # partition of the events topic (512), which a shrunk fleet or a
+        # single-replica deployment really does produce.
+        line = _offsets_only(self._message(512))[0]
+        assert line.endswith("(512)")
+        assert "more)" not in line
+
+    def test_the_boundary(self):
+        fits = self._widest_that_fits()
+        assert fits > 512  # a whole 512-partition topic on one pod still fits
+        whole = _offsets_only(self._message(fits))[0]
+        assert whole.endswith(f"({fits})")
+        assert "more)" not in whole
+
+        over = _offsets_only(self._message(fits + 1))[0]
+        assert len(over.encode()) <= hoglake._MESSAGE_OFFSETS_LIMIT
+        assert over.endswith(" more)")
+        kept = len([tok for tok in over.split(" ") if tok.startswith("p")])
+        dropped = int(re.search(r"\.\.\. \(\+(\d+) more\)$", over).group(1))
+        assert kept + dropped == fits + 1
+        # The kept ranges are the FIRST ones, in partition order.
+        assert over.startswith("offsets clickhouse_events_json p0:4128819-4155470 p1:")
+
+    def test_a_range_that_exactly_fits_is_kept(self):
+        # The truncation guard is `>`, not `>=`: a range whose last byte
+        # lands exactly on the limit belongs in the line. Off by one
+        # here silently drops a partition from every truncated message.
+        parts = [f"p{p}:{4128819 + p}-{4155470 + p}" for p in range(10)]
+        head = "offsets clickhouse_events_json"
+        exact = " ".join([head, *parts[:5]]) + " ... (+5 more)"
+        line = _offsets_only(self._message(10, limit=len(exact.encode())))[0]
+        assert line == exact
+
+    def test_the_summary_line_is_never_truncated(self):
+        # A limit too small even for the topic name is the floor case:
+        # the summary is still whole, and the offsets line keeps the
+        # topic and the count of what it could not fit. Nothing trims a
+        # topic name — a half-written topic would be a different topic.
+        message = self._message(4000, limit=40)
+        summary, offsets = message.split("\n")
+        assert summary.startswith("records=26402 files=31 partitions=31 ")
+        assert offsets == "offsets clickhouse_events_json ... (+4000 more)"
+
+    def test_a_small_limit_keeps_what_fits(self):
+        line = _offsets_only(self._message(10, limit=60))[0]
+        assert len(line.encode()) <= 60
+        assert line.endswith(" more)")
+
+
+class TestCommitMessageOnThePayload:
+    """The message rides the commit payload beside the author."""
+
+    OFFSETS = (("events", 0, 30, 41), ("events", 1, 9, 17))
+
+    def test_summary_and_offsets_reach_the_commit(self):
+        s, client, catalog, ns, table = _sink()
+        batch = pa.table({"uuid": ["a", "b"], "event": ["e", "e"], "team_id": [1, 2]})
+        s.write(batch, kafka_offsets=self.OFFSETS, trigger="size")
+        message = _committed(catalog)["message"]
+        summary, offsets = message.split("\n")
+        assert summary == (
+            f"records=2 files=1 partitions=0 arrow_bytes={batch.nbytes} trigger=size millpond=1.2.3 table={TABLE_UUID}"
+        )
+        assert offsets == "offsets events p0:30-41 p1:9-17 (2)"
+
+    def test_the_author_is_still_there(self):
+        s, client, catalog, *_ = _sink()
+        s.write(_batch(), kafka_offsets=self.OFFSETS, trigger="size")
+        assert _committed(catalog)["author"] == "millpond/events/0"
+
+    def test_partitions_counts_tuples_and_files_counts_objects(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        s.write(
+            pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 2]}),
+            kafka_offsets=self.OFFSETS,
+            trigger="interval",
+        )
+        summary = _committed(catalog)["message"].split("\n")[0]
+        assert "records=3 files=2 partitions=2 " in summary
+        assert "trigger=interval " in summary
+
+    def test_a_null_partition_value_is_still_a_partition(self):
+        # A null source value forms its own group, per Iceberg — a
+        # `(None,)` tuple is a partition and is counted. Only an
+        # unpartitioned table has no tuple at all.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        s.write(
+            pa.table({"uuid": ["a", "b"], "team_id": pa.array([None, None], pa.int64())}),
+            kafka_offsets=self.OFFSETS,
+        )
+        assert "records=2 files=1 partitions=1 " in _committed(catalog)["message"]
+
+    def test_an_unpartitioned_table_touches_no_partition_tuple(self):
+        s, client, catalog, *_ = _sink()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        assert " partitions=0 " in _committed(catalog)["message"]
+
+    def test_a_flush_with_no_trigger_says_unknown(self):
+        s, client, catalog, *_ = _sink()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        assert " trigger=unknown " in _committed(catalog)["message"]
+
+    def test_an_anonymous_flush_has_no_offsets_line(self):
+        s, client, catalog, *_ = _sink()
+        s.write(_batch())
+        assert "\n" not in _committed(catalog)["message"]
+
+    @patch("millpond.hoglake.metrics")
+    def test_arrow_bytes_is_the_batch_main_handed_over(self, mock_metrics):
+        # Measured BEFORE the unwritable columns are dropped, so the
+        # number compares against the flush gate rather than against
+        # whatever survived this module. A poison producer key must not
+        # quietly shrink the size an operator reconciles with.
+        s, client, catalog, *_ = _sink()
+        batch = pa.table({"uuid": ["a", "b"], "team_id": [1, 2], "utm-source": ["x", "y"]})
+        dropped = hoglake._drop_unwritable_columns(batch)
+        assert dropped.nbytes < batch.nbytes, "the fixture must actually drop a column"
+        s.write(batch, kafka_offsets=self.OFFSETS, trigger="size")
+        assert f" arrow_bytes={batch.nbytes} " in _committed(catalog)["message"]
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_message_is_identical_on_a_replay(self, mock_metrics):
+        # A retry under the same idempotency key re-sends the payload
+        # verbatim, message included. Nothing on the replay path compares
+        # the message — the receipt is keyed on the idempotency key alone
+        # — but a message that moved between attempts would mean two
+        # snapshots could describe the same flush differently, which is
+        # exactly what an operator reconciling a gap must be able to rule
+        # out.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [
+            httpx.ReadTimeout("response lost"),
+            MagicMock(snapshot_id=7, schema_version=1),
+        ]
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_batch(), kafka_offsets=self.OFFSETS, trigger="size")
+        s.write(_batch(), kafka_offsets=self.OFFSETS, trigger="size")
+        first, second = (c[0][0]["message"] for c in catalog.commit_prepared.call_args_list)
+        assert first == second
+        assert table.prepare_append_files.call_count == 1  # replayed, not rebuilt
+
+    def test_a_rebuilt_flush_of_the_same_identity_says_the_same_thing(self):
+        # The across-a-restart case: a new process rebuilds the flush
+        # from Kafka. Object names and `_inserted_at` differ; the message
+        # must not.
+        batch = pa.table({"uuid": ["a", "b"], "event": ["e", "e"], "team_id": [1, 2]})
+        messages = []
+        for _ in range(2):
+            s, client, catalog, ns, table = _sink()
+            s.write(batch, kafka_offsets=self.OFFSETS, trigger="size")
+            messages.append(_committed(catalog)["message"])
+        assert messages[0] == messages[1]
+
+
+class TestTheMessageCannotOrphanAnUpload:
+    """The message is built BEFORE the upload, and that ordering is the
+    whole safety property.
+
+    `_prepare` splits into "upload the objects" and "hold the request
+    that registers them". Everything that can fail after the upload has
+    to be accounted for: `prepare_append_files` failures go through
+    `_count_orphans`, which names the objects nobody will ever
+    reference. A formatting bug raising after the upload — a
+    `TypeError` on some future field, say — would leave those objects
+    with no count, no log and no metric, and the retry loop would treat
+    it as transient and burn the whole budget on a batch that raises
+    identically every time.
+    """
+
+    def test_a_formatter_failure_happens_before_any_upload(self, monkeypatch):
+        s, client, catalog, ns, table = _sink()
+        monkeypatch.setattr(
+            hoglake,
+            "format_commit_message",
+            MagicMock(side_effect=TypeError("a future field is not a string")),
+        )
+        with pytest.raises(TypeError):
+            s.write(_batch(), kafka_offsets=(("events", 0, 30, 41),), trigger="size")
+        # Nothing was serialized, nothing was uploaded, nothing was
+        # committed — so there is nothing to orphan and nothing to count.
+        assert _WRITTEN == []
+        table.prepare_append_files.assert_not_called()
+        catalog.commit_prepared.assert_not_called()
+
+    def test_the_message_is_formatted_before_the_upload_call(self):
+        # The ordering as a source-level guard, so a later edit that
+        # moves the formatting back below the upload fails here rather
+        # than in production as an unaccounted orphan. The test above
+        # proves the behaviour for one failure; this pins the shape.
+        import inspect
+
+        body = inspect.getsource(hoglake.HoglakeSink._prepare)
+        assert body.index("format_commit_message(") < body.index("prepare_append_files(")

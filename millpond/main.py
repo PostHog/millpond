@@ -674,7 +674,7 @@ def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", writ
             time.sleep(delay)
 
 
-def _sink_write_kwargs(cfg, offsets: dict[tuple[str, int], tuple[int, int]]) -> dict:
+def _sink_write_kwargs(cfg, offsets: dict[tuple[str, int], tuple[int, int]], trigger: str = "unknown") -> dict:
     """Per-call arguments for backends that need to know WHICH batch this
     is, not only what is in it.
 
@@ -694,16 +694,26 @@ def _sink_write_kwargs(cfg, offsets: dict[tuple[str, int], tuple[int, int]]) -> 
     receipt then reports it as already published — offsets advance over
     rows that were never written.
 
+    `trigger` is why this flush is happening now — the same value
+    `batches_flushed_total` is labelled with. HoglakeSink writes it into
+    the snapshot's commit message, where it separates a flush that filled
+    its buffer from one that ran out of time and from the last flush
+    before a shutdown. It is NOT part of the flush identity: the same
+    rows flushed for a different reason are the same rows, and a restart
+    that reaches the size trigger where the previous process reached the
+    time trigger must still be recognized as a replay.
+
     DuckLake takes no per-call identity: its INSERT sits in a transaction
     whose commit outcome the client always learns, so a retry there
-    cannot be ambiguous the way a lost HTTP response is. The seam stays
-    empty for it — the same shape the icebox sink used at tag
+    cannot be ambiguous the way a lost HTTP response is. It records no
+    snapshot message either, so the trigger has nowhere to go. The seam
+    stays empty for it — the same shape the icebox sink used at tag
     `final-iceberg`.
     """
     if cfg.destination != "hoglake":
         return {}
     flushed = tuple(sorted((topic, partition, first, last) for (topic, partition), (first, last) in offsets.items()))
-    return {"kafka_offsets": flushed}
+    return {"kafka_offsets": flushed, "trigger": trigger}
 
 
 def _flush(
@@ -725,7 +735,7 @@ def _flush(
         sink,
         consolidated,
         destination=cfg.destination,
-        write_kwargs=_sink_write_kwargs(cfg, offsets),
+        write_kwargs=_sink_write_kwargs(cfg, offsets, trigger),
     )
     write_duration = time.monotonic() - t0
 
@@ -1014,6 +1024,13 @@ def main():
                 consolidated = pa.concat_tables(pending, promote_options="default")
                 elapsed = time.monotonic() - last_flush
                 log.info("Final flush: %d records, %d bytes", len(consolidated), pending_bytes)
+                # `final`, not the "time" default: this flush is the one
+                # SIGTERM caused, and it is the flush an operator looks
+                # for when reconciling what a pod wrote before it went
+                # away. It names itself in the hoglake snapshot's commit
+                # message and in `batches_flushed_total{trigger=}`,
+                # which until now counted it as an ordinary interval
+                # flush.
                 _flush(
                     sink,
                     cfg,
@@ -1023,6 +1040,7 @@ def main():
                     pending_records,
                     offsets,
                     elapsed,
+                    "final",
                 )
             except Exception:
                 log.exception("Final flush failed — data safe in Kafka, will replay on restart")
