@@ -69,6 +69,7 @@ import os
 import tempfile
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import httpx
@@ -278,6 +279,36 @@ _ALIGNMENT_REFUSALS: tuple[str, ...] = (
     "prepared Parquet schema/field IDs differ from destination",
     "prepared Parquet columns differ from destination",
 )
+
+# How long the offsets line of a commit message may be, in bytes. The
+# server stores `message` as unbounded text, so this bound is millpond's
+# own: a snapshot row whose message is larger than the rest of the
+# snapshot serves nobody.
+#
+# Sized so that ONE pod owning an entire 512-partition topic still
+# writes every range — 512 ranges of the events topic measure about
+# 10.5 KiB, and a shrunk fleet or a single-replica deployment really does
+# produce that. The production shape (512 partitions over 16 pods) is
+# about 32 ranges. 16 KiB holds about 780, so truncation is now reserved
+# for a partition count no millpond topic has.
+_MESSAGE_OFFSETS_LIMIT = 16384
+
+# What the message calls each flush trigger. `metrics.batches_flushed_total`
+# labels the interval trigger `time`, and that label value stays as it
+# is because dashboards and alerts already read it; the message says
+# `interval`, which is what the setting is called
+# (MILLPOND_FLUSH_INTERVAL_MS). The two vocabularies are mapped here, in
+# one place, rather than by renaming a live metric label. Anything not
+# in this table is `unknown` — a caller that supplies no trigger, and a
+# future trigger nobody taught this table about, both name themselves
+# honestly instead of claiming one of the three.
+_MESSAGE_TRIGGERS: dict[str | None, str] = {
+    "size": "size",
+    "time": "interval",
+    "interval": "interval",
+    "final": "final",
+}
+_UNKNOWN_TRIGGER = "unknown"
 
 
 class HoglakeSinkError(RuntimeError):
@@ -621,6 +652,143 @@ def _describe_partition(spec, live_columns) -> str:
     )
 
 
+@dataclass(frozen=True)
+class _FlushFacts:
+    """What the commit message needs that the prepared payload does not
+    already carry.
+
+    Grouped rather than passed as three more `_prepare` keywords because
+    they are one thing — the flush as main.py saw it, before this module
+    dropped columns, stamped `_inserted_at` and fanned the rows out over
+    partitions. `_prepare` supplies the rest (rows, files, partition
+    tuples) from what it actually wrote.
+    """
+
+    kafka_offsets: tuple[tuple[str, int, int, int], ...] = ()
+    arrow_bytes: int = 0
+    trigger: str | None = None
+
+
+def _message_token(value) -> str:
+    """One `key=value` value, guaranteed to hold no space.
+
+    The summary line is a fixed sequence of `key=value` pairs, so a
+    space inside a value moves every pair after it for anything that
+    reads the line by splitting on whitespace. Only the version can
+    carry one — `MILLPOND_SERVICE_VERSION` takes any string an operator
+    sets, an image digest included — so only it is passed through here.
+    An empty value becomes `unknown`, because `millpond=` at the end of
+    a line reads as a defect in the writer rather than as a version
+    nobody set.
+    """
+    text = "".join("_" if character.isspace() else character for character in str(value))
+    return text or "unknown"
+
+
+def _offsets_line(topic: str, ranges: list[tuple[int, int, int]], limit: int) -> str:
+    """One topic's partition ranges: `offsets <topic> p<n>:<first>-<last> ... (<count>)`.
+
+    The topic is named ONCE and every range carries its partition, so
+    the line stays readable at 32 ranges and two partitions can never be
+    read as having swapped ranges. The trailing count is what an
+    operator checks against the pod's partition assignment: a flush that
+    names fewer partitions than the pod owns is a flush some partition
+    delivered nothing to.
+
+    Over `limit` bytes the line keeps the ranges it can and ends with
+    `... (+<k> more)` in place of the count, so the two forms cannot be
+    confused and the dropped ranges are still counted. The kept ones are
+    the first by partition number, which is arbitrary but stable — a
+    truncated line is a prompt to go and read the Kafka position
+    directly, not a substitute for it. The topic name and the marker are
+    the floor: a limit too small for those two is answered with those
+    two, because a trimmed topic name is a different topic.
+    """
+    head = f"offsets {topic}"
+    parts = [f"p{partition}:{first}-{last}" for partition, first, last in ranges]
+    whole = " ".join([head, *parts]) + f" ({len(parts)})"
+    if len(whole.encode()) <= limit:
+        return whole
+    # Greedy prefix, and the emitted line needs no correction after it:
+    # each range is admitted against the marker that would follow it if
+    # it were the LAST one kept, which is exactly the marker the emitted
+    # line carries. So the last admitted range leaves the line at or
+    # under the limit by the same arithmetic that admitted it, digit
+    # rollover in the count included. (The floor case — no range fits at
+    # all — emits the head and the marker and may exceed a limit too
+    # small for those two, which is the documented behaviour above.)
+    kept = 0
+    size = len(head.encode())
+    for index, part in enumerate(parts):
+        grown = size + 1 + len(part.encode())
+        marker = f" ... (+{len(parts) - index - 1} more)"
+        if grown + len(marker.encode()) > limit:
+            break
+        size = grown
+        kept = index + 1
+    return " ".join([head, *parts[:kept]]) + f" ... (+{len(parts) - kept} more)"
+
+
+def format_commit_message(
+    *,
+    records: int,
+    files: int,
+    partitions: int,
+    arrow_bytes: int,
+    trigger: str | None,
+    version: str,
+    table_uuid: str | None,
+    kafka_offsets: Sequence[tuple[str, int, int, int]] = (),
+    limit: int = _MESSAGE_OFFSETS_LIMIT,
+) -> str:
+    """The text of a snapshot's `message`: what the flush was, then where
+    it came from in Kafka.
+
+    The offset ranges are the point. A hoglake snapshot records its
+    author (`millpond/<table>/<ordinal>`) and its files, and nothing
+    else ties it to a position in the topic — so without them no one can
+    answer "is offset X in the lake", audit a replay after a crash, or
+    reconcile a gap, other than by reading parquet. The summary line is
+    the cheap half: it costs one line and answers the questions that
+    otherwise need the file list (how much landed, how wide the fanout
+    was, why the flush happened, which build wrote it).
+
+    Line 1 is a fixed sequence of `key=value` pairs, in a fixed order,
+    with no space inside any value — it is meant to be read by a person
+    first and to survive `awk` second. Line 2 (and further lines, one
+    per topic, if a flush ever spans more than one) lists every
+    partition range, sorted by partition number.
+
+    `partitions` is how many partition tuples the fanout produced, which
+    is 0 on an unpartitioned table and equal to `files` on a partitioned
+    one — the two keys answer different questions (how many objects to
+    compact later, how wide the flush spread), and they only agree
+    because the fanout writes one file per tuple.
+
+    `table_uuid` is the destination INCARNATION, and it is here for the
+    same reason it is in the idempotency key: a drop and recreate under
+    one name makes two tables that receipts do not span, and without it
+    a range published into each produces two byte-identical messages
+    with nothing in the catalog to tell them apart.
+
+    DETERMINISTIC for a given flush: the same rows, files, trigger,
+    incarnation and offsets produce the same text, on a retry in this
+    process and on a rebuild in a new one. Nothing compares messages —
+    the server's receipt is keyed on the idempotency key alone — but two
+    snapshots that describe one flush differently is a question an
+    operator reconciling a gap should never have to ask.
+    """
+    summary = (
+        f"records={records} files={files} partitions={partitions} arrow_bytes={arrow_bytes} "
+        f"trigger={_MESSAGE_TRIGGERS.get(trigger, _UNKNOWN_TRIGGER)} millpond={_message_token(version)} "
+        f"table={_message_token(table_uuid or 'unknown')}"
+    )
+    by_topic: dict[str, list[tuple[int, int, int]]] = {}
+    for topic, partition, first, last in kafka_offsets or ():
+        by_topic.setdefault(topic, []).append((partition, first, last))
+    return "\n".join([summary, *(_offsets_line(topic, sorted(by_topic[topic]), limit) for topic in sorted(by_topic))])
+
+
 class HoglakeSink:
     """The hoglake sink: owns the pyhoglake client, the resolved
     catalog/namespace/table handles, and the live-schema cache.
@@ -691,6 +859,15 @@ class HoglakeSink:
         # Commit author recorded on every snapshot — the pipeline
         # identity plus the pod ordinal, for multi-writer forensics.
         self._author = f"millpond/{cfg.table_label}/{cfg.ordinal}"
+        # The running version, named in every commit message and read
+        # ONCE. `cfg.service_version` already holds it (the package
+        # version, or whatever MILLPOND_SERVICE_VERSION overrides it
+        # with — an image digest, typically), so the message and the
+        # OTLP `service.version` resource attribute cannot disagree
+        # about which build wrote a snapshot. Reading it per flush would
+        # put a metadata lookup in the write path for a value that
+        # cannot change while the process lives.
+        self._version = _message_token(cfg.service_version or "unknown")
         # Resolved lazily on first write; reset_caches() drops them so the
         # retry path re-resolves (another pod may have created/altered the
         # table, or it may have been dropped+recreated).
@@ -744,7 +921,13 @@ class HoglakeSink:
 
     # -- Sink protocol -----------------------------------------------------
 
-    def write(self, batch: pa.Table, *, kafka_offsets: tuple[tuple[str, int, int, int], ...] | None = None) -> int:
+    def write(
+        self,
+        batch: pa.Table,
+        *,
+        kafka_offsets: tuple[tuple[str, int, int, int], ...] | None = None,
+        trigger: str | None = None,
+    ) -> int:
         """Publish `batch` as ONE idempotent commit.
 
         `kafka_offsets` is the flush's identity — the
@@ -755,6 +938,13 @@ class HoglakeSink:
         duplicates); main.py always supplies it, direct callers usually
         should not care.
 
+        `trigger` is what made main.py flush now (`size`, `time`,
+        `final`). It reaches only the snapshot's commit message and is
+        deliberately NOT part of the identity: the same rows flushed for
+        a different reason are the same rows, and putting the trigger in
+        the key would make a restart that flushes on size what a running
+        pod flushed on time into a second publication.
+
         Returns the number of rows THIS CALL published. That is normally
         the batch's row count, and it is 0 when the batch was skipped
         whole — or when the server answered from a receipt, because then
@@ -762,6 +952,20 @@ class HoglakeSink:
         not claim otherwise.
         """
         check_reserved_collision(batch.schema, RESERVED_COLUMNS, "Hoglake")
+        # The batch AS HANDED IN, before the unwritable columns go and
+        # before `_inserted_at` is stamped on, so a poison producer key
+        # cannot quietly shrink the size an operator reconciles with.
+        #
+        # APPROXIMATELY the flush gate's `pending_bytes`, not equal to
+        # it: main.py measures the gate per accumulated table and hands
+        # the sink the CONSOLIDATED one, so this is measured after
+        # `pa.concat_tables` (with type promotion) and after the sort.
+        # Measured drift is about +0.75% for a sorted flush and about
+        # +10% when the batch carried schema drift. Close enough to
+        # compare against MILLPOND_FLUSH_SIZE and
+        # `millpond_flush_size_bytes`; never a figure to reconcile byte
+        # for byte.
+        arrow_bytes = batch.nbytes
         had_columns = batch.num_columns > 0
         batch = _drop_unwritable_columns(batch)
         if had_columns and batch.num_columns == 0:
@@ -803,8 +1007,9 @@ class HoglakeSink:
         table = self._ensure_table(batch.schema)
         key = self._flush_key(self._table_uuid, kafka_offsets)
         batch = self._evolve_and_align(table, batch)
+        facts = _FlushFacts(kafka_offsets=identity or (), arrow_bytes=arrow_bytes, trigger=trigger)
         try:
-            payload = self._prepare(table, batch, key)
+            payload = self._prepare(table, batch, key, facts)
         except ValidationError as e:
             # Concurrent-DDL race (found by the live integration suite):
             # another writer's add_column can land between this sink's
@@ -825,7 +1030,7 @@ class HoglakeSink:
                 raise
             self._adopt_columns(table.info().columns)
             batch = self._null_fill_missing(batch)
-            payload = self._prepare(table, batch, key)
+            payload = self._prepare(table, batch, key, facts)
         self._prepared = payload
         self._prepared_rows = batch.num_rows
         self._prepared_offsets = identity
@@ -977,7 +1182,7 @@ class HoglakeSink:
         )
         return str(uuid.uuid5(_IDEMPOTENCY_NAMESPACE, name))
 
-    def _prepare(self, table, batch: pa.Table, key: str) -> dict:
+    def _prepare(self, table, batch: pa.Table, key: str, facts: _FlushFacts) -> dict:
         """Write the batch's parquet, upload it, and return the commit
         request — WITHOUT publishing it.
 
@@ -1011,6 +1216,34 @@ class HoglakeSink:
         aligned = batch.select(list(target.names)).cast(target)
         groups = _partition_groups(aligned, info)
         self._prepared_spec = _partition_tuples(info.partition_spec)
+        # Formatted BEFORE the first byte is uploaded, and that ordering
+        # is a safety property, not a style choice. Everything that can
+        # fail after the upload has to account for the objects it
+        # abandons — that is what the `_count_orphans` arm around
+        # `prepare_append_files` is for. A formatting failure raised
+        # after it (a future field that is not a string, say) would
+        # leave those objects with no count, no log and no metric, and
+        # the retry loop would call the TypeError transient and spend
+        # the whole budget re-raising it. Here it can only fail before
+        # anything exists to orphan.
+        #
+        # `files` is `len(groups)`: the fanout writes one parquet per
+        # partition tuple, which is the same list the upload is built
+        # from and the same count `_commit_prepared` books on
+        # `hoglake_files_written_total`. `partitions` counts the tuples
+        # themselves — every group but the unpartitioned table's single
+        # `None`, so a `(None,)` tuple (a null source value, which
+        # Iceberg gives its own partition) IS counted.
+        message = format_commit_message(
+            records=aligned.num_rows,
+            files=len(groups),
+            partitions=sum(1 for partition_values, _ in groups if partition_values is not None),
+            arrow_bytes=facts.arrow_bytes,
+            trigger=facts.trigger,
+            version=self._version,
+            table_uuid=self._table_uuid,
+            kafka_offsets=facts.kafka_offsets,
+        )
         with tempfile.TemporaryDirectory(prefix="millpond-hoglake-") as tmp:
             files = []
             for index, (partition_values, part) in enumerate(groups):
@@ -1095,6 +1328,12 @@ class HoglakeSink:
         # entry) remains the real safety mechanism.
         payload.pop("read_snapshot", None)
         payload["author"] = self._author
+        # Attached HERE, with the payload, and not at commit time: the
+        # payload is held across retries and re-sent verbatim, so a
+        # message attached beside the author is the same message on
+        # every attempt by construction rather than by the formatter
+        # happening to be deterministic.
+        payload["message"] = message
         return payload
 
     def _commit_prepared(self) -> int:

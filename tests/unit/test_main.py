@@ -1553,18 +1553,31 @@ class TestFlushIdentity:
         return cfg
 
     def test_offsets_are_flattened_with_both_ends_of_each_range(self):
-        out = _sink_write_kwargs(self._cfg(), {("events", 1): (9, 17), ("events", 0): (30, 41)})
-        assert out == {"kafka_offsets": (("events", 0, 30, 41), ("events", 1, 9, 17))}
+        out = _sink_write_kwargs(self._cfg(), {("events", 1): (9, 17), ("events", 0): (30, 41)}, "size")
+        assert out == {"kafka_offsets": (("events", 0, 30, 41), ("events", 1, 9, 17)), "trigger": "size"}
 
     def test_the_flush_identity_is_order_independent(self):
-        a = _sink_write_kwargs(self._cfg(), {("events", 0): (30, 41), ("events", 1): (9, 17)})
-        b = _sink_write_kwargs(self._cfg(), {("events", 1): (9, 17), ("events", 0): (30, 41)})
+        a = _sink_write_kwargs(self._cfg(), {("events", 0): (30, 41), ("events", 1): (9, 17)}, "size")
+        b = _sink_write_kwargs(self._cfg(), {("events", 1): (9, 17), ("events", 0): (30, 41)}, "size")
         assert a == b
+
+    def test_the_trigger_rides_along(self):
+        # What made this flush happen goes in the hoglake snapshot's
+        # message. It is not part of the identity — the same rows
+        # flushed for a different reason are the same rows — so it is a
+        # second kwarg rather than a fifth element of each quadruple.
+        out = _sink_write_kwargs(self._cfg(), {("events", 0): (30, 41)}, "final")
+        assert out["trigger"] == "final"
+        assert out["kafka_offsets"] == (("events", 0, 30, 41),)
+
+    def test_an_unstated_trigger_is_unknown(self):
+        assert _sink_write_kwargs(self._cfg(), {("events", 0): (30, 41)})["trigger"] == "unknown"
 
     def test_ducklake_gets_no_identity(self):
         # Its INSERT sits in a transaction whose outcome the client always
-        # learns; there is no lost-response ambiguity to name away.
-        assert _sink_write_kwargs(self._cfg("ducklake"), {("events", 0): (30, 41)}) == {}
+        # learns; there is no lost-response ambiguity to name away — and
+        # no snapshot message to put the trigger in either.
+        assert _sink_write_kwargs(self._cfg("ducklake"), {("events", 0): (30, 41)}, "size") == {}
 
     def test_the_same_kwargs_go_to_every_attempt(self):
         # A retry must be recognizable as the SAME flush. Sending the
@@ -1588,7 +1601,31 @@ class TestFlushIdentity:
         cfg.sort_by = None
         with patch("millpond.main.time"), patch("millpond.main.server"), patch("millpond.main.metrics"):
             _flush(sink, cfg, MagicMock(), pa.table({"a": [1, 2]}), 100, 2, {("events", 0): (30, 41)}, 1.0)
-        assert sink.write.call_args.kwargs == {"kafka_offsets": (("events", 0, 30, 41),)}
+        assert sink.write.call_args.kwargs == {
+            "kafka_offsets": (("events", 0, 30, 41),),
+            "trigger": "time",
+        }
+
+    def test_flush_hands_the_sink_the_trigger_it_was_called_with(self):
+        sink = _make_sink()
+        sink.write.return_value = 2
+        cfg = MagicMock()
+        cfg.destination = "hoglake"
+        cfg.table_label = "events"
+        cfg.sort_by = None
+        with patch("millpond.main.time"), patch("millpond.main.server"), patch("millpond.main.metrics"):
+            _flush(
+                sink,
+                cfg,
+                MagicMock(),
+                pa.table({"a": [1, 2]}),
+                100,
+                2,
+                {("events", 0): (30, 41)},
+                1.0,
+                "final",
+            )
+        assert sink.write.call_args.kwargs["trigger"] == "final"
 
 
 class TestOffsetSequencing:

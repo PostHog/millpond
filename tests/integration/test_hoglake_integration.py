@@ -73,6 +73,9 @@ class HogCfg:
     sort_by: tuple[str, ...] | None = None
     ordinal: int = 0
     table_label: str = field(default="events")
+    # Named in every commit message; a real string, because the sink
+    # reads it once at construction.
+    service_version: str = "0.0.0+it"
 
 
 @pytest.fixture(scope="session")
@@ -159,6 +162,18 @@ def _delete_object(uri: str) -> None:
     """Remove one object if it is there; a no-op if it is not."""
     with contextlib.suppress(FileNotFoundError, OSError):
         _minio().delete_file(uri.removeprefix("s3://"))
+
+
+def _snapshots(client, cfg) -> list:
+    """This table's snapshots, oldest first.
+
+    The feed is `GET /v1/catalogs/{catalog}/snapshots`, which pyhoglake
+    wraps — and it is CATALOG-wide: every table in this session shares
+    it. The author carries the table name, so filtering on it is what
+    makes "the snapshot this flush wrote" a well-defined thing here.
+    """
+    author = f"millpond/{cfg.hoglake_table}/{cfg.ordinal}"
+    return [s for s in client.catalog(cfg.hoglake_catalog).snapshots() if s.author == author]
 
 
 def _read_parquet(path: str) -> pa.Table:
@@ -788,8 +803,8 @@ class TestSpecChangeUnderAPreparedPayload:
         sink = Sink(cfg)
         original = Sink._prepare
 
-        def prepare_then_respec(self, table, batch, key):
-            payload = original(self, table, batch, key)
+        def prepare_then_respec(self, table, batch, key, facts):
+            payload = original(self, table, batch, key, facts)
             # Another operator re-specs the table while the upload is in
             # flight. Same arity, so the server's commit-side validation
             # (which checks arity and nothing else) would accept it.
@@ -1286,3 +1301,103 @@ class TestUuidPinRollbackLive:
         values = [v for path in _list_objects(DATA_PATH, cfg) for v in _read_parquet(path).column("uuid").to_pylist()]
         assert None in values
         assert uuid.UUID(self.OTHER) in values
+
+
+class TestCommitMessage:
+    """The snapshot's `message`, read back from the real catalog.
+
+    The offset ranges in it are the ONLY record of which Kafka positions
+    a snapshot holds — the author names the pipeline and the files name
+    object keys, and nothing else connects a published snapshot to a
+    position in the topic. The unit tests pin the format; these pin that
+    it survives the wire, the server and the read back.
+    """
+
+    TOPIC = "clickhouse_events_json"
+    OFFSETS = ((TOPIC, 3, 4128819, 4155470), (TOPIC, 19, 4130021, 4156802))
+
+    def test_the_snapshot_carries_the_offsets_it_published(self, hog_stack, client):
+        cfg = _fresh()
+        batch = _batch(4)
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(batch, kafka_offsets=self.OFFSETS, trigger="size") == 4
+        finally:
+            sink.close()
+
+        snapshots = _snapshots(client, cfg)
+        assert len(snapshots) == 1
+        summary, offsets = snapshots[0].message.split("\n")
+        live_uuid = _table(client, cfg).info().table_uuid
+        assert summary == (
+            f"records=4 files=1 partitions=0 arrow_bytes={batch.nbytes} trigger=size "
+            f"millpond={cfg.service_version} table={live_uuid}"
+        )
+        assert offsets == f"offsets {self.TOPIC} p3:4128819-4155470 p19:4130021-4156802 (2)"
+        # The author is unchanged by any of this.
+        assert snapshots[0].author == f"millpond/{cfg.hoglake_table}/0"
+
+    def test_a_partitioned_flush_counts_its_files_and_partition_tuples(self, hog_stack, client):
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        batch = _batch(9, teams=(1, 2, 3))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(batch, kafka_offsets=self.OFFSETS, trigger="time")
+        finally:
+            sink.close()
+
+        summary = _snapshots(client, cfg)[-1].message.split("\n")[0]
+        # Three tuples, one file each; `time` is the metric's name for
+        # the interval trigger and the message says `interval`.
+        assert summary.startswith(f"records=9 files=3 partitions=3 arrow_bytes={batch.nbytes} trigger=interval ")
+        assert len(_table(client, cfg).files()) == 3
+
+    def test_main_flush_labels_the_trigger_all_the_way_through(self, hog_stack, client):
+        # The seam end to end: main._flush -> _sink_write_kwargs ->
+        # HoglakeSink.write -> the commit -> the catalog.
+        cfg = _fresh()
+        batch = _batch(2)
+        sink = HoglakeSink(cfg)
+        try:
+            _flush(sink, cfg, MagicMock(), batch, batch.nbytes, 2, {(self.TOPIC, 3): (30, 41)}, 1.0, "final")
+        finally:
+            sink.close()
+
+        summary, offsets = _snapshots(client, cfg)[-1].message.split("\n")
+        assert " trigger=final " in summary
+        assert offsets == f"offsets {self.TOPIC} p3:30-41 (1)"
+
+    def test_a_replayed_commit_leaves_one_snapshot_with_the_same_message(self, hog_stack, client):
+        # The lost-response case. The retry re-sends the payload
+        # verbatim, the server answers from its receipt, and the catalog
+        # holds ONE snapshot whose message still describes that flush.
+        cfg = _fresh()
+        batch = _batch(5)
+        sink = HoglakeSink(cfg)
+        # The same harness TestIdempotentPublication uses: let the commit
+        # reach the server and apply, then destroy the response.
+        http = sink._client._http
+        real = http.request
+        state = {"dropped": False}
+
+        def request(method, url, **kwargs):
+            response = real(method, url, **kwargs)
+            if not state["dropped"] and method == "POST" and "/commit" in str(url):
+                state["dropped"] = True
+                raise httpx.ReadTimeout("response lost in transit", request=response.request)
+            return response
+
+        http.request = request
+        try:
+            with pytest.raises(httpx.ReadTimeout):
+                sink.write(batch, kafka_offsets=self.OFFSETS, trigger="size")
+            assert sink.write(batch, kafka_offsets=self.OFFSETS, trigger="size") == 5
+        finally:
+            sink.close()
+        assert state["dropped"]
+
+        snapshots = _snapshots(client, cfg)
+        assert len(snapshots) == 1, "the replay published a second snapshot"
+        assert snapshots[0].message.split("\n")[1] == (
+            f"offsets {self.TOPIC} p3:4128819-4155470 p19:4130021-4156802 (2)"
+        )
