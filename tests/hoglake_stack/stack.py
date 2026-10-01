@@ -68,7 +68,11 @@ def compose(*args: str, profile: str | None = None, check: bool = True) -> subpr
     if profile:
         cmd += ["--profile", profile]
     cmd += list(args)
-    return subprocess.run(cmd, check=check, capture_output=True, text=True, timeout=600)
+    # The compose file falls back to hoglake-server:latest. Hand it the
+    # pinned image explicitly, otherwise a new server release changes
+    # what CI tests against without any commit here.
+    env = {**os.environ, "HOGLAKE_SERVER_IMAGE": server_image()}
+    return subprocess.run(cmd, check=check, capture_output=True, text=True, timeout=600, env=env)
 
 
 def docker_available() -> bool:
