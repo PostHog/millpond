@@ -81,8 +81,10 @@ jobs:
 
   integration:
     # Integration suite: ducklake.write() + SchemaManager against
-    # in-memory DuckDB (no containers, ~10s), then the hoglake sink
-    # against a REAL hoglake server on the throwaway compose stack.
+    # in-memory DuckDB (no containers, ~10s), the Postgres-only
+    # maintenance ops against a throwaway Postgres (runner's initdb,
+    # docker fallback), then the hoglake sink against a REAL hoglake
+    # server on the throwaway compose stack.
     runs-on: ubuntu-latest
     needs: check
     env:

@@ -49,6 +49,7 @@ from typing import Literal
 import duckdb
 import psycopg
 from prometheus_client import CollectorRegistry, Gauge, pushadd_to_gateway
+from psycopg import sql as pgsql
 
 log = logging.getLogger("maintenance")
 
@@ -2619,7 +2620,7 @@ class _Leaf:
         return max(f.begin_snapshot for f in self.files)
 
 
-def _pg_direct_connect() -> psycopg.Connection:
+def _pg_direct_connect(application_name: str = "millpond-drop-partitions") -> psycopg.Connection:
     """Direct libpq connection to the catalog database (same DUCKLAKE_RDS_*
     env vars as the duckdb ATTACH path). autocommit=True; the drop path opens
     explicit short transactions with conn.transaction().
@@ -2634,7 +2635,7 @@ def _pg_direct_connect() -> psycopg.Connection:
         f"dbname={_escape_libpq(os.environ.get('DUCKLAKE_RDS_DATABASE', 'ducklake'))} "
         f"user={_escape_libpq(os.environ.get('DUCKLAKE_RDS_USERNAME', 'ducklake'))} "
         f"password={_escape_libpq(_require('DUCKLAKE_RDS_PASSWORD'))} "
-        f"application_name=millpond-drop-partitions "
+        f"application_name={_escape_libpq(application_name)} "
         f"keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=3 "
         # 10-min session budget covers the driver-phase whole-table reads
         # (enumeration pivot, unageable anti-join); the drop txn overrides it
@@ -3674,7 +3675,343 @@ def drop_partitions(args: argparse.Namespace, gauges: dict) -> None:
     )
 
 
-_DIRECT_PG_COMMANDS = frozenset({"drop-partitions", "list-droppable-partitions"})
+# ---------------------------------------------------------------------------
+# drop-orphan-inline-tables: inlined-data tables of dropped DuckLake tables
+# ---------------------------------------------------------------------------
+# DuckLake (Postgres catalog) creates one Postgres table per (table,
+# schema_version) for data inlining, `public.ducklake_inlined_data_<table_id>_
+# <schema_version>`, registered in `ducklake_inlined_data_tables`. DuckLake's
+# own GC (DropEmptySupersededInlinedTables) only drops superseded-and-empty
+# ones, not the inlined tables of a DROPPED parent table; once nothing
+# retained can reach the parent, nothing reaps them. Catalogs with
+# DROP+CREATE-per-sync churn have accumulated them without bound in
+# production, and every one adds rows to pg_class / pg_attribute / pg_type.
+#
+# That bloat is what makes this op necessary AND why it must not use the
+# DuckLake ATTACH: DuckDB's ATTACH runs a full Postgres system-catalog scan
+# (pg_class x pg_attribute x pg_type x pg_description). On a catalog with
+# ~230k orphaned inlined tables (~18.7M pg_attribute rows) that scan spilled
+# ~1.5GB per session, ran for ~10 minutes and OOMed 4Gi DuckDB processes, so
+# every ATTACH-based recipe failed before doing anything. This op runs on the
+# direct libpq connection (`_DIRECT_PG_COMMANDS`) and never touches duckdb.
+
+_INLINE_TABLE_NAME_RE = re.compile(r"ducklake_inlined_data_[0-9]+_[0-9]+")  # used with fullmatch()
+_DROP_INLINE_DEFAULT_BATCH_SIZE = 500
+# Every DROP TABLE holds AccessExclusiveLock on the table, its TOAST table and
+# TOAST index, plus deletion locks on its row/array types, until COMMIT — about
+# five shared lock-table entries per table. The shared lock table is sized by
+# max_locks_per_transaction * (max_connections + max_prepared_transactions);
+# exhausting it fails OTHER sessions with "out of shared memory". The cap keeps
+# a single batch well inside that on any sanely-configured instance.
+_DROP_INLINE_MAX_BATCH_SIZE = 2000
+# Per-batch txn bounds. lock_timeout is short on purpose: a table someone still
+# holds a lock on is not worth waiting for (the batch rolls back and retries).
+_DROP_INLINE_STATEMENT_TIMEOUT = "120s"
+_DROP_INLINE_LOCK_TIMEOUT = "5s"
+_DROP_INLINE_MAX_ATTEMPTS = 5
+# drop-partitions' retryable classes plus 42P01 (undefined_table): an inlined
+# table dropped by a concurrent session between our selection and our LOCK.
+# The retry re-selects, sees it gone from pg_class, and only deletes the row.
+_DROP_INLINE_RETRYABLE_SQLSTATES = _DROP_RETRYABLE_SQLSTATES | {"42P01"}
+
+
+def _inline_orphan_predicate(alias: str) -> str:
+    """WHERE fragment: the registry row's table has no `ducklake_table` row
+    reachable from any retained snapshot.
+
+    Kept in lockstep with the `ducklake_unreachable_inline_tables` metric in
+    tools/ducklake_metrics.py (same range-overlap predicate: a table version
+    is reachable if begin_snapshot <= max(snapshot_id) and it was not ended
+    at or before min(snapshot_id)). The overlap test is a superset of "truly
+    visible from some retained snapshot", so it can only under-count orphans,
+    never flag a reachable table. The integration test asserts metric and
+    predicate count the same rows.
+
+    Orphanhood is permanent: table_ids are never reused, there is no undrop,
+    and snapshot expiry only shrinks the retained range. So a row selected as
+    orphaned stays orphaned for the rest of the transaction. The bounds are
+    evaluated per statement, i.e. re-evaluated for every batch.
+    """
+    s = PG_CATALOG_SCHEMA
+    return (
+        f"NOT EXISTS ("
+        f"SELECT 1 FROM {s}.ducklake_table t "
+        f"WHERE t.table_id = {alias}.table_id "
+        f"AND t.begin_snapshot <= (SELECT MAX(snapshot_id) FROM {s}.ducklake_snapshot) "
+        f"AND (t.end_snapshot IS NULL "
+        f"OR t.end_snapshot > (SELECT MIN(snapshot_id) FROM {s}.ducklake_snapshot))"
+        f")"
+    )
+
+
+def _inline_orphan_counts_sql() -> str:
+    """(registry_rows, orphaned, orphaned_present_in_pg_class)."""
+    s = PG_CATALOG_SCHEMA
+    return (
+        f"SELECT "
+        f"(SELECT COUNT(*) FROM {s}.ducklake_inlined_data_tables), "
+        f"COUNT(*), "
+        f"COUNT(c.oid) "
+        f"FROM {s}.ducklake_inlined_data_tables idt "
+        f"LEFT JOIN pg_catalog.pg_class c "
+        f"ON c.relname = idt.table_name AND c.relnamespace = '{s}'::regnamespace "
+        f"WHERE {_inline_orphan_predicate('idt')}"
+    )
+
+
+def _inline_orphan_batch_sql(for_update: bool) -> str:
+    """Next keyset page of orphaned registry rows after (table_id,
+    schema_version) = (%s, %s), with whether the table exists in pg_class.
+
+    Keyset, not plain LIMIT: rows we skip (non-empty, bad name, row-locked)
+    stay in the registry, and a plain LIMIT would reselect them forever.
+    FOR UPDATE OF idt SKIP LOCKED: a concurrent DuckLake GC deleting the same
+    registry row is skipped this run rather than waited on."""
+    s = PG_CATALOG_SCHEMA
+    return (
+        f"SELECT idt.table_id, idt.schema_version, idt.table_name, c.oid IS NOT NULL "
+        f"FROM {s}.ducklake_inlined_data_tables idt "
+        f"LEFT JOIN pg_catalog.pg_class c "
+        f"ON c.relname = idt.table_name AND c.relnamespace = '{s}'::regnamespace "
+        f"WHERE (idt.table_id, idt.schema_version) > (%s, %s) "
+        f"AND {_inline_orphan_predicate('idt')} "
+        f"ORDER BY idt.table_id, idt.schema_version "
+        f"LIMIT %s" + (" FOR UPDATE OF idt SKIP LOCKED" if for_update else "")
+    )
+
+
+def _inline_table_has_rows(cur: psycopg.Cursor, table_name: str) -> bool:
+    """True if the table holds at least one row (any row, live or not in
+    DuckLake's begin/end_snapshot sense).
+
+    Deliberately NOT pg_class.reltuples: it is a planner estimate refreshed
+    only by VACUUM / ANALYZE / CREATE INDEX — -1 on a never-vacuumed table and
+    0 on a table that received rows after its last analyze. `SELECT 1 ...
+    LIMIT 1` is exact and cheap: an empty heap has zero pages, so the scan
+    ends immediately; a non-empty one stops at the first visible tuple. In
+    execute mode the caller holds ACCESS EXCLUSIVE on the table first, so no
+    writer can insert between this check and the DROP."""
+    query = pgsql.SQL("SELECT 1 FROM {} LIMIT 1").format(pgsql.Identifier(PG_CATALOG_SCHEMA, table_name))
+    return cur.execute(query).fetchone() is not None
+
+
+@dataclass
+class _InlineBatchResult:
+    rows: int = 0  # registry rows selected this batch
+    dropped: int = 0  # Postgres tables dropped
+    registry_deleted: int = 0  # registry rows deleted (dropped + already-missing tables)
+    missing: int = 0  # orphan registry rows whose table was already gone
+    skipped_nonempty: int = 0
+    skipped_invalid: int = 0
+    last_key: tuple[int, int] | None = None
+
+
+def _drop_inline_batch(
+    pg: psycopg.Connection, after: tuple[int, int], batch_size: int, dry_run: bool
+) -> _InlineBatchResult:
+    """One batch in ONE transaction: select orphans, (lock, check, drop) each
+    present table, delete the matching registry rows, commit. Dry-run reads
+    the same page and checks emptiness without locking or writing."""
+    res = _InlineBatchResult()
+    with conn_transaction(pg) as cur:
+        if not dry_run:
+            cur.execute(f"SET LOCAL statement_timeout = '{_DROP_INLINE_STATEMENT_TIMEOUT}'")
+            cur.execute(f"SET LOCAL lock_timeout = '{_DROP_INLINE_LOCK_TIMEOUT}'")
+        rows = cur.execute(_inline_orphan_batch_sql(for_update=not dry_run), (*after, batch_size)).fetchall()
+        res.rows = len(rows)
+        to_delete: list[tuple[int, int, str]] = []
+        for table_id, schema_version, table_name, present in rows:
+            res.last_key = (table_id, schema_version)
+            if not isinstance(table_name, str) or not _INLINE_TABLE_NAME_RE.fullmatch(table_name):
+                # Never DROP a name we did not expect; the registry row stays
+                # so the anomaly remains visible in the metric.
+                log.warning(
+                    "drop-orphan-inline-tables: skipping registry row table_id=%s schema_version=%s: "
+                    "unexpected table_name %r",
+                    table_id,
+                    schema_version,
+                    table_name,
+                )
+                res.skipped_invalid += 1
+                continue
+            if present:
+                ident = pgsql.Identifier(PG_CATALOG_SCHEMA, table_name)
+                if not dry_run:
+                    cur.execute(pgsql.SQL("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE").format(ident))
+                if _inline_table_has_rows(cur, table_name):
+                    log.warning(
+                        "drop-orphan-inline-tables: skipping non-empty orphan %s.%s (table_id=%s)",
+                        PG_CATALOG_SCHEMA,
+                        table_name,
+                        table_id,
+                    )
+                    res.skipped_nonempty += 1
+                    continue
+                if not dry_run:
+                    cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}").format(ident))
+                res.dropped += 1
+            else:
+                res.missing += 1
+            to_delete.append((table_id, schema_version, table_name))
+        if to_delete and not dry_run:
+            cur.execute(
+                f"DELETE FROM {PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables idt "
+                f"USING unnest(%s::bigint[], %s::bigint[], %s::text[]) AS d(table_id, schema_version, table_name) "
+                f"WHERE idt.table_id = d.table_id AND idt.schema_version = d.schema_version "
+                f"AND idt.table_name = d.table_name",
+                ([r[0] for r in to_delete], [r[1] for r in to_delete], [r[2] for r in to_delete]),
+            )
+            res.registry_deleted = cur.rowcount
+    return res
+
+
+def drop_orphan_inline_tables(
+    dry_run: bool, batch_size: int, max_batches: int | None, gauges: dict, pg: psycopg.Connection | None = None
+) -> None:
+    """Drop the inlined-data tables (and registry rows) of DuckLake tables no
+    retained snapshot can reach. See the section header for why this exists
+    and why it runs on a direct libpq connection.
+
+    Safety:
+      - Takes the maintenance advisory lock (execute mode) so it cannot race
+        expire / cleanup / compaction. Like every maintenance op it does NOT
+        serialize against ingest writers; the per-batch predicate and the
+        row locks below are what make that safe.
+      - One transaction per batch: DROP TABLE and the registry DELETE commit
+        together, so the registry never points at a dropped table and a
+        dropped table is never left registered.
+      - Non-empty orphans are skipped and counted, never dropped.
+      - No VACUUM FULL: it takes ACCESS EXCLUSIVE on system catalogs and would
+        stall every catalog session. Plain autovacuum reuses the freed
+        pg_class / pg_attribute space for new rows.
+    """
+    owned = pg is None
+    if owned:
+        pg = _pg_direct_connect("millpond-drop-orphan-inline-tables")
+    total = _InlineBatchResult()
+    batches = 0
+    retries = 0
+    try:
+        registry = pg.execute(
+            f"SELECT to_regclass('{PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables') IS NOT NULL"
+        ).fetchone()[0]
+        if not registry:
+            log.info("drop-orphan-inline-tables: no ducklake_inlined_data_tables registry; nothing to do")
+            return
+        snapshots = pg.execute(f"SELECT COUNT(*) FROM {PG_CATALOG_SCHEMA}.ducklake_snapshot").fetchone()[0]
+        if snapshots == 0:
+            # MIN/MAX would be NULL and the predicate would call every table
+            # orphaned. A catalog without snapshots is not one to touch.
+            raise RuntimeError("drop-orphan-inline-tables: ducklake_snapshot is empty; refusing to run")
+
+        registry_rows, orphaned, orphaned_present = pg.execute(_inline_orphan_counts_sql()).fetchone()
+        log.info(
+            "drop-orphan-inline-tables: registry_rows=%d orphaned=%d orphaned_present_in_pg_class=%d "
+            "(dry_run=%s, batch_size=%d, max_batches=%s)",
+            registry_rows,
+            orphaned,
+            orphaned_present,
+            dry_run,
+            batch_size,
+            max_batches,
+        )
+        if orphaned == 0:
+            if not dry_run:
+                gauges["remaining"].set(0)
+            return
+
+        if not dry_run:
+            _lock_refresh(pg)
+            log.info("Acquired advisory lock %s", ADVISORY_LOCK_KEY_SQL)
+
+        after = (-1, -1)
+        while max_batches is None or batches < max_batches:
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    res = _drop_inline_batch(pg, after, batch_size, dry_run)
+                    break
+                except psycopg.Error as exc:
+                    if not _is_retryable_inline_error(exc) or attempt >= _DROP_INLINE_MAX_ATTEMPTS:
+                        raise
+                    retries += 1
+                    log.warning(
+                        "drop-orphan-inline-tables: batch after %s failed (attempt %d/%d, sqlstate=%s); retrying",
+                        after,
+                        attempt,
+                        _DROP_INLINE_MAX_ATTEMPTS,
+                        exc.sqlstate,
+                    )
+                    time.sleep(min(2**attempt, 30) * (0.5 + random.random()))
+            if res.rows == 0:
+                break
+            batches += 1
+            after = res.last_key
+            total.rows += res.rows
+            total.dropped += res.dropped
+            total.registry_deleted += res.registry_deleted
+            total.missing += res.missing
+            total.skipped_nonempty += res.skipped_nonempty
+            total.skipped_invalid += res.skipped_invalid
+            log.info(
+                "drop-orphan-inline-tables: batch %d: selected=%d %s=%d already_missing=%d registry_deleted=%d "
+                "skipped_nonempty=%d skipped_invalid_name=%d last_key=%s",
+                batches,
+                res.rows,
+                "would_drop" if dry_run else "dropped",
+                res.dropped,
+                res.missing,
+                res.registry_deleted,
+                res.skipped_nonempty,
+                res.skipped_invalid,
+                after,
+            )
+            if res.rows < batch_size:
+                break
+
+        remaining = pg.execute(
+            f"SELECT COUNT(*) FROM {PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables idt "
+            f"WHERE {_inline_orphan_predicate('idt')}"
+        ).fetchone()[0]
+    finally:
+        if owned:
+            with contextlib.suppress(Exception):
+                pg.close()
+
+    log.info(
+        "drop-orphan-inline-tables done: dry_run=%s batches=%d selected=%d %s=%d already_missing=%d "
+        "registry_deleted=%d skipped_nonempty=%d skipped_invalid_name=%d retries=%d remaining_orphans=%d",
+        dry_run,
+        batches,
+        total.rows,
+        "would_drop" if dry_run else "dropped",
+        total.dropped,
+        total.missing,
+        total.registry_deleted,
+        total.skipped_nonempty,
+        total.skipped_invalid,
+        retries,
+        remaining,
+    )
+    if not dry_run:
+        gauges["dropped"].set(total.dropped)
+        gauges["skipped_nonempty"].set(total.skipped_nonempty)
+        gauges["remaining"].set(remaining)
+        if total.dropped:
+            log.info(
+                "drop-orphan-inline-tables: pg_class / pg_attribute / pg_type keep their dead tuples until "
+                "autovacuum runs; plain autovacuum reuses that space for new rows. This tool never runs "
+                "VACUUM FULL (it takes ACCESS EXCLUSIVE on the system catalogs). To shrink them on disk, run "
+                "VACUUM FULL pg_catalog.pg_attribute (and pg_class, pg_type) manually in a quiet window."
+            )
+
+
+def _is_retryable_inline_error(exc: BaseException) -> bool:
+    return getattr(exc, "sqlstate", None) in _DROP_INLINE_RETRYABLE_SQLSTATES
+
+
+_DIRECT_PG_COMMANDS = frozenset({"drop-partitions", "list-droppable-partitions", "drop-orphan-inline-tables"})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3932,6 +4269,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--campaign", default=os.environ.get("CAMPAIGN", ""), help="Campaign id embedded in the commit message"
     )
 
+    # drop-orphan-inline-tables (direct libpq, no duckdb lifecycle — must work
+    # when the DuckLake ATTACH itself cannot complete)
+    p = sub.add_parser(
+        "drop-orphan-inline-tables",
+        help="Drop inlined-data tables (and registry rows) of DuckLake tables no retained snapshot can reach",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=_DROP_INLINE_DEFAULT_BATCH_SIZE,
+        help=(
+            f"Orphaned registry rows per transaction (default {_DROP_INLINE_DEFAULT_BATCH_SIZE}, "
+            f"max {_DROP_INLINE_MAX_BATCH_SIZE}). Each DROP holds several lock-table entries until "
+            "commit; lower this if Postgres reports 'out of shared memory'"
+        ),
+    )
+    p.add_argument(
+        "--max-batches",
+        type=_positive_int,
+        default=None,
+        help="Stop after this many batches (default: until no orphans remain)",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Report counts and walk the batches without DDL/DML")
+
     return parser
 
 
@@ -4032,13 +4393,42 @@ def main(argv: list[str] | None = None) -> None:
             registry=registry,
         ),
     }
+    # drop-orphan-inline-tables gauges are unlabeled, so they are registered
+    # ONLY for an execute run of that command. An unlabeled gauge always
+    # exports a sample: registered unconditionally, every other cron's pushadd
+    # (and any manual dry-run) would overwrite the last real values with 0.
+    inline_registry = (
+        registry if args.command == "drop-orphan-inline-tables" and not getattr(args, "dry_run", False) else None
+    )
+    inline_gauges = {
+        "dropped": Gauge(
+            "maintenance_inline_orphans_dropped_total",
+            "Orphaned DuckLake inlined-data tables dropped by drop-orphan-inline-tables in this run",
+            registry=inline_registry,
+        ),
+        "skipped_nonempty": Gauge(
+            "maintenance_inline_orphans_skipped_nonempty_total",
+            "Orphaned inlined-data tables skipped this run because they still hold rows",
+            registry=inline_registry,
+        ),
+        "remaining": Gauge(
+            "maintenance_inline_orphans_remaining",
+            "Orphaned inlined-data registry rows left after the last drop-orphan-inline-tables run",
+            registry=inline_registry,
+        ),
+    }
     operation = args.command
     if hasattr(args, "days") and args.days < 1:
         parser.error("--days must be >= 1")
-    if getattr(args, "batch_size", None) is not None and args.batch_size > _EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE:
+    if args.command == "expire-snapshots" and args.batch_size > _EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE:
         parser.error(
             f"--batch-size must be <= {_EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE}: the id list is interpolated "
             "into every batch statement, and huge batches produce multi-MB SQL and giant NOT-IN lists"
+        )
+    if args.command == "drop-orphan-inline-tables" and args.batch_size > _DROP_INLINE_MAX_BATCH_SIZE:
+        parser.error(
+            f"--batch-size must be <= {_DROP_INLINE_MAX_BATCH_SIZE}: every DROP in a batch holds "
+            "AccessExclusiveLock until commit, and the shared lock table is bounded by max_locks_per_transaction"
         )
 
     start_time.labels(operation=operation).set(time.time())
@@ -4048,8 +4438,9 @@ def main(argv: list[str] | None = None) -> None:
     t0 = time.monotonic()
     status = "success"
     conn = None
-    # drop-partitions / list-droppable-partitions run on a direct libpq
-    # connection and never touch duckdb (see the section header above them).
+    # drop-partitions / list-droppable-partitions / drop-orphan-inline-tables
+    # run on a direct libpq connection and never touch duckdb (see the
+    # section headers above them).
     if args.command not in _DIRECT_PG_COMMANDS:
         conn = connect(debug=args.debug)
     try:
@@ -4058,6 +4449,8 @@ def main(argv: list[str] | None = None) -> None:
                 list_droppable_partitions(args, drop_gauges)
             case "drop-partitions":
                 drop_partitions(args, drop_gauges)
+            case "drop-orphan-inline-tables":
+                drop_orphan_inline_tables(args.dry_run, args.batch_size, args.max_batches, inline_gauges)
             case "expire":
                 expire(conn, args.days, args.dry_run)
             case "expire-snapshots":

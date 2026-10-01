@@ -310,13 +310,13 @@ Requires Docker (uses `keytool` from the Kafka container image for cert generati
 
 The `tools/` directory ships two DuckLake-only operational binaries inside the same image as the writer:
 
-- **`tools/ducklake_maintenance.py`** — CLI for snapshot expiry (incl. Postgres-native `expire-snapshots`), file cleanup, orphan recovery, tiered compaction, fsck, and one-shot repairs (`repair-partition-values`, `dedup-deletions`, `purge-orphan-stats`). Runs as a K8s CronJob.
+- **`tools/ducklake_maintenance.py`** — CLI for snapshot expiry (incl. Postgres-native `expire-snapshots`), file cleanup, orphan recovery, tiered compaction, fsck, and one-shot repairs (`repair-partition-values`, `dedup-deletions`, `purge-orphan-stats`, `drop-orphan-inline-tables`). Runs as a K8s CronJob.
 - **`tools/ducklake_metrics.py`** — Catalog-side lake-state metrics, either as a long-running Prometheus-exposition daemon or in one-shot push mode (`--once`, POSTing to `DUCKLAKE_METRICS_PUSH_URL` — the per-tenant metrics CronJob path).
 
 `tools/justfile` (copied to `/justfile` in the image) wraps both. Recipe groups:
 
 - `interactive` — `shell`: a DuckDB shell wired to the DuckLake with the same session setup as the subcommands
-- `lifecycle` — snapshot + file lifecycle: `expire`/`expire-snapshots` (+ chain-safe `expire-7d`), `cleanup`/`cleanup-all`/`cleanup-all-safe`, orphan handling (`find-orphans`, `heal-orphans`, `delete-orphaned-files`, `fsck`), `dedup-deletions`, `purge-orphan-stats`, `repair-partition-values`, `maintain`, `checkpoint`. Destructive recipes print the target catalog and, on a TTY, demand confirmation.
+- `lifecycle` — snapshot + file lifecycle: `expire`/`expire-snapshots` (+ chain-safe `expire-7d`), `cleanup`/`cleanup-all`/`cleanup-all-safe`, orphan handling (`find-orphans`, `heal-orphans`, `delete-orphaned-files`, `fsck`), `dedup-deletions`, `purge-orphan-stats`, `drop-orphan-inline-tables` (+ chain-safe `drop-orphan-inline-tables-default`), `repair-partition-values`, `maintain`, `checkpoint`. Destructive recipes print the target catalog and, on a TTY, demand confirmation.
 - `compaction` — tiered `compact-to-tier-{1,2,3}` (+ dry-runs), `compact-all-tiers`, `compact-probe`, and chain-safe no-arg wrappers (`compact-all-tiers-default`) so the tenant-maintenance CronJob can run one flat recipe chain
 - `bootstrap` — `bootstrap-indexes`: the DuckLake catalog btrees (compaction scans, snapshot-range reads, per-file joins) via `psql`, all `CREATE INDEX CONCURRENTLY IF NOT EXISTS`
 - `metrics` — `ducklake-metrics` daemon recipes and chain-safe `metrics-once` for the per-tenant metrics CronJob

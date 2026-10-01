@@ -33,11 +33,13 @@ Self-contained CLI for DuckLake catalog and storage maintenance. Designed to run
 | File lifecycle | `fsck` | `cleanup-all-safe` + `ducklake_delete_orphaned_files` (S3-side sweep) |
 | File lifecycle | `orphans` | Delete S3-side orphaned files (no catalog row references them) |
 | File lifecycle | `maintain` | `expire` + `cleanup` |
+| Catalog hygiene | `purge-orphan-stats` | Delete global-stats rows of dropped tables (they tax every commit) |
+| Catalog hygiene | `drop-orphan-inline-tables` | Drop the Postgres inlined-data tables (`ducklake_inlined_data_<table_id>_<schema_version>`) and registry rows of DuckLake tables no retained snapshot can reach. Direct libpq connection, never the DuckLake ATTACH (which a large leak makes OOM). `--batch-size` (default 500, max 2000), `--max-batches`, `--dry-run`. Non-empty orphans and unexpected names are skipped with a WARN. Remediation for the `ducklake_unreachable_inline_tables` metric |
 | File lifecycle | `checkpoint` | DuckLake `CHECKPOINT` (integrated merge + expire + cleanup) |
 | Compaction | `compact --tier {1,2,3}` | Tiered compaction; bin ranges `[0, 1 MiB)` → `~5 MiB`, `[1 MiB, 10 MiB)` → `~32 MiB`, `[10 MiB, 64 MiB)` → `~128 MiB`. Bounds DuckDB resource use via `--threads` (default 2) and `--memory-limit` (default 4GB); raise on lakes that fit comfortably |
 | Compaction | `compact-probe` | Lightweight diagnostic: merge up to N adjacent files in one table, no `target_file_size` change |
 
-All destructive subcommands take `pg_try_advisory_lock(hashtext('millpond-ducklake-maintenance')::bigint)` on the `pg` ATTACH; concurrent invocations bail rather than racing each other's DELETEs. The lock provides mutual exclusion *between maintenance invocations* — it does not serialize against arbitrary catalog writers (e.g. ingest pods).
+All destructive subcommands take `pg_try_advisory_lock(hashtext('millpond-ducklake-maintenance')::bigint)` on the `pg` ATTACH (the direct-libpq ops `drop-partitions` and `drop-orphan-inline-tables` take it on their own connection); concurrent invocations bail rather than racing each other's DELETEs. The lock provides mutual exclusion *between maintenance invocations* — it does not serialize against arbitrary catalog writers (e.g. ingest pods).
 
 Every `cleanup` (skipped on `--dry-run`) and `cleanup-all` (which has no dry-run form — the CLI rejects `--dry-run`; preview with `cleanup-dry-run` for the age-gated subset or `fsck-dry-run` for the full pipeline) logs a single structured throughput line: `cleanup throughput: files_processed=N elapsed_s=T rate_obj_s=R queue_depth_after=A`. `--debug` flips DuckDB's HTTP logging and the postgres extension's `pg_debug_show_queries` back on for short-lived debugging; both are off by default because they add per-call overhead that compounds across tens of thousands of S3 deletes.
 
