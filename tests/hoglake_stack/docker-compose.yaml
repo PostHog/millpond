@@ -31,8 +31,9 @@ services:
       retries: 15
 
   minio:
-    # quay.io: Docker Hub stopped serving minio/minio anonymously.
-    image: quay.io/minio/minio:latest
+    # cgr.dev/chainguard: quay.io now refuses anonymous pulls of
+    # minio/minio (401). Same entrypoint, and mc is in the image.
+    image: cgr.dev/chainguard/minio:latest
     command: server /data
     environment:
       MINIO_ROOT_USER: hoglake
