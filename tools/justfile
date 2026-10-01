@@ -185,6 +185,16 @@ purge-orphan-stats-dry-run:
 purge-orphan-stats: _confirm-target
     env {{ _target_env }} python {{ ducklake_maintenance }} purge-orphan-stats
 
+# Report inlined-data tables of dropped DuckLake tables (counts + non-empty check, no DDL/DML)
+[group('lifecycle')]
+drop-orphan-inline-tables-dry-run batch_size="500":
+    env {{ _target_env }} python {{ ducklake_maintenance }} drop-orphan-inline-tables --batch-size {{ quote(batch_size) }} --dry-run
+
+# Drop inlined-data tables of dropped DuckLake tables (direct Postgres; works when ATTACH cannot)
+[group('lifecycle')]
+drop-orphan-inline-tables batch_size="500" max_batches="": _confirm-target
+    env {{ _target_env }} python {{ ducklake_maintenance }} drop-orphan-inline-tables --batch-size {{ quote(batch_size) }} {{ if max_batches != "" { "--max-batches " + quote(max_batches) } else { "" } }}
+
 # REMOVE-WHEN: upstream-ducklake-fix-deployed
 # Preview repair-partition-values (counts only, no DML; one-shot per customer)
 [group('lifecycle')]
@@ -318,6 +328,9 @@ compact-all-tiers-default: (compact-all-tiers)
 
 # snapshot expiry at the 7-day fleet default, chain-safe
 expire-7d: (expire "7")
+
+# drop-orphan-inline-tables at the default batch size, no batch limit, chain-safe
+drop-orphan-inline-tables-default: (drop-orphan-inline-tables)
 
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3) then delete scheduled S3 files
 [group('compaction')]

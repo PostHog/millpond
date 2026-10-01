@@ -48,8 +48,10 @@ lint-fix:
 test:
     uv run python -m pytest tests/unit
 
-# Run integration tests (in-memory DuckDB — no docker; the hoglake
-# suite is docker-gated and has its own recipe below)
+# Run integration tests (in-memory DuckDB — no docker; the Postgres-only
+# maintenance tests boot a throwaway Postgres via MILLPOND_TEST_PG_DSN,
+# local initdb/pg_ctl, or docker, and skip without any of them; the
+# hoglake suite is docker-gated and has its own recipe below)
 [group('test')]
 test-integration:
     uv run python -m pytest tests/integration --ignore=tests/integration/test_hoglake_integration.py

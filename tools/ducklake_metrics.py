@@ -288,7 +288,9 @@ queries:
       means the data_imports DROP+CREATE pattern is producing orphans.
       Uses the range-overlap predicate (strict superset of "actually
       reachable"; safe-conservative — won't false-positive an unreachable
-      table). See INCIDENT.md.
+      table). Remediation: `just drop-orphan-inline-tables`
+      (ducklake_maintenance.py drop-orphan-inline-tables), which shares
+      this predicate and runs without the DuckLake ATTACH.
     interval_mins: 5
     values: [total]
     sql: |

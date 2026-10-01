@@ -130,6 +130,32 @@ class TestArgparse:
         args = self.parser.parse_args(["purge-orphan-stats"])
         assert args.dry_run is False
 
+    def test_drop_orphan_inline_tables_defaults(self):
+        args = self.parser.parse_args(["drop-orphan-inline-tables"])
+        assert args.command == "drop-orphan-inline-tables"
+        assert (args.dry_run, args.batch_size, args.max_batches) == (False, 500, None)
+        assert args.command in ducklake_maintenance._DIRECT_PG_COMMANDS
+
+    def test_drop_orphan_inline_tables_batch_cap(self):
+        """Every DROP in a batch holds AccessExclusiveLock until commit; an
+        uncapped batch can exhaust the shared lock table for OTHER sessions."""
+        with pytest.raises(SystemExit):
+            ducklake_maintenance.main(["drop-orphan-inline-tables", "--batch-size", "2001", "--dry-run"])
+
+    @pytest.mark.parametrize(
+        "name, ok",
+        [
+            ("ducklake_inlined_data_12_3", True),
+            ("ducklake_inlined_data_12", False),
+            ("ducklake_inlined_data_tables", False),
+            ('ducklake_inlined_data_1_1"; DROP TABLE ducklake_snapshot; --', False),
+            ("ducklake_inlined_data_1_1\n", False),
+            ("ducklake_inlined_delete_1_1", False),
+        ],
+    )
+    def test_drop_orphan_inline_tables_name_guard(self, name, ok):
+        assert bool(ducklake_maintenance._INLINE_TABLE_NAME_RE.fullmatch(name)) is ok
+
     def test_cleanup_all_rejects_dry_run(self):
         """--dry-run used to be accepted and silently no-op — operators
         believed they had previewed something. Must now fail loudly."""
