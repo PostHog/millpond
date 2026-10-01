@@ -290,10 +290,18 @@ _hoglake_commit_replays_total = Counter(
 #
 # And, as before, nothing can count the orphan a SIGKILL leaves between
 # the upload and the commit.
+# `reason` is the call site that abandoned them, from a fixed set — one
+# per `_count_orphans` caller in hoglake.py: `prepare_failed`,
+# `commit_refused`, `ddl_since_read_snapshot`, `table_recreated`,
+# `read_snapshot_expired`, `already_published`, `superseded`,
+# `shutdown`. Unlabeled, every one of those funneled into a single
+# number and the only way to tell a routine shutdown orphan from a
+# re-spec quietly refusing every flush was to read the logs. Summing
+# over `reason` reproduces the old series exactly.
 _hoglake_orphaned_files_total = Counter(
     "millpond_hoglake_orphaned_files_total",
     "Parquet objects uploaded to the lake but never registered in a commit",
-    ["pipeline", "broker_source"],
+    ["pipeline", "broker_source", "reason"],
 )
 
 # librdkafka internal stats (via statistics.interval.ms callback)
@@ -433,7 +441,7 @@ def init(pipeline: str, broker_source: str = ""):
     variant_write_fallback_total = _variant_write_fallback_total.labels(pipeline=pipeline, broker_source=bs)
     hoglake_files_written_total = _hoglake_files_written_total.labels(pipeline=pipeline, broker_source=bs)
     hoglake_commit_replays_total = _AutoCommonLabels(_hoglake_commit_replays_total, pipeline, bs)
-    hoglake_orphaned_files_total = _hoglake_orphaned_files_total.labels(pipeline=pipeline, broker_source=bs)
+    hoglake_orphaned_files_total = _AutoCommonLabels(_hoglake_orphaned_files_total, pipeline, bs)
     variant_values_coerced_total = _variant_values_coerced_total.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)

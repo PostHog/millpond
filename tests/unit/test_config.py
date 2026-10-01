@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from millpond.config import _parse_ordinal, load
@@ -968,14 +970,57 @@ class TestHoglakeConfig:
     def test_retry_and_timeout_defaults(self):
         # The pair bounds the worst case a single flush can spend inside
         # sink.write(); see the comment in _load_hoglake_fields.
+        #
+        # SIX, not the eight this used to be. The worst-case model now
+        # charges every attempt a _PREPARE_ALLOWANCE_S of local
+        # encode-and-upload as well as its request timeout, because a
+        # commit the server refuses as `ddl_since_read_snapshot` is
+        # REBUILT rather than replayed — and under the old model eight
+        # attempts only fit because that work was free.
         cfg = load()
-        assert cfg.hoglake_max_retry_count == 8
+        assert cfg.hoglake_max_retry_count == 6
         # 45, not pyhoglake's 30: the server's commit-lock admission
         # bound is 30s, so an equal client timeout gave up at the same
         # instant the server would have answered 503 + Retry-After, and
         # its explicit backpressure signal surfaced as a
         # transport-uncertain failure instead.
         assert cfg.hoglake_request_timeout_s == 45.0
+
+    @pytest.mark.parametrize("value", ["0", "-1", "sixty-four", "64.0", ""])
+    def test_a_bad_upload_concurrency_is_refused_at_load(self, monkeypatch, value):
+        # pyhoglake reads PYHOGLAKE_UPLOAD_CONCURRENCY on the upload path
+        # and refuses a bad one as a client-side ValidationError, which
+        # is_retryable correctly calls permanent — so without this the
+        # pod starts clean, takes its partitions and crashes on its first
+        # flush over a variable no millpond code mentions. "" is the
+        # exception: an empty value is "unset" to pyhoglake too.
+        monkeypatch.setenv("PYHOGLAKE_UPLOAD_CONCURRENCY", value)
+        if value == "":
+            assert load().destination == "hoglake"
+            return
+        with pytest.raises(RuntimeError, match="PYHOGLAKE_UPLOAD_CONCURRENCY"):
+            load()
+
+    def test_a_good_upload_concurrency_loads(self, monkeypatch):
+        monkeypatch.setenv("PYHOGLAKE_UPLOAD_CONCURRENCY", " 32 ")
+        assert load().destination == "hoglake"
+
+    def test_the_check_matches_pyhoglakes_own_parse(self):
+        # One grammar, two readers: a check that refused what pyhoglake
+        # accepts (or accepted what it refuses) would be worse than none.
+        from pyhoglake.upload import resolve_concurrency
+
+        from millpond.config import _check_upload_concurrency
+
+        for value in ("0", "-1", "sixty-four", "64.0"):
+            os.environ["PYHOGLAKE_UPLOAD_CONCURRENCY"] = value
+            try:
+                with pytest.raises(RuntimeError):
+                    _check_upload_concurrency()
+                with pytest.raises(Exception):  # noqa: B017,PT011 - pyhoglake's own ValidationError
+                    resolve_concurrency(8, None)
+            finally:
+                del os.environ["PYHOGLAKE_UPLOAD_CONCURRENCY"]
 
     def test_a_retry_budget_that_outlives_liveness_is_refused(self, monkeypatch):
         # HOGLAKE_MAX_RETRY_COUNT was unbounded while its interaction
@@ -999,6 +1044,23 @@ class TestHoglakeConfig:
         cfg = load()
         worst = _hoglake_worst_case_flush_s(cfg.hoglake_max_retry_count, cfg.hoglake_request_timeout_s)
         assert worst <= _LIVENESS_BUDGET_S
+        # With MARGIN, not by a hair. The old defaults cleared the
+        # deadline by ~6s of 480, which is inside the error bar of every
+        # term in the model — and the failure it guards is a SIGKILL
+        # mid-flush with nothing in the pod's logs.
+        assert _LIVENESS_BUDGET_S - worst >= 30.0
+
+    def test_the_model_charges_every_attempt_for_its_own_prepare(self):
+        # The hoglake retry REBUILDS: a `ddl_since_read_snapshot` refusal
+        # discards the uploaded payload, so the next attempt re-encodes
+        # and re-uploads the whole fanout. A model that only counted
+        # request timeouts priced that at zero and let the default budget
+        # sit ~6s inside the liveness deadline.
+        from millpond.config import _PREPARE_ALLOWANCE_S, _hoglake_worst_case_flush_s
+
+        one = _hoglake_worst_case_flush_s(1, 10.0)
+        two = _hoglake_worst_case_flush_s(2, 10.0)
+        assert two - one >= 10.0 + _PREPARE_ALLOWANCE_S
 
     @pytest.mark.parametrize(
         "value",

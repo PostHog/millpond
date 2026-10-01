@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import MagicMock, patch
 
 import duckdb
@@ -130,6 +131,121 @@ _DUCKLAKE_CONTENTION_MESSAGES = [
         " - but another transaction has deleted from it"
     ),
 ]
+
+
+class TestFlushDeadline:
+    """The wall-clock bound on one flush, which the attempt count is not.
+
+    The consume loop is single threaded, so every second a flush spends
+    retrying is a second `server.HealthState` sees no poll. Three costs
+    are invisible to the startup model: the server's `Retry-After`
+    floors each backoff gap (clamped per gap, never in sum), a rebuild
+    re-resolves the destination and re-reads its shape under their own
+    timeouts, and a stalled object store can hold one prepare far past
+    its allowance. So the loop stops on the clock — raising the last
+    error, which is the outcome exhausting the attempts already gives,
+    except that it happens while the process can still log why rather
+    than being SIGKILLed mid-flush with nothing in its own logs.
+    """
+
+    def _sink(self, budget_s=450.0, attempt_cost_s=65.0, attempts=6):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "write_retry_budget", "write_flush_deadline"])
+        sink.write.side_effect = OSError("S3 timeout")
+        sink.write_retry_budget.return_value = (attempts, 1.0)
+        sink.write_flush_deadline.return_value = (budget_s, attempt_cost_s)
+        return sink
+
+    def _clock(self, step_s: float):
+        """A clock that advances `step_s` on every reading, so each
+        attempt's elapsed time grows without anything sleeping."""
+        t = {"now": 0.0}
+
+        def now():
+            t["now"] += step_s
+            return t["now"]
+
+        return now
+
+    def test_a_flush_that_cannot_finish_another_attempt_stops_early(self):
+        # 100s per reading against a 450s budget and a 65s reservation:
+        # the deadline bites well before the 6 attempts run out.
+        sink = self._sink()
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(100.0))
+        assert sink.write.call_count < 6, "the attempt budget was spent despite the deadline"
+
+    def test_the_early_stop_is_logged_as_its_own_fact(self, caplog):
+        # "gave up on purpose" and "ran out of attempts" look identical
+        # in the exception and lead to different investigations, so the
+        # flag is greppable and the numbers behind the decision are on
+        # the line.
+        sink = self._sink()
+        with (
+            caplog.at_level(logging.ERROR, logger="millpond.main"),
+            patch("millpond.main.time"),
+            pytest.raises(OSError),
+        ):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(100.0))
+        assert "flush_deadline_exceeded=true" in caplog.text
+        assert "elapsed=" in caplog.text
+        assert "budget=450.0s" in caplog.text
+        assert "attempts=" in caplog.text
+
+    @patch("millpond.main.metrics")
+    def test_the_early_stop_is_counted(self, mock_metrics):
+        sink = self._sink()
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(100.0))
+        mock_metrics.errors_total.labels.assert_any_call(type="flush_deadline_exceeded")
+
+    def test_a_fast_flush_spends_its_whole_attempt_budget(self):
+        # The negative, and the one that matters most: the deadline must
+        # not shorten the ladder a healthy-but-convoyed catalog needs.
+        # A clock that barely moves leaves every attempt affordable.
+        sink = self._sink()
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(0.01))
+        assert sink.write.call_count == 6
+
+    @patch("millpond.main.metrics")
+    def test_a_fast_flush_is_not_counted_as_a_deadline_stop(self, mock_metrics):
+        sink = self._sink()
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(0.01))
+        for call in mock_metrics.errors_total.labels.call_args_list:
+            assert call.kwargs.get("type") != "flush_deadline_exceeded"
+
+    def test_a_sink_without_the_hook_is_unbounded_by_the_clock(self):
+        # DuckLake: three outer attempts over an inner loop with its own
+        # bound. Adding a deadline it never asked for would change a
+        # deployed path for no reason.
+        sink = MagicMock(spec=["write", "reset_caches", "close"])
+        sink.write.side_effect = OSError("S3 timeout")
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), now=self._clock(10_000.0))
+        assert sink.write.call_count == 3
+
+    def test_the_deadline_never_blocks_the_first_attempt(self):
+        # However far behind the pod already is, the flush gets one try:
+        # refusing to attempt at all would advance nothing and crash on
+        # a batch that might have landed.
+        sink = self._sink(budget_s=1.0, attempt_cost_s=1000.0)
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(500.0))
+        assert sink.write.call_count == 1
+
+    def test_the_hoglake_sinks_own_numbers_fit_the_budget(self):
+        # The hook's values, not a fixture's: the per-attempt reservation
+        # has to be the request timeout plus the prepare allowance, and
+        # the budget has to be the liveness deadline less the margin.
+        from millpond.config import _LIVENESS_BUDGET_S, _PREPARE_ALLOWANCE_S, hoglake_flush_deadline
+
+        budget_s, attempt_cost_s = hoglake_flush_deadline(45.0)
+        assert attempt_cost_s == 45.0 + _PREPARE_ALLOWANCE_S
+        assert budget_s < _LIVENESS_BUDGET_S
+        # And the default ladder still fits inside it, or the deadline
+        # would be cutting healthy flushes short rather than doomed ones.
+        assert budget_s >= 6 * attempt_cost_s
 
 
 class TestWriteWithRetryErrorLabels:

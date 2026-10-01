@@ -15,6 +15,7 @@ Run explicitly:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -48,6 +49,14 @@ def e2e_stack():
     stack.ensure_available()
     stack.up(profile="e2e")
     try:
+        # Same pin assertion as the integration suite: read the image
+        # back off the daemon rather than trusting the substitution. See
+        # tests/hoglake_stack/stack.py's `running_server_image`.
+        running = stack.running_server_image()
+        assert running == stack.server_image(), (
+            f"the hoglake-server container is running {running!r}, not the pinned {stack.server_image()!r}"
+        )
+        logging.getLogger(__name__).warning("hoglake server image under test: %s", running)
         stack.make_bucket(BUCKET)
         _wait_for_kafka()
         yield stack
