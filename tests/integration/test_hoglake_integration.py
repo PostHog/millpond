@@ -28,7 +28,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from pyarrow import fs as pafs
-from pyhoglake import IncarnationChangedError, NotFoundError, ValidationError
+from pyhoglake import CommitConflictError, IncarnationChangedError, NotFoundError, ValidationError
 from pyhoglake.types import columns_to_arrow_schema
 
 from millpond.hoglake import HoglakeSink, HoglakeSinkError, is_retryable, table_schema_for_batch
@@ -83,6 +83,20 @@ def hog_stack():
     stack.ensure_available()
     stack.up()
     try:
+        # The pin, ASSERTED rather than asserted-in-a-comment. These are
+        # contract tests against a specific server build, and for two
+        # weeks the container ran whatever `:latest` resolved to locally
+        # while every comment in stack.py said it was pinned by digest —
+        # because the digest only ever reached `docker pull`. Reading the
+        # image back off the daemon is the one check that cannot be
+        # falsified by a substitution going wrong.
+        running = stack.running_server_image()
+        assert running == stack.server_image(), (
+            f"the hoglake-server container is running {running!r}, not the pinned "
+            f"{stack.server_image()!r} — the compose image substitution is not taking effect, so "
+            f"these contract tests would assert against a server nobody chose"
+        )
+        logging.getLogger(__name__).warning("hoglake server image under test: %s", running)
         stack.make_bucket(BUCKET)
         yield stack
     finally:
@@ -174,6 +188,19 @@ def _snapshots(client, cfg) -> list:
     """
     author = f"millpond/{cfg.hoglake_table}/{cfg.ordinal}"
     return [s for s in client.catalog(cfg.hoglake_catalog).snapshots() if s.author == author]
+
+
+def _read_all(client, cfg) -> pa.Table:
+    """Every live row of the table, concatenated across its files.
+
+    Schemas differ between files when a flush predates a column, so the
+    concat promotes rather than demanding identity — which is also what
+    makes "this column is null in files written before it existed" a
+    usable assertion.
+    """
+    tables = [_read_parquet(f.path) for f in _table(client, cfg).files()]
+    assert tables, "the table has no live files"
+    return pa.concat_tables(tables, promote_options="permissive")
 
 
 def _read_parquet(path: str) -> pa.Table:
@@ -474,6 +501,25 @@ class TestSchemaEvolution:
         assert second.column("event").null_count == 2  # null-filled
 
     def test_concurrent_writers_evolving_and_appending(self, hog_stack, client):
+        """Two pods adding columns and appending at once still converge —
+        now THROUGH the retry loop, which is the shape production runs.
+
+        It used to converge with no retry at all, because the sink
+        stripped `read_snapshot` off the payload and a commit with no
+        conflict basis cannot be refused for a DDL race. With the basis
+        on, the other writer's `add_column` landing between this flush's
+        read and its commit is refused as `ddl_since_read_snapshot` —
+        atomically, zero rows written — and the recovery is the rebuild
+        `_write_with_retry` drives: `reset_caches`, re-resolve, re-align
+        against the new column, upload again, commit. That refusal is the
+        POINT of the basis (a payload built against the old layout is
+        exactly what must not be registered under the new one), so the
+        test asserts convergence under the real retry rather than
+        pretending the refusal does not happen. The cost is the refused
+        flush's parquet, which the orphan counter books.
+        """
+        from millpond.main import _write_with_retry
+
         cfg = _fresh()
         settle = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table))
         settle.write(_batch(1))  # settle creation before the race
@@ -486,7 +532,12 @@ class TestSchemaEvolution:
             try:
                 for round_ in range(3):
                     extra = {f"col_w{idx}_{round_}": [f"v{idx}"] * 2}
-                    s.write(_batch(2, teams=(idx,), extra_cols=extra))
+                    _write_with_retry(
+                        s,
+                        _batch(2, teams=(idx,), extra_cols=extra),
+                        destination="hoglake",
+                        write_kwargs={"kafka_offsets": (("events", idx, round_, round_),)},
+                    )
             except BaseException as e:  # noqa: BLE001 - collected for assertion
                 errors.append(e)
             finally:
@@ -503,6 +554,21 @@ class TestSchemaEvolution:
         for idx in (1, 2):
             for round_ in range(3):
                 assert f"col_w{idx}_{round_}" in names
+        # PER FLUSH, not just in total. The retry loop rebuilds a refused
+        # flush and re-uploads it, and the total would be right either
+        # way if one flush landed twice while another landed not at all
+        # (the refusals are concurrent, so the two errors cancel). Each
+        # round's marker column is written by exactly one flush of
+        # exactly 2 rows, so its non-null count is that flush's
+        # publication count.
+        rows = _read_all(client, cfg)
+        for idx in (1, 2):
+            for round_ in range(3):
+                column = f"col_w{idx}_{round_}"
+                landed = [v for v in rows.column(column).to_pylist() if v is not None]
+                assert landed == [f"v{idx}", f"v{idx}"], (
+                    f"{column} landed {len(landed)} time(s), not 2 — a refused flush was published twice or lost"
+                )
 
 
 class TestRestartAndReset:
@@ -531,17 +597,22 @@ class TestRestartAndReset:
             s2.close()
         assert _record_count(client, cfg) == 6
 
-    def test_external_drop_recreate_recovers_after_reset(self, hog_stack, client):
+    def test_external_drop_recovers_after_reset(self, hog_stack, client):
         cfg = _fresh()
         sink = HoglakeSink(cfg)
         try:
             sink.write(_batch(2))
             _table(client, cfg).drop()
-            # The cached handle points at a dead incarnation: either the
-            # client's pre-flight re-resolve or the server's
-            # expected_table_uuid guard refuses it. Both are retryable —
-            # reset_caches adopts the live table on the next attempt.
-            with pytest.raises((IncarnationChangedError, NotFoundError)) as caught:
+            # The cached handle names a table that no longer resolves.
+            # WHICH refusal depends on how far the flush gets, and all of
+            # them are retryable, so the test accepts the family rather
+            # than one of them: the client's pre-flight re-resolve
+            # (`NotFoundError`, only on a cold writer cache — see
+            # `test_a_pre_upload_refusal_really_does_carry_zero`), or the
+            # commit, which the server answers 409 `table_dropped` ->
+            # `CommitConflictError`. `reset_caches` adopts the live table
+            # on the next attempt either way.
+            with pytest.raises((CommitConflictError, IncarnationChangedError, NotFoundError)) as caught:
                 sink.write(_batch(2))
             assert is_retryable(caught.value) is True
             sink.reset_caches()
@@ -551,16 +622,28 @@ class TestRestartAndReset:
         assert _record_count(client, cfg) == 3
 
     def test_external_drop_recreate_is_refused_not_published(self, hog_stack, client):
-        # The RECREATE case, which the drop-only test above cannot reach.
-        # Once the name resolves again, every check that was supposed to
-        # catch this passed: `_prepare`'s own `table.info()` adopts the
-        # new incarnation into the pyhoglake handle, and a defaulted
-        # `expected_table_uuid` is then read off that same refreshed
-        # value — so the client pre-flight, the server's guard and
-        # `_check_destination_still_ours` all compared fresh against
-        # fresh. The commit landed on a table this sink had never
-        # reconciled, and the only thing still naming the dead one was
-        # the idempotency key.
+        """The RECREATE case, which the drop-only test above cannot reach.
+
+        Once the name resolves again, every check that was supposed to
+        catch this used to pass: `_prepare`'s own `table.info()` adopted
+        the new incarnation into the pyhoglake handle, and a defaulted
+        `expected_table_uuid` was then read off that same refreshed value
+        — so the client pre-flight, the server's guard and the
+        (now-retired) pre-commit destination read all compared fresh
+        against fresh. The commit landed on a table this sink had never
+        reconciled, and the only thing still naming the dead one was the
+        idempotency key.
+
+        What closes it is `_prepare` pinning `expected_table_uuid` to the
+        resolved-and-reconciled incarnation, which is unchanged. WHERE it
+        is caught moved: the sink no longer re-reads the destination
+        before the commit, and pyhoglake skips its own pre-flight
+        re-resolve while its writer cache is warm — so the refusal is the
+        server's 409 `table_recreated`, after the upload. millpond
+        converts it to a retryable `HoglakeSinkError`, discards the
+        payload and books its parquet as an orphan, which is the cost of
+        catching it one round trip later.
+        """
         cfg = _fresh()
         sink = HoglakeSink(cfg)
         try:
@@ -571,9 +654,10 @@ class TestRestartAndReset:
             reborn = ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
             assert reborn.table_uuid != dead
 
-            with pytest.raises(IncarnationChangedError) as caught:
+            with pytest.raises(HoglakeSinkError, match="recreated") as caught:
                 sink.write(_batch(2), kafka_offsets=(("events", 0, 2, 3),))
             assert is_retryable(caught.value) is True
+            assert isinstance(caught.value.__cause__, IncarnationChangedError)
             assert _record_count(client, cfg) == 0, "the flush published across incarnations"
 
             # Retryable, so main.py resets and re-resolves — which is
@@ -836,24 +920,75 @@ class TestSpecChangeUnderAPreparedPayload:
         assert _record_count(client, cfg) == 6
 
 
-class _FailNthUpload:
-    """The real S3 filesystem, with the Nth `open_output_stream` refused.
+class _FailNthRequest:
+    """Refuse the Nth upload REQUEST of a fan-out, counted across both
+    transports and thread-safely.
 
-    Wrapping the filesystem rather than mocking pyhoglake is the point:
-    every upload before the Nth is a real object really in MinIO, so the
-    count pyhoglake stamps can be checked against the bucket instead of
-    against another fake."""
+    Two things it has to cope with that the old filesystem-only wrapper
+    did not. pyhoglake 1.3.7 sends any object at or under 8 MiB as a
+    single boto3 `put_object` (the `fast-upload` extra, which millpond
+    pins) and only a larger one through pyarrow's
+    `open_output_stream` — so a wrapper that only intercepts the stream
+    never fires for a real millpond flush, which is hundreds of ~12 KiB
+    files. And the fan-out is CONCURRENT, so "the Nth call" is whichever
+    thread claims the counter third; the lock is what keeps that exactly
+    one refusal rather than nondeterministically zero or two.
 
-    def __init__(self, real, fail_on: int):
-        self._real = real
+    Which group fails is deliberately not pinned. Every group is
+    submitted at once (the fan-out is wider than this test's group
+    count), the failure cancels nothing that has already started, and
+    `run_uploads` waits for the rest — so exactly one object is missing
+    and the others really are in MinIO, which is the claim: the count
+    pyhoglake stamps is checkable against the bucket instead of against
+    another fake. What is NOT checkable any more is that the landed set
+    is a PREFIX of the groups, and that is the point of reading the uris
+    rather than the count."""
+
+    def __init__(self, fail_on: int):
         self._fail_on = fail_on
+        self._lock = threading.Lock()
         self.calls = 0
 
+    def claim(self) -> bool:
+        with self._lock:
+            self.calls += 1
+            return self.calls == self._fail_on
+
+
+class _FailNthStream:
+    """The real S3 filesystem with `_FailNthRequest` in front of its
+    output stream — the transport a too-large object still takes."""
+
+    def __init__(self, real, gate: _FailNthRequest):
+        self._real = real
+        self._gate = gate
+
     def open_output_stream(self, path, *a, **kw):
-        self.calls += 1
-        if self.calls == self._fail_on:
-            raise OSError(f"injected object-store failure on upload {self.calls}")
+        if self._gate.claim():
+            raise OSError(f"injected object-store failure on upload {self._gate.calls}")
         return self._real.open_output_stream(path, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _FailNthPut:
+    """The real boto3 client with the same gate in front of `put_object`
+    — the transport every object in a millpond flush actually takes.
+
+    The OSError is raised rather than a botocore fault on purpose:
+    `perform_upload` translates botocore's taxonomy into `OSError`
+    anyway, so this is the exception shape the caller sees either way and
+    the one millpond's `is_retryable` classifies."""
+
+    def __init__(self, real, gate: _FailNthRequest):
+        self._real = real
+        self._gate = gate
+
+    def put_object(self, **kw):
+        if self._gate.claim():
+            raise OSError(f"injected object-store failure on upload {self._gate.calls}")
+        return self._real.put_object(**kw)
 
     def __getattr__(self, name):
         return getattr(self._real, name)
@@ -877,16 +1012,26 @@ class TestPrepareOrphanAccounting:
         try:
             sink.write(_batch(3, teams=(1,)))  # bootstrap, so the table exists
             before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
-            real = sink._client._filesystem()
-            sink._client._fs = _FailNthUpload(real, fail_on=3)
+            # Both transports, one gate: the bootstrap flush above has
+            # already built and cached both clients, and the 3-way
+            # fan-out below asks for a pool no wider than the one they
+            # got, so neither is rebuilt out from under the wrapper.
+            real_fs = sink._client._filesystem()
+            real_put = sink._client._put_client(1)
+            gate = _FailNthRequest(fail_on=3)
+            sink._client._fs = _FailNthStream(real_fs, gate)
+            if real_put is not None:
+                sink._client._put = _FailNthPut(real_put, gate)
             with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError) as caught:
                 sink.write(_batch(9, teams=(1, 2, 3)))
         finally:
-            sink._client._fs = real
+            sink._client._fs = real_fs
+            sink._client._put = real_put
             sink.close()
 
         # pyhoglake's own accounting: two uploads closed cleanly, the
         # third raised and is in neither number.
+        assert gate.calls == 3, "the injected failure never fired — which transport did the upload take?"
         assert caught.value.uploaded_files == 2
         assert len(caught.value.uploaded_uris) == 2
 
@@ -906,11 +1051,20 @@ class TestPrepareOrphanAccounting:
         assert "truncated" in caplog.text
 
     def test_a_pre_upload_refusal_really_does_carry_zero(self, hog_stack, client):
-        # The other half of the contract, and the one millpond used to
-        # assert from first principles: a refusal raised before the first
-        # upload reports 0 / (). Driven through a real drop+recreate
-        # under the sink's cached handle, so the real client pre-flight
-        # raises it.
+        """The other half of the contract, and the one millpond used to
+        assert from first principles: a refusal raised before the first
+        upload reports 0 / (). Driven through a real drop+recreate under
+        the sink's cached handle, so the real client pre-flight raises
+        it.
+
+        `invalidate()` is what makes the pre-flight run at all, and it is
+        the condition rather than a convenience: pyhoglake 1.3.7 SKIPS
+        its incarnation re-resolve while its writer cache is warm (that
+        is the whole of "zero table reads per flush"), so on a warm cache
+        this same sequence is caught by the server at the commit instead
+        — see the test below. A cold cache is the ordinary state after a
+        restart, after any `re_prepare` refusal, and once per
+        half-retention."""
         cfg = _fresh()
         sink = HoglakeSink(cfg)
         try:
@@ -919,6 +1073,7 @@ class TestPrepareOrphanAccounting:
             ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
             ns.table(cfg.hoglake_table).drop()
             ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
+            sink._table.invalidate()
             with pytest.raises(IncarnationChangedError) as caught:
                 sink.write(_batch(2))
         finally:
@@ -928,6 +1083,113 @@ class TestPrepareOrphanAccounting:
         # And the bucket agrees — no object was written for the refusal.
         after = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
         assert after == before
+
+    def test_a_warm_cache_pays_one_flush_of_uploads_for_a_recreation(self, hog_stack, client, caplog):
+        """The cost of the skipped pre-flight, measured rather than
+        argued: with a warm writer cache the recreation is caught by the
+        server's `expected_table_uuid` guard AFTER the upload, so that
+        flush's parquet is in the bucket with nothing referencing it.
+
+        This is the trade the zero-read flush makes — one flush's objects
+        for one table GET per flush, forever — and the orphan counter and
+        its log are the whole accounting for it, so they are what gets
+        asserted."""
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+            before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+            ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
+            ns.table(cfg.hoglake_table).drop()
+            ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
+            with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+                with pytest.raises(HoglakeSinkError, match="recreated") as caught:
+                    sink.write(_batch(2))
+            assert isinstance(caught.value.__cause__, IncarnationChangedError)
+            assert is_retryable(caught.value) is True
+        finally:
+            sink.close()
+        after = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+        orphans = after - before
+        assert len(orphans) == 1, "the refused flush's upload should be in the bucket, unreferenced"
+        assert "Orphaned 1 uploaded parquet file(s)" in caplog.text
+        for path in orphans:
+            assert path in caplog.text
+        assert _record_count(client, cfg) == 0  # nothing published to the new incarnation
+
+
+class TestOneRequestPerFlush:
+    """The wire-level form of the zero-reads claim, which the unit tests
+    cannot make.
+
+    They assert on the mock handles millpond itself calls, so they are
+    blind to anything pyhoglake issues inside `prepare_append_tables` —
+    its catalog head refresh, its incarnation re-resolve. What an
+    operator cares about is the request count against the control plane,
+    so count THAT: an httpx event hook on the sink's own client, which
+    already has one for `Retry-After`.
+    """
+
+    def _counted(self, sink) -> list[str]:
+        """Every catalog request this sink makes, newest last."""
+        seen: list[str] = []
+
+        def record(response):
+            seen.append(f"{response.request.method} {response.request.url.path}")
+
+        sink._client._http.event_hooks["response"].append(record)
+        return seen
+
+    def test_the_steady_state_flush_is_one_commit_and_nothing_else(self, hog_stack, client):
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3, teams=(1,)))  # bootstrap: creates, declares, reconciles
+            seen = self._counted(sink)
+            for i in range(5):
+                sink.write(_batch(3, teams=(1, 2)), kafka_offsets=(("events", 0, i, i),))
+        finally:
+            sink.close()
+        # FLAT, and flat at one: five flushes, five requests, every one
+        # of them the commit. Not "few" — exactly the commits, because a
+        # per-flush table GET carried a live-totals scan and the point of
+        # the whole change is that it is gone.
+        assert seen == ["POST /v1/catalogs/" + cfg.hoglake_catalog + "/commit/prepared"] * 5, seen
+
+    def test_the_bootstrap_flush_is_the_only_one_that_reads(self, hog_stack, client):
+        # The reads that remain, named: resolve the catalog, resolve (or
+        # create) namespace and table, reconcile the specs. All of them
+        # are once per sink, and the assertion is that the SECOND flush
+        # adds none of them back.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        seen = self._counted(sink)
+        try:
+            sink.write(_batch(2), kafka_offsets=(("events", 0, 0, 1),))
+            bootstrap = len(seen)
+            sink.write(_batch(2), kafka_offsets=(("events", 0, 2, 3),))
+        finally:
+            sink.close()
+        assert len(seen) - bootstrap == 1, seen[bootstrap:]
+        assert seen[-1].endswith("/commit/prepared")
+
+    def test_no_read_asks_for_the_live_totals(self, hog_stack, client):
+        # The totals scan is a count and two sums over every live file
+        # row of the table; the writer has never read one. Asserted on
+        # the wire so it holds for pyhoglake's reads too, not only
+        # millpond's.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        urls: list[str] = []
+        sink._client._http.event_hooks["response"].append(lambda r: urls.append(str(r.request.url)))
+        try:
+            sink.write(_batch(2))
+            sink.write(_batch(2))
+        finally:
+            sink.close()
+        table_gets = [u for u in urls if "/tables/" in u and "totals=" in u]
+        assert table_gets, "no table read happened at all; this test would pass vacuously"
+        assert all("totals=false" in u for u in table_gets), table_gets
 
 
 class TestAtLeastOnce:
@@ -1124,9 +1386,16 @@ class TestUuidColumnLive:
                 path = os.path.join(tmp, "part-0.parquet")
                 pq.write_table(rows, path)
                 assert pq.ParquetFile(path).schema.column(0).logical_type.type == "NONE"
+                # `prepare_append_files`, not `_tables`: the FILE path is
+                # what a variant-aware or old-spelling writer uses, and
+                # the bare `fixed_size_binary(16)` form cannot be
+                # produced from Arrow through the table path at all.
                 payload = table.prepare_append_files([(path, None)], idempotency_key=str(uuid.uuid4()))
-            payload.pop("read_snapshot", None)
-            client.catalog(cfg.hoglake_catalog).commit_prepared(payload)
+            # `read_snapshot` stays on, as it does on every millpond
+            # commit now: appends do not conflict with appends, so the
+            # basis costs this commit nothing and sending it is the shape
+            # the fleet is moving to.
+            client.catalog(cfg.hoglake_catalog).commit_prepared(payload, table=table)
         finally:
             sink.close()
         assert _record_count(client, cfg) == 4

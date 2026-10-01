@@ -3,8 +3,11 @@
 The hoglake control plane is a *service* (Kotlin/Ktor + Postgres): clients
 write parquet to object storage themselves and register the files via
 footer-shipping commits — the server never opens data files on the write
-path. pyhoglake owns that writer path (field-id-stamped parquet, footer
-stat extraction, one-commit registration, partitioned fanout appends);
+path. pyhoglake owns that writer path (field-id-stamped parquet encoded
+straight from Arrow to a buffer, footer stat extraction, concurrent
+single-request uploads, one-commit registration, partitioned fanout
+appends, and the `read_snapshot` basis the server's conflict check
+answers "did DDL touch this table since my read" against);
 this module owns everything millpond-shaped around it:
 
 * startup catalog resolution (in `__init__`, so a bad URL or an absent
@@ -65,8 +68,7 @@ matters at 3am:
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
+import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -75,18 +77,19 @@ from datetime import UTC, datetime
 import httpx
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from pyhoglake import (
     AlreadyExistsError,
     AlterOp,
     Column,
     CommitConflictError,
+    DdlSinceReadSnapshotError,
     ExpiredError,
     HoglakeClient,
     HoglakeError,
     IncarnationChangedError,
     MalformedResponseError,
     NotFoundError,
+    ReadSnapshotExpiredError,
     S3Config,
     UnsupportedTypeError,
     ValidationError,
@@ -264,10 +267,12 @@ _REUSED_KEY_MARKER = "idempotency_key reused"
 # The refusals pyhoglake raises when a PREPARED file's columns do not
 # match the destination's, quoted from its source so a re-align is
 # attempted for the cases a re-align can actually fix:
-#   * pyhoglake/client.py:901 — the strict schema/field-id comparison on
-#     the ordinary (non-variant) prepare path, which is the one millpond
-#     takes;
-#   * pyhoglake/parquet_schema.py:173 — the same refusal on the variant
+#   * pyhoglake/client.py:2126 (`_encode_group`, 1.3.7) — the strict
+#     schema/field-id comparison on the ordinary (non-variant) prepare
+#     path, which is the one millpond takes. It runs on the ENCODED
+#     footer, not on the Arrow schema handed in, which is what makes it
+#     the check a stale cached shape trips: see `_table_info`;
+#   * pyhoglake/parquet_schema.py:197 — the same refusal on the variant
 #     validation path.
 # Deliberately NOT here: "prepared file partition arity differs from
 # destination" (a spec change, which re-aligning columns cannot fix) and
@@ -279,6 +284,46 @@ _ALIGNMENT_REFUSALS: tuple[str, ...] = (
     "prepared Parquet schema/field IDs differ from destination",
     "prepared Parquet columns differ from destination",
 )
+
+# The server's typed "the destination moved under your basis" refusals —
+# the three pyhoglake flags `re_prepare` rather than `retryable`. Every
+# one of them is a commit the server judged and refused atomically with
+# zero rows written, and every one of them is cleared by a flush REBUILT
+# against a fresh read rather than by resending this payload: a prepared
+# request's `read_snapshot` is frozen, the expiry floor only moves
+# forward, and an alter does not un-happen.
+#
+# BOTH are subclasses, and the ARM ORDER in `_commit_prepared` is what
+# keeps each on the right path — not, as an earlier version of this
+# comment claimed, a difference in whether the payload is replayed. It
+# never is: `_is_answered_refusal` discards the payload for ANY 409, a
+# plain `commit_conflict` included, and that is deliberate (see
+# `_commit_prepared`). What the ordering actually buys:
+#
+#   * `DdlSinceReadSnapshotError` subclasses `CommitConflictError`, so
+#     without the typed arm first it would be discarded and then
+#     classified RETRYABLE by `is_retryable`'s conflict arm — correct by
+#     accident, since the rebuild does clear it, but it would reach
+#     main.py as "the catalog is contended" and be counted as OCC
+#     contention rather than as a layout race.
+#   * `ReadSnapshotExpiredError` subclasses `ExpiredError`, so without
+#     the typed arm it would be discarded and then classified PERMANENT
+#     by `is_retryable`'s `ExpiredError` arm — main.py re-raises
+#     immediately and the pod crashes on a flush a rebuild publishes
+#     cleanly. That one is not correct by accident, which is why the
+#     order is load-bearing rather than tidy.
+_DESTINATION_MOVED: tuple[type[HoglakeError], ...] = (
+    DdlSinceReadSnapshotError,
+    IncarnationChangedError,
+    ReadSnapshotExpiredError,
+)
+
+# What the sink assumes the catalog's snapshot retention is when it
+# cannot read one, mirroring pyhoglake's own
+# `_ASSUMED_RETENTION_SECONDS`. Mirrored rather than imported because it
+# is a private module constant; the VALUE matters less than the two
+# sides agreeing, and `_live_info_ttl_s` explains why.
+_ASSUMED_RETENTION_S = 1800.0
 
 # How long the offsets line of a commit message may be, in bytes. The
 # server stores `message` as unbounded text, so this bound is millpond's
@@ -371,9 +416,10 @@ def is_retryable(exc: BaseException) -> bool:
         disagrees with config, a partition column that is not in the
         table, a declaration the server did not apply). They are
         statements about the config or the code, and a retry cannot
-        change either. The one flagged `retryable=True` — the partition
-        spec moving under a prepared payload — is the exception, because
-        a REBUILT flush genuinely clears it.
+        change either. The ones flagged `retryable=True` are the
+        exception: `_destination_moved` raises one for each of the
+        server's three re-prepare refusals, and a REBUILT flush
+        genuinely clears all three.
       * `ValueError` / `KeyError` / `TypeError` — millpond's own
         validation (`check_reserved_collision`) and the pyarrow
         misuse that a schema race can produce. Same argument: waiting
@@ -383,6 +429,19 @@ def is_retryable(exc: BaseException) -> bool:
         read_snapshot below the catalog's expiry floor; only a fresh plan
         fixes that), `MalformedResponseError` (wire-contract violation),
         and any other 4xx.
+
+    THE THREE TYPED COMMIT REFUSALS DO NOT REACH HERE, and that is why
+    their classification below reads oddly: `DdlSinceReadSnapshotError`
+    (a `CommitConflictError` subclass, so the retryable arm would claim
+    it) and `ReadSnapshotExpiredError` (an `ExpiredError`, so the
+    permanent arm would) are both converted by `_commit_prepared` into
+    `HoglakeSinkError(retryable=True)` — one verdict, carried on the
+    exception itself, for the one recovery all three have. Reading the
+    flags here instead would say "retryable" for a payload whose basis is
+    frozen, which is a livelock, and "permanent" for a flush a rebuild
+    publishes cleanly, which is a crash. `IncarnationChangedError` keeps
+    its own retryable verdict for the PRE-UPLOAD shape, which is still
+    raised straight out of the client's pre-flight.
     """
     # This sink's own refusals, first: they carry their own verdict.
     if isinstance(exc, HoglakeSinkError):
@@ -450,12 +509,22 @@ def _is_answered_refusal(exc: BaseException) -> bool:
     is still worth holding: hold for transport-uncertain (no status, a
     timeout, a reset) and for 5xx, drop for an answered 4xx refusal.
 
-    BOTH codes reach here. pyhoglake maps every wire 422 to
+    ALL THREE codes reach here. pyhoglake maps every wire 422 to
     `ValidationError` and every wire 409 to a conflict class, and
     `_commit_prepared` catches their common base in one arm so this
     function is the only place the rule is written down.
+
+    410 joined them with the typed refusals: a commit's 410 is its own
+    `read_snapshot` below the catalog's expiry floor
+    (`ReadSnapshotExpiredError`), which the server answered by refusing
+    to evaluate a conflict window it cannot see — one judged
+    transaction, zero rows. It is only ever reached from the commit's
+    except arm, where a 410 can mean nothing else. The typed arm above
+    it discards the payload itself, so this is the backstop rather than
+    the mechanism; it is here because a rule stated for two of three
+    answered refusals is a rule nobody can rely on.
     """
-    return isinstance(exc, HoglakeError) and exc.status_code in (409, 422)
+    return isinstance(exc, HoglakeError) and exc.status_code in (409, 410, 422)
 
 
 # How many orphan uris one warning line will carry. The fanout is one
@@ -467,9 +536,16 @@ def _is_answered_refusal(exc: BaseException) -> bool:
 _ORPHAN_URIS_LOGGED = 20
 
 
-def _count_orphans(count: int, why: str, uris: Sequence[str] = ()) -> None:
+def _count_orphans(count: int, why: str, uris: Sequence[str] = (), *, reason: str) -> None:
     """Record parquet objects uploaded to the lake that no commit
     references.
+
+    `reason` is the metric's `reason` label and `why` the operator-facing
+    sentence. Two arguments rather than one because they answer to
+    different readers: the label has to be a small fixed vocabulary a
+    dashboard can group by, and the sentence has to name this table,
+    this fanout width and this status code. Keyword-only so a new call
+    site cannot acquire a reason by argument position.
 
     Nothing on the server side reclaims a client's uploads, so this
     counter is the whole observability story for them; an uncounted
@@ -500,7 +576,7 @@ def _count_orphans(count: int, why: str, uris: Sequence[str] = ()) -> None:
         )
     else:
         log.warning("Orphaned %d uploaded parquet file(s) in the lake: %s", count, why)
-    metrics.hoglake_orphaned_files_total.inc(count)
+    metrics.hoglake_orphaned_files_total.labels(reason=reason).inc(count)
 
 
 def _is_alignment_refusal(exc: ValidationError) -> bool:
@@ -881,6 +957,27 @@ class HoglakeSink:
         # — is named from THIS value.
         self._table_uuid: str | None = None
         self._live_columns: dict[str, Column] = {}
+        # The last `TableInfo` read for the destination — the columns AND
+        # the specs the flush path builds against. Held here rather than
+        # re-read per flush: see `_table_info` for why that is safe and
+        # `_destination_moved` for what drops it.
+        #
+        # pyhoglake keeps its own copy (`Table._info`, paired with the
+        # snapshot it was read at in `Table._cache`) and that is the one
+        # the commit's `read_snapshot` comes from, but it exposes only
+        # `Table.columns` publicly — not the partition spec, which the
+        # fanout needs. So this is millpond's copy of the same read, not
+        # a second source of truth: both are seeded from a `table.info()`
+        # or a `table.alter()` on the same handle, and the server's
+        # conflict check on `read_snapshot` is what makes a disagreement
+        # between them a refusal rather than a wrong file.
+        self._live_info = None
+        # When `_live_info` was read, on the MONOTONIC clock, and the
+        # clock itself — injected so a test can drive the TTL without
+        # sleeping out a catalog retention period. `_live_info_ttl_s` is
+        # the whole argument for why there is a TTL at all.
+        self._live_info_read_at: float | None = None
+        self._monotonic = time.monotonic
         # The in-flight flush's uploaded-and-not-yet-published commit
         # request, held IN MEMORY for the lifetime of the flush so a
         # retry replays it rather than building a second one. Survives
@@ -892,10 +989,6 @@ class HoglakeSink:
         # depends on the live table incarnation, which the retry path
         # deliberately does not re-resolve.
         self._prepared_offsets: tuple | None = None
-        # The live partition spec `_prepare` computed its partition
-        # VALUES under. A spec change between prepare and commit would
-        # stamp those values with a spec_id they were not computed for.
-        self._prepared_spec: tuple[tuple[int, str, int | None], ...] = ()
         # How many times this payload has been sent. >1 on success means
         # the commit was RESOLVED BY REPLAY: the server either answered
         # from its receipt or applied it now, and either way the rows
@@ -1001,7 +1094,7 @@ class HoglakeSink:
         # resolved and never will — a different offset range, or an
         # anonymous batch, which has no identity to replay under. Its
         # upload is already in object storage with nothing referencing it.
-        self._discard_prepared("superseded by a new flush")
+        self._discard_prepared("superseded by a new flush", reason="superseded")
 
         batch = self._stamp_inserted_at(batch)
         table = self._ensure_table(batch.schema)
@@ -1028,7 +1121,11 @@ class HoglakeSink:
             # one.
             if not _is_alignment_refusal(e):
                 raise
-            self._adopt_columns(table.info().columns)
+            # `totals=False`: a writer read wants the uuid, the columns
+            # and the specs, and the totals are a count plus two sums
+            # over every live file row of the table (~15M on prod-us).
+            # This sink has never read one.
+            self._adopt_info(table.info(totals=False))
             batch = self._null_fill_missing(batch)
             payload = self._prepare(table, batch, key, facts)
         self._prepared = payload
@@ -1051,13 +1148,19 @@ class HoglakeSink:
         self._table = None
         self._table_uuid = None
         self._live_columns = {}
+        # The cached shape goes with the handle it was read through: a
+        # reset means "re-resolve the destination", and keeping a shape
+        # read off the old handle would let the next flush build against
+        # a table this pod has not re-reconciled.
+        self._live_info = None
+        self._live_info_read_at = None
 
     def close(self) -> None:
         # A payload still held at shutdown is an upload nobody will ever
         # reference: SIGTERM between prepare and commit. Nothing on the
         # server reclaims client uploads, so the count is the only trace
         # it leaves.
-        self._discard_prepared("the sink closed before its commit resolved")
+        self._discard_prepared("the sink closed before its commit resolved", reason="shutdown")
         self._client.close()
 
     # -- retry policy (read by main._write_with_retry) ---------------------
@@ -1183,24 +1286,69 @@ class HoglakeSink:
         return str(uuid.uuid5(_IDEMPOTENCY_NAMESPACE, name))
 
     def _prepare(self, table, batch: pa.Table, key: str, facts: _FlushFacts) -> dict:
-        """Write the batch's parquet, upload it, and return the commit
+        """Encode the batch's parquet, upload it, and return the commit
         request — WITHOUT publishing it.
 
         The split is what makes the retry safe: after this returns, the
-        files exist in object storage and the request that registers them
-        is a value we can hold and re-send verbatim. pyhoglake's
-        `prepare_append_files` owns the upload (streamed from disk in
-        chunks, so a 100MB flush never doubles in RAM the way an
-        in-memory serialize does) and the registration's stats/footer
-        conventions.
+        objects exist in object storage and the request that registers
+        them is a value we can hold and re-send verbatim. pyhoglake's
+        `prepare_append_tables` owns the encode, the upload and the
+        registration's stats/footer conventions; each group goes straight
+        from Arrow to a parquet buffer to one `PutObject`, with no temp
+        file to write, fsync, re-read for the footer and re-read for the
+        upload.
+
+        MEMORY, because the disk path's whole argument was about it,
+        and the honest accounting is bigger than "input plus buffers".
+        Alive at once, at the moment the uploads run:
+
+        * main.py's `consolidated` table, which the retry loop holds for
+          the whole of `_write_with_retry` — so it survives every
+          attempt, not just this one;
+        * `aligned`, the result of `select(...).cast(target)`. A cast
+          that changes a type (int32 -> int64, string -> uuid) allocates
+          a new buffer; one that does not is zero-copy, so this is
+          somewhere between a few columns and a full copy depending on
+          how much the batch drifted;
+        * `groups`, which `_partition_groups` materialises with
+          `data.filter(mask)` per tuple — a full copy of the rows,
+          partitioned, so about one more `aligned` in total;
+        * every encoded parquet buffer, which pyhoglake holds all of at
+          once because it validates every group before the first upload
+          starts (that is what keeps a refusal from orphaning objects).
+
+        So roughly THREE Arrow-sized copies plus the parquet, not one
+        plus the parquet. What makes it a non-issue is the last term
+        being small: the prod-us events writer's ~105K rows over ~271
+        partitions encode to a few MiB, because parquet of a sorted,
+        dictionary-friendly column set is a fraction of its Arrow
+        representation and the per-group split means no single buffer is
+        the whole flush. The Arrow side is bounded by MILLPOND_FLUSH_SIZE
+        — 100 MiB at the code default, and ~1 GiB in the prod-us values
+        file, which is the figure the 16 GiB pod sizing was done
+        against; do not read that number as a property of the code.
+        Nothing is held twice within this method: there is no temp file
+        and the upload reads the buffer it was handed.
 
         Partition fanout is ours to compute because the prepared path
         puts row-to-partition correctness on the caller — transform math
         still comes from pyhoglake.transforms, so the Iceberg semantics
         have exactly one implementation.
+
+        Destinations with a `variant` column are refused by
+        `prepare_append_tables` (an Arrow rewrite drops the native
+        parquet VARIANT annotation). Nothing is done about that here and
+        nothing needs to be: millpond cannot produce such a destination
+        (`config.load()` rejects MILLPOND_VARIANT_COLUMNS for this
+        backend, and `table_schema_for_batch` has no variant mapping),
+        and pointing this sink at someone else's variant table already
+        failed one line later than it does now —
+        `columns_to_arrow_schema` raises `UnsupportedTypeError` for a
+        variant column. Either way it is a permanent refusal that names
+        the reason, which is the right answer for a destination this
+        backend does not support.
         """
-        info = table.info()
-        self._adopt_columns(info.columns)
+        info = self._table_info(table)
         target = columns_to_arrow_schema(info.columns)
         # Null-fill against THESE columns, not the ones the caller
         # aligned to. `_evolve_and_align` filled against the schema it
@@ -1215,12 +1363,11 @@ class HoglakeSink:
         batch = self._null_fill_missing(batch)
         aligned = batch.select(list(target.names)).cast(target)
         groups = _partition_groups(aligned, info)
-        self._prepared_spec = _partition_tuples(info.partition_spec)
         # Formatted BEFORE the first byte is uploaded, and that ordering
         # is a safety property, not a style choice. Everything that can
         # fail after the upload has to account for the objects it
         # abandons — that is what the `_count_orphans` arm around
-        # `prepare_append_files` is for. A formatting failure raised
+        # `prepare_append_tables` is for. A formatting failure raised
         # after it (a future field that is not a string, say) would
         # leave those objects with no count, no log and no metric, and
         # the retry loop would call the TypeError transient and spend
@@ -1244,89 +1391,88 @@ class HoglakeSink:
             table_uuid=self._table_uuid,
             kafka_offsets=facts.kafka_offsets,
         )
-        with tempfile.TemporaryDirectory(prefix="millpond-hoglake-") as tmp:
-            files = []
-            for index, (partition_values, part) in enumerate(groups):
-                path = os.path.join(tmp, f"part-{index}.parquet")
-                pq.write_table(part, path)
-                files.append((path, partition_values))
-            try:
-                payload = table.prepare_append_files(
-                    files,
-                    idempotency_key=key,
-                    # PINNED, not defaulted. Left to its default,
-                    # pyhoglake reads `self.table_uuid` off its own
-                    # `_info` — which the `table.info()` at the top of
-                    # this method has just rebased onto whatever the name
-                    # resolves to NOW. The client's pre-flight, the
-                    # server's guard and `_check_destination_still_ours`
-                    # would then all compare fresh against fresh and pass
-                    # over a drop+recreate that happened under the cached
-                    # handle. Naming the resolved-and-reconciled
-                    # incarnation instead makes the pre-flight fire, and
-                    # `IncarnationChangedError` is retryable, so
-                    # reset_caches re-resolves and `_reconcile_specs`
-                    # finally runs against the table we are writing to.
-                    expected_table_uuid=self._table_uuid,
-                )
-            except Exception as e:
-                # ONE arm, because there is now one question and
-                # pyhoglake answers it. Since 1.1.1 every exception
-                # leaving `prepare_append_files` carries what it had
-                # already written: `uploaded_files` is how many uploads
-                # CLOSED cleanly, `uploaded_uris` names exactly those.
-                # A refusal raised before the first upload carries 0 and
-                # (), so the same read covers the validation refusals,
-                # the catalog-side failures and the object-store ones
-                # alike.
-                #
-                # This used to be three arms whose only content was an
-                # argument about where in someone else's control flow
-                # each failure could fire ("a validation refusal is a
-                # property of the whole set, so it fires at index 0";
-                # "the catalog work all precedes the upload loop"). The
-                # arguments were re-derived from pyhoglake's source and
-                # happened to hold, but deducing another library's
-                # progress is exactly the defect class this branch
-                # already shipped twice — once booking a whole fanout
-                # that was never uploaded, once booking N-1 for a
-                # refusal that self-heals into a successful flush. Read
-                # the number; do not reconstruct it.
-                #
-                # getattr with defaults, and not only for an older
-                # client: pyhoglake stamps best-effort and suppresses
-                # the AttributeError from an exception type whose
-                # __slots__ refuse the attributes. Zero is then the
-                # honest answer, and raising an AttributeError over a
-                # live object-store failure is not.
-                #
-                # The file that FAILED is in neither number — its upload
-                # may never have opened, or may have closed badly over a
-                # TRUNCATED object that really is there. So the count is
-                # a lower bound on objects present, and the log says so.
-                _count_orphans(
-                    int(getattr(e, "uploaded_files", 0)),
-                    f"the prepared upload of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} "
-                    f"failed partway through a {len(files)}-file fanout. The file it failed on is not "
-                    "among these and is not counted, but a failed close can leave a truncated object, "
-                    "so treat it as possibly present too",
-                    getattr(e, "uploaded_uris", ()),
-                )
-                raise
-        # Blind append, exactly as `Table.append` does it.
-        # `prepare_append_files` pins `read_snapshot` to the catalog head
-        # at prepare time, and the server's conflict scan then fails the
-        # commit with a 409 if any DDL touched this table since — which
-        # for millpond means "another pod added a column", the single
-        # most likely thing to happen during a producer rollout. A
-        # prepared payload cannot survive that: its read_snapshot is
-        # frozen, so the conflict is permanent and the only way out is
-        # re-uploading under a new registration. Appends never conflict
-        # with appends, so dropping the field restores the semantics the
-        # non-idempotent path always had, and the incarnation guard
-        # (expected_table_uuid, which prepare_append_files puts on the
-        # entry) remains the real safety mechanism.
-        payload.pop("read_snapshot", None)
+        try:
+            payload = table.prepare_append_tables(
+                [(part, partition_values) for partition_values, part in groups],
+                idempotency_key=key,
+                # PINNED, not defaulted. Left to its default, pyhoglake
+                # reads `self.table_uuid` off its own `_info` — which any
+                # refresh of its cache rebases onto whatever the name
+                # resolves to NOW. The client's pre-flight and the
+                # server's guard would then both compare fresh against
+                # fresh and pass over a drop+recreate that happened under
+                # the cached handle. Naming the resolved-and-reconciled
+                # incarnation instead makes the guards fire, and
+                # `IncarnationChangedError` is retryable, so reset_caches
+                # re-resolves and `_reconcile_specs` finally runs against
+                # the table we are writing to.
+                expected_table_uuid=self._table_uuid,
+            )
+        except Exception as e:
+            # ONE arm, because there is now one question and pyhoglake
+            # answers it. Since 1.1.1 every exception leaving
+            # `prepare_append_files` / `prepare_append_tables` carries
+            # what it had already written: `uploaded_files` is how many
+            # uploads CLOSED cleanly, `uploaded_uris` names exactly
+            # those. A refusal raised before the first upload carries 0
+            # and (), so the same read covers the validation refusals,
+            # the catalog-side failures and the object-store ones alike.
+            #
+            # This used to be three arms whose only content was an
+            # argument about where in someone else's control flow each
+            # failure could fire ("a validation refusal is a property of
+            # the whole set, so it fires at index 0"; "the catalog work
+            # all precedes the upload loop"). The arguments were
+            # re-derived from pyhoglake's source and happened to hold,
+            # but deducing another library's progress is exactly the
+            # defect class this branch already shipped twice — once
+            # booking a whole fanout that was never uploaded, once
+            # booking N-1 for a refusal that self-heals into a successful
+            # flush. Read the number; do not reconstruct it. The
+            # concurrent fan-out makes that literal rather than merely
+            # prudent: the uris are no longer a contiguous PREFIX of the
+            # groups, because group 7 can land while group 6 fails, so
+            # position and count say nothing about any particular file.
+            #
+            # getattr with defaults, and not only for an older client:
+            # pyhoglake stamps best-effort and suppresses the
+            # AttributeError from an exception type whose __slots__
+            # refuse the attributes. Zero is then the honest answer, and
+            # raising an AttributeError over a live object-store failure
+            # is not.
+            #
+            # The file that FAILED is in neither number — its upload may
+            # never have opened, or may have closed badly over a
+            # TRUNCATED object that really is there. So the count is a
+            # lower bound on objects present, and the log says so.
+            _count_orphans(
+                int(getattr(e, "uploaded_files", 0)),
+                f"the prepared upload of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} "
+                f"failed partway through a {len(groups)}-file fanout. The file it failed on is not "
+                "among these and is not counted, but a failed close can leave a truncated object, "
+                "so treat it as possibly present too",
+                getattr(e, "uploaded_uris", ()),
+                reason="prepare_failed",
+            )
+            raise
+        # `read_snapshot` STAYS ON THE PAYLOAD, and it is the conflict
+        # basis the whole zero-read flush rests on: `prepare_append_*`
+        # binds it to the snapshot the cached `TableInfo` was resolved
+        # at, and the server's conflict scan then answers exactly the
+        # question this sink used to re-read the table to answer — "did
+        # anything alter, drop or recreate this table since my read".
+        # Anything that did comes back as a typed, non-retryable refusal
+        # (`ddl_since_read_snapshot` / `table_recreated` /
+        # `ReadSnapshotExpiredError`), which `_commit_prepared` answers
+        # by discarding the payload and rebuilding against a fresh read
+        # — the recovery a frozen payload actually has. Stripping it
+        # (which this module did, back when the only answer was an
+        # untyped retryable 409 that a replay could never clear) also
+        # leaves the commit with NO conflict window at all, and the
+        # server's HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS flag exists
+        # to refuse that shape once the fleet stops sending it: a
+        # partitioned append whose values were computed under a spec
+        # nobody can prove is still live.
         payload["author"] = self._author
         # Attached HERE, with the payload, and not at commit time: the
         # payload is held across retries and re-sent verbatim, so a
@@ -1362,11 +1508,20 @@ class HoglakeSink:
         if payload is None:  # unreachable; an explicit raise, not an assert (python -O strips those)
             raise HoglakeSinkError("_commit_prepared called with no prepared payload")
         files = payload["appends"][0]["files"]
-        self._check_destination_still_ours(payload)
         self._prepared_sends += 1
         replayed = self._prepared_sends > 1
         try:
-            self._catalog.commit_prepared(payload)
+            # `table=` whenever the sink still holds the handle the
+            # payload was prepared from: pyhoglake then invalidates THAT
+            # Table's writer cache on a `re_prepare` refusal, so the
+            # rebuild cannot send the same stale `read_snapshot` and take
+            # the same refusal again. `reset_caches()` drops the handle
+            # and so the cache with it, which is the other way out — but
+            # one that depends on main.py calling it, and a livelock is
+            # too expensive a thing to leave to a caller's manners. None
+            # here is the cross-process form (a replay after a reset),
+            # where there is no cache left to invalidate.
+            self._catalog.commit_prepared(payload, table=self._table)
         except HoglakeError as e:
             # ONE arm, deliberately. Split across `except ValidationError`
             # and `except HoglakeError` this read as two rules, but
@@ -1377,8 +1532,10 @@ class HoglakeSink:
             # stated differently in each.
             if isinstance(e, ValidationError) and _REUSED_KEY_MARKER in _error_text(e):
                 return self._accept_already_published(payload, files)
+            if isinstance(e, _DESTINATION_MOVED):
+                raise self._destination_moved(e) from e
             if _is_answered_refusal(e):
-                self._discard_prepared(f"the server refused the commit with a {e.status_code}")
+                self._discard_prepared(f"the server refused the commit with a {e.status_code}", reason="commit_refused")
             raise
         # One parquet per partition tuple per flush (fanout appends) —
         # the hoglake compaction-debt feed rate. Counted AFTER the commit
@@ -1397,51 +1554,120 @@ class HoglakeSink:
         self._clear_prepared()
         return rows
 
-    def _check_destination_still_ours(self, payload: dict) -> None:
-        """Re-read the destination immediately before publishing, and
-        refuse to publish into a table that moved under the payload.
+    def _destination_moved(self, refused: HoglakeError) -> HoglakeSinkError:
+        """Turn one of the server's typed re-prepare refusals into this
+        sink's own retryable stop, having abandoned the payload it refused.
 
-        Two things can move between prepare and commit, and the server
-        catches neither on the commit path:
+        THIS IS WHERE THE PRE-COMMIT TABLE READ WENT. The sink used to
+        re-read the destination immediately before every publish, to
+        refuse a table that had moved under an already-uploaded payload:
 
-        * the INCARNATION — it does check `expected_table_uuid`, but it
-          answers with a bare 409, and by then the upload is spent. This
-          just says so earlier and in millpond's own words.
-        * the PARTITION SPEC. A file is registered with its partition
-          VALUES and stamped with the table's CURRENT spec_id; the server
-          validates the arity and nothing else, because it never opens
-          the file. Re-spec a table from `identity(team_id)` to
-          `bucket(team_id, 16)` — same arity — while a payload is in
-          flight, and the file lands stamped as bucketed while carrying
-          identity values. Every future scan prunes it wrongly, forever,
-          with nothing anywhere saying so.
+        * the INCARNATION, because the server's `expected_table_uuid`
+          guard answered with a bare 409 that said nothing about which
+          table it meant;
+        * the PARTITION SPEC, because a file is registered with the
+          partition VALUES the client computed and stamped with the
+          table's CURRENT spec_id. Re-spec from `identity(team_id)` to
+          `bucket(team_id, 16)` — same arity, so the server's arity check
+          passes — while a payload is in flight, and the file lands
+          stamped as bucketed while carrying identity values. Every
+          future scan prunes it wrongly, forever, with nothing anywhere
+          saying so.
 
-        The window this closes is prepare-to-commit, which is the wide
-        one (it contains the upload). The residual — a spec change
-        between this check and the server taking the commit lock — is not
-        closable from the client; it needs the server to validate values
-        it deliberately does not read.
+        Both are now answered by the payload's own `read_snapshot`,
+        atomically and under the commit lock. What that is and is not:
+
+        * a partition-spec change is an ALTER, and
+          `AlterService.alterTable` mints exactly one `table_altered`
+          change row per alter regardless of op count. An append-only
+          commit's conflict scan counts `table_dropped` and
+          `table_altered` on every table it touches since
+          `read_snapshot` (`CommitService.checkConflicts`), and binds
+          nothing else for an append — `requireUnchangedTables` scopes
+          the row-content kinds to DELETE targets — so every row it can
+          match is DDL and the refusal is always the typed
+          `ddl_since_read_snapshot`, never a bare conflict. Schema DDL
+          (another pod's add_column) lands in the same arm, which is why
+          stripping `read_snapshot` used to be necessary and is now
+          wrong.
+        * THE WINDOW ONLY COVERS DRIFT INSIDE IT, and for the partition
+          spec that is NOT automatic — it is bought by
+          `_live_info_ttl_s`. `read_snapshot` comes from pyhoglake's
+          writer cache, which refreshes itself at half the catalog's
+          retention; past a refresh the basis sits AHEAD of an older
+          alter, the scan finds nothing, and a payload built under the
+          superseded spec is accepted and stamped with the live spec_id.
+          Re-reading this sink's own copy at a quarter of the retention
+          is what makes that state unreachable: the sink is never staler
+          than `Table._cache`, so a spec the commit cannot see is a spec
+          no flush is still computing under. This bullet is the whole
+          reason the TTL exists; deleting it reopens silent permanent
+          mis-pruning.
+        * a drop+recreate is covered by NEITHER the window nor the TTL,
+          because the scan keys on the resolved (new) table id. It is
+          closed solely by `expected_table_uuid` -> 409
+          `table_recreated`, which `_prepare` pins to the
+          resolved-and-reconciled incarnation.
+        * and a `read_snapshot` that sank below the catalog's expiry
+          floor is a 410: the server cannot evaluate the conflict window
+          at all, so it refuses rather than accepting on a basis it
+          cannot check.
+
+        What the server DOES do strictly better than the read this
+        replaced is the timing: the check is inside the commit
+        transaction under the catalog lock, so there is no residual
+        window between checking and committing — which the client-side
+        read admitted to having and could not close.
+
+        Each is non-retryable AS THIS PAYLOAD — the basis is frozen in a
+        request that must be replayed byte-identically, and the floor and
+        the alter only ever move forward — and each is cleared by a
+        REBUILT flush. So the payload is discarded (its uploads are
+        orphans, counted by `_discard_prepared`), the sink's cached table
+        info is dropped so the rebuild reads fresh, and the refusal
+        becomes a `HoglakeSinkError(retryable=True)`: one type, because
+        there is one recovery, and retryable because `is_retryable` would
+        otherwise call `ReadSnapshotExpiredError` permanent and re-raise
+        instead of rebuilding. The server's own exception stays attached
+        as `__cause__`.
         """
-        expected = payload["appends"][0].get("expected_table_uuid")
-        info = self._live_table().info()
-        if expected is not None and info.table_uuid != expected:
-            self._discard_prepared("the destination table was recreated before the commit")
-            raise IncarnationChangedError(
-                f"table {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} was recreated "
-                f"while this flush was in flight: prepared against table_uuid {expected}, the "
-                f"name now resolves to {info.table_uuid}. The prepared upload is abandoned; the "
-                f"flush rebuilds against the live incarnation."
+        table_name = f"{self._cfg.hoglake_namespace}.{self._cfg.hoglake_table}"
+        prepared_for = (self._prepared or {}).get("appends", [{}])[0].get("expected_table_uuid")
+        if isinstance(refused, IncarnationChangedError):
+            reason = "table_recreated"
+            why = "the destination table was recreated before the commit"
+            message = (
+                f"table {table_name} was recreated while this flush was in flight: prepared "
+                f"against table_uuid {prepared_for}, which the name no longer resolves to "
+                f"({refused}). The prepared upload is abandoned; the flush rebuilds against the "
+                f"live incarnation."
             )
-        live_spec = _partition_tuples(info.partition_spec)
-        if live_spec != self._prepared_spec:
-            self._discard_prepared("the partition spec changed before the commit")
-            raise HoglakeSinkError(
-                f"partition spec of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} "
-                f"changed while this flush was in flight (prepared under {self._prepared_spec}, "
-                f"live {live_spec}); the prepared files carry values computed under the old spec "
-                f"and would be registered under the new spec_id. Rebuilding the flush.",
-                retryable=True,
+        elif isinstance(refused, ReadSnapshotExpiredError):
+            reason = "read_snapshot_expired"
+            why = "the prepared commit's read_snapshot fell below the catalog's expiry floor"
+            message = (
+                f"the conflict basis of this flush to {table_name} expired before the commit "
+                f"landed ({refused}); the server cannot judge the prepared files against a "
+                f"snapshot it no longer retains. The prepared upload is abandoned; the flush "
+                f"rebuilds against a retained snapshot."
             )
+        else:
+            reason = "ddl_since_read_snapshot"
+            why = "DDL landed on the destination before the commit"
+            message = (
+                f"schema or partition spec of {table_name} changed while this flush was in "
+                f"flight ({refused}); the prepared files were built against the old layout and "
+                f"would be registered under the new one. Rebuilding the flush."
+            )
+        self._discard_prepared(why, reason=reason)
+        # The cached shape is stale BY THE SERVER'S OWN STATEMENT, so the
+        # rebuild must read rather than re-derive the same doomed payload
+        # from it. pyhoglake invalidates its own cache on these refusals
+        # (`Catalog._commit` does it for a `re_prepare`); this is the half
+        # that lives on millpond's side of the line.
+        self._live_info = None
+        self._live_info_read_at = None
+        return HoglakeSinkError(message, retryable=True)
 
     def _accept_already_published(self, payload: dict, files: list) -> int:
         """The receipt exists and our request is not the one it was
@@ -1459,9 +1685,16 @@ class HoglakeSink:
         already there.
 
         What this must never do is accept on the strength of a receipt
-        that belongs somewhere else, so the incarnation is checked
-        against the live table first (`_check_destination_still_ours`
-        already ran; this re-states the invariant it upholds).
+        that belongs somewhere else, and nothing here has to check that
+        because `_flush_key` already has: `table_uuid` is one of the
+        components hashed into the key, so a receipt found under THIS key
+        was written by a commit to THIS incarnation. (It used to be
+        re-checked by a table read immediately before the commit. That
+        read is gone, and the invariant did not depend on it — the key
+        did. The server's `expected_table_uuid` guard is the second
+        answer: a recreated destination refuses the commit with 409
+        `table_recreated` instead of answering it from a receipt, which
+        is why the reuse marker is believed only on a 422.)
 
         Rows returned: ZERO. This process published nothing — some
         earlier one did — and `records_written_total` counts rows this
@@ -1506,22 +1739,16 @@ class HoglakeSink:
             len(files),
         )
         metrics.hoglake_commit_replays_total.labels(outcome="already_published").inc()
-        _count_orphans(len(files), "the offset range was already published", [f["path"] for f in files])
+        _count_orphans(
+            len(files),
+            "the offset range was already published",
+            [f["path"] for f in files],
+            reason="already_published",
+        )
         self._clear_prepared()
         return 0
 
-    def _live_table(self):
-        """The destination table handle, resolved if the cache is empty.
-
-        Deliberately NOT cached into `self._table`: that cache means
-        "resolved and reconciled by `_ensure_table`", and a handle
-        fetched here has been through neither.
-        """
-        if self._table is not None:
-            return self._table
-        return self._catalog.namespace(self._cfg.hoglake_namespace).table(self._cfg.hoglake_table)
-
-    def _discard_prepared(self, why: str) -> None:
+    def _discard_prepared(self, why: str, *, reason: str) -> None:
         """Drop a prepared payload that will never be published, and
         account for the upload it leaves behind."""
         if self._prepared is None:
@@ -1533,14 +1760,13 @@ class HoglakeSink:
             len(files),
             why,
         )
-        _count_orphans(len(files), why, [f["path"] for f in files])
+        _count_orphans(len(files), why, [f["path"] for f in files], reason=reason)
         self._clear_prepared()
 
     def _clear_prepared(self) -> None:
         self._prepared = None
         self._prepared_rows = 0
         self._prepared_offsets = None
-        self._prepared_spec = ()
         self._prepared_sends = 0
 
     # -- metadata column ---------------------------------------------------
@@ -1604,12 +1830,28 @@ class HoglakeSink:
 
         The shape is chosen for three reasons:
 
-        * It is the SAME call the flush path makes. pyhoglake uploads
-          each parquet file with `_filesystem().open_output_stream(...)`
-          (client.py:971 in `prepare_append_files`, and `_upload` at
-          :1280, at the pinned 1.1.1), so what the probe proves at
-          startup is mechanically the request the write path will issue
-          — not a nearby operation chosen for being cheap.
+        * It issues a real write request with the sink's own
+          credentials, which is the point of writing rather than
+          looking. It is no longer the same CALL the flush path makes,
+          and that claim died at pyhoglake 1.3.7: with boto3 present (the `fast-upload` extra, which
+          millpond pins) `prepare_append_tables` puts every object at or
+          under 8 MiB up as a single boto3 `put_object`
+          (`pyhoglake/upload.py`, `perform_upload`), and only a larger
+          one still takes `open_output_stream`. So the probe exercises
+          the fallback transport rather than the hot one, and in
+          particular it resolves credentials through Arrow's C++ SDK
+          chain while the hot path resolves them through botocore's.
+          pyhoglake hands both the same explicit fields — access key,
+          secret key, endpoint override with the same path-style
+          addressing, region when one is set — and refuses ambient
+          endpoint configuration on both sides, so a static-key or
+          IRSA-by-omission deployment proves the same identity either
+          way. What the probe does NOT cover is a divergence between the
+          two chains themselves (botocore falls back to its own default
+          region and leans on S3's region redirect where Arrow resolves
+          the bucket's region), which is the one reason
+          `HOGLAKE_S3_REGION` is worth setting explicitly even under
+          IRSA.
         * It proves the grant the sink actually needs. The role carries
           write access under this prefix and nothing else — a LIST would
           test `s3:ListBucket`, a permission the role is not meant to
@@ -1765,11 +2007,11 @@ class HoglakeSink:
             # declared the same thing — which the verification below
             # proves rather than assumes.
             log.info("Hoglake spec DDL raced another writer, continuing: %s", e)
-            info = table.info()
-        self._adopt_columns(info.columns)
+            info = table.info(totals=False)
+        self._adopt_info(info)
         self._verify_specs(info)
 
-    def _reconcile_specs(self, table) -> None:
+    def _reconcile_specs(self, table, info=None) -> None:
         """Compare the live partition spec / sort order of an EXISTING
         table against config.
 
@@ -1784,12 +2026,17 @@ class HoglakeSink:
 
         The one divergence that is NOT an error is an unspecced table
         that config says should be specced: that is the create-then-alter
-        window reopening, and declaring the spec is the recovery."""
+        window reopening, and declaring the spec is the recovery.
+
+        `info` lets a caller that has JUST read the table hand its copy
+        over instead of paying a second request — which is what
+        `_table_info` does on every TTL refresh, and the reason this
+        check is no longer a pod-start-only tripwire. Omitted, it reads."""
         # No early out when both knobs are unset: "config says
         # unpartitioned, the table is partitioned" is the destination-flip
         # case, and it is the one this check exists for.
-        info = table.info()
-        self._adopt_columns(info.columns)
+        if info is None:
+            info = self._adopt_info(table.info(totals=False))
         want_partition = self._want_partition_fields()
         live_partition = _partition_tuples(info.partition_spec)
         if live_partition and live_partition != want_partition:
@@ -1934,6 +2181,164 @@ class HoglakeSink:
 
     def _adopt_columns(self, columns) -> None:
         self._live_columns = {c.name: c for c in columns}
+
+    def _adopt_info(self, info):
+        """Take a `TableInfo` as the destination's live shape, and stamp
+        when it was read.
+
+        One function, so the columns and the specs can never come from
+        two different reads: `_live_columns` drives schema evolution and
+        `info.partition_spec` drives the fanout, and a flush that
+        computed partition values under one read while aligning columns
+        to another would register files nothing could detect as wrong.
+
+        Every producer of a whole `TableInfo` routes through here — an
+        `info()` read and an `alter()` receipt alike. pyhoglake's
+        `Table.alter` re-seeds its OWN writer cache from the same
+        receipt (at the post-alter snapshot) and `Table.info` does the
+        same through `Table._adopt`, so every stamp taken here coincides
+        with a stamp taken there. `_live_info_ttl_s` depends on that.
+        """
+        self._live_info = info
+        self._live_info_read_at = self._monotonic()
+        self._adopt_columns(info.columns)
+        return info
+
+    def _live_info_ttl_s(self) -> float:
+        """How long the cached shape may be used before it is re-read:
+        a QUARTER of the catalog's snapshot retention.
+
+        THE NUMBER IS NOT A GUESS, it is half of pyhoglake's own
+        threshold, and the factor-of-two is the only thing standing
+        between this sink and silently mis-partitioned files.
+
+        `Table._cache_is_usable` lets pyhoglake prepare against its
+        cached info while that cache is younger than retention/2; past
+        that, `_prepared_read` re-reads and the `read_snapshot` it sends
+        moves forward with it. Suppose the sink had no TTL. A pod runs
+        for an hour, an operator re-specs the table from
+        `identity(team_id)` to `bucket(team_id, 16)`, pyhoglake's cache
+        ages out and self-refreshes past the alter, and the next flush:
+        computes partition values from the sink's hour-old spec
+        (identity), passes pyhoglake's only structural check on them
+        (arity, which is 1 either way), passes the footer/schema compare
+        (no column changed), and commits with a `read_snapshot` NEWER
+        than the alter — so the conflict scan finds nothing, the server
+        accepts, and the files are stamped with the live spec_id while
+        carrying values computed under the old transform. Every future
+        scan prunes them wrongly, forever, with nothing anywhere saying
+        so. That is the hazard the deleted pre-commit table read used to
+        catch, and a TTH strictly shorter than pyhoglake's is what
+        replaces it: the sink always re-reads FIRST, so the spec it
+        computes under is never older than the basis the commit carries.
+        Expressed as an invariant — THIS CACHE IS NEVER STALER THAN
+        `Table._cache` — which holds by construction because every
+        refresh here goes through `table.info()`, which re-seeds that
+        cache in the same call.
+
+        Retention comes from `Catalog._retention_seconds()`: the SAME
+        cached value pyhoglake's own threshold is computed from, so the
+        two cannot disagree about the period even when an operator
+        shortens retention live and one side has not noticed yet. It is
+        one options GET per Catalog object, not per flush, so this stays
+        a zero-request check in steady state. A private accessor, hence
+        the guard: a pyhoglake that renames it falls back to the same
+        assumed retention pyhoglake assumes when it cannot read one,
+        which keeps the factor-of-two intact.
+
+        `inf` (retention disabled) is correct as "never re-read for
+        staleness": with no expiry floor pyhoglake's cache never ages
+        out either, so its `read_snapshot` stays pinned at the sink's own
+        read and any later alter is INSIDE the conflict window — the
+        commit is refused rather than accepted wrong. The invariant holds
+        trivially there; it is the finite case that needs the quarter.
+        """
+        read = getattr(self._catalog, "_retention_seconds", None)
+        if read is None:
+            return _ASSUMED_RETENTION_S / 4
+        try:
+            retention = read()
+        except Exception:  # noqa: BLE001 - a retention read must never fail a flush
+            return _ASSUMED_RETENTION_S / 4
+        if not isinstance(retention, int | float) or isinstance(retention, bool) or retention <= 0:
+            # Includes a test double that answers something unusable:
+            # falling back is right, silently treating the TTL as zero or
+            # as infinite is not.
+            return _ASSUMED_RETENTION_S / 4
+        return float(retention) / 4
+
+    def _live_info_is_fresh(self) -> bool:
+        if self._live_info is None or self._live_info_read_at is None:
+            return False
+        return self._monotonic() - self._live_info_read_at < self._live_info_ttl_s()
+
+    def _table_info(self, table):
+        """The destination's live shape, from this sink's cached copy,
+        re-reading only on a cold cache or past `_live_info_ttl_s`.
+
+        ZERO TABLE READS PER STEADY-STATE FLUSH is the point, and the
+        correctness argument is not "the shape probably has not
+        changed". It is two things together, and neither is sufficient
+        alone:
+
+        * THE CONFLICT WINDOW. The commit carries the `read_snapshot`
+          this shape was resolved at, and the server refuses it if
+          anything altered, dropped or recreated the table since —
+          atomically, zero rows written, as the typed
+          `ddl_since_read_snapshot` (or 410 when the basis itself
+          expired), after which `_destination_moved` drops this cache and
+          the flush rebuilds against a fresh read.
+        * THE TTL, because the window only covers drift that is INSIDE
+          it. pyhoglake refreshes its own cache at retention/2 and the
+          `read_snapshot` moves forward with it, so a spec change older
+          than that would be outside the window with nothing on the file
+          to contradict it. Re-reading at retention/4 keeps this cache
+          at least as fresh as pyhoglake's, which is what keeps every
+          spec change the commit cannot see from existing. See
+          `_live_info_ttl_s` for the worked example.
+
+        So, precisely:
+
+        * COLUMN drift is caught without the TTL. pyhoglake builds the
+          destination schema from its OWN (possibly fresher) read and
+          compares it against the encoded parquet footer, so a column
+          this copy has not seen is a `ValidationError` —
+          `write()`'s alignment self-heal answers it by re-reading,
+          null-filling and preparing once more.
+        * SPEC drift is caught by the TTL plus the conflict window, as
+          above. Nothing on the file or in the request encodes the
+          transform a partition value was computed under, which is why
+          there is no third mechanism to fall back on.
+        * A DROP + RECREATE is covered by NEITHER: the conflict scan
+          keys on the resolved (new) table id, so the old incarnation's
+          `table_dropped` row is outside its window. It is closed solely
+          by `expected_table_uuid` -> 409 `table_recreated`, which
+          `_prepare` pins to the resolved-and-reconciled incarnation.
+
+        The periodic re-read is also the ONLY place a long-lived pod can
+        notice that config and the live layout have diverged, so it runs
+        `_reconcile_specs` on the info it just read. Without that, the
+        "a pod that disagrees with the table it writes to stops" rule
+        the README advertises only ever fired at pod start, and a
+        re-spec under a running fleet produced the silent mis-partitioning
+        above on every pod that had not restarted.
+
+        `totals=False` on the read: the writer needs the uuid, the
+        columns and the specs. The totals are a count and two sums over
+        every live file row of the table, which on prod-us is ~15M rows
+        and the whole cost of the call, and nothing in this sink has ever
+        read one.
+        """
+        if self._live_info_is_fresh():
+            return self._live_info
+        info = self._adopt_info(table.info(totals=False))
+        # Against the info just read, so this costs no second request —
+        # and AFTER the adopt, because the comparison resolves config
+        # column names through `self._live_columns`.
+        self._reconcile_specs(table, info)
+        # `_reconcile_specs` may declare a missing spec, which re-adopts
+        # a post-alter info; return the field rather than the local.
+        return self._live_info
 
     def _evolve_and_align(self, table, batch: pa.Table) -> pa.Table:
         """Reconcile the batch schema with the live table schema.
@@ -2139,8 +2544,7 @@ class HoglakeSink:
             return failed
         if len(add_ops) > 1:
             try:
-                info = table.alter(add_ops)
-                self._adopt_columns(info.columns)
+                self._adopt_info(table.alter(add_ops))
                 metrics.schema_columns_added_total.inc(len(add_ops))
                 return failed
             except HoglakeError as e:
@@ -2160,14 +2564,13 @@ class HoglakeSink:
             return False
         log.info("Schema evolution: adding hoglake column %s (%s)", field.name, type_name)
         try:
-            info = table.alter([ops.add_column(field.name, field.type)])
-            self._adopt_columns(info.columns)
+            self._adopt_info(table.alter([ops.add_column(field.name, field.type)]))
             metrics.schema_columns_added_total.inc()
             return True
         except CommitConflictError:
             # Concurrent DDL — typically another pod adding the same
             # column. Re-resolve; present means someone won the race.
-            self._adopt_columns(table.info().columns)
+            self._adopt_info(table.info(totals=False))
             if field.name in self._live_columns:
                 log.info("Column %s added by another writer, continuing", field.name)
                 return True
@@ -2185,11 +2588,10 @@ class HoglakeSink:
         cast decides per value."""
         log.info("Schema evolution: promoting hoglake column %s from %s to %s", name, from_type, to_type)
         try:
-            info = table.alter([ops.promote_column(name, to_type)])
-            self._adopt_columns(info.columns)
+            self._adopt_info(table.alter([ops.promote_column(name, to_type)]))
             metrics.schema_columns_widened_total.inc()
         except CommitConflictError:
-            self._adopt_columns(table.info().columns)
+            self._adopt_info(table.info(totals=False))
             live = self._live_columns.get(name)
             if live is not None and live.type == to_type:
                 log.info("Column %s promoted by another writer, continuing", name)

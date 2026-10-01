@@ -6,9 +6,19 @@
 # bound to 127.0.0.1 so this stack can coexist with a live hoglake dev
 # environment on the same machine.
 #
-# Server image: ghcr.io/posthog/hoglake-server:latest by default;
-# override with HOGLAKE_SERVER_IMAGE (e.g. an image built from a local
-# hoglake checkout's server/Dockerfile).
+# Server image: HOGLAKE_SERVER_IMAGE, and it is REQUIRED (`:?`) rather
+# than defaulted. tests/hoglake_stack/stack.py sets it from DEFAULT_IMAGE
+# — a pinned multi-arch digest — on every compose call, and an operator
+# overrides it in the environment to run against a locally built server
+# (e.g. an image from a hoglake checkout's server/Dockerfile).
+#
+# It used to default to `:latest`, and that default silently WON: the
+# only thing stack.py did with DEFAULT_IMAGE was `docker pull` it, so
+# the digest was downloaded and the container ran whatever `:latest`
+# resolved to locally. These suites are contract tests — a stale
+# `:latest` means they assert a server nobody chose, and a green run
+# proves nothing. Mandatory here so a bare `docker compose up` in this
+# directory fails loudly instead of resurrecting the old behaviour.
 #
 # The `e2e` profile adds a single-node KRaft Kafka for the end-to-end
 # pipeline test; the integration tests don't boot it.
@@ -49,7 +59,7 @@ services:
       retries: 15
 
   hoglake-server:
-    image: ${HOGLAKE_SERVER_IMAGE:-ghcr.io/posthog/hoglake-server:latest}
+    image: ${HOGLAKE_SERVER_IMAGE:?set by tests/hoglake_stack/stack.py (DEFAULT_IMAGE, or your own override)}
     environment:
       HOGLAKE_INSTANCE_NAME: millpond-hog-it
       HOGLAKE_JDBC_URL: jdbc:postgresql://postgres:5432/hoglake

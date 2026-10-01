@@ -20,6 +20,7 @@ from pyhoglake import (
     AlreadyExistsError,
     Column,
     CommitConflictError,
+    DdlSinceReadSnapshotError,
     ExpiredError,
     HoglakeError,
     IncarnationChangedError,
@@ -27,6 +28,7 @@ from pyhoglake import (
     NotFoundError,
     PartitionField,
     PartitionSpec,
+    ReadSnapshotExpiredError,
     UnsupportedTypeError,
     ValidationError,
 )
@@ -90,6 +92,76 @@ class _FakeInfo:
     table_uuid: str = TABLE_UUID
 
 
+def _wire_info(table, state):
+    """Make `table.info` answer the live state AND refuse a read that
+    asks for the live totals.
+
+    The sink has never read a total, and the scan that produces one is a
+    count plus two sums over every live file row of the table — ~15M on
+    prod-us, which is the whole cost of the call. The enforcement is
+    here, per call, rather than only in an after-the-fact loop over
+    `call_args_list`: a loop asserts what the calls looked like in the
+    one test that checks them, while this asserts it at every call site
+    in every test, so a mutation that drops `totals=False` from ONE of
+    the four (`_table_info`, `_declare_specs`'s conflict path,
+    `_add_column`, `_promote_column`) fails in the test that exercises
+    that site.
+
+    Tests that need `info` to answer differently over time replace this
+    side_effect with their own; `_info_sequence` keeps the totals guard
+    for them.
+    """
+    table.info.side_effect = _guarded_info(lambda: state)
+
+
+def _guarded_info(answer):
+    """An `info` stand-in that asserts `totals=False` and then defers to
+    `answer()` for the TableInfo to return."""
+
+    def info(*args, **kwargs):
+        assert kwargs.get("totals") is False, (
+            f"table.info() called with totals={kwargs.get('totals')!r}: every read on the writer "
+            "path must pass totals=False (the live-totals scan is the whole cost of the call)"
+        )
+        return answer()
+
+    return info
+
+
+def _set_info(table, info):
+    """Point `table.info` at a new TableInfo, keeping the totals guard.
+
+    Assigning `table.info.return_value` does NOT work: `_wire_info`
+    installs a `side_effect`, which Mock consults first, so the
+    assignment would be silently ignored and the test would keep seeing
+    the original state. (It was, for three tests, until the guard went
+    in.) Go through here.
+    """
+    table.info.side_effect = _guarded_info(lambda: info)
+
+
+def _set_info_sequence(table, infos):
+    """`table.info` answers each of `infos` in turn and then repeats the
+    last, keeping the totals guard.
+
+    For the concurrent-DDL paths, where the POINT is that two reads of
+    the same table disagree: the resolve sees the shape before another
+    writer's alter and the post-409 re-resolve sees it after. A single
+    `_set_info` cannot express that, and using one made
+    `test_conflict_on_add_reresolves_and_proceeds` vacuous for as long
+    as it existed — the pre-set shape already contained the column, so
+    no add was ever attempted and the 409 handler it was named for never
+    ran.
+    """
+    remaining = list(infos)
+    assert remaining, "need at least one info"
+
+    def answer():
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    table.info.side_effect = _guarded_info(answer)
+
+
 def _wire_dynamic_alter(table, state: _FakeInfo):
     """Make the mock table's alter() behave like the real server: apply
     the ops to the live table state and return the post-alter info,
@@ -123,41 +195,91 @@ def _wire_dynamic_alter(table, state: _FakeInfo):
     table.alter.side_effect = do_alter
 
 
-# Captured before the autouse fixture below replaces it: one test needs
-# the REAL serializer, because everything else in this file asserts on
-# the in-memory table that reaches `pq.write_table` and therefore never
-# exercises the cast or the file it produces.
-_REAL_WRITE_TABLE = pq.write_table
-
+# The groups the sink handed to `prepare_append_tables`, newest flush
+# last — (partition_values, pa.Table) pairs, in the order the fanout
+# produced them. The sink no longer writes parquet to disk at all: it
+# encodes each already-partitioned Arrow table in pyhoglake, so the batch
+# that lands in the lake is the one that reaches `prepare_append_tables`,
+# which is what these tests assert on. `_PREPARED_GROUPS` keeps every
+# group of every flush; `_WRITTEN` is the flattened table list the
+# `_published` helper reads.
+_PREPARED_GROUPS: list[list[tuple[tuple[str | None, ...] | None, pa.Table]]] = []
 _WRITTEN: list[pa.Table] = []
 
 
 @pytest.fixture(autouse=True)
-def _capture_parquet(monkeypatch):
-    """Capture what the sink serializes instead of writing it to disk.
+def _capture_parquet():
+    """Reset the per-test capture of what the sink prepared.
 
-    The sink no longer hands pyarrow tables to `Table.append`: it writes
-    local parquet, uploads it, and registers the upload in a separate
-    idempotent commit. The batch that lands in the lake is therefore the
-    one that reaches `pq.write_table`, which is what these tests assert
-    on."""
+    Nothing is monkeypatched any more — the capture happens in
+    `_wire_prepared_commit`'s stand-in for `prepare_append_tables`, which
+    is where the Arrow tables now arrive. The fixture stays autouse so a
+    test that reads `_published()` cannot see the previous test's
+    groups."""
+    _PREPARED_GROUPS.clear()
     _WRITTEN.clear()
-    monkeypatch.setattr(hoglake.pq, "write_table", lambda table, path, **kw: _WRITTEN.append(table))
     return _WRITTEN
 
 
+def _orphans(mock_metrics) -> list[tuple[str, int]]:
+    """Every orphan increment booked on a patched metrics module, as
+    (reason, count) in call order.
+
+    The counter is labeled now, so `.inc` lives on the child
+    `.labels(...)` returns — one shared mock whatever the label value, so
+    the reasons and the counts have to be paired by index. That is sound
+    here because `_count_orphans` is the only writer and it labels
+    immediately before it increments; this helper asserts the two lists
+    are the same length so a future call site that breaks the pairing
+    fails loudly instead of reporting a wrong reason.
+
+    Asserting on the pair rather than the count alone is the point: the
+    reason label is what tells a routine shutdown orphan from a re-spec
+    refusing every flush, and an unasserted label is a label that drifts.
+    """
+    metric = mock_metrics.hoglake_orphaned_files_total
+    reasons = [call.kwargs["reason"] for call in metric.labels.call_args_list]
+    counts = [call.args[0] for call in metric.labels.return_value.inc.call_args_list]
+    assert len(reasons) == len(counts), (
+        f"{len(reasons)} labels() call(s) against {len(counts)} inc() call(s): "
+        "something increments the orphan counter without labeling it, or vice versa"
+    )
+    return list(zip(reasons, counts, strict=True))
+
+
 def _published(_table=None) -> pa.Table:
-    """The (single) batch the last flush serialized for upload."""
+    """The (single) batch the last flush prepared for upload."""
     assert _WRITTEN, "nothing was written"
     return _WRITTEN[-1]
 
 
-def _wire_prepared_commit(table, catalog):
-    """Mock the prepared-append handshake: prepare_append_files returns a
-    commit request naming one file per partition group, and
-    Catalog.commit_prepared publishes it."""
+def _groups() -> list[tuple[tuple[str | None, ...] | None, pa.Table]]:
+    """The (partition_values, table) groups of the last flush."""
+    assert _PREPARED_GROUPS, "nothing was prepared"
+    return _PREPARED_GROUPS[-1]
 
-    def prepare(files, *, idempotency_key, expected_table_uuid=None, **kwargs):
+
+def _real_encode(group: pa.Table) -> pa.Table:
+    """`group` through a real parquet round trip, the way pyhoglake's
+    `_encode_group` does it (buffer, not a temp file).
+
+    The mock `prepare_append_tables` below never serializes, so a test
+    that cares about the FILE — the cast, the logical annotations, the
+    column order the footer carries — has to encode one itself. This is
+    the same two calls pyhoglake makes (`pq.write_table` into a
+    `BufferOutputStream`, then read the footer back), so what it proves
+    is what the destination would be sent."""
+    sink = pa.BufferOutputStream()
+    pq.write_table(group, sink)
+    return pq.ParquetFile(pa.BufferReader(sink.getvalue()))
+
+
+def _wire_prepared_commit(table, catalog):
+    """Mock the prepared-append handshake: prepare_append_tables captures
+    the Arrow groups and returns a commit request naming one file per
+    group, and Catalog.commit_prepared publishes it."""
+
+    def prepare(groups, *, idempotency_key, expected_table_uuid=None, **kwargs):
         # pyhoglake pins the guard to the incarnation the CALLER names
         # (`expected = expected_table_uuid or self.table_uuid`) and then
         # fast-fails, BEFORE the first upload, when the name now binds to
@@ -169,6 +291,19 @@ def _wire_prepared_commit(table, catalog):
             raise IncarnationChangedError(
                 f"table was recreated: expected table_uuid {expected}, name now resolves to {table.table_uuid}"
             )
+        # The real method REQUIRES each group's schema to be the
+        # destination's, field ids included, and checks it on the encoded
+        # footer. Assert the half a mock can assert — that the field ids
+        # are on the schema the sink handed over — so a sink that stopped
+        # casting to `columns_to_arrow_schema(info.columns)` fails here
+        # rather than in the live suite.
+        for part, _values in groups:
+            for field in part.schema:
+                assert field.metadata and b"PARQUET:field_id" in field.metadata, (
+                    f"group schema field {field.name!r} carries no PARQUET:field_id"
+                )
+        _PREPARED_GROUPS.append([(values, part) for part, values in groups])
+        _WRITTEN.extend(part for part, _values in groups)
         return {
             "idempotency_key": idempotency_key,
             "read_snapshot": 41,
@@ -178,14 +313,21 @@ def _wire_prepared_commit(table, catalog):
                     "table": "events",
                     "expected_table_uuid": expected,
                     "files": [
-                        {"path": f"s3://bucket/lake/{idempotency_key}/{i}.parquet", "partition_values": values}
-                        for i, (_path, values) in enumerate(files)
+                        # `list(values)`, as the real `prepare_append_tables`
+                        # writes it (and omitted entirely for an
+                        # unpartitioned table, which is what `values is
+                        # None` means here).
+                        {
+                            "path": f"s3://bucket/lake/{idempotency_key}/{i}.parquet",
+                            **({} if values is None else {"partition_values": list(values)}),
+                        }
+                        for i, (_part, values) in enumerate(groups)
                     ],
                 }
             ],
         }
 
-    table.prepare_append_files.side_effect = prepare
+    table.prepare_append_tables.side_effect = prepare
     catalog.commit_prepared.return_value = MagicMock(snapshot_id=7, schema_version=1)
 
 
@@ -199,10 +341,17 @@ def _mock_stack(columns, partition_spec=None, sort_spec=None):
     state = _FakeInfo(columns=tuple(columns), partition_spec=partition_spec, sort_spec=sort_spec)
     table.columns = state.columns
     table.table_uuid = state.table_uuid
-    table.info.return_value = state
+    _wire_info(table, state)
     table.state = state
     _wire_dynamic_alter(table, state)
     client.catalog.return_value = catalog
+    # The catalog's snapshot retention, which is what the sink's cached
+    # shape derives its TTL from (`_live_info_ttl_s` = retention/4, half
+    # pyhoglake's own threshold). A real number, not a Mock: the sink
+    # falls back to an assumed retention for anything unusable, and a
+    # test driving the TTL against the fallback would be testing a
+    # number no deployment has.
+    catalog._retention_seconds.return_value = 3600.0
     # A real string, because the startup credential probe derives the
     # object-store prefix from it: a MagicMock data_path would let a
     # probe that never formed a usable path still look healthy.
@@ -259,7 +408,7 @@ _URI_BASE = "s3://bucket/lake/data/analytics/events/9a1f0f0e-0000-0000-0000-0000
 
 def _stamped(exc: BaseException, count: int, uris: tuple[str, ...] | None = None) -> BaseException:
     """An exception as pyhoglake>=1.1.1 hands it back from
-    `prepare_append_files`: `uploaded_files` is how many uploads CLOSED
+    `prepare_append_tables`: `uploaded_files` is how many uploads CLOSED
     cleanly and `uploaded_uris` names exactly those, in order. A refusal
     raised before the first upload carries 0 / ()."""
     exc.uploaded_files = count
@@ -720,35 +869,33 @@ class TestUuidColumnWireForm:
             _col("_inserted_at", "timestamptz", 5, 5),
         ]
 
-    def _written(self, monkeypatch):
-        monkeypatch.setattr(hoglake.pq, "write_table", _REAL_WRITE_TABLE)
+    def _written(self):
+        """The parquet file this flush's single group encodes to.
+
+        The sink hands Arrow tables to `prepare_append_tables` now, so
+        the file is produced HERE, by the same buffer round trip
+        pyhoglake's `_encode_group` performs. What it proves is
+        unchanged: the destination schema `_prepare` casts to is what
+        decides the file's physical type and logical annotation."""
         s, client, catalog, ns, table = _sink(columns=self._uuid_columns())
-        captured: dict[str, list] = {}
-        prepared = table.prepare_append_files.side_effect
-
-        def prepare(files, **kwargs):
-            captured["files"] = [pq.ParquetFile(path) for path, _ in files]
-            return prepared(files, **kwargs)
-
-        table.prepare_append_files.side_effect = prepare
         batch = coerce_typed_columns(
             pa.table({"uuid": [self.RAW], "event": ["e"], "team_id": [1]}),
             (("uuid", "uuid"),),
         )
         s.write(batch)
-        return captured["files"][0]
+        return _real_encode(_published())
 
-    def test_coerced_column_aligns_to_the_live_uuid_column(self, monkeypatch):
+    def test_coerced_column_aligns_to_the_live_uuid_column(self):
         # No add_column, no promote: `pa.uuid()` already IS the live type,
         # and since pyhoglake 1.3.0 it is also the type the destination schema
         # names, so `_prepare`'s cast is a no-op rather than a downgrade.
-        pf = self._written(monkeypatch)
+        pf = self._written()
         assert pf.schema.column(0).name == "uuid"
         assert pf.schema.column(0).physical_type == "FIXED_LEN_BYTE_ARRAY"
         assert pf.schema.column(0).length == 16
         assert pf.read().column("uuid").to_pylist() == [uuid.UUID(self.RAW)]
 
-    def test_uploaded_parquet_carries_the_uuid_logical_annotation(self, monkeypatch):
+    def test_uploaded_parquet_carries_the_uuid_logical_annotation(self):
         """The file carries the parquet `LogicalTypeAnnotation.uuidType()` an
         Iceberg reader binds a uuid column through — the Trino hoglake
         connector among them.
@@ -758,14 +905,14 @@ class TestUuidColumnWireForm:
         `uuid` column with plain `pa.binary(16)` (`types.py`
         `coltype_to_arrow`), for which pyarrow stamps no logical type at all.
         Casting to `pa.uuid()` from the millpond side instead did produce the
-        annotation and then had the file REFUSED, because
-        `prepare_append_files` compared
+        annotation and then had the file REFUSED, because the
+        prepared-append path compared
         `parquet.schema_arrow.equals(columns_to_arrow_schema(...))` exactly —
         so the two spellings had to move together, which is what 1.3.0 did:
         `coltype_to_arrow("uuid")` returns `pa.uuid()` and append accepts
         either spelling. Nothing on this side changed; the pin did the work.
         """
-        pf = self._written(monkeypatch)
+        pf = self._written()
         assert pf.schema.column(0).logical_type.type == "UUID"
         assert pf.schema_arrow.field("uuid").type == pa.uuid()
 
@@ -1040,7 +1187,7 @@ class TestReservedCollision:
         with pytest.raises(ValueError, match="Hoglake-reserved"):
             s.write(pa.table({"_inserted_at": ["x"], "uuid": ["a"]}))
         ns.table.assert_not_called()
-        table.prepare_append_files.assert_not_called()
+        table.prepare_append_tables.assert_not_called()
 
     @pytest.mark.parametrize("name", ["year", "month", "day", "hour"])
     def test_hive_names_are_ordinary_columns_for_hoglake(self, name):
@@ -1223,6 +1370,40 @@ class TestBootstrapSpecs:
         assert fields[1]["source_field_id"] == 5  # _inserted_at
         assert fields[1]["transform"] == "month"
 
+    def test_a_spec_ddl_race_verifies_the_winners_spec_instead_of_trusting_it(self):
+        """The create-then-declare window with two pods in it: both
+        declare the same config-identical specs, the loser gets a 409,
+        and it re-reads rather than assuming the winner declared what it
+        would have.
+
+        The re-read is the point and it had no test — `_declare_specs`'
+        `except CommitConflictError` arm is one of the sink's three
+        concurrent-DDL re-resolves, and the only thing standing between
+        "the winner declared the same thing" (an assumption) and
+        `_verify_specs` proving it.
+        """
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, ns, table = self._create_flow(cfg)
+        table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
+        # What the winner actually declared, which is what the loser's
+        # re-read has to return for the verification to pass.
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "identity"))))
+        assert s.write(_batch()) == 1
+        assert table.info.called, "the losing pod must re-read rather than trust the winner"
+
+    def test_a_spec_ddl_race_whose_winner_declared_something_else_still_stops(self):
+        # The verification is not decoration: if the re-read shows a
+        # layout config did not ask for, the pod stops rather than
+        # writing under it. (A 409 from a pod with DIFFERENT config is
+        # exactly how that happens.)
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, ns, table = self._create_flow(cfg)
+        table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "bucket", 16))))
+        with pytest.raises(RuntimeError, match="partition spec"):
+            s.write(_batch())
+        assert s._table is None  # nothing cached: the next attempt re-checks
+
     def test_bucket_param_carried(self):
         cfg = _cfg(hoglake_partition_by=(("team_id", "bucket", 16),))
         s, ns, table = self._create_flow(cfg)
@@ -1301,7 +1482,7 @@ class TestSpecDeclarationIsAtomicOrRecoverable:
                 s.write(_batch())
             s.reset_caches()
         assert table.alter.call_count == 3
-        table.prepare_append_files.assert_not_called()
+        table.prepare_append_tables.assert_not_called()
 
     def test_post_condition_catches_a_spec_the_server_did_not_apply(self):
         # Belt and braces: if the alter reports success but the live spec
@@ -1405,7 +1586,7 @@ class TestSteadyStateWrite:
         s, *_, table = _sink()
         out = s.write(_batch())
         assert out == 1
-        assert table.prepare_append_files.call_count == 1
+        assert table.prepare_append_tables.call_count == 1
 
     def test_inserted_at_stamped_once_per_flush(self):
         s, *_, table = _sink()
@@ -1450,13 +1631,64 @@ class TestEvolution:
     def test_conflict_on_add_reresolves_and_proceeds(self, mock_metrics):
         # Another writer added the column concurrently: the 409 must not
         # fail the flush; re-resolve shows the column present.
+        #
+        # The two reads have to DISAGREE for this to test anything. With
+        # one pre-set shape that already carried `new_col`, the bootstrap
+        # resolve adopted it, `_evolve_and_align` found nothing to add,
+        # and the 409 handler this test is named for never executed —
+        # which is how it passed for months while covering nothing. The
+        # sequence is: resolve sees the old schema (so the add is
+        # attempted and conflicts), re-resolve sees the other writer's
+        # column.
         cols_after = _EVENTS_COLUMNS + [_col("new_col", "string", 6, 6)]
         s, client, catalog, ns, table = _sink()
         table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
-        table.info.return_value = _FakeInfo(columns=tuple(cols_after))
+        _set_info_sequence(
+            table,
+            [_FakeInfo(columns=tuple(_EVENTS_COLUMNS)), _FakeInfo(columns=tuple(cols_after))],
+        )
         s.write(pa.table({"uuid": ["a"], "new_col": ["x"]}))
+        add_ops = [o for c in table.alter.call_args_list for o in c.args[0] if o.op == "add_column"]
+        assert [o.body["column"]["name"] for o in add_ops] == ["new_col"], "the add was never attempted"
         appended = _published(table)
         assert "new_col" in appended.column_names
+        assert appended.column("new_col").to_pylist() == ["x"]
+
+    @patch("millpond.hoglake.metrics")
+    def test_conflict_on_promote_reresolves_and_proceeds(self, mock_metrics):
+        # The same race on the OTHER evolution op, which had no test at
+        # all: two pods both widen `team_id` long->... no, `count`
+        # int->long, one of them loses the DDL race, and the loser's
+        # re-resolve shows the column already at the target type. Same
+        # posture as the add: degrade, do not fail the flush.
+        cols_before = _EVENTS_COLUMNS + [_col("count", "int", 6, 6)]
+        cols_after = _EVENTS_COLUMNS + [_col("count", "long", 6, 6)]
+        s, client, catalog, ns, table = _sink(columns=cols_before)
+        table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
+        _set_info_sequence(
+            table,
+            [_FakeInfo(columns=tuple(cols_before)), _FakeInfo(columns=tuple(cols_after))],
+        )
+        s.write(pa.table({"uuid": ["a"], "count": pa.array([7], pa.int64())}))
+        promote_ops = [o for c in table.alter.call_args_list for o in c.args[0] if o.op == "promote_column"]
+        assert promote_ops and promote_ops[0].body == {"name": "count", "to": "long"}
+        # The winner's widening is what the flush writes against.
+        assert _published(table).column("count").type == pa.int64()
+        mock_metrics.schema_columns_widened_total.inc.assert_called_once()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_promote_conflict_the_winner_did_not_resolve_degrades(self, mock_metrics):
+        # The other half: the 409 was not another pod declaring the same
+        # widening, so the re-resolve still shows the narrow type. The
+        # column stays as it is and the append-side cast decides per
+        # value — logged and metricked, never fatal.
+        cols_before = _EVENTS_COLUMNS + [_col("count", "int", 6, 6)]
+        s, client, catalog, ns, table = _sink(columns=cols_before)
+        table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
+        _set_info(table, _FakeInfo(columns=tuple(cols_before)))
+        assert s.write(pa.table({"uuid": ["a"], "count": pa.array([7], pa.int64())})) == 1
+        mock_metrics.schema_columns_widened_total.inc.assert_not_called()
+        mock_metrics.errors_total.labels.assert_any_call(type="schema")
 
     @patch("millpond.hoglake.metrics")
     def test_several_new_columns_share_one_alter(self, mock_metrics):
@@ -1533,29 +1765,26 @@ class TestEvolution:
         s, *_, table = _sink()
         s.write(pa.table({"uuid": ["a"], "team_id": pa.array([None], type=pa.string())}))
         assert table.alter.call_count == 0
-        assert table.prepare_append_files.call_count == 1
+        assert table.prepare_append_tables.call_count == 1
 
 
 class TestRealSerialization:
-    """Every other test here reads the in-memory table handed to
-    `pq.write_table`, which the autouse fixture replaces with a no-op —
-    so the cast and the file it produces were never unit-exercised at
-    all. This one writes real parquet and reads it back."""
+    """Every other test here reads the in-memory Arrow table the sink
+    handed to `prepare_append_tables`, which the mock never serializes —
+    so the parquet that lands in the lake was never unit-exercised at
+    all. This one encodes it the way pyhoglake's `_encode_group` does
+    (into a buffer, no temp file) and reads the footer back.
 
-    def test_the_file_written_is_the_table_cast_to_the_destination(self, monkeypatch):
-        monkeypatch.setattr(hoglake.pq, "write_table", _REAL_WRITE_TABLE)
+    The disk path this replaced wrote a real temp file per group and read
+    it with `pq.read_table`. Same two assertions, one less filesystem:
+    `_prepare` casts to the destination schema and pyhoglake encodes
+    exactly what it is given."""
+
+    def test_the_file_written_is_the_table_cast_to_the_destination(self):
         s, client, catalog, ns, table = _sink()
-        captured: dict[str, list] = {}
-        prepared = table.prepare_append_files.side_effect
-
-        def prepare(files, **kwargs):
-            captured["files"] = [pq.read_table(path) for path, _ in files]
-            return prepared(files, **kwargs)
-
-        table.prepare_append_files.side_effect = prepare
         # team_id arrives as int32; the live column is `long`.
         s.write(pa.table({"uuid": ["a"], "team_id": pa.array([5], type=pa.int32())}))
-        written = captured["files"][0]
+        written = _real_encode(_published()).read()
         # Column ORDER is the destination's, not the batch's: the
         # prepared path compares schemas position by position.
         assert written.schema.names == [c.name for c in _EVENTS_COLUMNS]
@@ -1565,21 +1794,25 @@ class TestRealSerialization:
         assert written.column("_inserted_at").null_count == 0
         assert written.column("properties").null_count == 1  # absent upstream, null-filled
 
-    def test_a_partitioned_flush_writes_one_real_file_per_tuple(self, monkeypatch):
-        monkeypatch.setattr(hoglake.pq, "write_table", _REAL_WRITE_TABLE)
+    def test_the_encoded_file_carries_the_destination_field_ids(self):
+        # The comparison `prepare_append_tables` actually runs is on the
+        # ENCODED footer, field ids included — so a group whose schema
+        # carries them is only half the proof; they have to survive the
+        # encode. `PARQUET:field_id` metadata is what pyarrow writes into
+        # the parquet SchemaElement slots.
+        s, client, catalog, ns, table = _sink()
+        s.write(pa.table({"uuid": ["a"], "team_id": pa.array([5], type=pa.int32())}))
+        schema = _real_encode(_published()).schema_arrow
+        ids = [int(schema.field(c.name).metadata[b"PARQUET:field_id"]) for c in _EVENTS_COLUMNS]
+        assert ids == [c.field_id for c in _EVENTS_COLUMNS]
+
+    def test_a_partitioned_flush_writes_one_real_file_per_tuple(self):
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        captured: dict[str, list] = {}
-        prepared = table.prepare_append_files.side_effect
-
-        def prepare(files, **kwargs):
-            captured["files"] = [(values, pq.read_table(path)) for path, values in files]
-            return prepared(files, **kwargs)
-
-        table.prepare_append_files.side_effect = prepare
         s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [3, 1, 3]}))
-        assert [values for values, _ in captured["files"]] == [("3",), ("1",)]
-        assert [t.column("uuid").to_pylist() for _, t in captured["files"]] == [["a", "c"], ["b"]]
+        files = [(values, _real_encode(part).read()) for values, part in _groups()]
+        assert [values for values, _ in files] == [("3",), ("1",)]
+        assert [t.column("uuid").to_pylist() for _, t in files] == [["a", "c"], ["b"]]
 
 
 class TestPartitionGrouping:
@@ -1728,7 +1961,7 @@ class TestIdempotentPublication:
         # and that handle is a NAME, not an incarnation. A drop+recreate
         # underneath it used to be invisible to every guard at once:
         # `_prepare`'s own `table.info()` rebases pyhoglake's pinned
-        # `_info` onto the new incarnation before `prepare_append_files`
+        # `_info` onto the new incarnation before `prepare_append_tables`
         # reads `self.table_uuid` off it, so the client's pre-flight, the
         # server's `expected_table_uuid` and
         # `_check_destination_still_ours` all compared fresh against
@@ -1744,7 +1977,7 @@ class TestIdempotentPublication:
         assert s.write(_rows(2), kafka_offsets=(("events", 0, 0, 1),)) == 2
 
         reborn = "deadbeef-0000-0000-0000-000000000000"
-        table.info.return_value = _FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid=reborn)
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid=reborn))
         table.table_uuid = reborn
 
         with pytest.raises(IncarnationChangedError):
@@ -1754,7 +1987,7 @@ class TestIdempotentPublication:
         # The pre-flight refuses before the first upload, so there is no
         # orphan to count and counting one would send an operator
         # sweeping for an object that does not exist.
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+        assert _orphans(mock_metrics) == []
 
         # Retryable: main.py resets caches, the next attempt re-resolves
         # — which is what finally puts the recreated table through
@@ -1778,15 +2011,25 @@ class TestIdempotentPublication:
         assert payload["idempotency_key"] == self._key(s, self.OFFSETS)
         assert payload["author"] == "millpond/events/0"
 
-    def test_payload_is_a_blind_append(self):
-        # prepare_append_files pins read_snapshot to the catalog head,
-        # and the server then 409s the commit if ANY DDL touched this
-        # table since — which for millpond means "another pod added a
-        # column". A frozen payload can never clear that conflict.
-        # Appends never conflict with appends, so the field comes off.
+    def test_the_payload_keeps_its_read_snapshot(self):
+        # The field used to come OFF here. `prepare_append_*` binds
+        # `read_snapshot` to the snapshot the table info was resolved at,
+        # and the server 409s the commit if any DDL touched this table
+        # since — which for millpond means "another pod added a column".
+        # A frozen payload can never clear that by replaying, and before
+        # the typed refusals the answer was an untyped retryable 409, so
+        # the sink stripped the field and bought itself a commit with no
+        # conflict window at all.
+        #
+        # Now the refusal is `ddl_since_read_snapshot` /
+        # `table_recreated` / a 410, each of which `_commit_prepared`
+        # answers by discarding the payload and rebuilding — the recovery
+        # a frozen payload actually has. So the basis stays on, which is
+        # what lets the server refuse a DDL race at all, and what
+        # HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS will require.
         s, client, catalog, ns, table = _sink()
         s.write(_batch(), kafka_offsets=self.OFFSETS)
-        assert "read_snapshot" not in catalog.commit_prepared.call_args.args[0]
+        assert catalog.commit_prepared.call_args.args[0]["read_snapshot"] == 41
 
     def test_retry_replays_the_same_payload_without_re_uploading(self):
         s, client, catalog, ns, table = _sink()
@@ -1796,7 +2039,7 @@ class TestIdempotentPublication:
         # The retry path invalidates caches first, exactly as main.py does.
         s.reset_caches()
         assert s.write(_rows(3), kafka_offsets=self.OFFSETS) == 3
-        assert table.prepare_append_files.call_count == 1  # no second upload
+        assert table.prepare_append_tables.call_count == 1  # no second upload
         first, second = (c.args[0] for c in catalog.commit_prepared.call_args_list)
         assert first == second  # byte-identical replay
 
@@ -1833,7 +2076,7 @@ class TestIdempotentPublication:
         s, client, catalog, ns, table = _sink()
         s.write(_batch(), kafka_offsets=self.OFFSETS)
         s.write(_batch(), kafka_offsets=(("events", 0, 42, 99),))
-        assert table.prepare_append_files.call_count == 2
+        assert table.prepare_append_tables.call_count == 2
         keys = {c.args[0]["idempotency_key"] for c in catalog.commit_prepared.call_args_list}
         assert len(keys) == 2
 
@@ -1848,11 +2091,11 @@ class TestIdempotentPublication:
             s.write(_rows(3), kafka_offsets=self.OFFSETS)
         moved_on = (("events", 0, 42, 99),)
         assert s.write(_rows(7), kafka_offsets=moved_on) == 7
-        assert table.prepare_append_files.call_count == 2  # rebuilt, not replayed
+        assert table.prepare_append_tables.call_count == 2  # rebuilt, not replayed
         sent = catalog.commit_prepared.call_args.args[0]
         assert sent["idempotency_key"] == self._key(s, moved_on)
         # The abandoned upload is an orphan and is counted as one.
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        assert _orphans(mock_metrics) == [("superseded", 1)]
 
     def test_a_retry_is_recognized_by_its_kafka_identity_not_by_a_re_derived_key(self):
         # The identity the payload was BUILT for is what makes a retry a
@@ -1873,31 +2116,41 @@ class TestIdempotentPublication:
             s.write(_rows(3), kafka_offsets=self.OFFSETS)
         s.reset_caches()
         reborn = "deadbeef-0000-0000-0000-000000000000"
-        table.info.return_value = _FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid=reborn)
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid=reborn))
         table.table_uuid = reborn
-        with pytest.raises(IncarnationChangedError):
+        # The replay is sent verbatim and the SERVER judges it: the
+        # payload's own `expected_table_uuid` still names the dead
+        # incarnation, so the commit comes back 409 `table_recreated`.
+        catalog.commit_prepared.side_effect = IncarnationChangedError(
+            "table_recreated", status_code=409, table="analytics.events"
+        )
+        with pytest.raises(hoglake.HoglakeSinkError, match="recreated"):
             s.write(_rows(3), kafka_offsets=self.OFFSETS)
-        assert table.prepare_append_files.call_count == 1  # replayed and judged, never rebuilt
+        assert table.prepare_append_tables.call_count == 1  # replayed and judged, never rebuilt
+        assert catalog.commit_prepared.call_args.args[0]["appends"][0]["expected_table_uuid"] == TABLE_UUID
 
-    def test_the_commit_time_lookup_never_becomes_the_reconciled_cache(self):
-        # `_live_table` resolves a bare handle for the pre-commit
-        # incarnation/spec check, and must not cache it: `self._table`
-        # means "resolved AND reconciled by `_ensure_table`", and a
-        # handle fetched here has been through neither. Caching it would
-        # let the next flush write under a layout this pod never checked
-        # against config.
+    def test_a_replay_resolves_nothing_and_leaves_no_reconciled_cache(self):
+        # The replay path short-circuits to the commit, so after a
+        # `reset_caches()` it touches neither the namespace nor the
+        # table: there is no handle to resolve and nothing to reconcile,
+        # and `self._table` must stay empty — that cache means "resolved
+        # AND reconciled by `_ensure_table`", and a flush writing under a
+        # layout this pod never checked against config is the thing it
+        # guards. (Before the pre-commit destination read was retired,
+        # this was a statement about `_live_table` deliberately not
+        # caching the bare handle it fetched. Now there is no such read,
+        # which is a stronger version of the same guarantee.)
         s, client, catalog, ns, table = _sink()
         catalog.commit_prepared.side_effect = [httpx.ReadTimeout("lost"), MagicMock(), MagicMock()]
         with pytest.raises(httpx.ReadTimeout):
             s.write(_rows(2), kafka_offsets=self.OFFSETS)
-        # main.py's retry path: caches dropped, so the replay's
-        # destination check is what resolves the handle.
         s.reset_caches()
+        resolves = ns.table.call_count
         assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
         assert s._table is None
+        assert ns.table.call_count == resolves  # the replay resolved nothing
         # ...and the consequence that makes it matter: the next ordinary
         # flush still goes through `_ensure_table`'s resolve-and-reconcile.
-        resolves = ns.table.call_count
         assert s.write(_rows(2), kafka_offsets=(("events", 0, 42, 43),)) == 2
         assert ns.table.call_count > resolves
 
@@ -1914,7 +2167,7 @@ class TestIdempotentPublication:
         with pytest.raises(httpx.ReadTimeout):
             s.write(_rows(3), kafka_offsets=())
         assert s.write(_rows(7), kafka_offsets=()) == 7
-        assert table.prepare_append_files.call_count == 2  # rebuilt, never replayed
+        assert table.prepare_append_tables.call_count == 2  # rebuilt, never replayed
 
     @patch("millpond.hoglake.metrics")
     def test_key_reused_with_a_different_payload_publishes_nothing(self, mock_metrics):
@@ -1944,24 +2197,51 @@ class TestIdempotentPublication:
         mock_metrics.hoglake_commit_replays_total.labels.assert_called_once_with(outcome="already_published")
         # The upload we just made is unreferenced and nothing will
         # reclaim it — say so in a metric rather than in nothing.
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        assert _orphans(mock_metrics) == [("already_published", 1)]
         assert s._prepared is None
 
-    def test_a_reused_key_against_a_recreated_table_is_not_accepted(self):
-        # A receipt from the PREVIOUS incarnation must never stand in for
-        # a publication to this one. (The key names the incarnation, so
-        # this is belt and braces on the same invariant.)
+    @patch("millpond.hoglake.metrics")
+    def test_a_receipt_is_only_accepted_for_this_incarnation(self, mock_metrics):
+        """A receipt from the PREVIOUS incarnation must never stand in for
+        a publication to this one.
+
+        This used to be checked by re-reading the table immediately
+        before the commit and comparing uuids. That read is gone, and the
+        invariant now rests on two things the server cannot get wrong:
+        the key NAMES the incarnation (`_flush_key` hashes
+        `self._table_uuid` in, so a receipt under this key was written by
+        a commit to this table_uuid — see
+        `test_key_names_the_table_incarnation`), and the payload carries
+        `expected_table_uuid`, which a recreated destination answers with
+        409 `table_recreated` rather than with a receipt. The 409 arrives
+        as a refusal, not an acceptance: nothing is published, the
+        payload is discarded and its upload is counted."""
         s, client, catalog, ns, table = _sink()
-        catalog.commit_prepared.side_effect = ValidationError(
-            "validation", status_code=422, detail="idempotency_key reused with a different request"
+        catalog.commit_prepared.side_effect = IncarnationChangedError(
+            "table_recreated",
+            status_code=409,
+            detail="table 'analytics.events' no longer has the expected UUID",
+            table="analytics.events",
         )
-        infos = [_FakeInfo(columns=tuple(_EVENTS_COLUMNS)), _FakeInfo(columns=tuple(_EVENTS_COLUMNS))]
-        infos.append(_FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid="deadbeef-0000-0000-0000-000000000000"))
-        table.info.side_effect = infos
-        with pytest.raises(IncarnationChangedError):
+        with pytest.raises(hoglake.HoglakeSinkError, match="recreated"):
             s.write(_rows(5), kafka_offsets=self.OFFSETS)
         assert s._prepared is None
+        mock_metrics.hoglake_commit_replays_total.labels.assert_not_called()
+        assert _orphans(mock_metrics) == [("table_recreated", 1)]
 
+    # NO UNIT TEST for the composite case "a reused-key 422 arrives for
+    # a FOREIGN incarnation". It used to live here as
+    # `test_a_reused_key_against_a_recreated_table_is_not_accepted`, and
+    # it worked by sequencing the pre-commit table read the sink no
+    # longer makes — so the unit-level version could only assert against
+    # a mechanism that is gone. The invariant it guarded is now two
+    # things, each tested on its own above (`table_uuid` is inside
+    # `_flush_key`, so a receipt under this key belongs to this
+    # incarnation; and the server answers a recreated destination with
+    # 409 `table_recreated` rather than from a receipt). The composite
+    # sequence itself is covered end to end against a real server by
+    # `test_a_recreated_table_does_not_answer_from_the_old_receipt` in
+    # tests/integration/test_hoglake_integration.py.
     @pytest.mark.parametrize(
         "detail",
         [
@@ -2022,10 +2302,13 @@ class TestRefusedCommitsDropThePayload:
 
     OFFSETS = (("events", 0, 30, 41),)
 
+    # The three typed "the destination moved" refusals are NOT here: they
+    # are converted to a retryable `HoglakeSinkError` and have their own
+    # class (`TestTypedDestinationMovedRefusals`), which asserts the same
+    # discard-and-re-resolve shape plus the cache drop they add.
     @pytest.mark.parametrize(
         "exc",
         [
-            IncarnationChangedError("table was recreated", status_code=409, detail="the table was recreated"),
             CommitConflictError("commit_conflict", status_code=409, detail="removal queue collision"),
             ValidationError("validation", status_code=422, detail="path outside the catalog data path"),
         ],
@@ -2037,13 +2320,13 @@ class TestRefusedCommitsDropThePayload:
         with pytest.raises(type(exc)):
             s.write(_rows(2), kafka_offsets=self.OFFSETS)
         assert s._prepared is None
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        assert _orphans(mock_metrics) == [("commit_refused", 1)]
         # The next attempt (main.py resets caches first) rebuilds rather
         # than re-sending a request the server already judged.
         catalog.commit_prepared.side_effect = None
         s.reset_caches()
         assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
-        assert table.prepare_append_files.call_count == 2
+        assert table.prepare_append_tables.call_count == 2
         assert ns.table.call_count == 2  # the table WAS re-resolved
 
     def test_transport_uncertainty_keeps_the_payload(self):
@@ -2093,13 +2376,13 @@ class TestRefusedCommitsDropThePayload:
         # and `write()` self-heals into a flush that SUCCEEDS.
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        table.prepare_append_files.side_effect = _stamped(ValidationError(detail, status_code=None), 0)
+        table.prepare_append_tables.side_effect = _stamped(ValidationError(detail, status_code=None), 0)
         with pytest.raises(ValidationError):
             s.write(
                 pa.table({"uuid": [f"u{i}" for i in range(rows)], "team_id": list(range(rows))}),
                 kafka_offsets=self.OFFSETS,
             )
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+        assert _orphans(mock_metrics) == []
 
     @pytest.mark.parametrize(
         "exc",
@@ -2119,10 +2402,10 @@ class TestRefusedCommitsDropThePayload:
         # fanout) cannot book 64 phantom orphans a flush.
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        table.prepare_append_files.side_effect = _stamped(exc, 0)
+        table.prepare_append_tables.side_effect = _stamped(exc, 0)
         with pytest.raises(type(exc)):
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+        assert _orphans(mock_metrics) == []
 
     @patch("millpond.hoglake.metrics")
     def test_a_prepare_that_failed_mid_fanout_counts_exactly_what_landed(self, mock_metrics, caplog):
@@ -2133,10 +2416,10 @@ class TestRefusedCommitsDropThePayload:
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
         uris = (f"{_URI_BASE}/aaaa-0.parquet", f"{_URI_BASE}/bbbb-1.parquet")
-        table.prepare_append_files.side_effect = _stamped(OSError("S3 reset midway"), 2, uris)
+        table.prepare_append_tables.side_effect = _stamped(OSError("S3 reset midway"), 2, uris)
         with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(2)
+        assert _orphans(mock_metrics) == [("prepare_failed", 2)]
         assert "Orphaned 2 uploaded parquet file(s)" in caplog.text
 
     @patch("millpond.hoglake.metrics")
@@ -2149,7 +2432,7 @@ class TestRefusedCommitsDropThePayload:
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
         uris = (f"{_URI_BASE}/aaaa-0.parquet", f"{_URI_BASE}/bbbb-1.parquet")
-        table.prepare_append_files.side_effect = _stamped(OSError("S3 reset midway"), 2, uris)
+        table.prepare_append_tables.side_effect = _stamped(OSError("S3 reset midway"), 2, uris)
         with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
         for uri in uris:
@@ -2168,10 +2451,10 @@ class TestRefusedCommitsDropThePayload:
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
         uris = (f"{_URI_BASE}/aaaa-0.parquet",)
-        table.prepare_append_files.side_effect = _stamped(OSError("close failed"), 1, uris)
+        table.prepare_append_tables.side_effect = _stamped(OSError("close failed"), 1, uris)
         with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        assert _orphans(mock_metrics) == [("prepare_failed", 1)]
         assert "truncated" in caplog.text
 
     @patch("millpond.hoglake.metrics")
@@ -2181,10 +2464,10 @@ class TestRefusedCommitsDropThePayload:
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
         uris = tuple(f"{_URI_BASE}/f{i:03d}-{i}.parquet" for i in range(25))
-        table.prepare_append_files.side_effect = _stamped(OSError("S3 reset midway"), len(uris), uris)
+        table.prepare_append_tables.side_effect = _stamped(OSError("S3 reset midway"), len(uris), uris)
         with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError):
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(25)
+        assert _orphans(mock_metrics) == [("prepare_failed", 25)]
         listed = [uri for uri in uris if uri in caplog.text]
         assert len(listed) == hoglake._ORPHAN_URIS_LOGGED
         assert listed == list(uris[: hoglake._ORPHAN_URIS_LOGGED])
@@ -2202,11 +2485,11 @@ class TestRefusedCommitsDropThePayload:
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
         bare = OSError("S3 reset midway")
         assert not hasattr(bare, "uploaded_files")
-        table.prepare_append_files.side_effect = bare
+        table.prepare_append_tables.side_effect = bare
         with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError) as caught:
             s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
         assert caught.value is bare  # the original error, not an AttributeError over it
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_not_called()
+        assert _orphans(mock_metrics) == []
 
     @patch("millpond.hoglake.metrics")
     def test_a_discarded_payload_names_the_objects_it_orphans(self, mock_metrics, caplog):
@@ -2244,7 +2527,453 @@ class TestRefusedCommitsDropThePayload:
         with pytest.raises(httpx.ReadTimeout):
             s.write(_rows(2), kafka_offsets=self.OFFSETS)
         s.close()
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        assert _orphans(mock_metrics) == [("shutdown", 1)]
+
+
+class TestZeroSinkSideReadsPerFlush:
+    """The steady-state flush makes no SINK-SIDE catalog read.
+
+    Sink-side, precisely: these are mock assertions on the handles
+    millpond itself calls, so they cannot see a read pyhoglake makes
+    inside `prepare_append_tables` (its own head refresh, its
+    incarnation re-resolve). The wire-level claim — that the whole
+    flush is one request — is asserted against a real server in
+    `tests/integration/test_hoglake_integration.py`
+    (`TestOneRequestPerFlush`), which counts HTTP requests through the
+    sink's own httpx client.
+
+    What used to happen per flush: a `table.info()` at the top of
+    `_prepare` (whose live-totals scan is a count and two sums over every
+    live file row — ~15M on prod-us) and a second one in the pre-commit
+    destination check, plus pyhoglake's own catalog head read. The basis
+    the server needs to prove the files match the destination is now the
+    payload's `read_snapshot`, so the shape is cached and the reads are
+    gone: one identity read per resolve, nothing per flush."""
+
+    OFFSETS = (("events", 0, 30, 41),)
+
+    def test_the_first_flush_reads_the_table_once(self):
+        s, client, catalog, ns, table = _sink()
+        assert s.write(_batch(), kafka_offsets=self.OFFSETS) == 1
+        # `_ensure_table` -> `_reconcile_specs`, which is the read that
+        # seeds the cache. `_prepare` adds none.
+        assert table.info.call_count == 1
+
+    def test_the_second_flush_reads_nothing(self):
+        s, client, catalog, ns, table = _sink()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        table.info.reset_mock()
+        ns.table.reset_mock()
+        catalog.namespace.reset_mock()
+        catalog.refresh.reset_mock()
+        assert s.write(_batch(), kafka_offsets=(("events", 0, 42, 43),)) == 1
+        assert table.info.call_count == 0
+        # ...and no catalog GET either: no namespace resolve, no table
+        # resolve, no head read. The commit is the only request.
+        assert ns.table.call_count == 0
+        assert catalog.namespace.call_count == 0
+        assert catalog.commit_prepared.call_count == 2
+
+    def test_a_long_run_of_flushes_still_reads_nothing(self):
+        # The per-flush cost has to be flat, not amortized: a read every
+        # Nth flush is still a live-totals scan on prod-us.
+        s, client, catalog, ns, table = _sink()
+        for i in range(10):
+            s.write(_batch(), kafka_offsets=(("events", 0, i, i),))
+        assert table.info.call_count == 1
+
+    def test_every_info_read_skips_the_live_totals(self):
+        # Bootstrap, reconciliation, the alignment self-heal and the
+        # cache refresh all read for the uuid, the columns and the specs.
+        # None of them has ever read a total, and the scan that produces
+        # them is the whole cost of the call.
+        cols_after = _EVENTS_COLUMNS + [_col("other_writer_col", "string", 6, 6)]
+        s, client, catalog, ns, table = _sink()
+        prepared = table.prepare_append_tables.side_effect
+        calls = {"n": 0}
+
+        def prepare(groups, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValidationError("prepared Parquet schema/field IDs differ from destination", status_code=None)
+            return prepared(groups, **kwargs)
+
+        table.prepare_append_tables.side_effect = prepare
+        _set_info(table, _FakeInfo(columns=tuple(cols_after)))
+        assert s.write(_batch(), kafka_offsets=self.OFFSETS) == 1
+        assert table.info.call_count >= 2  # reconcile + the self-heal refresh
+        for call in table.info.call_args_list:
+            assert call.kwargs.get("totals") is False, f"info read without totals=False: {call}"
+
+    def test_a_reset_makes_the_next_flush_read_again(self):
+        # The cached shape belongs to the handle it was read through, so
+        # a reset drops it: otherwise the flush after a re-resolve would
+        # build against a shape read off the old handle, which this pod
+        # has not re-reconciled against config.
+        s, client, catalog, ns, table = _sink()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        assert s._live_info is not None
+        s.reset_caches()
+        assert s._live_info is None
+        table.info.reset_mock()
+        assert s.write(_batch(), kafka_offsets=(("events", 0, 42, 43),)) == 1
+        assert table.info.call_count == 1
+
+
+class TestTheCachedShapeHasATtl:
+    """The cache is only safe because it expires sooner than pyhoglake's.
+
+    `read_snapshot` — the commit's whole conflict basis — comes from
+    `Table._cache`, which pyhoglake refreshes at half the catalog's
+    snapshot retention. Once that happens the basis sits AHEAD of any
+    earlier `ALTER`, so the server's conflict scan finds nothing. A sink
+    holding an older partition spec would then compute values under the
+    superseded transform, pass pyhoglake's only structural check on them
+    (arity, unchanged by a same-arity re-spec), pass the footer compare
+    (no column moved), and have the commit ACCEPTED with the live
+    spec_id stamped on files carrying the old spec's values. Nothing on
+    the file or in the request records which transform produced a
+    partition value, so no later read can detect it: every scan prunes
+    those files wrongly, forever.
+
+    Re-reading at a QUARTER of the retention is what makes that state
+    unreachable — the sink always refreshes first, so the spec it
+    computes under is never older than the basis the commit carries.
+    These tests fail if `_live_info_ttl_s` is removed or raised above
+    pyhoglake's half.
+    """
+
+    OFFSETS = (("events", 0, 30, 41),)
+    RETENTION_S = 3600.0
+
+    def _clocked(self, cfg=None, **kw):
+        """A sink whose clock this test drives. `now()` advances it."""
+        s, client, catalog, ns, table = _sink(cfg, **kw)
+        clock = {"t": 1000.0}
+        s._monotonic = lambda: clock["t"]
+        # Re-stamp what the bootstrap read took on the real clock, so
+        # "age" is measured from this test's zero.
+        s._live_info_read_at = clock["t"]
+        return s, catalog, table, clock
+
+    def test_the_ttl_is_half_of_pyhoglakes_threshold(self):
+        # The INVARIANT, as arithmetic rather than as prose: pyhoglake
+        # prepares against its cache while it is younger than
+        # retention/2, so anything at retention/2 or above here would let
+        # the sink be the staler of the two.
+        s, catalog, table, clock = self._clocked()
+        assert s._live_info_ttl_s() == self.RETENTION_S / 4
+        assert s._live_info_ttl_s() < self.RETENTION_S / 2
+
+    def test_before_the_ttl_a_second_flush_reads_nothing(self):
+        s, catalog, table, clock = self._clocked()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        table.info.reset_mock()
+        clock["t"] += self.RETENTION_S / 4 - 1
+        assert s.write(_batch(), kafka_offsets=(("events", 0, 42, 43),)) == 1
+        assert table.info.call_count == 0
+
+    def test_past_the_ttl_the_flush_re_reads_and_uses_the_new_spec(self, monkeypatch):
+        """THE P1 CASE, and the one that cannot be seen from outside.
+
+        A same-arity re-spec lands while this pod is running. pyhoglake's
+        own cache self-refreshes past it, carrying the conflict window
+        with it, so the commit is ACCEPTED — and the only thing wrong
+        with the files is that their partition values were computed under
+        a transform nothing records. The sink has to notice the new spec
+        before pyhoglake stops refusing on its behalf.
+
+        `_reconcile_specs` is stubbed out for this test alone, because
+        the two things the TTL refresh buys are independent and have to
+        be asserted separately: ANY live spec that differs from config is
+        fatal to that check, so leaving it in means every re-spec
+        scenario ends in its exception and the value computation below is
+        never reached. The tripwire is the next test's subject.
+        """
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, catalog, table, clock = self._clocked(cfg, partition_spec=_spec(("team_id", "identity")))
+        monkeypatch.setattr(hoglake.HoglakeSink, "_reconcile_specs", lambda self, table, info=None: None)
+        s.write(pa.table({"uuid": ["a"], "team_id": [1]}), kafka_offsets=self.OFFSETS)
+        assert [values for values, _ in _groups()] == [("1",)], "flush 1 should use identity values"
+
+        # The re-spec, and a clock past the TTL.
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "bucket", 16))))
+        table.info.reset_mock()
+        clock["t"] += self.RETENTION_S / 4 + 1
+
+        assert s.write(pa.table({"uuid": ["b"], "team_id": [1]}), kafka_offsets=(("events", 0, 42, 43),)) == 1
+        assert table.info.call_count == 1, "the TTL must force exactly one re-read"
+        values = [v for v, _ in _groups()]
+        # bucket(1, 16) is not the identity string "1" — the point is
+        # that the VALUES moved, not which bucket it is.
+        assert values != [("1",)], "the flush is still computing values under the superseded spec"
+        assert len(values) == 1 and values[0][0] is not None
+        # And the registration carries them, so what would have been
+        # mis-stamped is what the commit now describes.
+        assert _committed(catalog)["appends"][0]["files"][0]["partition_values"] == list(values[0])
+
+    def test_past_the_ttl_a_config_divergence_finally_stops_the_pod(self):
+        # The second thing the periodic re-read buys: before it, the
+        # "config disagrees with the live layout => stop" tripwire ran
+        # only at pod start, so a re-spec under a running fleet was
+        # silent on every pod that had not restarted.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, catalog, table, clock = self._clocked(cfg, partition_spec=_spec(("team_id", "identity")))
+        s.write(pa.table({"uuid": ["a"], "team_id": [1]}), kafka_offsets=self.OFFSETS)
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "bucket", 16))))
+        clock["t"] += self.RETENTION_S / 4 + 1
+        with pytest.raises(hoglake.HoglakeSinkError, match="does not match"):
+            s.write(pa.table({"uuid": ["b"], "team_id": [1]}), kafka_offsets=(("events", 0, 42, 43),))
+
+    def test_the_refresh_re_reads_once_not_once_per_flush(self):
+        s, catalog, table, clock = self._clocked()
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        clock["t"] += self.RETENTION_S / 4 + 1
+        table.info.reset_mock()
+        for i in range(5):
+            s.write(_batch(), kafka_offsets=(("events", 0, i, i),))
+        assert table.info.call_count == 1, "the refresh must re-stamp the clock, not re-read every flush"
+
+    def test_an_unreadable_retention_falls_back_rather_than_disabling_the_ttl(self):
+        # pyhoglake answers its own assumed retention when the options
+        # read fails, and the fallback has to keep the factor-of-two: a
+        # TTL of zero would read per flush, and an infinite one would
+        # reopen the hazard above.
+        s, catalog, table, clock = self._clocked()
+        catalog._retention_seconds.side_effect = HoglakeError("options unavailable", status_code=503)
+        assert s._live_info_ttl_s() == hoglake._ASSUMED_RETENTION_S / 4
+
+    @pytest.mark.parametrize("answer", [None, 0, -1, "3600", True])
+    def test_an_unusable_retention_value_falls_back(self, answer):
+        # A pyhoglake that changes the return shape (or a test double
+        # that answers a Mock) must not silently make the TTL zero or
+        # infinite — both are the hazard, in opposite directions.
+        s, catalog, table, clock = self._clocked()
+        catalog._retention_seconds.return_value = answer
+        assert s._live_info_ttl_s() == hoglake._ASSUMED_RETENTION_S / 4
+
+    def test_a_missing_accessor_falls_back(self):
+        # `_retention_seconds` is private. A rename must degrade to the
+        # assumed retention, not to an exception on the write path.
+        s, catalog, table, clock = self._clocked()
+        del catalog._retention_seconds
+        catalog.mock_add_spec(["data_path", "commit_prepared", "namespace", "refresh"])
+        assert s._live_info_ttl_s() == hoglake._ASSUMED_RETENTION_S / 4
+
+    def test_retention_disabled_never_expires_and_that_is_correct(self):
+        # inf: pyhoglake's cache never ages out either, so the basis
+        # stays pinned at the sink's own read and ANY later alter is
+        # inside the conflict window. The invariant holds trivially.
+        s, catalog, table, clock = self._clocked()
+        catalog._retention_seconds.return_value = float("inf")
+        s.write(_batch(), kafka_offsets=self.OFFSETS)
+        table.info.reset_mock()
+        clock["t"] += 10**9
+        assert s.write(_batch(), kafka_offsets=(("events", 0, 42, 43),)) == 1
+        assert table.info.call_count == 0
+
+
+class TestTypedDestinationMovedRefusals:
+    """The three refusals that say "the destination moved under your
+    basis", which is what retired the pre-commit destination read.
+
+    Each is a commit the server judged and refused atomically with zero
+    rows written, each is permanent for THIS payload (a prepared
+    request's `read_snapshot` is frozen, the expiry floor only moves
+    forward, an alter does not un-happen), and each is cleared by a
+    REBUILT flush. So all three take one path: discard the payload (its
+    upload is an orphan and is counted), drop the cached shape so the
+    rebuild reads fresh, and raise one retryable `HoglakeSinkError`.
+
+    The conversion is load-bearing, not cosmetic.
+    `DdlSinceReadSnapshotError` subclasses `CommitConflictError` — which
+    `is_retryable` calls retryable — so leaving it alone would replay a
+    payload whose basis can never be accepted. `ReadSnapshotExpiredError`
+    subclasses `ExpiredError`, which `is_retryable` calls permanent, so
+    leaving THAT alone would crash the pod on a flush a rebuild
+    publishes cleanly."""
+
+    OFFSETS = (("events", 0, 30, 41),)
+
+    # (exception, message substring, expected orphan `reason` label).
+    # The label is parametrized rather than asserted loosely because it
+    # is the only thing that tells these three apart on a dashboard.
+    REFUSALS = [
+        pytest.param(
+            DdlSinceReadSnapshotError(
+                "ddl_since_read_snapshot",
+                status_code=409,
+                detail="concurrent DDL since snapshot 41 on table(s): analytics.events",
+                tables=("analytics.events",),
+                read_snapshot=41,
+            ),
+            "schema or partition spec",
+            "ddl_since_read_snapshot",
+            id="ddl_since_read_snapshot",
+        ),
+        pytest.param(
+            IncarnationChangedError(
+                "table_recreated",
+                status_code=409,
+                detail="table 'analytics.events' no longer has the expected UUID",
+                table="analytics.events",
+            ),
+            "recreated",
+            "table_recreated",
+            id="table_recreated",
+        ),
+        pytest.param(
+            ReadSnapshotExpiredError(
+                "expired",
+                status_code=410,
+                detail="read_snapshot 41 is below the expiry floor (earliest retained snapshot is 90)",
+            ),
+            "expired before the commit",
+            "read_snapshot_expired",
+            id="read_snapshot_expired",
+        ),
+    ]
+
+    @pytest.mark.parametrize(("exc", "match", "reason"), REFUSALS)
+    @patch("millpond.hoglake.metrics")
+    def test_the_payload_is_discarded_and_the_cache_dropped(self, mock_metrics, exc, match, reason):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = exc
+        with pytest.raises(hoglake.HoglakeSinkError, match=match) as caught:
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        # The server's own exception stays reachable: the operator needs
+        # the wire code, and a future caller may want to branch on it.
+        assert caught.value.__cause__ is exc
+        assert caught.value.retryable is True
+        assert hoglake.is_retryable(caught.value) is True
+        assert s._prepared is None
+        assert s._live_info is None
+        assert _orphans(mock_metrics) == [(reason, 1)]
+        mock_metrics.hoglake_files_written_total.inc.assert_not_called()
+        mock_metrics.hoglake_commit_replays_total.labels.assert_not_called()
+
+    @pytest.mark.parametrize(("exc", "match", "reason"), REFUSALS)
+    @patch("millpond.hoglake.metrics")
+    def test_the_retry_rebuilds_against_a_fresh_read_and_commits(self, mock_metrics, exc, match, reason):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [exc, MagicMock(snapshot_id=8, schema_version=1)]
+        with pytest.raises(hoglake.HoglakeSinkError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        table.info.reset_mock()
+        # main.py's retry loop: reset_caches, then the same flush again.
+        s.reset_caches()
+        assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
+        # Rebuilt, not replayed — the refused payload's basis could never
+        # be accepted, so re-sending it is a livelock.
+        assert table.prepare_append_tables.call_count == 2
+        assert table.info.call_count == 1  # read fresh
+        assert ns.table.call_count == 2  # the destination WAS re-resolved
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_rebuild_computes_values_under_the_spec_that_refused_it(self, mock_metrics):
+        """ "Rebuilds against a fresh read" has to mean the LAYOUT, not
+        just the columns.
+
+        `ddl_since_read_snapshot` is what a same-arity re-spec looks like
+        from the client, and a rebuild that re-read the columns but kept
+        the old partition spec would upload a second set of
+        mis-partitioned files and have them accepted — the refusal would
+        have bought nothing. So: flush 1 under `identity(team_id)` is
+        refused, the live spec is `bucket(team_id, 16)` by the time the
+        retry reads it, and the retry's groups, registrations and commit
+        message all have to describe the bucketed layout.
+        """
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        catalog.commit_prepared.side_effect = [
+            DdlSinceReadSnapshotError(
+                "ddl_since_read_snapshot",
+                status_code=409,
+                detail="concurrent DDL since snapshot 41 on table(s): analytics.events",
+                tables=("analytics.events",),
+                read_snapshot=41,
+            ),
+            MagicMock(snapshot_id=8, schema_version=1),
+        ]
+        batch = pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]})
+        with pytest.raises(hoglake.HoglakeSinkError, match="partition spec"):
+            s.write(batch, kafka_offsets=self.OFFSETS)
+        identity_values = [v for v, _ in _groups()]
+        assert identity_values == [("1",), ("2",), ("3",)]
+
+        # The re-spec the server refused the commit over. Config moves
+        # with it, because a pod whose config disagreed with the live
+        # spec is the case `_reconcile_specs` stops outright.
+        s._cfg = _cfg(hoglake_partition_by=(("team_id", "bucket", 16),))
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "bucket", 16))))
+        s.reset_caches()
+        assert s.write(batch, kafka_offsets=self.OFFSETS) == 3
+
+        bucket_values = [v for v, _ in _groups()]
+        assert bucket_values != identity_values, "the rebuild kept the superseded spec's values"
+        assert all(v[0] is not None for v in bucket_values)
+        payload = _committed(catalog)
+        registered = [tuple(f["partition_values"]) for f in payload["appends"][0]["files"]]
+        assert registered == bucket_values
+        # The message counts the rebuilt fanout, not the refused one.
+        summary = payload["message"].split("\n")[0]
+        assert f"records=3 files={len(bucket_values)} partitions={len(bucket_values)} " in summary
+
+    @pytest.mark.parametrize(("exc", "match", "reason"), REFUSALS)
+    @patch("millpond.hoglake.metrics")
+    def test_the_rebuild_reads_fresh_even_without_a_reset(self, mock_metrics, exc, match, reason):
+        # The cache drop lives on the refusal, not on `reset_caches()`:
+        # a retry that skipped the reset must still not rebuild the same
+        # doomed payload from the shape the server just called stale.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [exc, MagicMock(snapshot_id=8, schema_version=1)]
+        with pytest.raises(hoglake.HoglakeSinkError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        # The payload AND its identity go, so the next write cannot be
+        # recognized as a replay of it — which is what makes the
+        # following call a rebuild rather than a resend.
+        assert table.prepare_append_tables.call_count == 1
+        assert s._prepared_offsets is None
+        table.info.reset_mock()
+        assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
+        assert table.info.call_count == 1
+        assert table.prepare_append_tables.call_count == 2
+
+    @pytest.mark.parametrize(("exc", "match", "reason"), REFUSALS)
+    def test_pyhoglake_is_told_to_invalidate_its_own_cache_too(self, exc, match, reason):
+        # millpond's cached shape is only half of it: the
+        # `read_snapshot` a prepare sends comes from pyhoglake's writer
+        # cache, so a rebuild against a stale ONE of those re-sends the
+        # refused basis. Passing the Table is what makes pyhoglake drop
+        # it on a `re_prepare` refusal, and it is not optional dressing —
+        # without it the only other way out is `reset_caches()`, which is
+        # main.py's to call.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = exc
+        with pytest.raises(hoglake.HoglakeSinkError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert catalog.commit_prepared.call_args.kwargs["table"] is table
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_plain_commit_conflict_takes_the_ordinary_answered_path(self, mock_metrics):
+        # `DdlSinceReadSnapshotError` is a SUBCLASS of
+        # `CommitConflictError`, so the arms are ordered: only the
+        # subclass is converted, and an ordinary OCC 409 keeps the
+        # behaviour it has always had here — the server judged it, so the
+        # payload is dropped and the flush rebuilds under fresh object
+        # names (which is also what clears the one plain 409 an
+        # append-only prepared commit can actually take, a removal-queue
+        # path collision).
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = CommitConflictError(
+            "commit_conflict", status_code=409, detail="removal queue collision"
+        )
+        with pytest.raises(CommitConflictError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert s._prepared is None
+        # NOT the typed path: the cached shape is still good, because
+        # nothing said the destination moved.
+        assert s._live_info is not None
 
 
 class TestSpecChangeUnderAPreparedPayload:
@@ -2252,7 +2981,18 @@ class TestSpecChangeUnderAPreparedPayload:
     and the spec_id the table has when the commit lands. The server never
     opens the file, so a same-arity re-spec between prepare and commit
     stamps identity values as bucket values — silent, permanent
-    mis-pruning of every future scan."""
+    mis-pruning of every future scan.
+
+    THE GUARD MOVED. The sink used to re-read the destination
+    immediately before every publish and compare the live spec against
+    the one `_prepare` computed under. Now the payload carries its own
+    `read_snapshot` and the SERVER answers it: a partition-spec change is
+    an alter, every alter mints one `table_altered` change row, and an
+    append-only commit's conflict scan over
+    (`table_dropped`, `table_altered`) since that snapshot is therefore
+    always the typed `ddl_since_read_snapshot` — atomically, under the
+    commit lock, with no client-side read and no residual window between
+    the check and the commit."""
 
     OFFSETS = (("events", 0, 30, 41),)
 
@@ -2260,21 +3000,29 @@ class TestSpecChangeUnderAPreparedPayload:
     def test_a_same_arity_spec_change_refuses_the_commit(self, mock_metrics):
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
-        prepared = table.prepare_append_files.side_effect
-
-        def prepare(files, **kwargs):
-            # The re-spec lands while the upload is in flight.
-            table.info.return_value = _FakeInfo(
-                columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "bucket", 16))
-            )
-            return prepared(files, **kwargs)
-
-        table.prepare_append_files.side_effect = prepare
-        with pytest.raises(RuntimeError, match="partition spec"):
+        # The re-spec lands while the upload is in flight; the server
+        # sees it in the conflict window and refuses the commit.
+        catalog.commit_prepared.side_effect = DdlSinceReadSnapshotError(
+            "ddl_since_read_snapshot",
+            status_code=409,
+            detail="concurrent DDL since snapshot 41 on table(s): analytics.events",
+            tables=("analytics.events",),
+            read_snapshot=41,
+        )
+        with pytest.raises(hoglake.HoglakeSinkError, match="partition spec"):
             s.write(pa.table({"uuid": ["a"], "team_id": [1]}), kafka_offsets=self.OFFSETS)
-        catalog.commit_prepared.assert_not_called()
         assert s._prepared is None
-        mock_metrics.hoglake_orphaned_files_total.inc.assert_called_once_with(1)
+        assert _orphans(mock_metrics) == [("ddl_since_read_snapshot", 1)]
+
+    def test_the_payload_carries_the_basis_that_makes_that_answerable(self):
+        # Without `read_snapshot` the commit has no conflict window at
+        # all: the file registers its old-spec values under the new
+        # spec_id and nothing anywhere can detect it. (It is also the
+        # shape HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS will refuse.)
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        s.write(pa.table({"uuid": ["a"], "team_id": [1]}), kafka_offsets=self.OFFSETS)
+        assert catalog.commit_prepared.call_args.args[0]["read_snapshot"] == 41
 
     def test_the_refusal_is_retryable(self):
         # Unlike the sink's other stops: a REBUILT flush computes its
@@ -2298,83 +3046,98 @@ class TestSpecChangeUnderAPreparedPayload:
 class TestConcurrentAddDuringAppend:
     """The concurrent-`add_column` race, in both halves.
 
-    `_evolve_and_align` null-fills against the columns it resolved; a
-    beat later `_prepare` adopts a FRESH `table.info()`. Another writer's
-    add_column in that window puts a name in the target schema the batch
-    does not carry. The alignment must survive that on its own, and the
-    self-heal behind it must match the refusals pyhoglake ACTUALLY
-    raises.
+    `_evolve_and_align` null-fills against the columns it resolved;
+    `_prepare` then aligns against the sink's cached `TableInfo`. Another
+    writer's add_column puts a name in one of those and not the other.
+    The alignment must survive that on its own, and the self-heal behind
+    it must match the refusals pyhoglake ACTUALLY raises.
+
+    WHAT CHANGED with the zero-read flush: `_prepare` no longer takes a
+    fresh `table.info()`, so the window is no longer "between
+    `_evolve_and_align` and `_prepare`" — it is between the read that
+    seeded the cache and the commit. Both halves below still hold, and
+    the second one is now the PRIMARY path rather than a second line of
+    defence: a cached shape that has gone stale is caught by
+    `prepare_append_tables` comparing the encoded footer against the
+    destination schema it builds from its own (fresher) read, and the
+    self-heal answers it.
     """
 
-    def test_column_added_between_align_and_prepare_is_null_filled(self):
+    def test_a_cached_column_the_batch_lacks_is_null_filled_not_a_keyerror(self):
         # The live-suite failure (`KeyError: Field "col_w1_0" does not
         # exist in schema`): pa.Table.select raises KeyError, not a
         # ValidationError, so the self-heal never fired for its own
         # motivating case — and KeyError classifies as retryable, so the
         # pod burned its whole budget and then crashed.
         #
-        # This test is also what retires the KeyError arm the self-heal
-        # once carried: `_prepare` null-fills against `info.columns` and
-        # then selects names from that same object, so the select can
-        # only ever narrow. The column below arriving between the two
-        # resolves is exactly the case that used to raise, and it is
+        # The invariant that retires that arm is unchanged by the cache:
+        # `_prepare` null-fills against the SAME info object it then
+        # selects names from, so the select can only ever narrow. Here
+        # the cached shape carries a column `_evolve_and_align` never saw
+        # (another writer added it before this pod resolved the table),
+        # which is exactly the shape that used to raise — and it is
         # null-filled without the self-heal being consulted at all.
         cols_after = _EVENTS_COLUMNS + [_col("other_writer_col", "string", 6, 6)]
         s, client, catalog, ns, table = _sink()
-        before = _FakeInfo(columns=tuple(_EVENTS_COLUMNS))
-        after = _FakeInfo(columns=tuple(cols_after))
-        # _ensure_table resolves against the old schema; _prepare adopts
-        # the new one. The window is one round trip wide in production.
-        table.info.side_effect = [before, after, after, after]
+        _set_info(table, _FakeInfo(columns=tuple(cols_after)))
+        # `table.columns` is what `_ensure_table` adopts first and it is
+        # the OLD shape; the cached info the flush aligns to is the new
+        # one. One round trip apart in production.
+        table.columns = tuple(_EVENTS_COLUMNS)
         assert s.write(_batch()) == 1
         published = _published(table)
         assert "other_writer_col" in published.column_names
         assert published.column("other_writer_col").null_count == published.num_rows
-        assert table.prepare_append_files.call_count == 1  # no self-heal round needed
+        assert table.prepare_append_tables.call_count == 1  # no self-heal round needed
 
     @patch("millpond.hoglake.metrics")
     def test_align_refusal_refreshes_and_reappends_once(self, mock_metrics):
-        """The self-heal behind the null-fill, on the message pyhoglake
-        really raises: `prepare_append_files` compares the parquet's
-        schema (field IDs included) against the destination and refuses
-        with "prepared Parquet schema/field IDs differ from destination"
-        (client.py:901). The sink must refresh the live schema,
-        null-fill, and prepare ONCE more."""
+        """The self-heal, on the message pyhoglake really raises:
+        `prepare_append_tables` compares the ENCODED parquet's schema
+        (field IDs included) against the destination and refuses with
+        "prepared Parquet schema/field IDs differ from destination"
+        (`_encode_group`, client.py:2126 at 1.3.7). The sink must refresh
+        the live schema, null-fill, and prepare ONCE more.
+
+        This is the arm that makes the cached shape safe: pyhoglake's own
+        cache can refresh to a newer snapshot than millpond's copy, and
+        when it does, a column added in between shows up as this refusal
+        rather than as a file that silently does not match."""
         cols_after = _EVENTS_COLUMNS + [_col("other_writer_col", "string", 6, 6)]
         s, client, catalog, ns, table = _sink()
-        prepared = table.prepare_append_files.side_effect
+        prepared = table.prepare_append_tables.side_effect
         calls = {"n": 0}
 
-        def prepare(files, **kwargs):
+        def prepare(groups, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise ValidationError("prepared Parquet schema/field IDs differ from destination", status_code=None)
-            return prepared(files, **kwargs)
+            return prepared(groups, **kwargs)
 
-        table.prepare_append_files.side_effect = prepare
-        table.info.return_value = _FakeInfo(columns=tuple(cols_after))
+        table.prepare_append_tables.side_effect = prepare
+        _set_info(table, _FakeInfo(columns=tuple(cols_after)))
         assert s.write(_batch()) == 1
-        assert table.prepare_append_files.call_count == 2
+        assert table.prepare_append_tables.call_count == 2
         retried = _published(table)
         assert "other_writer_col" in retried.column_names
         assert retried.column("other_writer_col").null_count == retried.num_rows
 
     @patch("millpond.hoglake.metrics")
     def test_variant_path_column_refusal_also_self_heals(self, mock_metrics):
-        # The other real refusal string (parquet_schema.py:173).
+        # The other real refusal string (parquet_schema.py:197).
         s, client, catalog, ns, table = _sink()
-        prepared = table.prepare_append_files.side_effect
+        prepared = table.prepare_append_tables.side_effect
         calls = {"n": 0}
 
-        def prepare(files, **kwargs):
+        def prepare(groups, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise ValidationError("prepared Parquet columns differ from destination", status_code=None)
-            return prepared(files, **kwargs)
+            return prepared(groups, **kwargs)
 
-        table.prepare_append_files.side_effect = prepare
+        table.prepare_append_tables.side_effect = prepare
         assert s.write(_batch()) == 1
-        assert table.prepare_append_files.call_count == 2
+        assert table.prepare_append_tables.call_count == 2
 
     @patch("millpond.hoglake.metrics")
     def test_partition_arity_refusal_is_not_an_alignment_refusal(self, mock_metrics):
@@ -2382,30 +3145,30 @@ class TestConcurrentAddDuringAppend:
         # spec problem, not a column problem: re-aligning cannot fix it,
         # so it must not consume the one self-heal.
         s, *_, table = _sink()
-        table.prepare_append_files.side_effect = ValidationError(
+        table.prepare_append_tables.side_effect = ValidationError(
             "prepared file partition arity differs from destination", status_code=None
         )
         with pytest.raises(ValidationError):
             s.write(_batch())
-        assert table.prepare_append_files.call_count == 1
+        assert table.prepare_append_tables.call_count == 1
 
     @patch("millpond.hoglake.metrics")
     def test_other_validation_errors_still_raise(self, mock_metrics):
         s, *_, table = _sink()
-        table.prepare_append_files.side_effect = ValidationError("prepared file must contain rows", status_code=None)
+        table.prepare_append_tables.side_effect = ValidationError("prepared file must contain rows", status_code=None)
         with pytest.raises(ValidationError):
             s.write(_batch())
-        assert table.prepare_append_files.call_count == 1
+        assert table.prepare_append_tables.call_count == 1
 
     @patch("millpond.hoglake.metrics")
     def test_persistent_align_refusal_raises_after_one_retry(self, mock_metrics):
         s, *_, table = _sink()
-        table.prepare_append_files.side_effect = ValidationError(
+        table.prepare_append_tables.side_effect = ValidationError(
             "prepared Parquet schema/field IDs differ from destination", status_code=None
         )
         with pytest.raises(ValidationError):
             s.write(_batch())
-        assert table.prepare_append_files.call_count == 2
+        assert table.prepare_append_tables.call_count == 2
 
 
 class TestWriteFailurePropagation:
@@ -2413,13 +3176,13 @@ class TestWriteFailurePropagation:
         # At-least-once: a failed write must surface to main.py's retry
         # loop; offsets only commit after write() returns.
         s, *_, table = _sink()
-        table.prepare_append_files.side_effect = CommitConflictError("conflict", status_code=409)
+        table.prepare_append_tables.side_effect = CommitConflictError("conflict", status_code=409)
         with pytest.raises(CommitConflictError):
             s.write(_batch())
 
     def test_incarnation_change_raises(self):
         s, *_, table = _sink()
-        table.prepare_append_files.side_effect = IncarnationChangedError("recreated")
+        table.prepare_append_tables.side_effect = IncarnationChangedError("recreated")
         with pytest.raises(IncarnationChangedError):
             s.write(_batch())
 
@@ -2718,7 +3481,7 @@ class TestCommitMessageOnThePayload:
         s.write(_batch(), kafka_offsets=self.OFFSETS, trigger="size")
         first, second = (c[0][0]["message"] for c in catalog.commit_prepared.call_args_list)
         assert first == second
-        assert table.prepare_append_files.call_count == 1  # replayed, not rebuilt
+        assert table.prepare_append_tables.call_count == 1  # replayed, not rebuilt
 
     def test_a_rebuilt_flush_of_the_same_identity_says_the_same_thing(self):
         # The across-a-restart case: a new process rebuilds the flush
@@ -2739,7 +3502,7 @@ class TestTheMessageCannotOrphanAnUpload:
 
     `_prepare` splits into "upload the objects" and "hold the request
     that registers them". Everything that can fail after the upload has
-    to be accounted for: `prepare_append_files` failures go through
+    to be accounted for: `prepare_append_tables` failures go through
     `_count_orphans`, which names the objects nobody will ever
     reference. A formatting bug raising after the upload — a
     `TypeError` on some future field, say — would leave those objects
@@ -2760,7 +3523,7 @@ class TestTheMessageCannotOrphanAnUpload:
         # Nothing was serialized, nothing was uploaded, nothing was
         # committed — so there is nothing to orphan and nothing to count.
         assert _WRITTEN == []
-        table.prepare_append_files.assert_not_called()
+        table.prepare_append_tables.assert_not_called()
         catalog.commit_prepared.assert_not_called()
 
     def test_the_message_is_formatted_before_the_upload_call(self):
@@ -2771,4 +3534,4 @@ class TestTheMessageCannotOrphanAnUpload:
         import inspect
 
         body = inspect.getsource(hoglake.HoglakeSink._prepare)
-        assert body.index("format_commit_message(") < body.index("prepare_append_files(")
+        assert body.index("format_commit_message(") < body.index("prepare_append_tables(")

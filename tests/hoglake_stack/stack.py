@@ -49,7 +49,7 @@ S3_SECRET_KEY = "hoglake123"
 # locally before pushing, and say in the commit message what changed on
 # the server side. HOGLAKE_SERVER_IMAGE overrides this for a one-off run
 # against a locally built server (e.g. while developing a server change).
-DEFAULT_IMAGE = "ghcr.io/posthog/hoglake-server@sha256:c95500cae32940270e94228dfae6787b6bfa32d33729ec059204f14d950865c7"
+DEFAULT_IMAGE = "ghcr.io/posthog/hoglake-server@sha256:57485a90ee5cca260f5d8a7958ab5653dd8b5419d4a3a3b997f704643d467523"
 
 # CI sets this. Without it, a machine with no Docker (or no access to
 # ghcr.io) skips the docker-gated suites so local unit-test runs stay
@@ -68,9 +68,17 @@ def compose(*args: str, profile: str | None = None, check: bool = True) -> subpr
     if profile:
         cmd += ["--profile", profile]
     cmd += list(args)
-    # The compose file falls back to hoglake-server:latest. Hand it the
-    # pinned image explicitly, otherwise a new server release changes
-    # what CI tests against without any commit here.
+    # HOGLAKE_SERVER_IMAGE is RESOLVED HERE, into the environment compose
+    # interpolates from, and that is the whole reason the pin exists.
+    # Without it the compose file's own default (`:latest`) won the
+    # substitution and `DEFAULT_IMAGE` only ever reached `ensure_image`'s
+    # pull — so the digest was downloaded, the container ran whatever
+    # `:latest` happened to resolve to locally, and these contract suites
+    # asserted a server nobody had chosen. (Found the hard way: a 1.3.7
+    # typed refusal came back as its pre-1.3.6 wire code because the
+    # local `:latest` was two weeks stale.) `server_image` already
+    # honours an explicit override, so passing it through here keeps the
+    # one-off local-build escape hatch working.
     env = {**os.environ, "HOGLAKE_SERVER_IMAGE": server_image()}
     return subprocess.run(cmd, check=check, capture_output=True, text=True, timeout=600, env=env)
 
@@ -139,6 +147,26 @@ def up(profile: str | None = None) -> None:
     compose("up", "-d", profile=profile)
     wait_http_ok(f"{MINIO_URL}/minio/health/live")
     wait_http_ok(f"{SERVER_URL}/healthz")
+
+
+def running_server_image() -> str:
+    """The image the server CONTAINER is actually running, read back off
+    the daemon.
+
+    Separate from `server_image()` (what we asked for) on purpose: the
+    gap between those two is how the pin went unenforced for two weeks
+    while every comment in this file said it was pinned. Asserting the
+    two are equal is the only form of that claim nothing can quietly
+    falsify.
+    """
+    out = subprocess.run(
+        ["docker", "inspect", "-f", "{{.Config.Image}}", f"{PROJECT}-hoglake-server-1"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return out.stdout.strip()
 
 
 def down() -> None:

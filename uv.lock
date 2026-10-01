@@ -8,7 +8,7 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 pyducklake = "2026-08-14T00:00:00Z"
-pyhoglake = "2026-09-23T22:00:00Z"
+pyhoglake = "2026-10-01T02:00:00Z"
 
 [manifest]
 constraints = [
@@ -330,7 +330,7 @@ dependencies = [
     { name = "psycopg", extra = ["binary"] },
     { name = "pyarrow" },
     { name = "pyducklake" },
-    { name = "pyhoglake" },
+    { name = "pyhoglake", extra = ["fast-upload"] },
     { name = "pytz" },
     { name = "pyyaml" },
 ]
@@ -360,7 +360,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pyarrow", specifier = ">=21.0" },
     { name = "pyducklake", specifier = ">=1.0.17" },
-    { name = "pyhoglake", specifier = ">=1.3.0" },
+    { name = "pyhoglake", extras = ["fast-upload"], specifier = ">=1.3.7" },
     { name = "pytz", specifier = ">=2024.1" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
@@ -704,16 +704,21 @@ wheels = [
 
 [[package]]
 name = "pyhoglake"
-version = "1.3.0"
+version = "1.3.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pyarrow" },
     { name = "thrift" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7d/bc/b6cf3237c2de30054c84ce41ecca5eab725c42ad2b4eed742f9b6b6bcd1f/pyhoglake-1.3.0.tar.gz", hash = "sha256:686fd6bb3ce52ce15b98fb109d200ea8db3e178d6c00f88a4f5acb6927f415d6", size = 174521, upload-time = "2026-09-23T21:57:11.198Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c7/51/933792f342f60c7a5fdc8d333877dc611aae353d316b803428b85072a110/pyhoglake-1.3.7.tar.gz", hash = "sha256:b04611ce4743680b5ebd150a87a3fdff3b526ac8c5169c2e7dc1813901be45c8", size = 228005, upload-time = "2026-10-01T01:55:03.377Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/eb/1002cde0561464c56052d3adadcc754a1366c23e8bc5937c3bbe43049878/pyhoglake-1.3.0-py3-none-any.whl", hash = "sha256:ea1047bad214e6c510f4f24681effc3ac334a0ce349ce970c1046b87df0b116a", size = 68567, upload-time = "2026-09-23T21:57:09.852Z" },
+    { url = "https://files.pythonhosted.org/packages/18/a0/de5581285653960cc76076ad80431b51408dca75374a779ab377a13e69b0/pyhoglake-1.3.7-py3-none-any.whl", hash = "sha256:25587845317df34cd15344bcb841ae66ae346a5e8b3820c390256b15d521153f", size = 96244, upload-time = "2026-10-01T01:55:02.035Z" },
+]
+
+[package.optional-dependencies]
+fast-upload = [
+    { name = "boto3" },
 ]
 
 [[package]]
