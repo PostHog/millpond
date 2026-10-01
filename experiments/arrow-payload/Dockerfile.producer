@@ -1,0 +1,36 @@
+# Dockerfile for the arrow-payload experiment's Python producer.
+#
+# IMPORTANT: the build context MUST be the repository root
+# (/Users/jakob/src/millpond). From experiments/arrow-payload/docker-compose.yaml
+# this means:
+#
+#   build:
+#     context: ../..
+#     dockerfile: experiments/arrow-payload/Dockerfile.producer
+#
+# We reuse test/producer.py verbatim for its PostHog event generators
+# (pageview, autocapture, identify, etc.) and put it on PYTHONPATH so
+# arrow_producer.py can `import producer`.
+
+FROM python:3.12-slim
+
+# Pinned to minor versions. confluent-kafka 2.6.x ships with librdkafka
+# 2.6.x; pyarrow 18.1.x is the current stable at the time of writing.
+RUN pip install --no-cache-dir \
+        "pyarrow==18.1.*" \
+        "confluent-kafka==2.6.*"
+
+WORKDIR /app
+
+# Reused generators (copied from repo root — build context is repo root).
+COPY test/producer.py /app/posthog_gen/producer.py
+
+# The Arrow IPC producer itself.
+COPY experiments/arrow-payload/producer/arrow_producer.py /app/arrow_producer.py
+
+# Put the reused generators on PYTHONPATH so `import producer` in
+# arrow_producer.py resolves to /app/posthog_gen/producer.py.
+ENV PYTHONPATH=/app/posthog_gen
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "/app/arrow_producer.py"]
