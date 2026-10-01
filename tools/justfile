@@ -204,19 +204,21 @@ drop-orphan-inline-tables-dry-run batch_size="500":
 # purpose.
 #
 # run_budget_s bounds the wall clock because the whole run holds the
-# maintenance advisory lock, which expire / cleanup / compaction wait on: the
-# tenant maintenance CronJob runs ~6 recipes under ONE activeDeadlineSeconds
-# (default 18000, `$cActiveDeadline ... default 18000` in the charts
-# crossplane-config/templates/composition.yaml), so 18000 / 6 = 3000s per
-# recipe and 1800s leaves headroom for the others. Stopping on the budget is
-# a clean exit 0, not a failure: keyset paging restarts from the orphan
-# predicate rather than a saved cursor, so the next cron tick resumes the
-# backlog of droppable rows. Pass an empty run_budget_s to drain a backlog
-# unbudgeted by hand.
+# maintenance advisory lock, which expire / cleanup / compaction wait on. The
+# bound that matters is the cron CADENCE, not the activeDeadlineSeconds
+# (18000 by default): three prod-us tenants run the whole chain every 15
+# minutes under concurrencyPolicy Forbid, so a step that holds the chain for
+# longer than a tick skips the next tick for every other step. 300s keeps
+# the chain inside one tick; the chain wrapper below reads it from
+# MILLPOND_INLINE_RUN_BUDGET_S so a tenant can be raised without touching
+# the chain args. Stopping on the budget is a clean exit 0, not a failure:
+# keyset paging restarts from the orphan predicate rather than a saved
+# cursor, so the next cron tick resumes the backlog of droppable rows. Pass
+# an empty run_budget_s to drain a backlog unbudgeted by hand.
 
 # Drop inlined-data tables of dropped DuckLake tables (direct Postgres; works when ATTACH cannot)
 [group('lifecycle')]
-drop-orphan-inline-tables batch_size="500" max_batches="" run_budget_s="1800": _confirm-target
+drop-orphan-inline-tables batch_size="500" max_batches="" run_budget_s="300": _confirm-target
     env {{ _target_env }} python {{ ducklake_maintenance }} drop-orphan-inline-tables --batch-size {{ quote(batch_size) }} {{ if run_budget_s != "" { "--run-budget-s " + quote(run_budget_s) } else { "" } }} {{ if max_batches != "" { "--max-batches " + quote(max_batches) } else { "" } }}
 
 # REMOVE-WHEN: upstream-ducklake-fix-deployed
@@ -353,14 +355,18 @@ compact-all-tiers-default: (compact-all-tiers)
 # snapshot expiry at the 7-day fleet default, chain-safe
 expire-7d: (expire "7")
 
-# The 1800s run budget is passed explicitly (not left to the recipe default)
-# because this is the form the maintenance cron runs: one of ~6 recipes under a
-# single 18000s activeDeadlineSeconds, so 18000 / 6 = 3000s each and 1800s
-# leaves headroom. A budgeted stop is not a failure - the next tick resumes
-# from the orphan predicate (keyset paging, no saved cursor).
+# The run budget comes from MILLPOND_INLINE_RUN_BUDGET_S (default 300s), not
+# from the recipe default, because this is the form the maintenance cron runs
+# and the cron's cadence is the real bound: three prod-us tenants run the whole
+# chain every 15 minutes under concurrencyPolicy Forbid, so a step that holds
+# the chain for 30 minutes skips their ticks (compaction included). 300s keeps
+# the chain inside one tick with the other steps. A budgeted stop is not a
+# failure - the next tick resumes from the orphan predicate (keyset paging, no
+# saved cursor). Raise it per tenant with the env var, never by editing the
+# chain args: a parameterized recipe in a just chain eats the next word.
 
-# drop-orphan-inline-tables at the default batch size, no batch limit, 30m budget, chain-safe
-drop-orphan-inline-tables-default: (drop-orphan-inline-tables "500" "" "1800")
+# drop-orphan-inline-tables at the default batch size, no batch limit, env budget (default 300s), chain-safe
+drop-orphan-inline-tables-default: (drop-orphan-inline-tables "500" "" env_var_or_default("MILLPOND_INLINE_RUN_BUDGET_S", "300"))
 
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3) then delete scheduled S3 files
 [group('compaction')]
