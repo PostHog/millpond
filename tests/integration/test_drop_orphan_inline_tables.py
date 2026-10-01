@@ -9,7 +9,8 @@ Postgres source, first available wins:
   1. MILLPOND_TEST_PG_DSN — an existing server; the test creates and drops a
      throwaway database on it (needs CREATEDB).
   2. initdb / pg_ctl on PATH (or under /usr/lib/postgresql/*/bin, where the
-     GitHub ubuntu runner keeps them) — a throwaway cluster in tmp.
+     GitHub ubuntu runner keeps them) WITH the `postgres` server binary beside
+     them — a throwaway cluster in tmp.
   3. docker — a throwaway postgres:17 container on a random 127.0.0.1 port.
 Otherwise the module skips (fails when MILLPOND_REQUIRE_DOCKER_STACK is set,
 same contract as the hoglake suites).
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import glob
+import logging
 import os
 import shutil
 import socket
@@ -64,6 +66,18 @@ def _pg_bin(name: str) -> str | None:
         return found
     candidates = sorted(glob.glob(f"/usr/lib/postgresql/*/bin/{name}"))
     return candidates[-1] if candidates else None
+
+
+def _has_local_server() -> bool:
+    """initdb/pg_ctl on PATH are not enough: brew's `libpq` ships both WITHOUT
+    the `postgres` server binary, and initdb then fails at run time instead of
+    letting the fixture fall through to docker. Require an EXECUTABLE server
+    next to the initdb we would actually call (initdb resolves its own real
+    path and looks for `postgres` there)."""
+    initdb, pg_ctl = _pg_bin("initdb"), _pg_bin("pg_ctl")
+    if not (initdb and pg_ctl):
+        return False
+    return os.access(os.path.join(os.path.dirname(initdb), "postgres"), os.X_OK)
 
 
 @contextlib.contextmanager
@@ -138,12 +152,15 @@ def pg_server():
             "dbname": info.get("dbname", "postgres"),
         }
         return
-    if _pg_bin("initdb") and _pg_bin("pg_ctl"):
+    if _has_local_server():
         cm = _local_cluster()
     elif stack.docker_available():
         cm = _docker_cluster()
     else:
-        stack.require_or_skip("no Postgres available (no MILLPOND_TEST_PG_DSN, no initdb/pg_ctl, no docker)")
+        stack.require_or_skip(
+            "no Postgres available: no MILLPOND_TEST_PG_DSN, no local initdb/pg_ctl with an executable "
+            "`postgres` server beside them, no docker"
+        )
     with cm as server:
         _wait_ready(_conninfo(server))
         yield server
@@ -229,6 +246,7 @@ def _gauges():
         "dropped": Gauge("dropped", "", registry=reg),
         "skipped_nonempty": Gauge("skipped_nonempty", "", registry=reg),
         "remaining": Gauge("remaining", "", registry=reg),
+        "budget_exhausted": Gauge("budget_exhausted", "", registry=reg),
     }
 
 
@@ -241,9 +259,17 @@ def _metric_count(pg) -> int:
     return pg.execute(q.sql.replace("__ducklake_metadata_lake.", "public.")).fetchone()[0]
 
 
-def _run(dry_run=False, batch_size=500, max_batches=None):
+def _expected_cap(gucs) -> int:
+    """The cap, restated from the finding rather than recomputed with the
+    production helper: a quarter of the lock table's documented floor at the
+    5 measured lock-table entries per DROP, clamped to [10, 2000]."""
+    max_locks, max_conns, max_prepared = gucs
+    return max(10, min(2000, int(max_locks * (max_conns + max_prepared) * 0.25 / 5)))
+
+
+def _run(dry_run=False, batch_size=500, max_batches=None, run_budget_s=None):
     reg, gauges = _gauges()
-    dm.drop_orphan_inline_tables(dry_run, batch_size, max_batches, gauges)
+    dm.drop_orphan_inline_tables(dry_run, batch_size, max_batches, gauges, run_budget_s=run_budget_s)
     return {k: g._value.get() for k, g in gauges.items()}
 
 
@@ -265,7 +291,7 @@ class TestDropOrphanInlineTables:
         for name in (*orphan, unregistered_parent):
             assert not _relation_exists(pg, name)
         assert _registry(pg) == set()
-        assert out == {"dropped": 2, "skipped_nonempty": 0, "remaining": 0}
+        assert out == {"dropped": 2, "skipped_nonempty": 0, "remaining": 0, "budget_exhausted": 0}
 
     def test_reachable_and_live_tables_kept(self, pg):
         _make_catalog(pg, RETAINED)
@@ -295,7 +321,7 @@ class TestDropOrphanInlineTables:
         assert _relation_exists(pg, full[0])
         assert pg.execute(f'SELECT COUNT(*) FROM "{full[0]}"').fetchone()[0] == 3
         assert not _relation_exists(pg, empty[0])
-        assert out == {"dropped": 1, "skipped_nonempty": 1, "remaining": 1}
+        assert out == {"dropped": 1, "skipped_nonempty": 1, "remaining": 1, "budget_exhausted": 0}
         assert "skipping non-empty orphan" in caplog.text
 
     def test_unexpected_table_name_never_dropped(self, pg):
@@ -332,12 +358,12 @@ class TestDropOrphanInlineTables:
 
         caplog.set_level("INFO")
         out = _run(batch_size=3, max_batches=2)
-        assert out == {"dropped": 5, "skipped_nonempty": 1, "remaining": 2}
+        assert out == {"dropped": 5, "skipped_nonempty": 1, "remaining": 2, "budget_exhausted": 0}
         assert "batch 2:" in caplog.text and "batch 3:" not in caplog.text
 
         caplog.clear()
         out = _run(batch_size=3)
-        assert out == {"dropped": 1, "skipped_nonempty": 1, "remaining": 1}
+        assert out == {"dropped": 1, "skipped_nonempty": 1, "remaining": 1, "budget_exhausted": 0}
         assert _registry(pg) == {"ducklake_inlined_data_2_1", "ducklake_inlined_data_50_1"}
 
     def test_metric_and_predicate_count_the_same_rows(self, pg):
@@ -380,6 +406,246 @@ class TestDropOrphanInlineTables:
         monkeypatch.delenv("PUSHGATEWAY_URL", raising=False)
         dm.main(["drop-orphan-inline-tables", "--batch-size", "10"])
         assert not _relation_exists(pg, orphan[0])
+
+    # --- bounds: the lock budget and the wall-clock budget -----------------
+
+    def test_effective_batch_size_is_derived_from_the_servers_gucs(self, pg, caplog):
+        """The cap comes from THIS server's GUCs. The formula is restated here
+        from the finding (not recomputed with the production helper, which
+        would make the test a tautology), and the EFFECTIVE size is read off
+        the loop by counting batches, not just off the pre-loop log line."""
+        _make_catalog(pg, RETAINED)
+        for i in range(1, 8):
+            _add_table(pg, i, begin=10, end=20)
+        gucs = pg.execute(dm._INLINE_LOCK_GUC_SQL).fetchone()
+        capacity = gucs[0] * (gucs[1] + gucs[2])
+        cap = _expected_cap(gucs)
+        # The stock/CNPG-default case is pinned numerically, whatever this
+        # server happens to be configured as.
+        assert _expected_cap((64, 100, 0)) == 320
+
+        caplog.set_level("INFO")
+        # Ask for 3 (well under any cap) and count the batches: 7 orphans in
+        # pages of 3 is 3 batches, so the size the loop USED was 3.
+        _run(batch_size=3)
+
+        assert (
+            f"max_locks_per_transaction={gucs[0]} max_connections={gucs[1]} max_prepared_transactions={gucs[2]} "
+            f"capacity={capacity}"
+        ) in caplog.text
+        assert f"batch_cap={cap} batch_size=3 requested=3" in caplog.text
+        assert "batch 3:" in caplog.text and "batch 4:" not in caplog.text
+
+    def test_a_request_above_the_cap_is_lowered_and_one_at_the_cap_is_not(self, pg, caplog):
+        _make_catalog(pg, RETAINED)
+        _add_table(pg, 1, begin=10, end=20)
+        cap = _expected_cap(pg.execute(dm._INLINE_LOCK_GUC_SQL).fetchone())
+
+        caplog.set_level("INFO")
+        _run(batch_size=cap + 1)
+        assert f"--batch-size {cap + 1} lowered to {cap}" in caplog.text
+        assert f"batch_cap={cap} batch_size={cap} requested={cap + 1}" in caplog.text
+        # P3: this is INFO on the servers where it fires every single run.
+        assert [r.levelno for r in caplog.records if "lowered to" in r.getMessage()] == [logging.INFO]
+
+        caplog.clear()
+        _add_table(pg, 2, begin=10, end=20)
+        _run(batch_size=cap)
+        assert "lowered to" not in caplog.text
+
+    def test_run_budget_stops_between_batches_and_the_next_run_converges(self, pg, caplog, monkeypatch):
+        _make_catalog(pg, RETAINED)
+        for i in range(1, 8):
+            _add_table(pg, i, begin=10, end=20)
+
+        # Let the batch itself run unbounded (so this exercises the
+        # BETWEEN-batches check) and burn the budget right after it commits.
+        real_batch = dm._drop_inline_batch
+
+        def slow(conn, after, batch_size, dry_run, deadline=None):
+            res = real_batch(conn, after, batch_size, dry_run, None)
+            time.sleep(0.05)
+            return res
+
+        monkeypatch.setattr(dm, "_drop_inline_batch", slow)
+        caplog.set_level("INFO")
+        out = _run(batch_size=2, run_budget_s=0.01)
+
+        assert out == {"dropped": 2, "skipped_nonempty": 0, "remaining": 5, "budget_exhausted": 1}
+        assert "batch 1:" in caplog.text and "batch 2:" not in caplog.text
+        assert "truncated=False" in caplog.text  # the batch completed; the RUN stopped
+        assert "budget_exhausted=true" in caplog.text and "remaining_orphans=5" in caplog.text
+        assert len(_registry(pg)) == 5
+
+        # Convergence: keyset paging restarts from the predicate, so a second
+        # run (here unbudgeted, and without the slow wrapper) finishes the
+        # backlog with no saved cursor. Restore just the batch function —
+        # monkeypatch.undo() would also drop the fixture's DUCKLAKE_RDS_* env.
+        monkeypatch.setattr(dm, "_drop_inline_batch", real_batch)
+        caplog.clear()
+        out = _run(batch_size=2)
+        assert out == {"dropped": 5, "skipped_nonempty": 0, "remaining": 0, "budget_exhausted": 0}
+        assert _registry(pg) == set()
+
+    def test_an_exhausted_budget_truncates_the_batch_after_one_row(self, pg, caplog):
+        """statement_timeout bounds a statement, not the ~3+3n statements of a
+        batch, so the deadline is enforced inside the row loop: the row in
+        flight finishes and commits WITH its registry row, and nothing else
+        is taken. One row always goes through, so a run cannot no-op."""
+        _make_catalog(pg, RETAINED)
+        for i in range(1, 6):
+            _add_table(pg, i, begin=10, end=20)
+
+        caplog.set_level("INFO")
+        out = _run(batch_size=5, run_budget_s=0.001)
+
+        assert out == {"dropped": 1, "skipped_nonempty": 0, "remaining": 4, "budget_exhausted": 1}
+        assert "selected=1 dropped=1" in caplog.text and "truncated=True" in caplog.text
+        assert "batch 2:" not in caplog.text
+        # Atomic: exactly the dropped table's registry row is gone.
+        assert _registry(pg) == {f"ducklake_inlined_data_{i}_1" for i in range(2, 6)}
+        assert not _relation_exists(pg, "ducklake_inlined_data_1_1")
+
+    def test_out_of_shared_memory_inside_the_transaction_halves_and_completes(self, pg, monkeypatch, caplog):
+        """The real psycopg error, raised from INSIDE the batch transaction, so
+        the retry has to survive an aborted transaction as well as shrink."""
+        _make_catalog(pg, RETAINED)
+        orphans = [n for i in range(1, 13) for n in _add_table(pg, i, begin=10, end=20)]
+        real_has_rows = dm._inline_table_has_rows
+        raised = []
+
+        def flaky(cur, table_name):
+            if not raised:
+                raised.append(table_name)
+                raise psycopg.errors.OutOfMemory("out of shared memory")
+            return real_has_rows(cur, table_name)
+
+        monkeypatch.setattr(dm, "_inline_table_has_rows", flaky)
+        monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
+
+        caplog.set_level("INFO")
+        out = _run(batch_size=20)
+
+        assert raised  # the error really came from inside the transaction
+        assert "out of shared memory (53200): batch size 20 -> 10" in caplog.text
+        assert "retries=1 batch_size_start=20 batch_size_final=10" in caplog.text
+        assert out == {"dropped": 12, "skipped_nonempty": 0, "remaining": 0, "budget_exhausted": 0}
+        assert not any(_relation_exists(pg, n) for n in orphans)
+        assert _registry(pg) == set()
+
+    def test_skipped_share_is_reported(self, pg, caplog):
+        """Skipped rows are re-walked by every run and never converge, so the
+        run says what share of its work they were."""
+        _make_catalog(pg, RETAINED)
+        _add_table(pg, 1, begin=10, end=20, rows=1)  # non-empty: skipped forever
+        _add_table(pg, 2, begin=10, end=20)
+
+        caplog.set_level("INFO")
+        _run()
+        assert "skipped_nonempty=1 skipped_invalid_name=0 skipped_share=50.0%" in caplog.text
+
+    def test_main_passes_the_run_budget_and_registers_the_gauge(self, pg, monkeypatch, caplog):
+        """CLI -> dispatch wiring: without `run_budget_s=args.run_budget_s` in
+        main() every other test here still passes."""
+        _make_catalog(pg, RETAINED)
+        for i in range(1, 6):
+            _add_table(pg, i, begin=10, end=20)
+        gauge_names = []
+        real_gauge = dm.Gauge
+
+        def recording_gauge(*a, **kw):
+            gauge_names.append(a[0])
+            return real_gauge(*a, **kw)
+
+        monkeypatch.setattr(dm, "Gauge", recording_gauge)
+        monkeypatch.setattr(dm, "connect", lambda *a, **kw: pytest.fail("connect() must not be called"))
+        monkeypatch.delenv("PUSHGATEWAY_URL", raising=False)
+
+        caplog.set_level("INFO")
+        dm.main(["drop-orphan-inline-tables", "--batch-size", "2", "--run-budget-s", "0.001"])
+
+        assert "budget_exhausted=true" in caplog.text
+        assert "maintenance_inline_orphans_budget_exhausted" in gauge_names
+        assert _registry(pg)  # rows left for the next tick
+
+
+class TestJustfileDelivery:
+    """The chain wrapper is what the cron actually runs; an unwired flag there
+    is invisible to every python-level test."""
+
+    def test_default_wrapper_renders_the_run_budget(self):
+        just = shutil.which("just")
+        if not just:
+            pytest.skip("just not installed")
+        justfile = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools", "justfile"
+        )
+        out = subprocess.run(
+            [just, "--justfile", justfile, "--dry-run", "drop-orphan-inline-tables-default"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        rendered = out.stdout + out.stderr
+        assert out.returncode == 0, rendered
+        assert "drop-orphan-inline-tables --batch-size '500'" in rendered
+        assert "--run-budget-s '1800'" in rendered
+        assert "--max-batches" not in rendered
+
+    def test_empty_run_budget_renders_an_unbudgeted_command(self):
+        """An operator draining a backlog by hand must be able to pass ""."""
+        just = shutil.which("just")
+        if not just:
+            pytest.skip("just not installed")
+        justfile = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools", "justfile"
+        )
+        out = subprocess.run(
+            [just, "--justfile", justfile, "--dry-run", "drop-orphan-inline-tables", "500", "", ""],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        rendered = out.stdout + out.stderr
+        assert out.returncode == 0, rendered
+        assert "--run-budget-s" not in rendered
+        assert "--max-batches" not in rendered
+
+
+class TestLocalServerDetection:
+    """`initdb` on PATH does not imply a local server: brew's libpq ships the
+    client programs without `postgres`, and initdb fails at run time instead
+    of letting this module fall through to docker."""
+
+    def _patch(self, monkeypatch, *, which, executable):
+        monkeypatch.setattr(shutil, "which", lambda name: which.get(name))
+        monkeypatch.setattr(glob, "glob", lambda pattern: [])
+        monkeypatch.setattr(os, "access", lambda path, mode: path in executable)
+
+    def test_no_client_programs(self, monkeypatch):
+        self._patch(monkeypatch, which={}, executable=set())
+        assert _has_local_server() is False
+
+    def test_initdb_without_pg_ctl(self, monkeypatch):
+        self._patch(monkeypatch, which={"initdb": "/bin/initdb"}, executable={"/bin/postgres"})
+        assert _has_local_server() is False
+
+    def test_client_programs_without_a_server(self, monkeypatch):
+        # The brew-libpq case that errored the whole module before this gate.
+        self._patch(
+            monkeypatch,
+            which={"initdb": "/opt/homebrew/bin/initdb", "pg_ctl": "/opt/homebrew/bin/pg_ctl"},
+            executable=set(),
+        )
+        assert _has_local_server() is False
+
+    def test_server_beside_initdb(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            which={"initdb": "/usr/lib/postgresql/17/bin/initdb", "pg_ctl": "/usr/lib/postgresql/17/bin/pg_ctl"},
+            executable={"/usr/lib/postgresql/17/bin/postgres"},
+        )
+        assert _has_local_server() is True
 
 
 class TestAgainstRealDuckLakeCatalog:

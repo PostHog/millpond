@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import duckdb
 import ducklake_maintenance
+import psycopg
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,7 @@ class TestArgparse:
     def test_drop_orphan_inline_tables_defaults(self):
         args = self.parser.parse_args(["drop-orphan-inline-tables"])
         assert args.command == "drop-orphan-inline-tables"
-        assert (args.dry_run, args.batch_size, args.max_batches) == (False, 500, None)
+        assert (args.dry_run, args.batch_size, args.max_batches, args.run_budget_s) == (False, 500, None, None)
         assert args.command in ducklake_maintenance._DIRECT_PG_COMMANDS
 
     def test_drop_orphan_inline_tables_batch_cap(self):
@@ -1828,3 +1829,341 @@ class TestAcquireAdvisoryLock:
         conn.execute.return_value.fetchone.return_value = (False,)
         with pytest.raises(RuntimeError, match="advisory lock"):
             ducklake_maintenance._acquire_advisory_lock(conn)
+
+
+# ---------------------------------------------------------------------------
+# drop-orphan-inline-tables bounds: the per-batch lock budget, the 53200
+# shrink/re-grow, and the wall-clock run budget. All three are run state, so
+# they are exercised here with a stubbed connection; the integration suite
+# pins them against a real server's GUCs.
+# ---------------------------------------------------------------------------
+
+dm = ducklake_maintenance
+
+
+class _Gauge:
+    """Stand-in for a prometheus Gauge: records the last value set."""
+
+    def __init__(self):
+        self.value = None
+
+    def set(self, v):
+        self.value = v
+
+
+def _inline_gauges():
+    return {k: _Gauge() for k in ("dropped", "skipped_nonempty", "remaining", "budget_exhausted")}
+
+
+class _FakeCursor:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+class _FakePg:
+    """Answers the scalar reads drop_orphan_inline_tables makes around the
+    batch loop (the batch itself is monkeypatched out) and REFUSES anything
+    else, so a new query cannot silently take a stub answer meant for another
+    statement."""
+
+    def __init__(self, *, gucs=(64, 100, 0), orphaned=10_000, remaining=0, snapshots=5):
+        self.gucs = gucs
+        self.orphaned = orphaned
+        self.remaining = remaining
+        self.snapshots = snapshots
+        self.statements = []
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        if "current_setting" in sql:
+            row = self.gucs
+        elif "to_regclass" in sql:
+            row = (True,)
+        elif "advisory" in sql:
+            row = (True,)
+        elif "pg_catalog.pg_class" in sql:  # the three-count summary
+            row = (self.orphaned, self.orphaned, self.orphaned)
+        elif "ducklake_inlined_data_tables idt" in sql:  # remaining-orphan recount
+            row = (self.remaining,)
+        elif "ducklake_snapshot" in sql:
+            row = (self.snapshots,)
+        else:
+            raise AssertionError(f"_FakePg received an unexpected statement: {sql!r}")
+        return _FakeCursor(row)
+
+    def close(self):
+        pass
+
+
+class _Clock:
+    """Monotonic clock advancing a fixed step per read."""
+
+    def __init__(self, step):
+        self.t = 0.0
+        self.step = step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+def _sqlstate_error(sqlstate):
+    """psycopg fills sqlstate in from the server; here it is set directly (it
+    is a plain class attribute on psycopg.Error, so it is assignable)."""
+    exc = psycopg.OperationalError(f"simulated {sqlstate}")
+    exc.sqlstate = sqlstate
+    return exc
+
+
+class TestInlineLockBudget:
+    """The batch cap is DERIVED from the server's lock table: capacity =
+    max_locks_per_transaction * (max_connections + max_prepared_transactions),
+    of which one batch may claim a quarter at the MEASURED 5 lock-table
+    entries per DROP (heap + TOAST heap + TOAST index + 2 pg_type object
+    locks). The entry count is the denominator, so a conservative estimate is
+    a high one."""
+
+    def test_stock_postgres_cap_is_below_the_default_batch_size(self):
+        # 64 * (100 + 0) = 6400 entries; a quarter is 1600, / 5 = 320. That is
+        # BELOW the 500 default, which is why the cap is read off the server.
+        assert (dm._DROP_INLINE_LOCK_TABLE_SHARE, dm._DROP_INLINE_ENTRIES_PER_DROP) == (0.25, 5)
+        b = dm._inline_lock_budget(500, 64, 100, 0)
+        assert (b.capacity, b.cap, b.batch_size, b.lowered) == (6400, 320, 320, True)
+
+    def test_prepared_transactions_count_toward_capacity(self):
+        assert dm._inline_lock_budget(500, 64, 500, 10).capacity == 64 * 510
+
+    def test_rds_sized_server_is_governed_by_the_absolute_ceiling(self):
+        # RDS default max_connections is ~1800 on a db.r7g.large: the raw cap
+        # lands in the thousands, so the derivation does NOT bite in prod.
+        b = dm._inline_lock_budget(2000, 64, 1800, 0)
+        assert b.capacity == 115_200
+        assert b.cap == dm._DROP_INLINE_MAX_BATCH_SIZE
+        assert b.batch_size == 2000 and not b.lowered
+
+    def test_request_below_the_cap_is_left_alone(self):
+        b = dm._inline_lock_budget(100, 64, 1800, 0)
+        assert b.cap == 2000 and b.batch_size == 100 and not b.lowered
+
+    def test_tiny_server_floors_at_the_minimum(self):
+        # capacity 20 -> a cap of 1 would make no progress; floor it.
+        b = dm._inline_lock_budget(500, 4, 5, 0)
+        assert b.capacity == 20
+        assert b.cap == b.batch_size == dm._DROP_INLINE_MIN_BATCH_SIZE
+
+    def test_read_from_connection_uses_the_guc_sql(self):
+        assert dm._read_inline_lock_budget(_FakePg(gucs=(64, 100, 0)), 500).batch_size == 320
+        for guc in ("max_locks_per_transaction", "max_connections", "max_prepared_transactions"):
+            assert guc in dm._INLINE_LOCK_GUC_SQL
+
+
+class TestInlineBatchSizeRunState:
+    """The effective batch size is run state: lowered once from the GUCs,
+    halved on every 53200, re-grown after enough clean batches, and fatal if
+    53200 outlives the attempt budget."""
+
+    def _drive(self, monkeypatch, *, errors=(), requested=400, gucs=(64, 10_000, 0), full_pages=0):
+        """Raise `errors` on the first calls, then return `full_pages` full
+        pages (which keep the loop going) and finally a short page (which ends
+        the run). gucs are generous so the GUC cap does not interfere."""
+        sizes = []
+        queue = list(errors)
+        full = [full_pages]
+
+        def fake_batch(pg, after, batch_size, dry_run, deadline=None):
+            sizes.append(batch_size)
+            if queue:
+                raise queue.pop(0)
+            rows = batch_size if full[0] > 0 else 1
+            full[0] -= 1
+            return dm._InlineBatchResult(rows=rows, dropped=rows, last_key=(len(sizes), 1))
+
+        monkeypatch.setattr(dm, "_drop_inline_batch", fake_batch)
+        monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
+        gauges = _inline_gauges()
+        dm.drop_orphan_inline_tables(False, requested, None, gauges, pg=_FakePg(gucs=gucs), run_budget_s=None)
+        return sizes, gauges
+
+    def test_53200_is_retryable_and_its_neighbours_are_not(self):
+        assert "53200" in dm._DROP_INLINE_RETRYABLE_SQLSTATES
+        # Disk full / too many connections / configuration limit: a smaller
+        # batch does not help any of them.
+        assert dm._DROP_INLINE_RETRYABLE_SQLSTATES.isdisjoint({"53100", "53300", "53400"})
+
+    def test_53200_halves_for_the_rest_of_the_run(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            sizes, _ = self._drive(monkeypatch, errors=[_sqlstate_error("53200")])
+        assert sizes == [400, 200]
+        assert "out of shared memory (53200): batch size 400 -> 200" in caplog.text
+
+    def test_other_retryable_errors_keep_the_size(self, monkeypatch):
+        sizes, _ = self._drive(monkeypatch, errors=[_sqlstate_error("40001")])
+        assert sizes == [400, 400]
+
+    def test_one_batch_cannot_halve_past_the_attempt_budget(self, monkeypatch):
+        """The floor of 10 is reachable only ACROSS batches: within one batch
+        the attempt budget runs out first, and a lock table still full after
+        five tries is fatal on purpose."""
+        with pytest.raises(psycopg.Error, match="simulated 53200"):
+            self._drive(monkeypatch, errors=[_sqlstate_error("53200")] * 5, requested=500)
+        assert dm._DROP_INLINE_MAX_ATTEMPTS == 5
+
+    def test_the_sizes_tried_within_one_fatal_batch(self, monkeypatch):
+        sizes = []
+
+        def fake_batch(pg, after, batch_size, dry_run, deadline=None):
+            sizes.append(batch_size)
+            raise _sqlstate_error("53200")
+
+        monkeypatch.setattr(dm, "_drop_inline_batch", fake_batch)
+        monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
+        with pytest.raises(psycopg.Error):
+            dm.drop_orphan_inline_tables(
+                False, 500, None, _inline_gauges(), pg=_FakePg(gucs=(64, 10_000, 0)), run_budget_s=None
+            )
+        assert sizes == [500, 250, 125, 62, 31]
+
+    def test_halving_never_grows_a_below_floor_size(self, monkeypatch):
+        # --batch-size 5 is below the floor; halving must not raise it to 10.
+        sizes, _ = self._drive(monkeypatch, errors=[_sqlstate_error("53200")], requested=5)
+        assert sizes == [5, 5]
+
+    def test_size_re_grows_after_ten_clean_batches(self, monkeypatch, caplog):
+        """Without this, three transient 53200s would hold a multi-hour run at
+        62 rows a batch forever."""
+        caplog.set_level(logging.INFO, logger="maintenance")
+        sizes, _ = self._drive(monkeypatch, errors=[_sqlstate_error("53200")], full_pages=12)
+        # call 1 raises (400 -> 200); the batch that follows it is not clean,
+        # so ten clean batches at 200 come after it, then the re-growth.
+        assert sizes[0] == 400
+        assert sizes[1:12] == [200] * 11
+        assert sizes[12] == 400
+        assert dm._DROP_INLINE_REGROW_AFTER_BATCHES == 10
+        assert "10 clean batches: batch size 200 -> 400 (ceiling 400" in caplog.text
+        assert "batch_size_start=400 batch_size_final=400" in caplog.text
+
+    def test_re_growth_never_passes_the_size_the_run_started_with(self, monkeypatch, caplog):
+        """The ceiling is the size the run started with (min(requested, cap)),
+        not the cap: re-growth must not hand the operator a bigger batch than
+        they asked for."""
+        caplog.set_level(logging.INFO, logger="maintenance")
+        sizes, _ = self._drive(
+            monkeypatch, errors=[_sqlstate_error("53200")], requested=300, gucs=(64, 100, 0), full_pages=12
+        )
+        assert sizes[0] == 300 and sizes[1] == 150
+        assert "batch size 150 -> 300 (ceiling 300" in caplog.text
+        assert max(sizes) == 300  # never 320, the server-derived cap
+
+    def test_guc_cap_lowers_the_requested_size_at_info_not_warning(self, monkeypatch, caplog):
+        """On the only servers where this fires it fires every run, dry-runs
+        included; WARN is reserved for the 53200 halving."""
+        with caplog.at_level(logging.INFO, logger="maintenance"):
+            sizes, _ = self._drive(monkeypatch, requested=500, gucs=(64, 100, 0))
+        assert sizes == [320]
+        assert "--batch-size 500 lowered to 320" in caplog.text
+        lowered = [r for r in caplog.records if "lowered to" in r.getMessage()]
+        assert [r.levelno for r in lowered] == [logging.INFO]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestInlineRunBudget:
+    """--run-budget-s bounds how long the run holds the maintenance advisory
+    lock. It is enforced between batches and inside one."""
+
+    def _drive(self, monkeypatch, *, step, budget, remaining=7, max_batches=4, truncate_at=None):
+        batches = []
+        deadlines = []
+
+        def fake_batch(pg, after, batch_size, dry_run, deadline=None):
+            batches.append(batch_size)
+            deadlines.append(deadline)
+            # Always a full page, so only the budget, a truncation or
+            # max_batches can stop the loop.
+            return dm._InlineBatchResult(
+                rows=batch_size,
+                dropped=batch_size,
+                last_key=(len(batches), 1),
+                truncated=truncate_at == len(batches),
+            )
+
+        monkeypatch.setattr(dm, "_drop_inline_batch", fake_batch)
+        monkeypatch.setattr(dm, "_monotonic", _Clock(step))
+        gauges = _inline_gauges()
+        dm.drop_orphan_inline_tables(
+            False, 100, max_batches, gauges, pg=_FakePg(remaining=remaining), run_budget_s=budget
+        )
+        return batches, gauges, deadlines
+
+    def test_budget_not_reached_keeps_batching(self, monkeypatch):
+        batches, gauges, deadlines = self._drive(monkeypatch, step=1.0, budget=1000.0)
+        assert len(batches) == 4  # stopped by max_batches, not the budget
+        assert gauges["budget_exhausted"].value == 0
+        assert gauges["remaining"].value == 7
+        assert all(d is not None for d in deadlines)  # the batch gets the deadline
+
+    def test_budget_reached_stops_after_the_current_batch(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            batches, gauges, _ = self._drive(monkeypatch, step=100.0, budget=10.0)
+        assert len(batches) == 1
+        assert gauges["budget_exhausted"].value == 1
+        assert gauges["remaining"].value == 7
+        assert "budget_exhausted=true" in caplog.text and "remaining_orphans=7" in caplog.text
+
+    def test_a_truncated_batch_ends_the_run_as_budget_exhausted(self, monkeypatch):
+        # The batch hit the deadline mid-page, committed what it had and said
+        # so; the loop must not start another one.
+        batches, gauges, _ = self._drive(monkeypatch, step=1.0, budget=1000.0, truncate_at=2)
+        assert len(batches) == 2
+        assert gauges["budget_exhausted"].value == 1
+
+    def test_no_budget_is_unbounded_and_passes_no_deadline(self, monkeypatch):
+        batches, gauges, deadlines = self._drive(monkeypatch, step=10_000.0, budget=None)
+        assert len(batches) == 4
+        assert gauges["budget_exhausted"].value == 0
+        assert deadlines == [None] * 4
+
+    def test_budget_reached_during_retry_backoff_abandons_the_batch(self, monkeypatch, caplog):
+        """The backoff sleeps are elapsed time too, and they sit between the
+        batch and the next budget check."""
+        calls = []
+
+        def fake_batch(pg, after, batch_size, dry_run, deadline=None):
+            calls.append(batch_size)
+            raise _sqlstate_error("40001")
+
+        monkeypatch.setattr(dm, "_drop_inline_batch", fake_batch)
+        monkeypatch.setattr(dm, "_monotonic", _Clock(100.0))
+        slept = []
+        monkeypatch.setattr(dm.time, "sleep", lambda s: slept.append(s))
+        gauges = _inline_gauges()
+        with caplog.at_level(logging.WARNING, logger="maintenance"):
+            dm.drop_orphan_inline_tables(False, 100, None, gauges, pg=_FakePg(remaining=3), run_budget_s=10.0)
+        assert calls == [100]  # one attempt, then the budget said stop
+        assert slept == []
+        assert "abandoning this batch instead of retrying" in caplog.text
+        assert gauges["budget_exhausted"].value == 1
+
+
+class TestInlineRunBudgetArgs:
+    def setup_method(self):
+        self.parser = ducklake_maintenance.build_parser()
+
+    def test_default_is_unbounded(self):
+        assert self.parser.parse_args(["drop-orphan-inline-tables"]).run_budget_s is None
+
+    def test_float_seconds_accepted(self):
+        assert self.parser.parse_args(["drop-orphan-inline-tables", "--run-budget-s", "1800"]).run_budget_s == 1800.0
+        assert self.parser.parse_args(["drop-orphan-inline-tables", "--run-budget-s", "0.5"]).run_budget_s == 0.5
+
+    def test_inf_is_the_explicit_unbounded_escape_hatch(self):
+        assert self.parser.parse_args(["drop-orphan-inline-tables", "--run-budget-s", "inf"]).run_budget_s == float(
+            "inf"
+        )
+
+    @pytest.mark.parametrize("value", ["0", "-1", "abc"])
+    def test_non_positive_rejected(self, value):
+        with pytest.raises(SystemExit):
+            self.parser.parse_args(["drop-orphan-inline-tables", "--run-budget-s", value])

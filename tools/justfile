@@ -190,10 +190,34 @@ purge-orphan-stats: _confirm-target
 drop-orphan-inline-tables-dry-run batch_size="500":
     env {{ _target_env }} python {{ ducklake_maintenance }} drop-orphan-inline-tables --batch-size {{ quote(batch_size) }} --dry-run
 
+# batch_size is an UPPER BOUND only. The op derives the real cap from the
+# server: max_locks_per_transaction * (max_connections +
+# max_prepared_transactions), a quarter of it, divided by the 5 shared
+# lock-table entries each DROP of an inlined table holds until commit
+# (measured on PG 16/17/18: heap + TOAST heap + TOAST index + 2 pg_type
+# object locks). A stock server gives 6400 x 0.25 / 5 -> a cap of 320, below
+# this default; an RDS-sized max_connections puts the raw cap in the
+# thousands, so there the op's own 2000 ceiling governs instead. It logs the
+# GUCs and the effective size, and on SQLSTATE 53200 ("out of shared memory")
+# it retries with the size halved for the rest of the run, re-growing after
+# 10 clean batches. A lock table still full after 5 attempts is fatal, on
+# purpose.
+#
+# run_budget_s bounds the wall clock because the whole run holds the
+# maintenance advisory lock, which expire / cleanup / compaction wait on: the
+# tenant maintenance CronJob runs ~6 recipes under ONE activeDeadlineSeconds
+# (default 18000, `$cActiveDeadline ... default 18000` in the charts
+# crossplane-config/templates/composition.yaml), so 18000 / 6 = 3000s per
+# recipe and 1800s leaves headroom for the others. Stopping on the budget is
+# a clean exit 0, not a failure: keyset paging restarts from the orphan
+# predicate rather than a saved cursor, so the next cron tick resumes the
+# backlog of droppable rows. Pass an empty run_budget_s to drain a backlog
+# unbudgeted by hand.
+
 # Drop inlined-data tables of dropped DuckLake tables (direct Postgres; works when ATTACH cannot)
 [group('lifecycle')]
-drop-orphan-inline-tables batch_size="500" max_batches="": _confirm-target
-    env {{ _target_env }} python {{ ducklake_maintenance }} drop-orphan-inline-tables --batch-size {{ quote(batch_size) }} {{ if max_batches != "" { "--max-batches " + quote(max_batches) } else { "" } }}
+drop-orphan-inline-tables batch_size="500" max_batches="" run_budget_s="1800": _confirm-target
+    env {{ _target_env }} python {{ ducklake_maintenance }} drop-orphan-inline-tables --batch-size {{ quote(batch_size) }} {{ if run_budget_s != "" { "--run-budget-s " + quote(run_budget_s) } else { "" } }} {{ if max_batches != "" { "--max-batches " + quote(max_batches) } else { "" } }}
 
 # REMOVE-WHEN: upstream-ducklake-fix-deployed
 # Preview repair-partition-values (counts only, no DML; one-shot per customer)
@@ -329,8 +353,14 @@ compact-all-tiers-default: (compact-all-tiers)
 # snapshot expiry at the 7-day fleet default, chain-safe
 expire-7d: (expire "7")
 
-# drop-orphan-inline-tables at the default batch size, no batch limit, chain-safe
-drop-orphan-inline-tables-default: (drop-orphan-inline-tables)
+# The 1800s run budget is passed explicitly (not left to the recipe default)
+# because this is the form the maintenance cron runs: one of ~6 recipes under a
+# single 18000s activeDeadlineSeconds, so 18000 / 6 = 3000s each and 1800s
+# leaves headroom. A budgeted stop is not a failure - the next tick resumes
+# from the orphan predicate (keyset paging, no saved cursor).
+
+# drop-orphan-inline-tables at the default batch size, no batch limit, 30m budget, chain-safe
+drop-orphan-inline-tables-default: (drop-orphan-inline-tables "500" "" "1800")
 
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3) then delete scheduled S3 files
 [group('compaction')]

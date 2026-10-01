@@ -171,6 +171,13 @@ def _nonneg_int(s: str) -> int:
     return n
 
 
+def _positive_float(s: str) -> float:
+    v = float(s)
+    if not v > 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {v}")
+    return v
+
+
 def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
     """Connect to DuckLake using environment variables.
 
@@ -754,6 +761,16 @@ def _orphan_stats_predicate(alias: str) -> str:
 
     Kept in lockstep with the `ducklake_stats_rows_orphaned` metric in
     ducklake-metrics-daemon — metric and purge must count the same rows.
+
+    This is NOT `_inline_orphan_predicate`, the file's other definition of
+    "orphaned". Retention is irrelevant here and decisive there. Nothing ever
+    USES a non-live table's stats row: the commit path scans both stats tables
+    in full (that is precisely why orphans tax commits — see
+    purge_orphan_stats) but only consults the rows of tables it is writing,
+    and time travel does not read global stats at all. An inlined-data table
+    by contrast IS read by a time-travel query against a retained snapshot,
+    so there "can any retained snapshot still reach it" is the whole test.
+    Deliberately two predicates, not one helper: different questions.
     """
     return (
         f"NOT EXISTS ("
@@ -3697,22 +3714,124 @@ def drop_partitions(args: argparse.Namespace, gauges: dict) -> None:
 
 _INLINE_TABLE_NAME_RE = re.compile(r"ducklake_inlined_data_[0-9]+_[0-9]+")  # used with fullmatch()
 _DROP_INLINE_DEFAULT_BATCH_SIZE = 500
-# Every DROP TABLE holds AccessExclusiveLock on the table, its TOAST table and
-# TOAST index, plus deletion locks on its row/array types, until COMMIT — about
-# five shared lock-table entries per table. The shared lock table is sized by
-# max_locks_per_transaction * (max_connections + max_prepared_transactions);
-# exhausting it fails OTHER sessions with "out of shared memory". The cap keeps
-# a single batch well inside that on any sanely-configured instance.
+# Shared lock-table entries one `LOCK TABLE ... ACCESS EXCLUSIVE` + `DROP
+# TABLE` of an inlined table holds until COMMIT, MEASURED off pg_locks on
+# 16.15 / 17.10 / 18.6 (identical on all three): 5 = three locktype=relation
+# entries (the heap, its TOAST heap, the TOAST index) + two locktype=object
+# entries on pg_type for the composite rowtype and its array type, which
+# AcquireDeletionLock takes. A heap with no varlena column (hence no TOAST)
+# takes 3; one index would make it 6. The row updates the drop makes in
+# pg_class / pg_attribute / pg_depend take no lock-table entry at all.
+#
+# This constant is the DENOMINATOR of the cap, so UNDERestimating it inflates
+# the cap: a conservative estimate is a HIGH one. 5 is the measured value for
+# exactly the shape this op drops (inlined tables always carry varlena
+# columns and never carry indexes).
+#
+#   capacity  = max_locks_per_transaction * (max_connections + max_prepared_transactions)
+#   batch_cap = floor(capacity * _DROP_INLINE_LOCK_TABLE_SHARE / _DROP_INLINE_ENTRIES_PER_DROP)
+#
+# `capacity` is the lock table's documented FLOOR, not its total: Postgres
+# sizes the table max_locks_per_transaction * (MaxBackends +
+# max_prepared_transactions) where MaxBackends = max_connections +
+# autovacuum workers + 1 + max_worker_processes + max_wal_senders, and the
+# underlying hash table is not fixed-size (measurement fit ~10x the
+# documented count before 53200). So the quarter-share below is slack on top
+# of an already pessimistic number.
+#
+# Where this bites: a stock / CNPG-default server (64 * (100 + 0) = 6400)
+# gets a cap of 320, BELOW the 500 default, so the derivation governs there.
+# It does NOT govern the production targets: RDS's default max_connections is
+# LEAST(DBInstanceClassMemory/9531392, 5000), i.e. ~1,800 on a db.r7g.large
+# and 5,000 on a 2xlarge, so the raw cap lands at 7,200-20,000 and
+# _DROP_INLINE_MAX_BATCH_SIZE (2000, = 10,000 entries, well inside a stock
+# server's whole documented table by itself) is what actually governs. Read
+# the two as: the ceiling bounds prod, the derivation bounds small servers.
+_DROP_INLINE_LOCK_TABLE_SHARE = 0.25
+_DROP_INLINE_ENTRIES_PER_DROP = 5
 _DROP_INLINE_MAX_BATCH_SIZE = 2000
+# Floor for the server-derived cap and for the 53200 halving: 10 drops is ~50
+# lock entries, inside any usable configuration, and a run has to keep making
+# progress instead of converging on a zero-row batch. NOTE the floor is only
+# reachable ACROSS batches — within one batch _DROP_INLINE_MAX_ATTEMPTS caps
+# the halving chain (500 -> 250 -> 125 -> 62 -> 31, then fatal).
+_DROP_INLINE_MIN_BATCH_SIZE = 10
+# Consecutive retry-free batches after which a shrunken batch size doubles
+# again (never above the size the run started with). Without this a few
+# transient 53200s would hold a multi-hour run at a fraction of its size
+# forever: three of them take 500 to 62.
+_DROP_INLINE_REGROW_AFTER_BATCHES = 10
 # Per-batch txn bounds. lock_timeout is short on purpose: a table someone still
 # holds a lock on is not worth waiting for (the batch rolls back and retries).
 _DROP_INLINE_STATEMENT_TIMEOUT = "120s"
 _DROP_INLINE_LOCK_TIMEOUT = "5s"
 _DROP_INLINE_MAX_ATTEMPTS = 5
+_DROP_INLINE_OUT_OF_SHARED_MEMORY = "53200"
 # drop-partitions' retryable classes plus 42P01 (undefined_table): an inlined
 # table dropped by a concurrent session between our selection and our LOCK.
 # The retry re-selects, sees it gone from pg_class, and only deletes the row.
-_DROP_INLINE_RETRYABLE_SQLSTATES = _DROP_RETRYABLE_SQLSTATES | {"42P01"}
+# Plus 53200: retried with the batch halved, because a run that has been
+# dropping for hours must not die fatally on a transient shortage caused by
+# other sessions. 53200 is the GENERIC out_of_memory, not a lock-table-specific
+# code — a palloc failure in the registry DELETE's unnest() reports it too, and
+# a smaller batch is the right response to that as well. A lock table that is
+# STILL full after _DROP_INLINE_MAX_ATTEMPTS halvings is not something a cron
+# should paper over, so that case stays fatal. 53100 (disk full), 53300 (too
+# many connections) and 53400 (configuration limit exceeded) are deliberately
+# NOT retryable: a smaller batch does not help any of them.
+_DROP_INLINE_RETRYABLE_SQLSTATES = _DROP_RETRYABLE_SQLSTATES | {"42P01", _DROP_INLINE_OUT_OF_SHARED_MEMORY}
+
+# Module-level so tests can monkeypatch the run-budget clock without touching
+# the `time` module everything else in this file uses.
+_monotonic = time.monotonic
+
+# The GUCs the per-batch lock budget is derived from. Read on the direct
+# connection at the start of a run; the integration test runs this same SQL to
+# predict the effective batch size the op logs.
+_INLINE_LOCK_GUC_SQL = (
+    "SELECT current_setting('max_locks_per_transaction')::int, "
+    "current_setting('max_connections')::int, "
+    "current_setting('max_prepared_transactions')::int"
+)
+
+
+@dataclass(frozen=True)
+class _InlineLockBudget:
+    """How many orphans one batch may drop, derived from the server's GUCs."""
+
+    requested: int
+    max_locks_per_transaction: int
+    max_connections: int
+    max_prepared_transactions: int
+    capacity: int  # total shared lock-table entries on this server
+    cap: int  # rows per batch this server allows (clamped to MIN/MAX)
+    batch_size: int  # effective: min(requested, cap)
+
+    @property
+    def lowered(self) -> bool:
+        return self.batch_size < self.requested
+
+
+def _inline_lock_budget(
+    requested: int, max_locks_per_transaction: int, max_connections: int, max_prepared_transactions: int
+) -> _InlineLockBudget:
+    """Pure cap arithmetic; see the ENTRIES_PER_DROP comment for the derivation."""
+    capacity = max_locks_per_transaction * (max_connections + max_prepared_transactions)
+    cap = int(capacity * _DROP_INLINE_LOCK_TABLE_SHARE / _DROP_INLINE_ENTRIES_PER_DROP)
+    cap = max(_DROP_INLINE_MIN_BATCH_SIZE, min(cap, _DROP_INLINE_MAX_BATCH_SIZE))
+    return _InlineLockBudget(
+        requested=requested,
+        max_locks_per_transaction=max_locks_per_transaction,
+        max_connections=max_connections,
+        max_prepared_transactions=max_prepared_transactions,
+        capacity=capacity,
+        cap=cap,
+        batch_size=min(requested, cap),
+    )
+
+
+def _read_inline_lock_budget(pg: psycopg.Connection, requested: int) -> _InlineLockBudget:
+    return _inline_lock_budget(requested, *pg.execute(_INLINE_LOCK_GUC_SQL).fetchone())
 
 
 def _inline_orphan_predicate(alias: str) -> str:
@@ -3731,6 +3850,14 @@ def _inline_orphan_predicate(alias: str) -> str:
     and snapshot expiry only shrinks the retained range. So a row selected as
     orphaned stays orphaned for the rest of the transaction. The bounds are
     evaluated per statement, i.e. re-evaluated for every batch.
+
+    This is NOT `_orphan_stats_predicate`, the file's other definition of
+    "orphaned": that one calls any dropped table's stats rows orphaned and
+    ignores retention entirely, which is correct there because the commit
+    path reads only LIVE tables' stats. Here retention is the whole test — a
+    time-travel read of a retained snapshot can still read this table's
+    inlined rows, so a table version reachable from one must survive.
+    Deliberately two predicates, not one helper: different questions.
     """
     s = PG_CATALOG_SCHEMA
     return (
@@ -3797,6 +3924,7 @@ def _inline_table_has_rows(cur: psycopg.Cursor, table_name: str) -> bool:
 
 @dataclass
 class _InlineBatchResult:
+    truncated: bool = False  # stopped mid-page on the run deadline (P7)
     rows: int = 0  # registry rows selected this batch
     dropped: int = 0  # Postgres tables dropped
     registry_deleted: int = 0  # registry rows deleted (dropped + already-missing tables)
@@ -3807,11 +3935,27 @@ class _InlineBatchResult:
 
 
 def _drop_inline_batch(
-    pg: psycopg.Connection, after: tuple[int, int], batch_size: int, dry_run: bool
+    pg: psycopg.Connection,
+    after: tuple[int, int],
+    batch_size: int,
+    dry_run: bool,
+    deadline: float | None = None,
 ) -> _InlineBatchResult:
     """One batch in ONE transaction: select orphans, (lock, check, drop) each
     present table, delete the matching registry rows, commit. Dry-run reads
-    the same page and checks emptiness without locking or writing."""
+    the same page and checks emptiness without locking or writing.
+
+    `deadline` (a _monotonic() reading) bounds the batch from the INSIDE,
+    which the per-statement settings cannot: statement_timeout applies to one
+    statement and a batch issues roughly 1 + 3*batch_size + 1 of them, and
+    PG 16 has no transaction_timeout. Reaching it stops the loop from taking
+    NEW rows; the row in flight finishes, the registry rows for everything
+    processed are deleted, and the transaction commits, so a truncated batch
+    is still all-or-nothing for what it touched. `last_key` is then the last
+    row actually processed (the caller resumes there) and `truncated` tells
+    the caller to stop. Absent a deadline the batch's own bound is ~3 round
+    trips per row plus at most one _DROP_INLINE_LOCK_TIMEOUT wait, which
+    aborts the batch rather than extending it."""
     res = _InlineBatchResult()
     with conn_transaction(pg) as cur:
         if not dry_run:
@@ -3821,10 +3965,21 @@ def _drop_inline_batch(
         res.rows = len(rows)
         to_delete: list[tuple[int, int, str]] = []
         for table_id, schema_version, table_name, present in rows:
+            if deadline is not None and res.last_key is not None and _monotonic() >= deadline:
+                # Take no new row; commit what this transaction already did.
+                # `last_key is not None` guarantees forward progress: a budget
+                # already spent when the batch starts still processes one row,
+                # so a run can never consume a cron tick doing nothing.
+                res.truncated = True
+                break
             res.last_key = (table_id, schema_version)
             if not isinstance(table_name, str) or not _INLINE_TABLE_NAME_RE.fullmatch(table_name):
                 # Never DROP a name we did not expect; the registry row stays
-                # so the anomaly remains visible in the metric.
+                # so the anomaly remains visible in the metric. This check is
+                # deliberately BEFORE the LOCK TABLE below: an unexpected name
+                # must not cost an ACCESS EXCLUSIVE lock on whatever relation
+                # it happens to be, on this run or any of the runs that will
+                # re-select it forever.
                 log.warning(
                     "drop-orphan-inline-tables: skipping registry row table_id=%s schema_version=%s: "
                     "unexpected table_name %r",
@@ -3853,6 +4008,10 @@ def _drop_inline_batch(
             else:
                 res.missing += 1
             to_delete.append((table_id, schema_version, table_name))
+        if res.truncated:
+            # `rows` means the work this batch took on, so a deadline-truncated
+            # batch does not report rows it never looked at as selected.
+            res.rows = res.dropped + res.missing + res.skipped_nonempty + res.skipped_invalid
         if to_delete and not dry_run:
             cur.execute(
                 f"DELETE FROM {PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables idt "
@@ -3866,7 +4025,12 @@ def _drop_inline_batch(
 
 
 def drop_orphan_inline_tables(
-    dry_run: bool, batch_size: int, max_batches: int | None, gauges: dict, pg: psycopg.Connection | None = None
+    dry_run: bool,
+    batch_size: int,
+    max_batches: int | None,
+    gauges: dict,
+    pg: psycopg.Connection | None = None,
+    run_budget_s: float | None = None,
 ) -> None:
     """Drop the inlined-data tables (and registry rows) of DuckLake tables no
     retained snapshot can reach. See the section header for why this exists
@@ -3884,6 +4048,26 @@ def drop_orphan_inline_tables(
       - No VACUUM FULL: it takes ACCESS EXCLUSIVE on system catalogs and would
         stall every catalog session. Plain autovacuum reuses the freed
         pg_class / pg_attribute space for new rows.
+
+    Bounds:
+      - batch_size is an upper bound only. The effective size is derived from
+        the server's lock-table GUCs (see _inline_lock_budget) and halved for
+        the rest of the run on SQLSTATE 53200.
+      - run_budget_s bounds the wall clock. A 230k-row backlog at 500 per
+        batch is ~460 transactions, and the advisory lock is held for all of
+        them, so expire / cleanup / compaction wait behind an unbounded run.
+        The budget is enforced both between batches and INSIDE one (see
+        _drop_inline_batch's `deadline`), and a run that stops on it is a
+        success, not a failure: keyset paging restarts from the orphan
+        predicate rather than a saved cursor, so the next cron tick picks the
+        backlog up where this one left it.
+      - That convergence covers DROPPABLE rows only. Rows skipped as non-empty
+        or as unexpected names are never deleted, so every run re-selects them
+        from the head of the registry, and they consume batch capacity (and,
+        for non-empty ones, an ACCESS EXCLUSIVE lock) on every tick. Under a
+        budget a large enough stuck set can spend the whole budget on rows
+        that will never drop — which is why the run logs the skipped share and
+        the metric keeps counting them.
     """
     owned = pg is None
     if owned:
@@ -3891,7 +4075,41 @@ def drop_orphan_inline_tables(
     total = _InlineBatchResult()
     batches = 0
     retries = 0
+    budget_exhausted = False
+    started = _monotonic()
+    # One deadline for the whole run: the between-batch check and the
+    # inside-the-batch check (and the retry backoff) all read it.
+    deadline = None if run_budget_s is None else started + run_budget_s
     try:
+        budget = _read_inline_lock_budget(pg, batch_size)
+        # Mutable run state, not a constant: a 53200 retry halves it below.
+        batch_size = budget.batch_size
+        log.info(
+            "drop-orphan-inline-tables: lock budget: max_locks_per_transaction=%d max_connections=%d "
+            "max_prepared_transactions=%d capacity=%d entries_per_drop=%d share=%.2f batch_cap=%d "
+            "batch_size=%d requested=%d",
+            budget.max_locks_per_transaction,
+            budget.max_connections,
+            budget.max_prepared_transactions,
+            budget.capacity,
+            _DROP_INLINE_ENTRIES_PER_DROP,
+            _DROP_INLINE_LOCK_TABLE_SHARE,
+            budget.cap,
+            budget.batch_size,
+            budget.requested,
+        )
+        if budget.lowered:
+            # INFO, not WARN: on a server whose GUCs produce a cap below the
+            # requested size this fires on every run (dry-runs included) and
+            # nothing is wrong. WARN is reserved for the 53200 halving.
+            log.info(
+                "drop-orphan-inline-tables: --batch-size %d lowered to %d: this server's shared lock table "
+                "holds at least %d entries and one DROP holds ~%d of them until commit",
+                budget.requested,
+                budget.batch_size,
+                budget.capacity,
+                _DROP_INLINE_ENTRIES_PER_DROP,
+            )
         registry = pg.execute(
             f"SELECT to_regclass('{PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables') IS NOT NULL"
         ).fetchone()[0]
@@ -3907,13 +4125,14 @@ def drop_orphan_inline_tables(
         registry_rows, orphaned, orphaned_present = pg.execute(_inline_orphan_counts_sql()).fetchone()
         log.info(
             "drop-orphan-inline-tables: registry_rows=%d orphaned=%d orphaned_present_in_pg_class=%d "
-            "(dry_run=%s, batch_size=%d, max_batches=%s)",
+            "(dry_run=%s, batch_size=%d, max_batches=%s, run_budget_s=%s)",
             registry_rows,
             orphaned,
             orphaned_present,
             dry_run,
             batch_size,
             max_batches,
+            run_budget_s,
         )
         if orphaned == 0:
             if not dry_run:
@@ -3925,12 +4144,14 @@ def drop_orphan_inline_tables(
             log.info("Acquired advisory lock %s", ADVISORY_LOCK_KEY_SQL)
 
         after = (-1, -1)
+        clean_batches = 0
         while max_batches is None or batches < max_batches:
             attempt = 0
+            res = None
             while True:
                 attempt += 1
                 try:
-                    res = _drop_inline_batch(pg, after, batch_size, dry_run)
+                    res = _drop_inline_batch(pg, after, batch_size, dry_run, deadline)
                     break
                 except psycopg.Error as exc:
                     if not _is_retryable_inline_error(exc) or attempt >= _DROP_INLINE_MAX_ATTEMPTS:
@@ -3943,11 +4164,42 @@ def drop_orphan_inline_tables(
                         _DROP_INLINE_MAX_ATTEMPTS,
                         exc.sqlstate,
                     )
+                    if exc.sqlstate == _DROP_INLINE_OUT_OF_SHARED_MEMORY:
+                        # Retrying at the same size would hit the same wall, so
+                        # shrink for the rest of the run (other retryable
+                        # classes keep the size). The outer min() keeps this a
+                        # shrink — an operator who asked for fewer rows than
+                        # the floor keeps theirs.
+                        halved = min(batch_size, max(_DROP_INLINE_MIN_BATCH_SIZE, batch_size // 2))
+                        log.warning(
+                            "drop-orphan-inline-tables: out of shared memory (53200): batch size %d -> %d "
+                            "for the rest of the run (floor %d, fatal after attempt %d)",
+                            batch_size,
+                            halved,
+                            _DROP_INLINE_MIN_BATCH_SIZE,
+                            _DROP_INLINE_MAX_ATTEMPTS,
+                        )
+                        batch_size = halved
+                    if deadline is not None and _monotonic() >= deadline:
+                        # The backoff sleeps (up to ~30s each) are elapsed time
+                        # too; do not spend budget we no longer have.
+                        log.warning(
+                            "drop-orphan-inline-tables: run budget reached while backing off from "
+                            "sqlstate=%s; abandoning this batch instead of retrying",
+                            exc.sqlstate,
+                        )
+                        break
                     time.sleep(min(2**attempt, 30) * (0.5 + random.random()))
+            if res is None:  # gave up mid-retry on the budget
+                budget_exhausted = True
+                break
             if res.rows == 0:
+                budget_exhausted = res.truncated
                 break
             batches += 1
-            after = res.last_key
+            clean_batches = clean_batches + 1 if attempt == 1 else 0
+            if res.last_key is not None:
+                after = res.last_key
             total.rows += res.rows
             total.dropped += res.dropped
             total.registry_deleted += res.registry_deleted
@@ -3956,7 +4208,7 @@ def drop_orphan_inline_tables(
             total.skipped_invalid += res.skipped_invalid
             log.info(
                 "drop-orphan-inline-tables: batch %d: selected=%d %s=%d already_missing=%d registry_deleted=%d "
-                "skipped_nonempty=%d skipped_invalid_name=%d last_key=%s",
+                "skipped_nonempty=%d skipped_invalid_name=%d truncated=%s last_key=%s",
                 batches,
                 res.rows,
                 "would_drop" if dry_run else "dropped",
@@ -3965,10 +4217,29 @@ def drop_orphan_inline_tables(
                 res.registry_deleted,
                 res.skipped_nonempty,
                 res.skipped_invalid,
+                res.truncated,
                 after,
             )
+            if res.truncated:
+                budget_exhausted = True
+                break
             if res.rows < batch_size:
                 break
+            if deadline is not None and _monotonic() >= deadline:
+                budget_exhausted = True
+                break
+            if clean_batches >= _DROP_INLINE_REGROW_AFTER_BATCHES and batch_size < budget.batch_size:
+                regrown = min(budget.batch_size, batch_size * 2)
+                log.info(
+                    "drop-orphan-inline-tables: %d clean batches: batch size %d -> %d (ceiling %d, the size "
+                    "this run started with)",
+                    clean_batches,
+                    batch_size,
+                    regrown,
+                    budget.batch_size,
+                )
+                batch_size = regrown
+                clean_batches = 0
 
         remaining = pg.execute(
             f"SELECT COUNT(*) FROM {PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables idt "
@@ -3978,10 +4249,18 @@ def drop_orphan_inline_tables(
         if owned:
             with contextlib.suppress(Exception):
                 pg.close()
+        elif not dry_run:
+            # The advisory lock is SESSION-scoped and the caller keeps the
+            # session, so closing is not an option and letting go is not
+            # optional: the next op on that connection would self-deadlock.
+            with contextlib.suppress(Exception):
+                pg.execute("SELECT pg_advisory_unlock_all()")
 
+    skipped = total.skipped_nonempty + total.skipped_invalid
     log.info(
         "drop-orphan-inline-tables done: dry_run=%s batches=%d selected=%d %s=%d already_missing=%d "
-        "registry_deleted=%d skipped_nonempty=%d skipped_invalid_name=%d retries=%d remaining_orphans=%d",
+        "registry_deleted=%d skipped_nonempty=%d skipped_invalid_name=%d skipped_share=%.1f%% retries=%d "
+        "batch_size_start=%d batch_size_final=%d remaining_orphans=%d",
         dry_run,
         batches,
         total.rows,
@@ -3991,13 +4270,35 @@ def drop_orphan_inline_tables(
         total.registry_deleted,
         total.skipped_nonempty,
         total.skipped_invalid,
+        100.0 * skipped / total.rows if total.rows else 0.0,
         retries,
+        budget.batch_size,
+        batch_size,
         remaining,
     )
+    if skipped and total.rows and skipped == total.rows:
+        # Every row this run touched is stuck: the budget (and every future
+        # run's) is being spent re-walking rows that will never drop.
+        log.warning(
+            "drop-orphan-inline-tables: all %d selected rows were skipped (non-empty or unexpected name); "
+            "these are re-selected from the head of the registry by every run and never converge",
+            total.rows,
+        )
+    if budget_exhausted:
+        log.warning(
+            "drop-orphan-inline-tables: budget_exhausted=true run_budget_s=%s batches=%d remaining_orphans=%d; "
+            "stopping cleanly so the rest of the maintenance chain gets the advisory lock. The next run "
+            "resumes from the orphan predicate (keyset paging, no saved cursor), so the backlog converges "
+            "across cron ticks",
+            run_budget_s,
+            batches,
+            remaining,
+        )
     if not dry_run:
         gauges["dropped"].set(total.dropped)
         gauges["skipped_nonempty"].set(total.skipped_nonempty)
         gauges["remaining"].set(remaining)
+        gauges["budget_exhausted"].set(1 if budget_exhausted else 0)
         if total.dropped:
             log.info(
                 "drop-orphan-inline-tables: pg_class / pg_attribute / pg_type keep their dead tuples until "
@@ -4280,9 +4581,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=_DROP_INLINE_DEFAULT_BATCH_SIZE,
         help=(
-            f"Orphaned registry rows per transaction (default {_DROP_INLINE_DEFAULT_BATCH_SIZE}, "
-            f"max {_DROP_INLINE_MAX_BATCH_SIZE}). Each DROP holds several lock-table entries until "
-            "commit; lower this if Postgres reports 'out of shared memory'"
+            f"Upper bound on orphaned registry rows per transaction (default "
+            f"{_DROP_INLINE_DEFAULT_BATCH_SIZE}, absolute max {_DROP_INLINE_MAX_BATCH_SIZE}, which is what "
+            "governs an RDS-sized server). The effective size is derived from the server at run time: a "
+            "quarter of max_locks_per_transaction * (max_connections + max_prepared_transactions), divided "
+            f"by the {_DROP_INLINE_ENTRIES_PER_DROP} shared lock-table entries each DROP of an inlined "
+            "table holds until commit (measured) — a stock server caps at 320. A lower value than "
+            "requested is used and logged. SQLSTATE 53200 ('out of shared memory') is retried with the "
+            f"size halved for the rest of the run, which within ONE batch means at most "
+            f"{_DROP_INLINE_MAX_ATTEMPTS} attempts (500/250/125/62/31) and then a FATAL exit — a lock "
+            f"table still full after that is a catalog problem a cron must not paper over. The "
+            f"{_DROP_INLINE_MIN_BATCH_SIZE}-row floor and the re-growth after "
+            f"{_DROP_INLINE_REGROW_AFTER_BATCHES} clean batches apply across batches"
         ),
     )
     p.add_argument(
@@ -4290,6 +4600,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help="Stop after this many batches (default: until no orphans remain)",
+    )
+    p.add_argument(
+        "--run-budget-s",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Wall-clock budget in seconds (default: unbounded; pass 'inf' to say unbounded "
+            "explicitly, e.g. from a wrapper that always sets the flag). Enforced between batches AND "
+            "inside one: the row in flight finishes, its registry rows commit, and the run stops cleanly "
+            "and exits 0. Bounds how long the maintenance advisory lock is held in a recipe chain. The "
+            "next run resumes from the orphan predicate (keyset paging, no saved cursor), so a budgeted "
+            "backlog of DROPPABLE rows converges across runs; rows skipped as non-empty or oddly named "
+            "are re-walked every run and never converge"
+        ),
     )
     p.add_argument("--dry-run", action="store_true", help="Report counts and walk the batches without DDL/DML")
 
@@ -4416,6 +4740,11 @@ def main(argv: list[str] | None = None) -> None:
             "Orphaned inlined-data registry rows left after the last drop-orphan-inline-tables run",
             registry=inline_registry,
         ),
+        "budget_exhausted": Gauge(
+            "maintenance_inline_orphans_budget_exhausted",
+            "1 if the last drop-orphan-inline-tables run stopped on its --run-budget-s, else 0",
+            registry=inline_registry,
+        ),
     }
     operation = args.command
     if hasattr(args, "days") and args.days < 1:
@@ -4428,7 +4757,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "drop-orphan-inline-tables" and args.batch_size > _DROP_INLINE_MAX_BATCH_SIZE:
         parser.error(
             f"--batch-size must be <= {_DROP_INLINE_MAX_BATCH_SIZE}: every DROP in a batch holds "
-            "AccessExclusiveLock until commit, and the shared lock table is bounded by max_locks_per_transaction"
+            "AccessExclusiveLock until commit, and the shared lock table is bounded by "
+            "max_locks_per_transaction * (max_connections + max_prepared_transactions). This is the "
+            "absolute ceiling only; the run derives its own, usually lower, cap from those GUCs"
         )
 
     start_time.labels(operation=operation).set(time.time())
@@ -4450,7 +4781,13 @@ def main(argv: list[str] | None = None) -> None:
             case "drop-partitions":
                 drop_partitions(args, drop_gauges)
             case "drop-orphan-inline-tables":
-                drop_orphan_inline_tables(args.dry_run, args.batch_size, args.max_batches, inline_gauges)
+                drop_orphan_inline_tables(
+                    args.dry_run,
+                    args.batch_size,
+                    args.max_batches,
+                    inline_gauges,
+                    run_budget_s=args.run_budget_s,
+                )
             case "expire":
                 expire(conn, args.days, args.dry_run)
             case "expire-snapshots":
