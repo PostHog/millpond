@@ -808,6 +808,41 @@ def _hoglake_worst_case_flush_s(max_retries: int, timeout_s: float) -> float:
     return max_retries * (timeout_s + _PREPARE_ALLOWANCE_S) + ladder * (1 + _BACKOFF_JITTER)
 
 
+# How much of the liveness budget the runtime deadline refuses to spend,
+# so that the attempt it lets through still has room to finish and the
+# consume loop still has room to record a poll afterwards. The startup
+# model has no margin of its own because it is not the enforcement.
+_FLUSH_DEADLINE_MARGIN_S = 30.0
+
+
+def hoglake_flush_deadline(timeout_s: float) -> tuple[float, float]:
+    """(wall-clock budget for one flush, cost to reserve per attempt).
+
+    The RUNTIME half of the liveness story, read by
+    `main._write_with_retry` before every backoff sleep. The startup
+    model below cannot see what a real flush actually spends:
+
+    * `_retry_delay` floors each gap with the server's own `Retry-After`
+      and clamps only the GAP (30 s), not the sum — six attempts and
+      five floored gaps already exceed the budget on their own;
+    * a rebuild (which is what every `ddl_since_read_snapshot` refusal
+      forces) re-resolves the namespace and table and re-reads the
+      shape, each under its own HTTP timeout, none of which the
+      attempts x timeout product counts;
+    * boto3's upload client retries four times at a 30 s read timeout
+      per object and `prepare_append_tables` waits for every in-flight
+      upload before it re-raises, so a stalled object store can put one
+      prepare well past `_PREPARE_ALLOWANCE_S`.
+
+    Each of those is bounded on its own and none of them is bounded
+    TOGETHER, which is what a wall clock is for. Returned as a pair
+    rather than read off module constants by main.py so the whole
+    model — budget, margin and per-attempt reservation — stays in the
+    file that owns the arithmetic.
+    """
+    return _LIVENESS_BUDGET_S - _FLUSH_DEADLINE_MARGIN_S, timeout_s + _PREPARE_ALLOWANCE_S
+
+
 def _check_hoglake_liveness_budget(max_retries: int, timeout_s: float) -> None:
     """Refuse a retry budget that can outlive the liveness deadline.
 
@@ -816,6 +851,14 @@ def _check_hoglake_liveness_budget(max_retries: int, timeout_s: float) -> None:
     one values-file edit away, and springing it looks like a pod
     SIGKILLed mid-flush with no explanation in its own logs. The
     arithmetic that comment describes is now the check.
+
+    A SANITY MODEL, NOT THE ENFORCEMENT. It prices attempts x (timeout +
+    prepare) plus the unfloored ladder, which is a lower bound on what a
+    flush can spend — see `hoglake_flush_deadline` for the three things
+    it cannot see. Its job is to refuse a budget that is obviously
+    impossible at config time, where the operator can still fix it; the
+    runtime deadline in `main._write_with_retry` is what actually keeps
+    a flush inside the liveness window.
     """
     worst = _hoglake_worst_case_flush_s(max_retries, timeout_s)
     if worst <= _LIVENESS_BUDGET_S:

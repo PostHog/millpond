@@ -620,7 +620,29 @@ def _retry_delay(sink, attempt: int, base: float) -> float:
     return min(delay + random.uniform(0.0, delay * _RETRY_JITTER), _RETRY_AFTER_MAX_S)
 
 
-def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", write_kwargs=None):
+def _flush_deadline(sink) -> tuple[float, float] | None:
+    """(wall-clock budget for one flush, seconds to reserve per attempt),
+    or None when this sink does not bound its flushes by the clock.
+
+    A duck-typed hook like `is_retryable` and `write_retry_budget`, so
+    DuckLake — whose outer three attempts cannot approach the liveness
+    deadline, and which carries its own inner bound — is unaffected by
+    not implementing it.
+    """
+    deadline = getattr(sink, "write_flush_deadline", None)
+    if deadline is None:
+        return None
+    return deadline()
+
+
+def _write_with_retry(
+    sink,
+    consolidated,
+    *,
+    destination: str = "ducklake",
+    write_kwargs=None,
+    now=time.monotonic,
+):
     """Write to the sink with exponential backoff on transient failures.
 
     Returns the record count the sink actually wrote (0 when it skipped the
@@ -637,10 +659,29 @@ def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", writ
     (a permanent 422 is not worth three attempts and a backoff; crash the
     pod now and let the operator see it), and may publish its own retry
     budget and Retry-After hint.
+
+    THE ATTEMPT COUNT IS NOT THE ONLY BOUND. A sink that publishes
+    `write_flush_deadline()` also gets a wall-clock one, checked before
+    every backoff sleep: if the elapsed time plus that sleep plus what
+    the next attempt is expected to cost would pass the budget, the loop
+    stops and re-raises the last error instead of starting an attempt it
+    cannot finish. The outcome is the one exhausting the attempts already
+    produces — crash, restart, replay from Kafka, offsets never
+    advanced — with the difference that it happens while the process can
+    still log WHY. Without it the next attempt runs, the consume loop
+    (single threaded) records no poll, and `server.HealthState` SIGKILLs
+    the pod mid-flush: the one failure that leaves nothing in its own
+    logs. See `config.hoglake_flush_deadline` for the three costs the
+    startup model cannot see.
+
+    `now` is the clock, injectable so the deadline is testable without
+    spending eight minutes of it.
     """
     write_kwargs = write_kwargs or {}
     max_attempts, base_delay = _write_retry_budget(sink)
     classify_retryable = getattr(sink, "is_retryable", None)
+    deadline = _flush_deadline(sink)
+    started = now()
     for attempt in range(max_attempts):
         try:
             return sink.write(consolidated, **write_kwargs)
@@ -660,6 +701,34 @@ def _write_with_retry(sink, consolidated, *, destination: str = "ducklake", writ
             if attempt == max_attempts - 1:
                 raise
             delay = _retry_delay(sink, attempt, base_delay)
+            if deadline is not None:
+                budget_s, attempt_cost_s = deadline
+                elapsed = now() - started
+                if elapsed + delay + attempt_cost_s > budget_s:
+                    # Measured BEFORE the sleep, and including it: the
+                    # question is whether the attempt this sleep leads to
+                    # can finish inside the budget, not whether we are
+                    # already past it. Logged as a distinct, greppable
+                    # fact rather than folded into the generic retry
+                    # warning, because "the pod gave up early on purpose"
+                    # and "the pod ran out of attempts" look identical in
+                    # the exception and lead to different investigations.
+                    log.error(
+                        "Write failed and the flush deadline leaves no room for another attempt "
+                        "(flush_deadline_exceeded=true attempts=%d/%d elapsed=%.1fs next_delay=%.1fs "
+                        "attempt_reserve=%.1fs budget=%.1fs type=%s); raising rather than being killed "
+                        "mid-flush by the liveness probe",
+                        attempt + 1,
+                        max_attempts,
+                        elapsed,
+                        delay,
+                        attempt_cost_s,
+                        budget_s,
+                        error_type,
+                        exc_info=True,
+                    )
+                    metrics.errors_total.labels(type="flush_deadline_exceeded").inc()
+                    raise
             log.warning(
                 "Write failed (attempt %d/%d, type=%s), retrying in %.1fs",
                 attempt + 1,

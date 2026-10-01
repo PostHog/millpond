@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -1174,22 +1175,55 @@ class TestOneRequestPerFlush:
         assert seen[-1].endswith("/commit/prepared")
 
     def test_no_read_asks_for_the_live_totals(self, hog_stack, client):
-        # The totals scan is a count and two sums over every live file
-        # row of the table; the writer has never read one. Asserted on
-        # the wire so it holds for pyhoglake's reads too, not only
-        # millpond's.
+        """The totals scan is a count and two sums over every live file
+        row of the table; the writer has never read one. Asserted on the
+        wire, so it covers pyhoglake's reads and not only millpond's.
+
+        The selector is the ENDPOINT, not the query string. Selecting on
+        `totals=` was a tautology: a read that omitted the parameter —
+        the exact regression this test exists to catch — was filtered
+        out of the set before the assertion ran, so the only way to fail
+        was to send `totals=true` explicitly, which no code path does.
+
+        Fixing that immediately found one such read, which is why the
+        assertion below is in two parts. `Namespace.table(name)` —
+        pyhoglake's table RESOLVE, which `_ensure_table` calls — issues a
+        bare `GET /tables/<name>` and takes no parameter at all, so it
+        pays the live-totals scan and millpond cannot ask it not to.
+        That is one scan per resolve (per sink, plus one per
+        `reset_caches()`), never per flush, so it does not touch the
+        steady-state claim above; the bound here is what keeps it that
+        way. Removing it needs a `totals` argument on `Namespace.table`
+        upstream.
+        """
         cfg = _fresh()
         sink = HoglakeSink(cfg)
-        urls: list[str] = []
-        sink._client._http.event_hooks["response"].append(lambda r: urls.append(str(r.request.url)))
+        requests: list[tuple[str, str, str]] = []
+        sink._client._http.event_hooks["response"].append(
+            lambda r: requests.append((r.request.method, r.request.url.path, str(r.request.url)))
+        )
         try:
             sink.write(_batch(2))
             sink.write(_batch(2))
         finally:
             sink.close()
-        table_gets = [u for u in urls if "/tables/" in u and "totals=" in u]
+        # Every GET of a single table, whatever it asked for: the path
+        # ends at `/tables/<name>` with no further segment (so `/files`,
+        # `/scan`, `/alter` and the table LIST are all out).
+        table_endpoint = re.compile(r"/tables/[^/]+$")
+        table_gets = [url for method, path, url in requests if method == "GET" and table_endpoint.search(path)]
         assert table_gets, "no table read happened at all; this test would pass vacuously"
-        assert all("totals=false" in u for u in table_gets), table_gets
+        asked = [url for url in table_gets if "totals=" in url]
+        unasked = [url for url in table_gets if "totals=" not in url]
+        # Every read that CAN say so, does.
+        assert asked, "no read carried the parameter at all; this half would pass vacuously"
+        assert all("totals=false" in url for url in asked), asked
+        # And the only reads that cannot are the resolves: one sink, two
+        # flushes, no reset between them, so exactly one. A millpond read
+        # that stopped passing `totals=False` would land in this bucket
+        # and break the count — which is the property the old
+        # query-string selector did not have.
+        assert len(unasked) == 1, unasked
 
 
 class TestAtLeastOnce:

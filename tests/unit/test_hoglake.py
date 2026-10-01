@@ -221,6 +221,12 @@ def _capture_parquet():
     return _WRITTEN
 
 
+def _flush_key_for(sink, offsets, table_uuid=TABLE_UUID) -> str:
+    """The idempotency key this sink would mint for (incarnation,
+    offsets). Module-level because two classes need it."""
+    return sink._flush_key(table_uuid, offsets)
+
+
 def _orphans(mock_metrics) -> list[tuple[str, int]]:
     """Every orphan increment booked on a patched metrics module, as
     (reason, count) in call order.
@@ -1903,7 +1909,7 @@ class TestIdempotentPublication:
     OFFSETS = (("events", 0, 30, 41), ("events", 1, 9, 17))
 
     def _key(self, sink, offsets, table_uuid=TABLE_UUID):
-        return sink._flush_key(table_uuid, offsets)
+        return _flush_key_for(sink, offsets, table_uuid)
 
     def test_key_is_derived_from_the_offsets(self):
         s, *_ = _sink()
@@ -2712,6 +2718,55 @@ class TestTheCachedShapeHasATtl:
         # mis-stamped is what the commit now describes.
         assert _committed(catalog)["appends"][0]["files"][0]["partition_values"] == list(values[0])
 
+    def test_a_shape_adopted_without_a_config_check_is_still_reconciled(self):
+        """A FRESH shape is not necessarily a RECONCILED one.
+
+        `_adopt_info` is reached from schema evolution and from
+        `write()`'s alignment self-heal, and all of those adopt whatever
+        layout is live and re-stamp the TTL clock with no config check
+        anywhere. The fresh-path early return in `_table_info` therefore
+        skipped `_reconcile_specs` entirely for those shapes — and a pod
+        drifting columns often enough could keep the shape perpetually
+        fresh and postpone the TTL's own reconciliation indefinitely,
+        writing under an externally re-specced layout the whole time.
+
+        Driven through the self-heal, which is the shortest path to
+        "adopted a fresh external shape mid-flush" that does not involve
+        the clock at all: no TTL has expired here.
+        """
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, catalog, table, clock = self._clocked(cfg, partition_spec=_spec(("team_id", "identity")))
+        s.write(pa.table({"uuid": ["a"], "team_id": [1]}), kafka_offsets=self.OFFSETS)
+
+        # The external re-spec, picked up by the self-heal's refresh
+        # rather than by a TTL refresh: the clock does not move.
+        respecced = _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "bucket", 16)))
+        _set_info(table, respecced)
+        prepared = table.prepare_append_tables.side_effect
+        calls = {"n": 0}
+
+        def prepare(groups, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValidationError("prepared Parquet schema/field IDs differ from destination", status_code=None)
+            return prepared(groups, **kwargs)
+
+        table.prepare_append_tables.side_effect = prepare
+        with pytest.raises(hoglake.HoglakeSinkError, match="does not match"):
+            s.write(pa.table({"uuid": ["b"], "team_id": [1]}), kafka_offsets=(("events", 0, 42, 43),))
+
+    def test_a_reconciled_layout_is_not_re_checked_every_flush(self):
+        # The check is keyed on the LAYOUT, not on the shape: a
+        # concurrent add_column changes the columns and must not drag
+        # the config comparison onto every schema-evolution flush.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, catalog, table, clock = self._clocked(cfg, partition_spec=_spec(("team_id", "identity")))
+        s.write(pa.table({"uuid": ["a"], "team_id": [1]}), kafka_offsets=self.OFFSETS)
+        with patch.object(hoglake.HoglakeSink, "_reconcile_specs") as reconcile:
+            for i in range(5):
+                s.write(pa.table({"uuid": ["b"], "team_id": [1]}), kafka_offsets=(("events", 0, i, i),))
+        reconcile.assert_not_called()
+
     def test_past_the_ttl_a_config_divergence_finally_stops_the_pod(self):
         # The second thing the periodic re-read buys: before it, the
         # "config disagrees with the live layout => stop" tripwire ran
@@ -2922,9 +2977,22 @@ class TestTypedDestinationMovedRefusals:
     @pytest.mark.parametrize(("exc", "match", "reason"), REFUSALS)
     @patch("millpond.hoglake.metrics")
     def test_the_rebuild_reads_fresh_even_without_a_reset(self, mock_metrics, exc, match, reason):
-        # The cache drop lives on the refusal, not on `reset_caches()`:
-        # a retry that skipped the reset must still not rebuild the same
-        # doomed payload from the shape the server just called stale.
+        """The recovery lives on the refusal, not on `reset_caches()`: a
+        caller that retries without resetting must still not rebuild the
+        same doomed payload.
+
+        For a RECREATION that means more than dropping the shape, and
+        this test used to pass without proving it — the simulated
+        recreation left `table.table_uuid` alone, so the rebuild
+        re-prepared against an incarnation that was still (as far as the
+        mock was concerned) live, and a sink that had kept
+        `self._table_uuid` would have looked fine. Now the uuid moves,
+        which is what makes the assertions below bite: `_table_uuid` is
+        what `_prepare` pins `expected_table_uuid` to AND what
+        `_flush_key` hashes, so a sink that only dropped the shape
+        rebuilds with the dead incarnation's guard and key and is refused
+        identically for the whole retry budget.
+        """
         s, client, catalog, ns, table = _sink()
         catalog.commit_prepared.side_effect = [exc, MagicMock(snapshot_id=8, schema_version=1)]
         with pytest.raises(hoglake.HoglakeSinkError):
@@ -2934,10 +3002,29 @@ class TestTypedDestinationMovedRefusals:
         # following call a rebuild rather than a resend.
         assert table.prepare_append_tables.call_count == 1
         assert s._prepared_offsets is None
+
+        reborn = "deadbeef-0000-0000-0000-000000000000"
+        if isinstance(exc, IncarnationChangedError):
+            # The drop+recreate the server just refused over, now
+            # visible to the client: the name resolves to a new uuid.
+            _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), table_uuid=reborn))
+            table.table_uuid = reborn
+            # ...and the handle itself must have been dropped, or the
+            # rebuild never re-resolves and never sees any of that.
+            assert s._table is None
+            assert s._table_uuid is None
+
         table.info.reset_mock()
         assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
         assert table.info.call_count == 1
         assert table.prepare_append_tables.call_count == 2
+
+        if isinstance(exc, IncarnationChangedError):
+            expected = table.prepare_append_tables.call_args.kwargs["expected_table_uuid"]
+            assert expected == reborn, "the rebuild still names the dead incarnation"
+            published = catalog.commit_prepared.call_args.args[0]["idempotency_key"]
+            assert published == _flush_key_for(s, self.OFFSETS, reborn)
+            assert published != _flush_key_for(s, self.OFFSETS, TABLE_UUID)
 
     @pytest.mark.parametrize(("exc", "match", "reason"), REFUSALS)
     def test_pyhoglake_is_told_to_invalidate_its_own_cache_too(self, exc, match, reason):
@@ -2971,9 +3058,97 @@ class TestTypedDestinationMovedRefusals:
         with pytest.raises(CommitConflictError):
             s.write(_rows(2), kafka_offsets=self.OFFSETS)
         assert s._prepared is None
-        # NOT the typed path: the cached shape is still good, because
-        # nothing said the destination moved.
+        # NOT the typed path: no `HoglakeSinkError`, the server's own
+        # exception propagates, and the handle survives (only a
+        # recreation invalidates the identity).
+        assert s._table is not None
+        assert s._table_uuid == TABLE_UUID
+        # The cached SHAPE goes, though, and that is the one thing a
+        # plain 409 shares with the typed refusals: pyhoglake's
+        # invalidation predicate is its own, so the only way to keep
+        # "the sink is never staler than pyhoglake's cache" true without
+        # re-deriving `_basis_was_cached` here is to drop ours on every
+        # judged commit. Over-dropping costs one read on the rebuild
+        # this refusal already forces.
+        assert s._live_info is None
+
+
+class TestTheCacheNeverOutlivesPyhoglakes:
+    """Every commit the SERVER answered drops the sink's cached shape.
+
+    pyhoglake drops `Table._cache` on a `re_prepare` refusal, on a 410,
+    and on any non-retryable refusal whose `read_snapshot` matched that
+    cache — a set that includes the reused-key 422 millpond turns into
+    SUCCESS and a 5xx (`HoglakeError.retryable` is False on the base
+    class). Each of those leaves pyhoglake re-reading on its next
+    prepare and the sink not, so pyhoglake's basis moves forward first
+    and the same-arity spec-drift hole the TTL exists to close reopens
+    INSIDE the TTL.
+
+    The rule is therefore not "mirror pyhoglake's predicate" but "any
+    event that can drop pyhoglake's cache drops ours", which is every
+    `HoglakeError` out of the commit. These tests pin the two cases that
+    are easiest to miss, because neither looks like a cache event: one
+    of them is a success and the other is a flat refusal.
+    """
+
+    OFFSETS = (("events", 0, 30, 41),)
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_reused_key_accept_still_drops_the_shape(self, mock_metrics):
+        # The 422 that becomes success. pyhoglake invalidates on it
+        # (non-retryable, basis cached) while millpond returns 0 rows and
+        # carries on — so without the drop this is the one path that
+        # ends in a HEALTHY sink holding a shape staler than pyhoglake's.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError(
+            "validation", status_code=422, detail="idempotency_key reused with a different request"
+        )
+        assert s.write(_rows(5), kafka_offsets=self.OFFSETS) == 0
+        assert s._live_info is None
+        catalog.commit_prepared.side_effect = None
+        table.info.reset_mock()
+        assert s.write(_rows(2), kafka_offsets=(("events", 0, 42, 43),)) == 2
+        assert table.info.call_count == 1
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_plain_answered_refusal_drops_the_shape(self, mock_metrics):
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError(
+            "validation", status_code=422, detail="path outside the catalog data path"
+        )
+        with pytest.raises(ValidationError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert s._live_info is None
+        catalog.commit_prepared.side_effect = None
+        table.info.reset_mock()
+        assert s.write(_rows(2), kafka_offsets=(("events", 0, 42, 43),)) == 2
+        assert table.info.call_count == 1
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_5xx_drops_the_shape_but_keeps_the_payload(self, mock_metrics):
+        # `HoglakeError.retryable` is False on the base class, so
+        # pyhoglake's `_basis_was_cached` arm invalidates on a 503 too.
+        # The PAYLOAD still survives — a 5xx is not a verdict on the
+        # request — so this is a drop that must not become a discard.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = HoglakeError("commit_queue_timeout", status_code=503)
+        with pytest.raises(HoglakeError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert s._live_info is None
+        assert s._prepared is not None
+
+    def test_a_transport_failure_keeps_the_shape(self):
+        # The other side of the rule. Nothing was judged, pyhoglake's
+        # cache is untouched, and the payload is replayed verbatim with
+        # its basis frozen — so there is nothing to be stale about, and
+        # dropping would buy a read per flapping network.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = httpx.ReadTimeout("no response")
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
         assert s._live_info is not None
+        assert s._prepared is not None
 
 
 class TestSpecChangeUnderAPreparedPayload:

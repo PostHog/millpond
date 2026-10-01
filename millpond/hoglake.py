@@ -100,6 +100,7 @@ from pyhoglake.types import arrow_type_to_coltype, column_to_arrow_field, column
 
 from millpond import arrow_converter, metrics
 from millpond.config import Config
+from millpond.config import hoglake_flush_deadline as config_hoglake_flush_deadline
 from millpond.sink import SAFE_IDENTIFIER, check_reserved_collision
 
 log = logging.getLogger(__name__)
@@ -717,6 +718,19 @@ def _sort_tuples(spec) -> tuple[tuple[int, str, str], ...]:
     return tuple((f.source_field_id, f.direction, f.null_order) for f in spec.fields)
 
 
+def _spec_identity(info) -> tuple:
+    """A TableInfo's LAYOUT as comparable tuples: (partition, sort).
+
+    The unit `_reconcile_specs`' verdict is recorded against and
+    `_table_info` compares an adopted shape to. Columns are deliberately
+    not in it — a concurrent `add_column` changes the shape without
+    changing the layout config has an opinion about, and treating that as
+    a reconciliation-worthy change would run the config check on every
+    schema-evolution flush for no reason.
+    """
+    return (_partition_tuples(info.partition_spec), _sort_tuples(info.sort_spec))
+
+
 def _describe_partition(spec, live_columns) -> str:
     """A live spec in HOGLAKE_PARTITION_BY's own grammar, so the operator
     can paste the fix straight into the values file."""
@@ -978,6 +992,13 @@ class HoglakeSink:
         # the whole argument for why there is a TTL at all.
         self._live_info_read_at: float | None = None
         self._monotonic = time.monotonic
+        # The (partition, sort) spec tuples `_reconcile_specs` last
+        # validated against config. See `_table_info`: a shape adopted by
+        # schema evolution or the alignment self-heal is FRESH but has
+        # not been reconciled, and without this the fresh-path early
+        # return skipped the config check for as long as evolution kept
+        # re-stamping the clock.
+        self._reconciled_specs: tuple | None = None
         # The in-flight flush's uploaded-and-not-yet-published commit
         # request, held IN MEMORY for the lifetime of the flush so a
         # retry replays it rather than building a second one. Survives
@@ -1152,8 +1173,23 @@ class HoglakeSink:
         # reset means "re-resolve the destination", and keeping a shape
         # read off the old handle would let the next flush build against
         # a table this pod has not re-reconciled.
+        self._drop_cached_shape()
+
+    def _drop_cached_shape(self) -> None:
+        """Forget the destination's cached shape, so the next flush
+        re-reads it.
+
+        Separate from `reset_caches()` because it is a strictly smaller
+        thing: the resolved handle and the incarnation stay, which is
+        right for every event that invalidates the SHAPE without
+        invalidating the identity (a commit refusal, a 410, a reused-key
+        422). `reset_caches()` is the superset and calls this.
+        """
         self._live_info = None
         self._live_info_read_at = None
+        # The reconciliation verdict belongs to the shape it was reached
+        # on; a new read has to be re-checked against config.
+        self._reconciled_specs = None
 
     def close(self) -> None:
         # A payload still held at shutdown is an upload nobody will ever
@@ -1185,6 +1221,29 @@ class HoglakeSink:
         see config.py for how the default interacts with the liveness
         deadline."""
         return self._cfg.hoglake_max_retry_count, _WRITE_BASE_DELAY_S
+
+    def write_flush_deadline(self) -> tuple[float, float]:
+        """(wall-clock budget for one flush, seconds to reserve for the
+        next attempt) — the runtime liveness bound main.py enforces.
+
+        The attempt COUNT was never the real limit. The consume loop is
+        single threaded, so every second a flush spends retrying is a
+        second `server.HealthState` sees no poll, and three of the things
+        a flush spends it on are invisible to the startup arithmetic: the
+        server's `Retry-After` floors each backoff gap (clamped per gap,
+        not in sum), a rebuild re-resolves the destination and re-reads
+        its shape under their own timeouts, and a stalled object store
+        can hold one `prepare_append_tables` far past its allowance
+        because boto3 retries per object and the fan-out waits for every
+        upload in flight before it re-raises.
+
+        So main.py stops on the CLOCK instead, and the outcome is the one
+        exhausting the attempts already produces — raise the last error,
+        crash, restart, replay from Kafka — except that it happens while
+        the process can still say why. `DuckLakeSink` does not implement
+        this: its inner loop has its own bound and its outer three
+        attempts cannot approach the deadline."""
+        return config_hoglake_flush_deadline(self._cfg.hoglake_request_timeout_s)
 
     def _note_response(self, response) -> None:
         """httpx response hook: remember a Retry-After from a response
@@ -1523,6 +1582,36 @@ class HoglakeSink:
             # where there is no cache left to invalidate.
             self._catalog.commit_prepared(payload, table=self._table)
         except HoglakeError as e:
+            # FIRST, before any branch, and unconditionally for the whole
+            # HoglakeError family: drop our cached shape.
+            #
+            # THE INVARIANT IS "THE SINK IS NEVER STALER THAN
+            # PYHOGLAKE'S CACHE" (see `_live_info_ttl_s`), and the TTL
+            # alone does not hold it here. pyhoglake drops `Table._cache`
+            # on a `re_prepare` refusal, on a 410, AND on any
+            # non-retryable refusal whose `read_snapshot` matched that
+            # cache (`_basis_was_cached`) — which includes the reused-key
+            # 422 this method turns into SUCCESS, and a 5xx, since
+            # `HoglakeError.retryable` is False on the base class. Every
+            # one of those leaves pyhoglake re-reading on its next
+            # prepare and us not, so pyhoglake's basis moves forward
+            # first and the same-arity spec-drift hole reopens INSIDE the
+            # TTL — the exact state the quarter-retention exists to make
+            # unreachable.
+            #
+            # So the rule is not "mirror pyhoglake's predicate" (two
+            # copies of someone else's invalidation logic, drifting) but
+            # "any event that can drop pyhoglake's cache drops ours". It
+            # over-drops on a plain `commit_conflict`, where pyhoglake
+            # keeps its cache; the cost is one table read on the rebuild
+            # that refusal already forces, and the alternative is
+            # re-deriving `_basis_was_cached` from a private helper.
+            #
+            # Transport failures are deliberately NOT here: they are not
+            # HoglakeErrors, nothing was judged, pyhoglake's cache is
+            # untouched, and the payload is replayed verbatim with its
+            # basis frozen — so there is nothing to be stale about.
+            self._drop_cached_shape()
             # ONE arm, deliberately. Split across `except ValidationError`
             # and `except HoglakeError` this read as two rules, but
             # pyhoglake maps every 422 on the wire to `ValidationError`
@@ -1665,8 +1754,22 @@ class HoglakeSink:
         # from it. pyhoglake invalidates its own cache on these refusals
         # (`Catalog._commit` does it for a `re_prepare`); this is the half
         # that lives on millpond's side of the line.
-        self._live_info = None
-        self._live_info_read_at = None
+        if isinstance(refused, IncarnationChangedError):
+            # A RECREATION INVALIDATES THE IDENTITY, NOT JUST THE SHAPE,
+            # so this one needs the full reset. `self._table` is a handle
+            # to a name and `self._table_uuid` is the dead incarnation —
+            # and `_table_uuid` is what `_prepare` pins
+            # `expected_table_uuid` to AND what `_flush_key` hashes. Drop
+            # only the shape and a retry re-prepares against the corpse:
+            # same expected uuid, same key, refused identically, for the
+            # whole retry budget. main.py's loop calls `reset_caches()`
+            # between attempts and would mask it, which is exactly why it
+            # is wrong to rely on: a caller that retries without
+            # resetting (or any future one) gets a livelock out of a
+            # refusal that is supposed to be recoverable.
+            self.reset_caches()
+        else:
+            self._drop_cached_shape()
         return HoglakeSinkError(message, retryable=True)
 
     def _accept_already_published(self, payload: dict, files: list) -> int:
@@ -1688,13 +1791,27 @@ class HoglakeSink:
         that belongs somewhere else, and nothing here has to check that
         because `_flush_key` already has: `table_uuid` is one of the
         components hashed into the key, so a receipt found under THIS key
-        was written by a commit to THIS incarnation. (It used to be
-        re-checked by a table read immediately before the commit. That
-        read is gone, and the invariant did not depend on it — the key
-        did. The server's `expected_table_uuid` guard is the second
-        answer: a recreated destination refuses the commit with 409
-        `table_recreated` instead of answering it from a receipt, which
-        is why the reuse marker is believed only on a 422.)
+        was written by a commit to THIS incarnation. The key is the
+        whole of that argument, and it has to be, because NOTHING
+        re-checks the live incarnation at replay time — not this method,
+        and not the server.
+
+        THE SERVER ANSWERS FROM THE RECEIPT BEFORE IT RESOLVES ANY
+        TABLE. `CommitService.doCommit` looks the receipt up first
+        (v1.3.7, lines ~456-527) and returns it on a hit; table
+        resolution and the `expected_table_uuid` check are after that
+        (~555+). So the sequence commit-applies-to-A, response-lost,
+        A-dropped-and-recreated-as-B, replay returns A's receipt and this
+        sink accepts — with no 409 `table_recreated` anywhere, even
+        though the name now resolves to B.
+
+        That is the intended exactly-once-by-key semantics, not a hole in
+        it. The rows WERE published, into the table that existed when the
+        commit landed. The drop destroyed them afterwards, which is what
+        a drop does. Re-publishing them into B would publish the same
+        flush twice — and the flush's own offsets have already advanced
+        past it, so there would be nothing to tell the two apart later.
+        Accepting is the only answer that does not invent a write.
 
         Rows returned: ZERO. This process published nothing — some
         earlier one did — and `records_written_total` counts rows this
@@ -2079,6 +2196,13 @@ class HoglakeSink:
             # The sort alone: the partition spec is already live and
             # already matches (the mismatch check above ran first).
             self._declare_specs(table, partition=False)
+        # The verdict, recorded against the shape it was reached ON —
+        # `self._live_info` rather than `info`, because a declaration
+        # above re-adopts a post-alter shape and THAT is what the next
+        # flush will build from. `_table_info` compares against this to
+        # decide whether an adopted shape still has a verdict; see the
+        # "a fresh shape is not a reconciled shape" note there.
+        self._reconciled_specs = _spec_identity(self._live_info or info)
 
     def _verify_specs(self, info) -> None:
         """Post-condition on the declaration: the live layout IS what
@@ -2330,6 +2454,24 @@ class HoglakeSink:
         read one.
         """
         if self._live_info_is_fresh():
+            if _spec_identity(self._live_info) != self._reconciled_specs:
+                # A FRESH SHAPE IS NOT NECESSARILY A RECONCILED ONE, and
+                # the early return above used to assume it was.
+                # `_adopt_info` is reached from schema evolution
+                # (`_add_column`, `_promote_column`, their alter
+                # receipts) and from `write()`'s alignment self-heal —
+                # all of which adopt whatever layout is live and re-stamp
+                # the clock, with no config check anywhere. So an
+                # external re-spec picked up through one of those paths
+                # was written under, and a pod drifting columns often
+                # enough could postpone the TTL's own reconciliation
+                # indefinitely by keeping the shape perpetually fresh.
+                #
+                # Comparing layouts costs no request, so the check runs
+                # whenever the layout is not the one a verdict was
+                # reached on — which is once per actual spec change, not
+                # once per flush.
+                self._reconcile_specs(table, self._live_info)
             return self._live_info
         info = self._adopt_info(table.info(totals=False))
         # Against the info just read, so this costs no second request —
