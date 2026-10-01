@@ -323,11 +323,20 @@ def _wire_prepared_commit(table, catalog):
                         # writes it (and omitted entirely for an
                         # unpartitioned table, which is what `values is
                         # None` means here).
+                        #
+                        # `record_count` is on every real registration too
+                        # — pyhoglake reads it off the group's own parquet
+                        # footer and the server's tail read needs it — and
+                        # it is what the fanout metric's rows-per-object
+                        # series is observed from. A mock that omitted it
+                        # would let that series silently collapse to
+                        # nothing.
                         {
                             "path": f"s3://bucket/lake/{idempotency_key}/{i}.parquet",
+                            "record_count": part.num_rows,
                             **({} if values is None else {"partition_values": list(values)}),
                         }
-                        for i, (_part, values) in enumerate(groups)
+                        for i, (part, values) in enumerate(groups)
                     ],
                 }
             ],
@@ -1897,6 +1906,124 @@ class TestFilesWrittenMetric:
         s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}))
         mock_metrics.hoglake_files_written_total.inc.assert_called_once_with(3)
         assert len(_WRITTEN) == 3  # one parquet per tuple
+
+
+class TestFlushFanoutMetrics:
+    """`millpond_flush_files` and `millpond_flush_file_rows`: how many
+    objects a flush wrote, and how many rows went into each.
+
+    The partition fanout writes one object per distinct partition tuple,
+    so a flush whose rows reach far enough back in time pays an object
+    per old partition however few rows that partition brought. The two
+    series separate a WIDE flush from a BIG one, which `flush_size_bytes`
+    and `flush_size_records` cannot, and the second one is the only thing
+    that can say "most of these objects hold tens of rows."
+    """
+
+    OFFSETS = (("events", 0, 30, 41),)
+
+    @staticmethod
+    def _rows_per_object(mock_metrics) -> list[int]:
+        """The rows-per-object observations of the last flush, in the
+        order they were made — which is group order, which is first
+        occurrence in the batch."""
+        return [call.args[0] for call in mock_metrics.flush_file_rows.observe.call_args_list]
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_known_partition_layout_observes_one_value_per_object(self, mock_metrics):
+        # Three tuples over seven rows, deliberately lopsided: a 4-row
+        # object and a 1-row object in one flush are different facts, and
+        # a mean over them is the one summary that hides the fanout
+        # problem it exists to show.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        batch = pa.table({"uuid": [f"u{i}" for i in range(7)], "team_id": [1, 1, 1, 1, 2, 3, 3]})
+        s.write(batch, kafka_offsets=self.OFFSETS)
+        mock_metrics.flush_files.observe.assert_called_once_with(3)
+        assert self._rows_per_object(mock_metrics) == [4, 1, 2]
+        # The fanout is the same list the file counter is booked from, so
+        # the two can never disagree about how wide a flush was.
+        mock_metrics.hoglake_files_written_total.inc.assert_called_once_with(3)
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_unpartitioned_flush_is_one_object_holding_every_row(self, mock_metrics):
+        s, client, catalog, ns, table = _sink()
+        s.write(_rows(5), kafka_offsets=self.OFFSETS)
+        mock_metrics.flush_files.observe.assert_called_once_with(1)
+        assert self._rows_per_object(mock_metrics) == [5]
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_refused_commit_observes_nothing(self, mock_metrics):
+        # The same rule as `hoglake_files_written_total`, for the same
+        # reason: a refused commit registered no objects, so a fanout
+        # observed here would describe compaction debt the lake does not
+        # carry. It also matches how main.py's own flush histograms
+        # behave — observed after the write returns, never on the way out
+        # of a failure.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError("validation", status_code=422, detail="nope")
+        with pytest.raises(ValidationError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        mock_metrics.flush_files.observe.assert_not_called()
+        mock_metrics.flush_file_rows.observe.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_failed_prepare_observes_nothing(self, mock_metrics):
+        # Objects may well be in the lake here — that is what the orphan
+        # counter is for — but nothing registered them, so there is no
+        # flush to describe.
+        s, client, catalog, ns, table = _sink()
+        table.prepare_append_tables.side_effect = HoglakeError("object store is unreachable", status_code=503)
+        with pytest.raises(HoglakeError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        mock_metrics.flush_files.observe.assert_not_called()
+        mock_metrics.flush_file_rows.observe.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_already_published_range_observes_nothing(self, mock_metrics):
+        # A receipt answered this range: an earlier process published it,
+        # this one published nothing and orphaned its upload. Counting
+        # its fanout would book one flush's objects twice across the two
+        # pods.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError(
+            "validation",
+            status_code=422,
+            detail="idempotency_key reused with a different request",
+        )
+        assert s.write(_rows(5), kafka_offsets=self.OFFSETS) == 0
+        mock_metrics.flush_files.observe.assert_not_called()
+        mock_metrics.flush_file_rows.observe.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_replayed_commit_observes_the_flush_once(self, mock_metrics):
+        # An uncertain transport failure re-sends the SAME payload. The
+        # objects were uploaded once and registered once, so the fanout is
+        # one flush's worth however many sends it took to hear back.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [
+            httpx.ReadTimeout("no response"),
+            MagicMock(snapshot_id=8, schema_version=1),
+        ]
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        mock_metrics.flush_files.observe.assert_called_once_with(1)
+        assert self._rows_per_object(mock_metrics) == [3]
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_registration_without_a_row_count_still_counts_the_object(self, mock_metrics):
+        # `record_count` is a required wire field, so this is the
+        # defensive read documented in `_observe_fanout`, not a shape
+        # pyhoglake produces: the object count stays right and only the
+        # rows observation is skipped. Asserted because the alternative —
+        # letting a KeyError out — would raise it after the rows were
+        # published, from inside main.py's retry loop.
+        hoglake._observe_fanout(
+            [{"path": "s3://bucket/a.parquet"}, {"path": "s3://bucket/b.parquet", "record_count": 9}]
+        )
+        mock_metrics.flush_files.observe.assert_called_once_with(2)
+        assert self._rows_per_object(mock_metrics) == [9]
 
 
 class TestIdempotentPublication:

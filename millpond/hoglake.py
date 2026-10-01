@@ -580,6 +580,46 @@ def _count_orphans(count: int, why: str, uris: Sequence[str] = (), *, reason: st
     metrics.hoglake_orphaned_files_total.labels(reason=reason).inc(count)
 
 
+def _observe_fanout(files: Sequence[dict]) -> None:
+    """Record the flush's object fanout: how many objects it registered,
+    and how many rows went into each.
+
+    Called with the REGISTERED file list, from the one place that knows
+    the commit landed — the same line that books
+    `hoglake_files_written_total`, and for the same reason. A flush that
+    raises in prepare or is refused at commit registered nothing, so
+    observing it would describe compaction debt the lake does not carry.
+    `flush_files` therefore has exactly the failure behaviour the other
+    `millpond_flush_*` histograms have: main.py observes those after the
+    write returns, never on the way out of a failure.
+
+    The two series answer different halves of one question. The partition
+    fanout writes one object per distinct partition tuple, so a flush
+    whose rows reach far enough back in time pays an object per old
+    partition no matter how few rows that partition brought:
+    `flush_files` is how many pieces, `flush_file_rows` is how small the
+    pieces are, and only the second can say "most of this flush's objects
+    hold tens of rows."
+
+    One observation per object, which is a few hundred per flush at
+    production fanout widths — a bucket search each, against a parquet
+    encode and an upload per object. Nothing cheaper answers what SHARE
+    of the objects are tiny, which is the question.
+
+    `record_count` is a required field of the registration pyhoglake
+    built from each object's own parquet footer (the server's tail read
+    depends on it), so it is always there and always exact. Read with a
+    default anyway: this runs after the rows are published, and a
+    histogram is not worth raising a KeyError over a flush that
+    succeeded.
+    """
+    metrics.flush_files.observe(len(files))
+    for registration in files:
+        rows = registration.get("record_count")
+        if rows is not None:
+            metrics.flush_file_rows.observe(rows)
+
+
 def _is_alignment_refusal(exc: ValidationError) -> bool:
     """Is this a "the prepared file's columns are not the destination's"
     refusal, i.e. one a refresh-and-null-fill can actually clear?
@@ -1631,6 +1671,9 @@ class HoglakeSink:
         # returns: files this process uploaded but did not get registered
         # are orphans, not writes.
         metrics.hoglake_files_written_total.inc(len(files))
+        # Fanout, off the same registered-file list and under the same
+        # "only what the commit published" rule. See `_observe_fanout`.
+        _observe_fanout(files)
         if replayed:
             # The healthy half of the replay story, and previously
             # invisible: a commit that was re-sent after an uncertain

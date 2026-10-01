@@ -240,6 +240,25 @@ def pipeline(e2e_stack, tmp_path_factory):
         client.close()
 
 
+def _metric_samples(metrics_text: str) -> dict[str, float]:
+    """Sum every sample in the scraped exposition by sample name.
+
+    Parsed with prometheus_client's own text parser rather than by regex,
+    so what the assertions read is what a scraper would read. Summed
+    across label sets because one pod serves one (pipeline,
+    broker_source) pair and the sum is then that pair's value — the
+    `_bucket` series are summed too and are not what any caller here
+    asks for.
+    """
+    from prometheus_client.parser import text_string_to_metric_families
+
+    totals: dict[str, float] = {}
+    for family in text_string_to_metric_families(metrics_text):
+        for sample in family.samples:
+            totals[sample.name] = totals.get(sample.name, 0.0) + sample.value
+    return totals
+
+
 def _count(client) -> int:
     from pyhoglake import NotFoundError
 
@@ -292,3 +311,30 @@ class TestHoglakeE2E:
         assert health == 200
         assert "millpond_records_written_total" in metrics_text
         assert "millpond_hoglake_files_written_total" in metrics_text
+
+    def test_flush_fanout_matches_the_objects_the_catalog_holds(self, pipeline):
+        """The fanout histograms, reconciled against the real catalog.
+
+        This is the one assertion the unit suite cannot make. Rows per
+        object are read off each file registration's `record_count`, which
+        pyhoglake fills from that object's own parquet footer — a field a
+        mocked `prepare_append_tables` can only promise. Here the
+        registrations are real: every object the catalog holds was
+        observed exactly once, and the rows summed over those
+        observations are the events that were produced. A `record_count`
+        that went missing or turned approximate fails here and nowhere
+        else.
+        """
+        client, _log_path, _proc, _count, _health, metrics_text = pipeline
+        samples = _metric_samples(metrics_text)
+        registered = len(client.catalog(CATALOG).namespace(NAMESPACE).table(TABLE).files())
+        # Nothing in this stack deletes or compacts, so every object ever
+        # registered is still live and the histogram's `_sum` is exactly
+        # the catalog's file count.
+        assert samples["millpond_flush_files_sum"] == registered
+        # One rows observation per object, and they account for every
+        # produced event exactly once.
+        assert samples["millpond_flush_file_rows_count"] == registered
+        assert samples["millpond_flush_file_rows_sum"] == N_EVENTS
+        # At least one flush, and never more flushes than objects.
+        assert 1 <= samples["millpond_flush_files_count"] <= registered

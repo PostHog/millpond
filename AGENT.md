@@ -435,6 +435,8 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | `millpond_flush_duration_seconds` | Histogram | Time per lake write |
 | `millpond_flush_size_bytes` | Histogram | Arrow bytes per flush |
 | `millpond_flush_size_records` | Histogram | Records per flush |
+| `millpond_flush_files` | Histogram | Objects (parquet files) written per flush (hoglake destinations only) |
+| `millpond_flush_file_rows` | Histogram | Rows per object written, one observation per object (hoglake destinations only) |
 | `millpond_pending_bytes` | Gauge | Current pending Arrow bytes awaiting flush |
 | `millpond_consumer_lag` | Gauge | Highwater - committed (by partition) |
 | `millpond_last_committed_offset` | Gauge | Last committed offset (by partition) |
