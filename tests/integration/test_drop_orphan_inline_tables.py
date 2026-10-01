@@ -589,7 +589,17 @@ class TestJustfileDelivery:
         rendered = out.stdout + out.stderr
         assert out.returncode == 0, rendered
         assert "drop-orphan-inline-tables --batch-size '500'" in rendered
-        assert "--run-budget-s '1800'" in rendered
+        assert "--run-budget-s '300'" in rendered
+        # The budget is an environment knob, so a tenant can be raised from
+        # the CronJob spec without touching the chain args.
+        raised = subprocess.run(
+            [just, "--justfile", justfile, "--dry-run", "drop-orphan-inline-tables-default"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "MILLPOND_INLINE_RUN_BUDGET_S": "900"},
+        )
+        assert raised.returncode == 0, raised.stdout + raised.stderr
+        assert "--run-budget-s '900'" in raised.stdout + raised.stderr
         assert "--max-batches" not in rendered
 
     def test_empty_run_budget_renders_an_unbudgeted_command(self):
