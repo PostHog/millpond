@@ -1,5 +1,24 @@
 # Millpond — Dead Simple Kafka to DuckLake
 
+## Public Repository
+
+This repository is public. Everything that lands in it is visible to anyone:
+code, comments, docs, commit messages, branch names, PR titles and
+descriptions, and review comments.
+
+Never include internal or customer-identifying information, for example:
+
+- customer, organization, team or project IDs and UUIDs
+- customer names, or details that let a reader identify a customer
+- per-tenant database, bucket or catalog names
+- internal hostnames, service endpoints, cluster or shard names, account IDs
+- secrets, tokens or credentials, even expired ones
+- links to internal dashboards, incident channels or private repositories
+
+When a real incident motivates a change, describe it generically, for
+example "a production tenant" or "a large catalog". Keep identifying
+diagnostics in internal channels.
+
 ## Pre-push Checklist
 
 Always run before pushing:
