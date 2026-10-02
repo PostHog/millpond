@@ -16,27 +16,50 @@ Periodically (or once) runs a fixed set of catalog-side
 queries against a DuckLake and exposes the results as Prometheus gauges.
 Built-in queries cover lake-shape signals (size-band distribution,
 compaction-tier candidate counts, pending-deletion queue depth, snapshot
-age). Operators can supply additional queries via a YAML file referenced
-by ``DUCKLAKE_METRICS_CONFIG``.
+age) and the size of the catalog database's Postgres system catalogs.
+Operators can supply additional queries via a YAML file referenced by
+``DUCKLAKE_METRICS_CONFIG``.
 
-Reuses ``ducklake_maintenance.connect()`` so the daemon inherits the same lake +
-postgres ATTACH, S3 secret, and session tunables that ducklake_maintenance.py runs
-under — see that module's docstring for the full env-var contract (RDS_* and
-DUCKDB_S3_REGION required; DUCKDB_S3_ACCESS_KEY_ID/_SECRET_ACCESS_KEY optional —
-omit both to use DuckDB's credential_chain provider).
+Catalog mode (``--catalog-mode`` / ``DUCKLAKE_METRICS_CATALOG_MODE``):
 
-Caveat for long-running deployments: ``connect()`` resolves S3 credentials via
-``CREATE SECRET`` at startup. Under credential_chain, the SDK-resolved temporary
-credentials (e.g. an IRSA STS token) are valid for ~1h and are NOT refreshed by
-the secret over the connection lifetime. Once the underlying creds expire the
-daemon will see ExpiredToken errors and only recover after the consecutive-
-failure threshold trips a reconnect. The compactor CronJob is unaffected
-(short-lived). Refresh handling is a known follow-up.
+- ``postgres``: a direct psycopg connection to the catalog database
+  (``ducklake_maintenance._pg_direct_connect``, application_name
+  ``millpond-metrics``). DuckDB is never opened and there is no DuckLake
+  ATTACH; each query's Postgres form (``server_sql``, against
+  ``public.*``) runs in its own read-only transaction with a
+  ``statement_timeout`` and a ``lock_timeout``. The ATTACH reads the whole
+  Postgres system catalog, which on a catalog with many inlined-data tables
+  exceeds the job's memory limit — so this mode keeps metrics flowing
+  exactly when the catalog is unhealthy. ``--duckdb-memory-limit`` is
+  ignored.
+- ``duckdb``: ``ducklake_maintenance.connect()`` — the lake + postgres
+  ATTACH, S3 secret, and session tunables that ducklake_maintenance.py runs
+  under (see that module's docstring for the env-var contract: RDS_* and
+  DUCKDB_S3_REGION required; DUCKDB_S3_ACCESS_KEY_ID/_SECRET_ACCESS_KEY
+  optional — omit both to use DuckDB's credential_chain provider). Needed
+  for dev/file lakes and for user queries with only a DuckDB form.
+- ``auto`` (default): postgres when DUCKLAKE_RDS_HOST is set and every
+  selected query has a Postgres form, duckdb otherwise.
+
+Metric names, labels and the ``tenant`` label are identical across catalog
+modes and run modes.
+
+Caveat for long-running duckdb-mode deployments: ``connect()`` resolves S3
+credentials via ``CREATE SECRET`` at startup. Under credential_chain, the
+SDK-resolved temporary credentials (e.g. an IRSA STS token) are valid for
+~1h and are NOT refreshed by the secret over the connection lifetime. Once
+the underlying creds expire the daemon will see ExpiredToken errors and
+only recover after the consecutive-failure threshold trips a reconnect.
+The compactor CronJob is unaffected (short-lived). Refresh handling is a
+known follow-up. Postgres mode does not touch S3.
 
 Optional:
-  DUCKLAKE_METRICS_PORT     — HTTP listen port (default 9100)
-  DUCKLAKE_METRICS_CONFIG   — path to user-supplied queries YAML
-  DUCKLAKE_METRICS_DISABLE  — comma-separated query names to skip
+  DUCKLAKE_METRICS_PORT                  — HTTP listen port (default 9100)
+  DUCKLAKE_METRICS_CONFIG                — path to user-supplied queries YAML
+  DUCKLAKE_METRICS_DISABLE               — comma-separated query names to skip
+  DUCKLAKE_METRICS_CATALOG_MODE          — auto (default) | postgres | duckdb
+  DUCKLAKE_METRICS_PG_STATEMENT_TIMEOUT  — postgres mode, seconds (default 30)
+  DUCKLAKE_METRICS_PG_LOCK_TIMEOUT       — postgres mode, seconds (default 5)
 """
 
 from __future__ import annotations
@@ -60,6 +83,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import duckdb
 import ducklake_maintenance
+import psycopg
 import yaml
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -86,6 +110,16 @@ _SERVER_SQL_FALLBACK_LOGGED: set[str] = set()
 # ``__ducklake_metadata_lake`` (per ducklake_maintenance.py's METADATA_SCHEMA). Built-in
 # queries hardcode that name; user-supplied queries are passed through verbatim
 # and may reference whatever schema they like.
+#
+# Every built-in also carries a `server_sql` form: the same query in Postgres
+# dialect against the real catalog schema, `public` (PG_CATALOG_SCHEMA —
+# `__ducklake_metadata_lake` exists only DuckDB-side). Postgres catalog mode
+# runs only that form, so a built-in without one is a test failure. Same
+# column names and value semantics as `sql`; the dialect differences that
+# matter are noted per query (regexp_extract -> substring(x FROM re),
+# regexp_matches -> ~, DOUBLE -> double precision, VARCHAR -> text, GROUP BY
+# an output alias -> GROUP BY position). tests/integration/
+# test_ducklake_metrics_postgres.py asserts both forms agree on a real catalog.
 BUILTIN_YAML = """
 queries:
   - name: ducklake_pending_deletes
@@ -104,6 +138,12 @@ queries:
         COUNT(DISTINCT path) AS unique_paths,
         COUNT(*) - COUNT(DISTINCT path) AS dup_rows
       FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion
+    server_sql: |
+      SELECT
+        COUNT(*) AS total,
+        COUNT(DISTINCT path) AS unique_paths,
+        COUNT(*) - COUNT(DISTINCT path) AS dup_rows
+      FROM public.ducklake_files_scheduled_for_deletion
 
   - name: ducklake_data_files
     help: |
@@ -120,6 +160,13 @@ queries:
         COALESCE(SUM(record_count), 0)    AS rows
       FROM __ducklake_metadata_lake.ducklake_data_file
       WHERE end_snapshot IS NULL
+    server_sql: |
+      SELECT
+        COUNT(*) AS files,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes,
+        COALESCE(SUM(record_count), 0)    AS rows
+      FROM public.ducklake_data_file
+      WHERE end_snapshot IS NULL
 
   - name: ducklake_delete_files
     help: |
@@ -134,6 +181,12 @@ queries:
         COUNT(*) AS files,
         COALESCE(SUM(file_size_bytes), 0) AS bytes
       FROM __ducklake_metadata_lake.ducklake_delete_file
+      WHERE end_snapshot IS NULL
+    server_sql: |
+      SELECT
+        COUNT(*) AS files,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes
+      FROM public.ducklake_delete_file
       WHERE end_snapshot IS NULL
 
   - name: ducklake_files_per_band
@@ -159,6 +212,19 @@ queries:
       FROM __ducklake_metadata_lake.ducklake_data_file
       WHERE end_snapshot IS NULL
       GROUP BY band
+    server_sql: |
+      SELECT
+        CASE
+          WHEN file_size_bytes < 1048576   THEN 'tier1'
+          WHEN file_size_bytes < 10485760  THEN 'tier2'
+          WHEN file_size_bytes < 67108864  THEN 'tier3'
+          ELSE 'large'
+        END AS band,
+        COUNT(*) AS count,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes
+      FROM public.ducklake_data_file
+      WHERE end_snapshot IS NULL
+      GROUP BY 1
 
   - name: ducklake_mergeable_files_per_band
     help: |
@@ -263,6 +329,14 @@ queries:
         COALESCE(MIN(snapshot_id), 0) AS oldest_id,
         COALESCE(MAX(snapshot_id), 0) AS newest_id
       FROM __ducklake_metadata_lake.ducklake_snapshot
+    server_sql: |
+      SELECT
+        COUNT(*) AS count,
+        COALESCE(EXTRACT(EPOCH FROM (now() - MIN(CAST(snapshot_time AS timestamptz)))), 0) AS oldest_seconds_ago,
+        COALESCE(EXTRACT(EPOCH FROM (now() - MAX(CAST(snapshot_time AS timestamptz)))), 0) AS newest_seconds_ago,
+        COALESCE(MIN(snapshot_id), 0) AS oldest_id,
+        COALESCE(MAX(snapshot_id), 0) AS newest_id
+      FROM public.ducklake_snapshot
 
   - name: ducklake_inlined_data_tables
     help: |
@@ -277,6 +351,9 @@ queries:
     sql: |
       SELECT COUNT(*) AS total
       FROM __ducklake_metadata_lake.ducklake_inlined_data_tables
+    server_sql: |
+      SELECT COUNT(*) AS total
+      FROM public.ducklake_inlined_data_tables
 
   - name: ducklake_unreachable_inline_tables
     help: |
@@ -307,6 +384,20 @@ queries:
       SELECT COUNT(*) AS total
       FROM __ducklake_metadata_lake.ducklake_inlined_data_tables idt
       WHERE NOT EXISTS (SELECT 1 FROM reachable r WHERE r.table_id = idt.table_id)
+    server_sql: |
+      WITH bounds AS (
+        SELECT MIN(snapshot_id) AS lo, MAX(snapshot_id) AS hi
+        FROM public.ducklake_snapshot
+      ),
+      reachable AS (
+        SELECT DISTINCT t.table_id
+        FROM public.ducklake_table t, bounds
+        WHERE t.begin_snapshot <= bounds.hi
+          AND (t.end_snapshot IS NULL OR t.end_snapshot > bounds.lo)
+      )
+      SELECT COUNT(*) AS total
+      FROM public.ducklake_inlined_data_tables idt
+      WHERE NOT EXISTS (SELECT 1 FROM reachable r WHERE r.table_id = idt.table_id)
 
   - name: ducklake_tables
     help: |
@@ -325,6 +416,12 @@ queries:
         COUNT(*) AS count
       FROM __ducklake_metadata_lake.ducklake_table
       GROUP BY state
+    server_sql: |
+      SELECT
+        CASE WHEN end_snapshot IS NULL THEN 'live' ELSE 'dropped' END AS state,
+        COUNT(*) AS count
+      FROM public.ducklake_table
+      GROUP BY 1
 
   - name: ducklake_files_per_partition_top20
     help: Twenty heaviest partitions by live data-file count (composite values joined with '/').
@@ -347,6 +444,26 @@ queries:
       GROUP BY partition
       ORDER BY count DESC
       LIMIT 20
+    # Postgres form: GROUP BY / ORDER BY by position, because Postgres
+    # resolves a bare GROUP BY name to the INPUT column l.partition before
+    # the output alias. The extra ORDER BY key makes the top-20 cut
+    # deterministic on ties; the DuckDB form picks an arbitrary tie.
+    server_sql: |
+      WITH labels AS (
+        SELECT data_file_id,
+               string_agg(partition_value, '/' ORDER BY partition_key_index) AS partition
+        FROM public.ducklake_file_partition_value
+        GROUP BY data_file_id
+      )
+      SELECT
+        COALESCE(l.partition, '<none>') AS partition,
+        COUNT(*) AS count
+      FROM public.ducklake_data_file df
+      LEFT JOIN labels l USING (data_file_id)
+      WHERE df.end_snapshot IS NULL
+      GROUP BY 1
+      ORDER BY 2 DESC, 1
+      LIMIT 20
 
   - name: ducklake_metadata_live_file_lookup
     help: |
@@ -366,6 +483,21 @@ queries:
       FROM (
         SELECT df.data_file_id
         FROM __ducklake_metadata_lake.ducklake_data_file df
+        JOIN target USING (data_file_id)
+        WHERE df.end_snapshot IS NULL
+        LIMIT 256
+      ) AS lookup_rows
+    server_sql: |
+      WITH target AS (
+        SELECT data_file_id
+        FROM public.ducklake_data_file
+        WHERE end_snapshot IS NULL
+        LIMIT 1
+      )
+      SELECT COUNT(*) AS files
+      FROM (
+        SELECT df.data_file_id
+        FROM public.ducklake_data_file df
         JOIN target USING (data_file_id)
         WHERE df.end_snapshot IS NULL
         LIMIT 256
@@ -392,6 +524,21 @@ queries:
         JOIN target USING (data_file_id)
         LIMIT 256
       ) AS lookup_rows
+    # VALUES is a reserved word in Postgres, so the alias is quoted.
+    server_sql: |
+      WITH target AS (
+        SELECT data_file_id
+        FROM public.ducklake_data_file
+        WHERE end_snapshot IS NULL
+        LIMIT 1
+      )
+      SELECT COUNT(*) AS "values"
+      FROM (
+        SELECT fpv.partition_key_index
+        FROM public.ducklake_file_partition_value fpv
+        JOIN target USING (data_file_id)
+        LIMIT 256
+      ) AS lookup_rows
 
   - name: ducklake_metadata_file_column_stats_lookup
     help: |
@@ -414,6 +561,20 @@ queries:
         JOIN target USING (data_file_id)
         LIMIT 256
       ) AS lookup_rows
+    server_sql: |
+      WITH target AS (
+        SELECT data_file_id
+        FROM public.ducklake_data_file
+        WHERE end_snapshot IS NULL
+        LIMIT 1
+      )
+      SELECT COUNT(*) AS stats
+      FROM (
+        SELECT fcs.column_id
+        FROM public.ducklake_file_column_stats fcs
+        JOIN target USING (data_file_id)
+        LIMIT 256
+      ) AS lookup_rows
 
   - name: ducklake_catalog
     help: |
@@ -432,6 +593,20 @@ queries:
         CAST(regexp_extract(value, '^[0-9]+(\\.[0-9]+)?') AS DOUBLE) AS format_version,
         regexp_replace(value, '^[0-9]+(\\.[0-9]+)?', '') AS suffix
       FROM __ducklake_metadata_lake.ducklake_metadata
+      WHERE key = 'version' AND scope IS NULL
+    # Postgres form. substring(x FROM re) returns the first capture group
+    # when the pattern has one, so the group is non-capturing (?:...). It
+    # returns NULL on no match where regexp_extract returns '', so the
+    # COALESCE keeps junk values failing loudly on the cast.
+    server_sql: |
+      SELECT
+        CAST(
+          CASE WHEN value IS NULL THEN NULL
+               ELSE COALESCE(substring(value FROM '^[0-9]+(?:\\.[0-9]+)?'), '')
+          END AS double precision
+        ) AS format_version,
+        regexp_replace(value, '^[0-9]+(\\.[0-9]+)?', '') AS suffix
+      FROM public.ducklake_metadata
       WHERE key = 'version' AND scope IS NULL
 
   - name: ducklake_config
@@ -462,6 +637,48 @@ queries:
         END AS value
       FROM __ducklake_metadata_lake.ducklake_metadata
       WHERE key IN ('auto_compact', 'data_inlining_row_limit')
+    server_sql: |
+      SELECT
+        key,
+        COALESCE(scope, '') AS scope,
+        COALESCE(CAST(scope_id AS text), '') AS scope_id,
+        CASE
+          WHEN value = 'true'  THEN 1.0
+          WHEN value = 'false' THEN 0.0
+          WHEN value ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN CAST(value AS double precision)
+          ELSE NULL
+        END AS value
+      FROM public.ducklake_metadata
+      WHERE key IN ('auto_compact', 'data_inlining_row_limit')
+
+  - name: ducklake_pg_catalog_size
+    help: |
+      Size of the Postgres system catalogs pg_class and pg_attribute in the
+      catalog database. Every inlined-data table adds rows to them, and the
+      DuckDB DuckLake ATTACH reads them in full, so a large value makes the
+      ATTACH slow and memory-hungry. Rows are planner estimates
+      (pg_class.reltuples). Remediation: `drop-orphan-inline-tables`, then
+      VACUUM FULL of pg_class / pg_attribute / pg_type. Postgres catalog
+      mode only.
+    interval_mins: 5
+    values: [pg_class_rows, pg_attribute_rows, pg_attribute_bytes]
+    # Postgres-only (no `sql`). reltuples, not COUNT(*): an exact count is a
+    # sequential scan of the whole catalog heap, and on a bloated catalog
+    # (the case this query exists to detect) that is hundreds of MB of
+    # reads every run. autovacuum and ANALYZE keep reltuples current enough
+    # for a trend signal. reltuples is -1 before the first ANALYZE; that
+    # becomes NULL, which drops the sample. pg_total_relation_size reads
+    # only file sizes. Both catalogs are per-database, so this measures
+    # the current catalog database only.
+    server_sql: |
+      SELECT
+        MAX(CASE WHEN oid = 'pg_catalog.pg_class'::regclass AND reltuples >= 0
+                 THEN reltuples END) AS pg_class_rows,
+        MAX(CASE WHEN oid = 'pg_catalog.pg_attribute'::regclass AND reltuples >= 0
+                 THEN reltuples END) AS pg_attribute_rows,
+        pg_total_relation_size('pg_catalog.pg_attribute'::regclass) AS pg_attribute_bytes
+      FROM pg_catalog.pg_class
+      WHERE oid IN ('pg_catalog.pg_class'::regclass, 'pg_catalog.pg_attribute'::regclass)
 """
 
 # Intervals are specified in whole minutes via the YAML field `interval_mins`
@@ -477,18 +694,25 @@ _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 class Query:
     name: str
     help: str
-    sql: str
+    # DuckDB-dialect form against the `__ducklake_metadata_lake` attach.
+    # None for a Postgres-only query (skipped in duckdb catalog mode).
+    sql: str | None
     interval_seconds: int
     labels: list[str] = field(default_factory=list)
     values: list[str] = field(default_factory=list)
-    # Optional Postgres-dialect form of the same query, shipped to the
-    # catalog via postgres_query() when the connection has the direct pg
-    # attach (same rationale as ducklake_maintenance's server-side
-    # enumeration: the duckdb postgres scanner pulls whole tables with
-    # projection pushdown only, so join-heavy metadata queries are
-    # tens-to-hundreds of MB per run client-side on a big catalog).
-    # Must return the same column names as `sql`. Falls back to `sql`
-    # on lakes without the attach (dev/file lakes, unit-test stubs).
+    # Postgres-dialect form of the same query against the real catalog
+    # schema (`public.*`, ducklake_maintenance.PG_CATALOG_SCHEMA). Two
+    # consumers:
+    #   - postgres catalog mode runs it directly on the psycopg connection
+    #     (the only form that mode uses; a query without one makes auto
+    #     mode fall back to duckdb, and an explicit postgres mode refuse).
+    #   - duckdb catalog mode ships it to the catalog via postgres_query()
+    #     when the connection has the direct pg attach (the duckdb postgres
+    #     scanner pulls whole tables with projection pushdown only, so
+    #     join-heavy metadata queries are tens-to-hundreds of MB per run
+    #     client-side on a big catalog), and falls back to `sql` on lakes
+    #     without the attach (dev/file lakes, unit-test stubs).
+    # Must return the same column names and value semantics as `sql`.
     server_sql: str | None = None
 
 
@@ -518,9 +742,13 @@ def _load_yaml_doc(text: str, source: str) -> list[dict]:
 
 
 def _query_from_dict(d: dict, source: str) -> Query:
-    for key in ("name", "help", "interval_mins", "sql"):
+    for key in ("name", "help", "interval_mins"):
         if key not in d:
             raise ValueError(f"{source}: query missing required key {key!r}")
+    # `sql` is required unless a `server_sql` form is given: a query with
+    # only `server_sql` is Postgres-only and is skipped in duckdb mode.
+    if d.get("sql") is None and d.get("server_sql") is None:
+        raise ValueError(f"{source}: query missing required key 'sql' (or 'server_sql' for a Postgres-only query)")
     name = d["name"]
     if not isinstance(name, str) or not _NAME_RE.match(name):
         raise ValueError(f"{source}: query name {name!r} must match {_NAME_RE.pattern}")
@@ -530,13 +758,16 @@ def _query_from_dict(d: dict, source: str) -> Query:
         raise ValueError(f"{source}: query {name!r} labels must be a list of strings")
     if not isinstance(values, list) or not all(isinstance(x, str) for x in values):
         raise ValueError(f"{source}: query {name!r} values must be a list of strings")
+    sql = d.get("sql")
+    if sql is not None and not isinstance(sql, str):
+        raise ValueError(f"{source}: query {name!r} sql must be a string")
     server_sql = d.get("server_sql")
     if server_sql is not None and not isinstance(server_sql, str):
         raise ValueError(f"{source}: query {name!r} server_sql must be a string")
     return Query(
         name=name,
         help=d["help"],
-        sql=d["sql"],
+        sql=sql,
         interval_seconds=_validate_interval_mins(d["interval_mins"]),
         labels=labels,
         values=values,
@@ -559,6 +790,173 @@ def load_queries(user_yaml_path: str | None, disable: set[str]) -> list[Query]:
     for name in disable:
         by_name.pop(name, None)
     return list(by_name.values())
+
+
+# ---------------------------------------------------------------------------
+# Catalog mode: how the queries reach the catalog.
+#
+#   postgres — a direct psycopg connection to the catalog database
+#              (ducklake_maintenance._pg_direct_connect). DuckDB is never
+#              opened, so there is no DuckLake ATTACH. The ATTACH reads the
+#              whole Postgres system catalog (pg_class / pg_attribute /
+#              pg_type / pg_description); on a catalog with many
+#              inlined-data tables that alone exceeds the job's memory
+#              limit, and the tenant stops reporting exactly when its
+#              catalog is unhealthy. Runs each query's `server_sql`.
+#   duckdb   — ducklake_maintenance.connect(): DuckDB + the DuckLake and
+#              Postgres ATTACHes. Needed for dev/file lakes and for user
+#              queries that only have a DuckDB form.
+#   auto     — postgres when DUCKLAKE_RDS_HOST is set AND every selected
+#              query has a `server_sql` form; duckdb otherwise (logged).
+# ---------------------------------------------------------------------------
+
+CATALOG_MODE_AUTO = "auto"
+CATALOG_MODE_POSTGRES = "postgres"
+CATALOG_MODE_DUCKDB = "duckdb"
+CATALOG_MODES = (CATALOG_MODE_AUTO, CATALOG_MODE_POSTGRES, CATALOG_MODE_DUCKDB)
+
+# application_name on the direct connection, so pg_stat_activity tells the
+# metrics job apart from the maintenance ops that share the catalog role.
+PG_APPLICATION_NAME = "millpond-metrics"
+
+_DEFAULT_PG_STATEMENT_TIMEOUT_SECONDS = 30.0
+_DEFAULT_PG_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def _resolve_catalog_mode(requested: str, queries: list[Query], env: dict | None = None) -> str:
+    """Turn the requested mode into ``postgres`` or ``duckdb``.
+
+    Raises ValueError for an explicit ``postgres`` request that cannot be
+    honored (no DUCKLAKE_RDS_HOST, or a selected query without a
+    Postgres form) — a forced mode must not silently become the other one.
+    """
+    env = os.environ if env is None else env
+    if requested not in CATALOG_MODES:
+        raise ValueError(f"catalog mode must be one of {', '.join(CATALOG_MODES)}; got {requested!r}")
+    if requested == CATALOG_MODE_DUCKDB:
+        return CATALOG_MODE_DUCKDB
+    has_host = bool(env.get("DUCKLAKE_RDS_HOST"))
+    no_pg_form = sorted(q.name for q in queries if q.server_sql is None)
+    if requested == CATALOG_MODE_POSTGRES:
+        if not has_host:
+            raise ValueError("catalog mode postgres requires DUCKLAKE_RDS_HOST")
+        if no_pg_form:
+            raise ValueError(
+                f"catalog mode postgres: these queries have no `server_sql` (Postgres) form: {no_pg_form}. "
+                "Add one, drop them via DUCKLAKE_METRICS_DISABLE, or use --catalog-mode duckdb."
+            )
+        return CATALOG_MODE_POSTGRES
+    if not has_host:
+        log.info("catalog mode auto -> duckdb: DUCKLAKE_RDS_HOST is not set")
+        return CATALOG_MODE_DUCKDB
+    if no_pg_form:
+        log.warning(
+            "catalog mode auto -> duckdb: these queries have no `server_sql` (Postgres) form: %s. "
+            "duckdb mode performs the full DuckLake ATTACH; add Postgres forms to use the direct connection.",
+            no_pg_form,
+        )
+        return CATALOG_MODE_DUCKDB
+    return CATALOG_MODE_POSTGRES
+
+
+def _queries_for_mode(queries: list[Query], mode: str) -> list[Query]:
+    """Drop the queries the resolved mode cannot run.
+
+    Postgres mode needs nothing dropped (_resolve_catalog_mode guarantees a
+    Postgres form). Duckdb mode skips Postgres-only queries (no `sql`), e.g.
+    ``ducklake_pg_catalog_size``.
+    """
+    if mode == CATALOG_MODE_POSTGRES:
+        return list(queries)
+    skipped = [q.name for q in queries if q.sql is None]
+    if skipped:
+        log.info("catalog mode duckdb: skipping Postgres-only queries %s", skipped)
+    return [q for q in queries if q.sql is not None]
+
+
+@dataclass(frozen=True)
+class PgOptions:
+    """Per-transaction limits for postgres catalog mode."""
+
+    statement_timeout_seconds: float = _DEFAULT_PG_STATEMENT_TIMEOUT_SECONDS
+    lock_timeout_seconds: float = _DEFAULT_PG_LOCK_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        for name in ("statement_timeout_seconds", "lock_timeout_seconds"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int | float) or not v > 0:
+                raise ValueError(f"{name} must be a positive number of seconds, got {v!r}")
+
+
+class _PostgresCatalog:
+    """A direct psycopg connection to the catalog, used by postgres mode.
+
+    Each fetch() runs ONE query in its own short transaction:
+    ``BEGIN; SET TRANSACTION READ ONLY; SET LOCAL statement_timeout;
+    SET LOCAL lock_timeout; <query>; COMMIT``. The settings are
+    transaction-local (SET LOCAL), never session-level, because the
+    catalog is reached through a pooler that can hand the next
+    transaction a different server connection. The transaction commits
+    as soon as the rows are fetched, so no idle-in-transaction snapshot
+    stays open on the catalog between queries (it would hold back vacuum
+    and widen every writer's conflict window). Any error rolls the
+    transaction back (psycopg's transaction() context) and propagates.
+
+    lock_timeout: the queries take only ACCESS SHARE locks, which wait
+    only behind an ACCESS EXCLUSIVE lock (e.g. a VACUUM FULL of a catalog
+    table). Waiting there also blocks every later lock request on that
+    table, so the query gives up quickly instead.
+    """
+
+    def __init__(self, conn: psycopg.Connection, options: PgOptions):
+        self.conn = conn
+        self.options = options
+
+    def fetch(self, q: Query) -> tuple[list[str], list[tuple]]:
+        if q.server_sql is None:
+            raise RuntimeError(f"query {q.name}: no `server_sql` form; cannot run in postgres catalog mode")
+        statement_ms = int(self.options.statement_timeout_seconds * 1000)
+        lock_ms = int(self.options.lock_timeout_seconds * 1000)
+        with self.conn.transaction():
+            # No parameters, so psycopg sends the three statements in one
+            # round trip. SET TRANSACTION must come first in the transaction.
+            self.conn.execute(
+                "SET TRANSACTION READ ONLY; "
+                f"SET LOCAL statement_timeout = {statement_ms}; "
+                f"SET LOCAL lock_timeout = {lock_ms}"
+            )
+            cur = self.conn.execute(q.server_sql)
+            cols = [d.name for d in cur.description]
+            rows = cur.fetchall()
+        return cols, rows
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def _connect_postgres(options: PgOptions) -> _PostgresCatalog:
+    """Open the direct catalog connection for postgres mode. Never opens DuckDB."""
+    conn = ducklake_maintenance._pg_direct_connect(application_name=PG_APPLICATION_NAME)
+    # No server-side prepared statements: psycopg prepares a statement after
+    # it has run a few times, and a transaction-mode pooler does not
+    # guarantee the next transaction sees the backend that holds it.
+    conn.prepare_threshold = None
+    log.info(
+        "Connected to the DuckLake catalog over a direct Postgres connection "
+        "(no DuckDB, no ATTACH; statement_timeout=%gs lock_timeout=%gs)",
+        options.statement_timeout_seconds,
+        options.lock_timeout_seconds,
+    )
+    return _PostgresCatalog(conn, options)
+
+
+def _log_memory_limit_ignored(memory_limit: str | None) -> None:
+    if memory_limit is not None:
+        log.info(
+            "DuckDB memory limit %r (--duckdb-memory-limit / DUCKLAKE_METRICS_MEMORY_LIMIT) is ignored "
+            "in postgres catalog mode: DuckDB is not opened",
+            memory_limit,
+        )
 
 
 @dataclass
@@ -724,8 +1122,66 @@ def _liveness_status(liveness: _Liveness | None, now: float) -> tuple[bool, str,
     return True, LIVENESS_REASON_OK, "ok"
 
 
+def _fetch_duckdb(conn: duckdb.DuckDBPyConnection, q: Query) -> tuple[list[str], list[tuple]]:
+    """Run one query on a DuckDB connection (duckdb catalog mode)."""
+    # Explicit transaction bracket, NOT for atomicity (these are
+    # single read-only statements) but for remote-connection hygiene.
+    # Under autocommit, duckdb-postgres ends the REMOTE transaction
+    # lazily: after a statement completes, the attached-Postgres
+    # connection sits in its REPEATABLE READ transaction ("idle in
+    # transaction" in pg_stat_activity) until the next statement
+    # reuses it — for this daemon, the entire inter-query interval
+    # (minutes). An idle-in-transaction snapshot on the shared
+    # catalog pins vacuum and lengthens every writer's OCC conflict
+    # window. An explicit COMMIT ends the remote transaction eagerly
+    # (verified against megaduck 2026-09-10: bare scan left the
+    # connection in-transaction for the full idle window;
+    # pg_pool_max_connections=0 did NOT help — the primary
+    # connection is exempt from the pool; a BEGIN/COMMIT bracket
+    # returned it clean). Safe here: the scheduler is strictly
+    # serial on this connection.
+    conn.execute("BEGIN")
+    cur = None
+    if q.server_sql is not None:
+        # Server-side first (see Query.server_sql). Bind/catalog errors
+        # mean "this lake has no direct pg attach" (dev/file lakes,
+        # test stubs) — expected shape, fall back to the local form.
+        # Any other error is a real failure and takes the normal path.
+        try:
+            cur = conn.execute(
+                f"SELECT * FROM postgres_query('{ducklake_maintenance.PG_ATTACH_NAME}', "
+                f"{ducklake_maintenance._sql_string_literal(q.server_sql)})"
+            )
+        except (duckdb.BinderException, duckdb.CatalogException) as e:
+            # The failed statement may have aborted the explicit
+            # transaction; reopen it so the fallback runs cleanly.
+            # ROLLBACK is best-effort: depending on the duckdb
+            # version the failed statement either aborts the
+            # transaction (ROLLBACK required) or unwinds it
+            # (ROLLBACK raises "no transaction is active").
+            try:
+                conn.execute("ROLLBACK")
+            except duckdb.Error:
+                pass
+            conn.execute("BEGIN")
+            if q.name not in _SERVER_SQL_FALLBACK_LOGGED:
+                _SERVER_SQL_FALLBACK_LOGGED.add(q.name)
+                log.info("query %s: server-side form unavailable (%s); using local metadata attach", q.name, e)
+    if cur is None:
+        if q.sql is None:
+            raise RuntimeError(f"query {q.name}: Postgres-only (no `sql` form) and no direct pg attach")
+        cur = conn.execute(q.sql)
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    # Commit as soon as the cursor is drained: gauge bookkeeping in the
+    # caller must not extend the remote transaction's lifetime, and a
+    # gauge-side exception must not leave the transaction open.
+    conn.execute("COMMIT")
+    return cols, rows
+
+
 def _run_query(
-    conn: duckdb.DuckDBPyConnection,
+    conn: duckdb.DuckDBPyConnection | _PostgresCatalog,
     q: Query,
     gauges: dict[str, Gauge],
     self_metrics: SelfMetrics,
@@ -740,6 +1196,9 @@ def _run_query(
     on at emit time so user-supplied YAML doesn't need to know about
     the multi-tenant deployment model.
 
+    ``conn`` is a DuckDB connection (duckdb catalog mode) or a
+    _PostgresCatalog (postgres catalog mode); only the fetch differs.
+
     On success: clears each value gauge before re-populating so label
     combinations that drop out between runs don't linger as stale series.
     On failure: increments the error counter and logs; the daemon stays
@@ -751,57 +1210,10 @@ def _run_query(
     if liveness is not None:
         liveness.current_query_start = t0
     try:
-        # Explicit transaction bracket, NOT for atomicity (these are
-        # single read-only statements) but for remote-connection hygiene.
-        # Under autocommit, duckdb-postgres ends the REMOTE transaction
-        # lazily: after a statement completes, the attached-Postgres
-        # connection sits in its REPEATABLE READ transaction ("idle in
-        # transaction" in pg_stat_activity) until the next statement
-        # reuses it — for this daemon, the entire inter-query interval
-        # (minutes). An idle-in-transaction snapshot on the shared
-        # catalog pins vacuum and lengthens every writer's OCC conflict
-        # window. An explicit COMMIT ends the remote transaction eagerly
-        # (verified against megaduck 2026-09-10: bare scan left the
-        # connection in-transaction for the full idle window;
-        # pg_pool_max_connections=0 did NOT help — the primary
-        # connection is exempt from the pool; a BEGIN/COMMIT bracket
-        # returned it clean). Safe here: the scheduler is strictly
-        # serial on this connection.
-        conn.execute("BEGIN")
-        cur = None
-        if q.server_sql is not None:
-            # Server-side first (see Query.server_sql). Bind/catalog errors
-            # mean "this lake has no direct pg attach" (dev/file lakes,
-            # test stubs) — expected shape, fall back to the local form.
-            # Any other error is a real failure and takes the normal path.
-            try:
-                cur = conn.execute(
-                    f"SELECT * FROM postgres_query('{ducklake_maintenance.PG_ATTACH_NAME}', "
-                    f"{ducklake_maintenance._sql_string_literal(q.server_sql)})"
-                )
-            except (duckdb.BinderException, duckdb.CatalogException) as e:
-                # The failed statement may have aborted the explicit
-                # transaction; reopen it so the fallback runs cleanly.
-                # ROLLBACK is best-effort: depending on the duckdb
-                # version the failed statement either aborts the
-                # transaction (ROLLBACK required) or unwinds it
-                # (ROLLBACK raises "no transaction is active").
-                try:
-                    conn.execute("ROLLBACK")
-                except duckdb.Error:
-                    pass
-                conn.execute("BEGIN")
-                if q.name not in _SERVER_SQL_FALLBACK_LOGGED:
-                    _SERVER_SQL_FALLBACK_LOGGED.add(q.name)
-                    log.info("query %s: server-side form unavailable (%s); using local metadata attach", q.name, e)
-        if cur is None:
-            cur = conn.execute(q.sql)
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchall()
-        # Commit as soon as the cursor is drained: gauge bookkeeping
-        # below must not extend the remote transaction's lifetime, and a
-        # gauge-side exception must not leave the transaction open.
-        conn.execute("COMMIT")
+        if isinstance(conn, _PostgresCatalog):
+            cols, rows = conn.fetch(q)
+        else:
+            cols, rows = _fetch_duckdb(conn, q)
         try:
             label_idx = [cols.index(name) for name in q.labels]
             value_idx = [cols.index(name) for name in q.values]
@@ -830,12 +1242,14 @@ def _run_query(
         return True
     except Exception:
         # Close any transaction the failure left open (including the
-        # explicit bracket above). Best-effort: on a dead connection the
-        # ROLLBACK fails too, and the reconnect path owns recovery.
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:  # noqa: BLE001
-            pass
+        # explicit bracket in _fetch_duckdb). Best-effort: on a dead
+        # connection the ROLLBACK fails too, and the reconnect path owns
+        # recovery. _PostgresCatalog.fetch already rolled back.
+        if not isinstance(conn, _PostgresCatalog):
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
         log.exception("query %s failed", q.name)
         self_metrics.errors.labels(tenant, q.name).inc()
         return False
@@ -849,7 +1263,7 @@ def _run_query(
 
 
 def _scheduler_loop(
-    conn: duckdb.DuckDBPyConnection,
+    conn: duckdb.DuckDBPyConnection | _PostgresCatalog,
     queries: list[Query],
     gauges: dict[str, dict[str, Gauge]],
     self_metrics: SelfMetrics,
@@ -983,8 +1397,13 @@ def _connect_with_backoff(
     tenant: str,
     liveness: _Liveness | None = None,
     memory_limit: str | None = None,
-) -> duckdb.DuckDBPyConnection | None:
-    """Call ducklake_maintenance.connect() with exponential backoff until it succeeds or stop is set.
+    catalog_mode: str = CATALOG_MODE_DUCKDB,
+    pg_options: PgOptions | None = None,
+) -> duckdb.DuckDBPyConnection | _PostgresCatalog | None:
+    """Connect to the catalog with exponential backoff until it succeeds or stop is set.
+
+    duckdb mode calls ducklake_maintenance.connect(); postgres mode calls
+    _connect_postgres() and ignores ``memory_limit`` (main() logs that once).
 
     Returns the new connection on success, or None if the daemon was asked
     to shut down before connect succeeded. ``self_metrics.up`` is held at 0
@@ -1012,7 +1431,8 @@ def _connect_with_backoff(
     fast at daemon startup rather than retrying forever in a tight loop
     that the broad except-clause below would otherwise swallow.
     """
-    if memory_limit is not None:
+    postgres = catalog_mode == CATALOG_MODE_POSTGRES
+    if memory_limit is not None and not postgres:
         ducklake_maintenance._sanitize_setting_value(memory_limit)
     delay = _BACKOFF_INITIAL_SECONDS
     self_metrics.up.labels(tenant).set(0)
@@ -1020,6 +1440,8 @@ def _connect_with_backoff(
         if liveness is not None:
             liveness.last_tick = time.monotonic()
         try:
+            if postgres:
+                return _connect_postgres(pg_options or PgOptions())
             conn = ducklake_maintenance.connect()
             if memory_limit is not None:
                 conn.execute(f"SET memory_limit = '{memory_limit}'")
@@ -1086,8 +1508,14 @@ def _run_once(
     tenant: str,
     push_url: str,
     memory_limit: str | None,
+    catalog_mode: str = CATALOG_MODE_DUCKDB,
+    pg_options: PgOptions | None = None,
 ) -> int:
     """One-shot mode: connect, run every query once, push, exit.
+
+    ``catalog_mode`` is a resolved mode (postgres or duckdb, see
+    _resolve_catalog_mode). In postgres mode DuckDB is never opened and
+    ``memory_limit`` is ignored (logged once).
 
     Per-query failures do NOT fail the run — they are themselves pushed
     (ducklake_metrics_query_errors_total) and therefore visible where the
@@ -1101,14 +1529,19 @@ def _run_once(
     every tenant's job fight over the same series. The push must contain
     exactly the tenant-labeled metrics and nothing else.
     """
+    queries = _queries_for_mode(queries, catalog_mode)
     registry = CollectorRegistry()
     self_metrics = _build_self_metrics(registry)
     gauges = _build_query_gauges(queries, registry)
 
     try:
-        conn = _connect_once(memory_limit)
+        if catalog_mode == CATALOG_MODE_POSTGRES:
+            _log_memory_limit_ignored(memory_limit)
+            conn = _connect_postgres(pg_options or PgOptions())
+        else:
+            conn = _connect_once(memory_limit)
     except Exception:
-        log.exception("connect to DuckLake failed")
+        log.exception("connect to DuckLake catalog failed (catalog mode %s)", catalog_mode)
         return 1
     try:
         self_metrics.up.labels(tenant).set(1)
@@ -1184,6 +1617,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--duckdb-memory-limit",
         default=os.environ.get("DUCKLAKE_METRICS_MEMORY_LIMIT"),
         help=(
+            "duckdb catalog mode only (ignored in postgres mode). "
             "DuckDB `memory_limit` applied right after connect (e.g. '512MB', '1GB'). "
             "DuckDB's default is ~75%% of detected RAM; inside a cgroup-limited pod "
             "that often resolves to the host RAM rather than the cgroup limit, and "
@@ -1193,6 +1627,37 @@ def build_parser() -> argparse.ArgumentParser:
             "the ducklake extension's in-memory catalog model, and HTTP server "
             "buffers — ~150-200Mi typical). Unset = DuckDB default (only safe on "
             "a host where DuckDB can actually use ~75%% of the reported RAM)."
+        ),
+    )
+    p.add_argument(
+        "--catalog-mode",
+        default=os.environ.get("DUCKLAKE_METRICS_CATALOG_MODE", CATALOG_MODE_AUTO),
+        help=(
+            "How queries reach the catalog: `postgres` = direct Postgres connection, "
+            "no DuckDB and no DuckLake ATTACH (runs each query's server_sql); "
+            "`duckdb` = DuckDB with the full DuckLake ATTACH; `auto` (default) = "
+            "postgres when DUCKLAKE_RDS_HOST is set and every selected query has a "
+            "server_sql form, else duckdb. Falls back to DUCKLAKE_METRICS_CATALOG_MODE env."
+        ),
+    )
+    p.add_argument(
+        "--pg-statement-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("DUCKLAKE_METRICS_PG_STATEMENT_TIMEOUT", _DEFAULT_PG_STATEMENT_TIMEOUT_SECONDS)),
+        help=(
+            "postgres mode: statement_timeout for each query's transaction "
+            f"(default {_DEFAULT_PG_STATEMENT_TIMEOUT_SECONDS:g}s). Falls back to "
+            "DUCKLAKE_METRICS_PG_STATEMENT_TIMEOUT env."
+        ),
+    )
+    p.add_argument(
+        "--pg-lock-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("DUCKLAKE_METRICS_PG_LOCK_TIMEOUT", _DEFAULT_PG_LOCK_TIMEOUT_SECONDS)),
+        help=(
+            "postgres mode: lock_timeout for each query's transaction "
+            f"(default {_DEFAULT_PG_LOCK_TIMEOUT_SECONDS:g}s). Falls back to "
+            "DUCKLAKE_METRICS_PG_LOCK_TIMEOUT env."
         ),
     )
     p.add_argument(
@@ -1244,10 +1709,21 @@ def main(argv: list[str] | None = None) -> None:
     tenant: str = args.tenant
     log.info("Tenant: %s", tenant)
 
+    try:
+        catalog_mode = _resolve_catalog_mode(args.catalog_mode, queries)
+        pg_options = PgOptions(args.pg_statement_timeout_seconds, args.pg_lock_timeout_seconds)
+    except ValueError as e:
+        sys.exit(str(e))
+    log.info("Catalog mode: %s (requested %s)", catalog_mode, args.catalog_mode)
+
     if args.once:
         if not args.push_url:
             sys.exit("--once requires --push-url (or DUCKLAKE_METRICS_PUSH_URL env)")
-        sys.exit(_run_once(queries, tenant, args.push_url, args.duckdb_memory_limit))
+        sys.exit(_run_once(queries, tenant, args.push_url, args.duckdb_memory_limit, catalog_mode, pg_options))
+
+    queries = _queries_for_mode(queries, catalog_mode)
+    if catalog_mode == CATALOG_MODE_POSTGRES:
+        _log_memory_limit_ignored(args.duckdb_memory_limit)
 
     self_metrics = _build_self_metrics()
     gauges = _build_query_gauges(queries)
@@ -1290,7 +1766,9 @@ def main(argv: list[str] | None = None) -> None:
     # and stays true thereafter — k8s shouldn't yank metrics traffic on
     # transient catalog flap, and there's no real "traffic" anyway.
     while not stop.is_set():
-        conn = _connect_with_backoff(stop, self_metrics, tenant, liveness, args.duckdb_memory_limit)
+        conn = _connect_with_backoff(
+            stop, self_metrics, tenant, liveness, args.duckdb_memory_limit, catalog_mode, pg_options
+        )
         if conn is None:
             break
         self_metrics.up.labels(tenant).set(1)

@@ -61,7 +61,22 @@ The header documents the constraints any new recipe must follow:
 
 ## ducklake_metrics.py
 
-Long-running Prometheus-exposition daemon for catalog-side lake-state metrics. Single Python file. Single thread for queries (one DuckDB connection isn't safe for concurrent calls anyway), separate thread for the HTTP server. Reuses `ducklake_maintenance.connect()`.
+Catalog-side lake-state metrics. Single Python file, two run modes over the same query set:
+
+- daemon (default): long-running Prometheus-exposition server. Single thread for queries (one catalog connection isn't safe for concurrent calls anyway), separate thread for the HTTP server.
+- `--once`: run every query once, POST the exposition to `--push-url` / `DUCKLAKE_METRICS_PUSH_URL` (a VictoriaMetrics `/api/v1/import/prometheus` endpoint), exit. The per-tenant metrics CronJob runs this via `just metrics-once`. It pushes a dedicated registry (tenant-labeled metrics only) and exits nonzero only on connect failure, zero successful queries, or push failure.
+
+Catalog mode (`--catalog-mode` / `DUCKLAKE_METRICS_CATALOG_MODE`) decides how queries reach the catalog:
+
+| Mode | Connection | Runs |
+|---|---|---|
+| `postgres` | Direct psycopg connection (`ducklake_maintenance._pg_direct_connect`, `application_name=millpond-metrics`). DuckDB is never opened; no DuckLake ATTACH, no S3. | each query's `server_sql` |
+| `duckdb` | `ducklake_maintenance.connect()`: DuckDB + DuckLake and Postgres ATTACHes | `server_sql` via `postgres_query()` when the `pg` ATTACH exists, else `sql`; Postgres-only queries skipped |
+| `auto` (default) | `postgres` when `DUCKLAKE_RDS_HOST` is set and every selected query has a `server_sql`; otherwise `duckdb` (logged) | |
+
+Why `postgres` mode exists: the DuckLake ATTACH scans the whole Postgres system catalog (`pg_class` ⋈ `pg_attribute` ⋈ `pg_type` ⋈ `pg_description`). On a catalog with many inlined-data tables that alone exceeds a small job's memory limit, so the job would stop reporting exactly when the catalog becomes unhealthy. None of the built-ins needs DuckDB or S3.
+
+In `postgres` mode each query runs in its own short transaction: `SET TRANSACTION READ ONLY`, `SET LOCAL statement_timeout` (`--pg-statement-timeout-seconds`, default 30) and `SET LOCAL lock_timeout` (`--pg-lock-timeout-seconds`, default 5), then COMMIT as soon as the rows are fetched. Settings are transaction-local, and psycopg's server-side prepared statements are off, because the catalog is reached through a pooler. A failed query increments `ducklake_metrics_query_errors_total` and the run continues, as in `duckdb` mode. `--duckdb-memory-limit` is ignored (logged once). An explicit `--catalog-mode postgres` refuses to start when `DUCKLAKE_RDS_HOST` is unset or a selected query has no `server_sql`.
 
 Endpoints: `/metrics`, `/-/healthy` (k8s liveness — 200 while the scheduler is making progress, 503 after `--liveness-timeout-seconds` either with a query stuck in flight or with no scheduler tick at all; pre-scheduler-start is unconditionally 200 so initial connect backoff doesn't trip the probe), `/-/ready` (k8s readiness — 200 after the first successful connect; never gated on individual query completion so slow queries can't block rollout).
 
@@ -74,25 +89,33 @@ YAML field reference:
 | `name` | string | yes | Becomes the metric prefix; matches `^[a-zA-Z_][a-zA-Z0-9_]*$` |
 | `help` | string | yes | Prometheus HELP line |
 | `interval_mins` | positive integer | yes | Whole minutes, ≥1. The unit is in the field name — no `1m`/`30s` suffix parsing |
-| `sql` | string | yes | Must return columns named in `labels` + `values` |
+| `sql` | string | one of `sql` / `server_sql` | DuckDB dialect against the `__ducklake_metadata_lake` attach. Must return columns named in `labels` + `values` |
+| `server_sql` | string | one of `sql` / `server_sql` | Postgres dialect against the catalog schema `public`. Same columns and value semantics as `sql`. Required for `postgres` mode; a query with only `server_sql` is Postgres-only and skipped in `duckdb` mode |
 | `labels` | list[string] | optional | Column names → Prometheus label dimensions |
 | `values` | list[string] | yes | Column names → metric suffixes; metric name is `<name>_<value>` |
 
 Every metric is a gauge — no `type` field. For a query with `labels: [band]` and `values: [count, bytes]`, the registered metrics are `<name>_count{band="…"}` and `<name>_bytes{band="…"}`.
 
-Built-in queries (lake-wide; no `table_name` label by design):
+Built-in queries (lake-wide; no `table_name` label by design). Every built-in has both forms except `ducklake_pg_catalog_size`, which is Postgres-only:
 
 | Name | Labels | Values | Source |
 |---|---|---|---|
 | `ducklake_pending_deletes` | — | `total`, `unique_paths`, `dup_rows` | `ducklake_files_scheduled_for_deletion` |
-| `ducklake_files_per_band` | `band` | `count`, `bytes` | `ducklake_data_file` |
-| `ducklake_compaction_candidates` | `tier` | `count` | `ducklake_data_file`; tier buckets match `ducklake_maintenance.py`'s `TIERS` (`tier1` < 1 MiB, `tier2` [1, 10) MiB, `tier3` [10, 64) MiB, `large` ≥ 64 MiB, plus `total`) |
-| `ducklake_snapshots` | — | `count`, `oldest_seconds_ago`, `newest_seconds_ago` | `ducklake_snapshot`; CASTs `snapshot_time` (VARCHAR) to TIMESTAMPTZ before time arithmetic |
+| `ducklake_data_files` | — | `files`, `bytes`, `rows` | live `ducklake_data_file` rows |
+| `ducklake_delete_files` | — | `files`, `bytes` | live `ducklake_delete_file` rows |
+| `ducklake_files_per_band` | `band` | `count`, `bytes` | `ducklake_data_file`; bands match `ducklake_maintenance.py`'s `TIERS` (`tier1` < 1 MiB, `tier2` [1, 10) MiB, `tier3` [10, 64) MiB, `large` ≥ 64 MiB) |
+| `ducklake_mergeable_files_per_band` | `band` | `count`, `bytes`, `groups` | Compaction-tier files sharing a (table, partition) group with another in-band file and carrying no live delete file |
+| `ducklake_snapshots` | — | `count`, `oldest_seconds_ago`, `newest_seconds_ago`, `oldest_id`, `newest_id` | `ducklake_snapshot`; CASTs `snapshot_time` to TIMESTAMPTZ before time arithmetic |
+| `ducklake_inlined_data_tables` | — | `total` | `ducklake_inlined_data_tables` |
+| `ducklake_unreachable_inline_tables` | — | `total` | Inlined-data tables whose parent no retained snapshot can reach (the `drop-orphan-inline-tables` predicate) |
+| `ducklake_tables` | `state` | `count` | `ducklake_table`, `live` / `dropped` |
 | `ducklake_files_per_partition_top20` | `partition` | `count` | Composite partition values joined with `/`; live files without partition_value rows surface as `<none>` |
 | `ducklake_metadata_live_file_lookup` | — | `files` | Hourly, bounded lookup of one live data-file metadata row; no data-file read or identifiers emitted |
 | `ducklake_metadata_partition_value_lookup` | — | `values` | Hourly, bounded lookup of partition metadata for one live data file; no partition values emitted |
 | `ducklake_metadata_file_column_stats_lookup` | — | `stats` | Hourly, bounded lookup of column-statistics metadata for one live data file; no statistics emitted |
-| `ducklake_catalog` | `suffix` | `format_version` | `ducklake_metadata` row with `key='version'` and `scope IS NULL`. Numeric `major.minor` (extracted via `regexp_extract`) lands in the gauge value; any trailing tag DuckLake attaches (`-dev1` on main after `MigrateV10`, future `-rcN`/`-betaN` shapes) lands in the `suffix` label. Empty `suffix=""` for clean releases. Polled every 60 minutes — value changes only on a DuckLake upgrade |
+| `ducklake_catalog` | `suffix` | `format_version` | `ducklake_metadata` row with `key='version'` and `scope IS NULL`. Numeric `major.minor` lands in the gauge value; any trailing tag (`-dev1`, `-rcN`) lands in the `suffix` label. A value with no leading number fails the query (error counter) |
+| `ducklake_config` | `key`, `scope`, `scope_id` | `value` | `auto_compact` and `data_inlining_row_limit` at every scope; `'true'`/`'false'` → 1/0, numbers cast, anything else dropped |
+| `ducklake_pg_catalog_size` | — | `pg_class_rows`, `pg_attribute_rows`, `pg_attribute_bytes` | Postgres-only. Row estimates (`pg_class.reltuples`) and the on-disk size of the catalog database's own `pg_class` / `pg_attribute`. These grow with every inlined-data table and make the DuckDB ATTACH slow and memory-hungry. Remediation: `drop-orphan-inline-tables`, then `VACUUM FULL` of the catalogs |
 
 Self-metrics (always on):
 
@@ -114,7 +137,12 @@ Env vars (in addition to the `DUCKLAKE_*` / `DUCKDB_*` set used by `ducklake_mai
 | `DUCKLAKE_METRICS_CONFIG` | unset | Path to user-supplied queries YAML |
 | `DUCKLAKE_METRICS_DISABLE` | unset | Comma-separated names to skip from built-ins |
 | `DUCKLAKE_METRICS_LIVENESS_TIMEOUT` | `300` | Seconds before `/-/healthy` flips 503 on a stuck query or stalled scheduler; size above the slowest legitimate query |
-| `DUCKLAKE_METRICS_MEMORY_LIMIT` | unset (DuckDB default) | DuckDB `memory_limit` applied right after connect (e.g. `1GB`). DuckDB defaults to ~75% of detected RAM, which inside a cgroup-limited pod often resolves to host RAM and the kernel OOM-kills the pod once DuckDB tries to grow into non-existent memory. Set this WELL UNDER `resources.limits.memory` to leave headroom for the Python interpreter, the ducklake extension's in-memory catalog model, and HTTP server buffers (~250-500Mi typical) |
+| `DUCKLAKE_METRICS_CATALOG_MODE` | `auto` | `auto`, `postgres` or `duckdb` (see above) |
+| `DUCKLAKE_METRICS_PG_STATEMENT_TIMEOUT` | `30` | `postgres` mode: per-query `statement_timeout`, seconds |
+| `DUCKLAKE_METRICS_PG_LOCK_TIMEOUT` | `5` | `postgres` mode: per-query `lock_timeout`, seconds |
+| `DUCKLAKE_METRICS_PUSH_URL` | unset | `--once` push target (Prometheus import endpoint) |
+| `DUCKLAKE_TENANT` | unset (required) | `tenant` label on every metric |
+| `DUCKLAKE_METRICS_MEMORY_LIMIT` | unset (DuckDB default) | `duckdb` mode only (ignored in `postgres` mode). DuckDB `memory_limit` applied right after connect (e.g. `1GB`). DuckDB defaults to ~75% of detected RAM, which inside a cgroup-limited pod often resolves to host RAM and the kernel OOM-kills the pod once DuckDB tries to grow into non-existent memory. Set this WELL UNDER `resources.limits.memory` to leave headroom for the Python interpreter, the ducklake extension's in-memory catalog model, and HTTP server buffers (~250-500Mi typical) |
 
 ## justfile
 
@@ -126,7 +154,7 @@ Groups visible in `just --list`:
 - `[lifecycle]` — every snapshot/file maintenance subcommand of `ducklake_maintenance.py`, both `*` and `*-dry-run` variants. Recipe names mirror subcommand names with one exception: the `orphans` subcommand is exposed as `delete-orphaned-files{,-dry-run}` — the noun name read as a listing while actually deleting every unreferenced S3 object under DATA_PATH
 - `[compaction]` — tiered compaction recipes plus `compact-probe`
 - `[bootstrap]` — `bootstrap-index-*` per-index recipes (idempotent `CREATE INDEX CONCURRENTLY IF NOT EXISTS` against the DuckLake catalog schema) and `bootstrap-indexes` umbrella; one-shot use against a freshly instantiated DuckLake
-- `[metrics]` — `ducklake-metrics`, `ducklake-metrics-with-config`, `ducklake-metrics-list`
+- `[metrics]` — `ducklake-metrics`, `ducklake-metrics-with-config`, `ducklake-metrics-list`, and the chain-safe `metrics-once` (the per-tenant metrics CronJob)
 
 The bootstrap recipes shell out to `psql` directly rather than going through the DuckDB ATTACH path used by everything else: `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, and the duckdb postgres extension wraps every `postgres_execute` call in one. They reuse the same `DUCKLAKE_RDS_*` env vars; `PGPASSWORD` is exported via env (not args) so the password doesn't show up in `ps`, and every interpolated credential goes through just's `quote()` builtin so values containing `'`, `"`, `$`, or `\` are shell-safe. The umbrella runs the 8 builds sequentially — same-relation `CONCURRENTLY` builds serialize on Postgres's `ShareUpdateExclusiveLock` anyway, and sequential output keeps the operator log linear.
 

@@ -544,7 +544,10 @@ ducklake-metrics-list config="":
 # $DUCKLAKE_METRICS_PUSH_URL (VictoriaMetrics import endpoint).
 # Chain-safe (no positional params) — the per-tenant metrics CronJob's
 # recipe; tenant identity via $DUCKLAKE_TENANT, catalog target via the
-# same _target_env contract the maintenance recipes use.
+# same _target_env contract the maintenance recipes use. With
+# DUCKLAKE_RDS_HOST set, catalog mode auto uses a direct Postgres
+# connection and never opens DuckDB (DUCKLAKE_METRICS_CATALOG_MODE
+# overrides it).
 [group('metrics')]
 metrics-once:
     env {{ _target_env }} python {{ ducklake_metrics }} --once
