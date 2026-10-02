@@ -313,7 +313,7 @@ Requires Docker (uses `keytool` from the Kafka container image for cert generati
 The `tools/` directory ships two DuckLake-only operational binaries inside the same image as the writer:
 
 - **`tools/ducklake_maintenance.py`** — CLI for snapshot expiry (incl. Postgres-native `expire-snapshots`), file cleanup, orphan recovery, tiered compaction, fsck, and one-shot repairs (`repair-partition-values`, `dedup-deletions`, `purge-orphan-stats`, `drop-orphan-inline-tables`). Runs as a K8s CronJob.
-- **`tools/ducklake_metrics.py`** — Catalog-side lake-state metrics, either as a long-running Prometheus-exposition daemon or in one-shot push mode (`--once`, POSTing to `DUCKLAKE_METRICS_PUSH_URL` — the per-tenant metrics CronJob path).
+- **`tools/ducklake_metrics.py`** — Catalog-side lake-state metrics, either as a long-running Prometheus-exposition daemon or in one-shot push mode (`--once`, POSTing to `DUCKLAKE_METRICS_PUSH_URL` — the per-tenant metrics CronJob path). By default (`--catalog-mode auto`) it reads the catalog over a direct Postgres connection and never opens DuckDB, so a catalog whose system tables have grown too large for the DuckLake ATTACH still reports; `--catalog-mode duckdb` keeps the DuckDB path for dev/file lakes and DuckDB-only user queries.
 
 `tools/justfile` (copied to `/justfile` in the image) wraps both. Recipe groups:
 

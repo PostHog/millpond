@@ -143,7 +143,9 @@ class TestDaemonHTTP:
         conn = duckdb.connect()
         _stub_full_catalog(conn)
 
-        queries = dm.load_queries(None, set())
+        # duckdb catalog mode, filtered the way main() filters it: the
+        # Postgres-only built-ins are skipped.
+        queries = dm._queries_for_mode(dm.load_queries(None, set()), dm.CATALOG_MODE_DUCKDB)
         gauges = dm._build_query_gauges(queries, registry=registry)
         self_metrics = dm._build_self_metrics(registry=registry)
         # Liveness holder threaded through `_start_http` AND `_scheduler_loop`

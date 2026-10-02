@@ -10,6 +10,7 @@ Coverage:
 
 from __future__ import annotations
 
+import re
 import threading
 
 import duckdb
@@ -1183,3 +1184,251 @@ class TestServerSql:
         assert _gauge_value(registry, "ducklake_mergeable_files_per_band_groups", {"band": "tier1"}) == 1
         for band in ("tier2", "tier3", "large"):
             assert _gauge_value(registry, "ducklake_mergeable_files_per_band_count", {"band": band}) is None
+
+
+# ---------------------------------------------------------------------------
+# Catalog mode: Postgres forms of the built-ins, mode selection, and the
+# postgres-mode run path (the real-Postgres behavior is in
+# tests/integration/test_ducklake_metrics_postgres.py)
+# ---------------------------------------------------------------------------
+
+
+# DuckDB-only spellings that a Postgres form must not contain.
+_DUCKDB_ONLY = re.compile(r"__ducklake_metadata_lake|regexp_extract|regexp_matches|\bDOUBLE\b|\bVARCHAR\b", re.I)
+
+
+class TestBuiltinPostgresForms:
+    def test_every_builtin_has_a_postgres_form(self):
+        missing = [q.name for q in dm.load_queries(None, set()) if q.server_sql is None]
+        assert missing == []
+
+    def test_postgres_forms_use_postgres_names_only(self):
+        for q in dm.load_queries(None, set()):
+            # `double precision` is the Postgres spelling; strip it before the DOUBLE check.
+            text = q.server_sql.replace("double precision", "")
+            assert not _DUCKDB_ONLY.search(text), q.name
+            if q.name != "ducklake_pg_catalog_size":
+                assert "public.ducklake_" in q.server_sql, q.name
+
+    def test_catalog_size_is_postgres_only(self):
+        q = _builtin("ducklake_pg_catalog_size")
+        assert q.sql is None
+        assert q.values == ["pg_class_rows", "pg_attribute_rows", "pg_attribute_bytes"]
+        assert "reltuples" in q.server_sql and "count(" not in q.server_sql.lower()
+
+    def test_loader_accepts_postgres_only_query(self):
+        q = dm._query_from_dict(
+            {"name": "t_pg", "help": "t", "interval_mins": 1, "server_sql": "SELECT 1 AS n", "values": ["n"]},
+            "test",
+        )
+        assert q.sql is None and q.server_sql == "SELECT 1 AS n"
+
+    def test_loader_needs_one_form(self):
+        with pytest.raises(ValueError, match="missing required key 'sql'"):
+            dm._query_from_dict({"name": "x", "help": "h", "interval_mins": 1, "values": ["n"]}, "test")
+
+    def test_loader_rejects_non_string_sql(self):
+        with pytest.raises(ValueError, match="sql must be a string"):
+            dm._query_from_dict({"name": "x", "help": "h", "interval_mins": 1, "sql": 5, "values": ["n"]}, "test")
+
+
+def _q(name, sql="SELECT 1 AS n", server_sql=None):
+    return dm.Query(name=name, help="t", sql=sql, server_sql=server_sql, interval_seconds=60, values=["n"])
+
+
+class TestResolveCatalogMode:
+    HOST = {"DUCKLAKE_RDS_HOST": "db"}
+
+    def test_auto_with_host_and_postgres_forms_is_postgres(self):
+        queries = dm.load_queries(None, set())
+        assert dm._resolve_catalog_mode("auto", queries, self.HOST) == "postgres"
+
+    def test_auto_without_host_is_duckdb(self):
+        queries = dm.load_queries(None, set())
+        assert dm._resolve_catalog_mode("auto", queries, {}) == "duckdb"
+
+    def test_auto_with_a_duckdb_only_user_query_is_duckdb(self, caplog):
+        queries = [*dm.load_queries(None, set()), _q("user_q")]
+        caplog.set_level("INFO")
+        assert dm._resolve_catalog_mode("auto", queries, self.HOST) == "duckdb"
+        assert "user_q" in caplog.text
+
+    def test_duckdb_is_always_duckdb(self):
+        assert dm._resolve_catalog_mode("duckdb", dm.load_queries(None, set()), self.HOST) == "duckdb"
+
+    def test_postgres_without_host_refuses(self):
+        with pytest.raises(ValueError, match="DUCKLAKE_RDS_HOST"):
+            dm._resolve_catalog_mode("postgres", [_q("a", server_sql="SELECT 1 AS n")], {})
+
+    def test_postgres_with_a_duckdb_only_query_refuses(self):
+        with pytest.raises(ValueError, match="user_q"):
+            dm._resolve_catalog_mode("postgres", [_q("user_q")], self.HOST)
+
+    def test_unknown_mode_refuses(self):
+        with pytest.raises(ValueError, match="one of auto, postgres, duckdb"):
+            dm._resolve_catalog_mode("sqlite", [], self.HOST)
+
+    def test_duckdb_mode_skips_postgres_only_queries(self, caplog):
+        caplog.set_level("INFO")
+        kept = dm._queries_for_mode([_q("a"), _q("pg_only", sql=None, server_sql="SELECT 1 AS n")], "duckdb")
+        assert [q.name for q in kept] == ["a"]
+        assert "skipping Postgres-only queries ['pg_only']" in caplog.text
+
+    def test_postgres_mode_keeps_every_query(self):
+        queries = dm.load_queries(None, set())
+        assert dm._queries_for_mode(queries, "postgres") == queries
+
+
+class TestPgOptions:
+    def test_defaults(self):
+        assert dm.PgOptions() == dm.PgOptions(30.0, 5.0)
+
+    @pytest.mark.parametrize("bad", [0, -1, True, "30"])
+    def test_rejects_non_positive(self, bad):
+        with pytest.raises(ValueError, match="positive number of seconds"):
+            dm.PgOptions(statement_timeout_seconds=bad)
+
+
+class _FakePgConn:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeCatalog(dm._PostgresCatalog):
+    """A _PostgresCatalog whose fetch() answers from a dict, no server."""
+
+    def __init__(self, answers):
+        super().__init__(_FakePgConn(), dm.PgOptions())
+        self.answers = answers
+        self.ran: list[str] = []
+
+    def fetch(self, q):
+        self.ran.append(q.name)
+        answer = self.answers[q.name]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+class TestRunOncePostgresMode:
+    def _forbid_duckdb(self, monkeypatch):
+        def no_duckdb(*_a, **_kw):
+            raise AssertionError("postgres catalog mode must not open DuckDB")
+
+        monkeypatch.setattr(dm, "_connect_once", no_duckdb)
+        monkeypatch.setattr(dm.ducklake_maintenance, "connect", no_duckdb)
+
+    def test_runs_server_sql_and_ignores_memory_limit(self, monkeypatch, caplog):
+        self._forbid_duckdb(monkeypatch)
+        fake = _FakeCatalog({"t_pg": (["n"], [(3,)])})
+        monkeypatch.setattr(dm, "_connect_postgres", lambda _opts: fake)
+        caplog.set_level("INFO")
+        sink = _CaptureSink()
+        try:
+            # An invalid DuckDB memory limit is not even validated: it is not used.
+            rc = dm._run_once(
+                [_q("t_pg", sql=None, server_sql="SELECT 3 AS n")], TENANT, sink.url, "1GB'; --", "postgres"
+            )
+        finally:
+            sink.close()
+        assert rc == 0
+        assert 't_pg_n{tenant="test"} 3.0' in sink.bodies[0].decode()
+        assert "is ignored in postgres catalog mode" in caplog.text
+        assert fake.conn.closed
+
+    def test_per_query_failure_counts_and_continues(self, monkeypatch):
+        self._forbid_duckdb(monkeypatch)
+        fake = _FakeCatalog({"t_bad": RuntimeError("statement timeout"), "t_ok": (["n"], [(1,)])})
+        monkeypatch.setattr(dm, "_connect_postgres", lambda _opts: fake)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once(
+                [_q("t_bad", server_sql="x"), _q("t_ok", server_sql="y")], TENANT, sink.url, None, "postgres"
+            )
+        finally:
+            sink.close()
+        assert rc == 0
+        body = sink.bodies[0].decode()
+        assert 'ducklake_metrics_query_errors_total{query="t_bad",tenant="test"} 1.0' in body
+        assert 't_ok_n{tenant="test"} 1.0' in body
+
+    def test_connect_failure_exits_nonzero(self, monkeypatch):
+        def boom(_opts):
+            raise RuntimeError("no catalog")
+
+        monkeypatch.setattr(dm, "_connect_postgres", boom)
+        assert dm._run_once([_q("t", server_sql="x")], TENANT, "http://127.0.0.1:1/nope", None, "postgres") == 1
+
+    def test_all_failing_exits_nonzero_without_push(self, monkeypatch):
+        fake = _FakeCatalog({"t_bad": RuntimeError("boom")})
+        monkeypatch.setattr(dm, "_connect_postgres", lambda _opts: fake)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once([_q("t_bad", server_sql="x")], TENANT, sink.url, None, "postgres")
+        finally:
+            sink.close()
+        assert rc == 1 and sink.bodies == []
+
+    def test_duckdb_mode_skips_postgres_only_query(self, conn, monkeypatch):
+        monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once(
+                [_once_query(), _q("t_pg_only", sql=None, server_sql="SELECT 1 AS n")], TENANT, sink.url, None
+            )
+        finally:
+            sink.close()
+        assert rc == 0
+        body = sink.bodies[0].decode()
+        assert "t_pg_only" not in body
+        assert 't_once_n{tenant="test"} 7.0' in body
+
+
+class TestConnectWithBackoffPostgresMode:
+    def test_uses_direct_connection_and_skips_memory_limit(self, registry, monkeypatch):
+        sm = dm._build_self_metrics(registry=registry)
+        fake = _FakeCatalog({})
+        seen = []
+
+        def fake_connect_postgres(opts):
+            seen.append(opts)
+            return fake
+
+        monkeypatch.setattr(dm, "_connect_postgres", fake_connect_postgres)
+        monkeypatch.setattr(
+            dm.ducklake_maintenance, "connect", lambda: pytest.fail("connect() must not be called in postgres mode")
+        )
+        opts = dm.PgOptions(10, 1)
+        result = dm._connect_with_backoff(
+            threading.Event(), sm, TENANT, memory_limit="bad'value", catalog_mode="postgres", pg_options=opts
+        )
+        assert result is fake and seen == [opts]
+
+
+class TestMainCatalogModeFlags:
+    def test_forced_postgres_without_host_exits(self, monkeypatch):
+        monkeypatch.delenv("DUCKLAKE_RDS_HOST", raising=False)
+        with pytest.raises(SystemExit) as exc:
+            dm.main(["--once", "--tenant", "t", "--push-url", "http://x", "--catalog-mode", "postgres"])
+        assert "DUCKLAKE_RDS_HOST" in str(exc.value.code)
+
+    def test_bad_mode_from_env_exits(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_METRICS_CATALOG_MODE", "sqlite")
+        with pytest.raises(SystemExit) as exc:
+            dm.main(["--once", "--tenant", "t", "--push-url", "http://x"])
+        assert "one of auto, postgres, duckdb" in str(exc.value.code)
+
+    def test_auto_dispatches_postgres_to_run_once(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "db")
+        monkeypatch.delenv("DUCKLAKE_METRICS_CATALOG_MODE", raising=False)
+        monkeypatch.delenv("DUCKLAKE_METRICS_CONFIG", raising=False)
+        calls = []
+        monkeypatch.setattr(dm, "_run_once", lambda *a: calls.append(a) or 0)
+        with pytest.raises(SystemExit) as exc:
+            dm.main(["--once", "--tenant", "t", "--push-url", "http://x", "--pg-statement-timeout-seconds", "12"])
+        assert exc.value.code == 0
+        (_queries, _tenant, _url, _ml, mode, opts) = calls[0]
+        assert mode == "postgres" and opts == dm.PgOptions(12.0, 5.0)
