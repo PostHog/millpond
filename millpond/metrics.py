@@ -69,6 +69,53 @@ _flush_size_records = Histogram(
     ["pipeline", "broker_source"],
     buckets=[100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000],
 )
+# Objects written per flush, and the rows inside each one. FANOUT, not
+# volume: the hoglake sink writes one parquet object per distinct
+# partition tuple in a flush (`hoglake._partition_groups`), so a flush
+# whose rows scatter across N old day partitions costs N objects however
+# few rows each holds. `flush_size_records` says how much landed; these
+# two say how many pieces it landed in and how small they are — which is
+# the compaction-debt shape, and the pair to graph against
+# MILLPOND_FLUSH_SIZE when sizing a flush. Before them the number existed
+# only as `files=` in the snapshot's own commit message, where no query
+# can reach it.
+#
+# Powers of two to 2048 because the question is an ORDER OF MAGNITUDE of
+# fanout (is this flush writing ten objects or a thousand), and because
+# the late-arrival tail that drives it moves by doublings rather than by
+# percentages. The rows ladder keeps `flush_size_records`' 1-2-5 shape but
+# starts at 1: the population worth resolving is the dozens-of-rows
+# objects a month-late tail produces, not the one big current-partition
+# object beside them.
+#
+# ONE OBSERVATION PER OBJECT on `flush_file_rows` — up to a few hundred
+# per flush, which is a bucket search each and nothing next to the
+# parquet encode that produced them. The cheaper shapes (a mean, a min)
+# cannot answer "what share of the objects are tiny", which is the whole
+# question.
+#
+# NO COUNTER accompanies them, deliberately. Files per hour is
+# `rate(millpond_flush_files_sum[...])` — a histogram's `_sum` is a
+# counter of the observed quantity, and its `_count` a counter of the
+# flushes — and the same number already has a counter of its own in
+# `hoglake_files_written_total`, incremented on the same line. A third
+# series for it would be a third thing to keep in agreement.
+#
+# Hoglake destinations only. The DuckLake sink hands DuckDB an INSERT and
+# the engine chooses the file layout, so millpond never learns a file
+# count there; these stay unobserved rather than report a wrong one.
+_flush_files = Histogram(
+    "millpond_flush_files",
+    "Objects (parquet files) written per flush",
+    ["pipeline", "broker_source"],
+    buckets=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+)
+_flush_file_rows = Histogram(
+    "millpond_flush_file_rows",
+    "Rows per object written, observed once per object",
+    ["pipeline", "broker_source"],
+    buckets=[1, 5, 10, 25, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000],
+)
 
 # --- Include-values source (see include_values.py for semantics) ---
 
@@ -343,6 +390,8 @@ flush_duration_seconds = _flush_duration_seconds
 arrow_conversion_seconds = _arrow_conversion_seconds
 flush_size_bytes = _flush_size_bytes
 flush_size_records = _flush_size_records
+flush_files = _flush_files
+flush_file_rows = _flush_file_rows
 pending_bytes = _pending_bytes
 buffer_fullness = _buffer_fullness
 consume_batch_size_current = _consume_batch_size_current
@@ -382,6 +431,7 @@ def init(pipeline: str, broker_source: str = ""):
     global records_skipped_total, errors_total
     global flush_duration_seconds, arrow_conversion_seconds
     global flush_size_bytes, flush_size_records
+    global flush_files, flush_file_rows
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total, variant_companion_columns_dropped_total
@@ -420,6 +470,8 @@ def init(pipeline: str, broker_source: str = ""):
     arrow_conversion_seconds = _arrow_conversion_seconds.labels(pipeline=pipeline, broker_source=bs)
     flush_size_bytes = _flush_size_bytes.labels(pipeline=pipeline, broker_source=bs)
     flush_size_records = _flush_size_records.labels(pipeline=pipeline, broker_source=bs)
+    flush_files = _flush_files.labels(pipeline=pipeline, broker_source=bs)
+    flush_file_rows = _flush_file_rows.labels(pipeline=pipeline, broker_source=bs)
     include_values_size = _include_values_size.labels(pipeline=pipeline, broker_source=bs)
     include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds.labels(
         pipeline=pipeline, broker_source=bs
