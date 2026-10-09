@@ -1,0 +1,73 @@
+# Arrow IPC on Kafka — C++ consumer experiment
+
+# Default recipe: list all available recipes
+default:
+    @just --list
+
+# === Docker ===
+
+# Build and start the full stack (Kafka, Postgres, MinIO, producer, consumer)
+[group('docker')]
+up:
+    docker compose build
+    docker compose up -d
+
+# Stop the stack and remove volumes
+[group('docker')]
+down:
+    docker compose down -v
+
+# Tail logs from all services
+[group('docker')]
+logs *ARGS:
+    docker compose logs {{ ARGS }}
+
+# Tail consumer logs
+[group('docker')]
+logs-consumer:
+    docker compose logs -f arrow-consumer
+
+# Tail producer logs
+[group('docker')]
+logs-producer:
+    docker compose logs -f producer
+
+# Open the MinIO console (login: minioadmin/minioadmin)
+[group('docker')]
+minio:
+    open http://localhost:9101
+
+# === Build (local, outside Docker) ===
+
+# Configure the CMake build
+[group('build')]
+configure:
+    cmake -B consumer/build -S consumer -DCMAKE_BUILD_TYPE=Release
+
+# Build the consumer binary
+[group('build')]
+build: configure
+    cmake --build consumer/build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+# Remove local build artifacts
+[group('build')]
+clean:
+    rm -rf consumer/build
+
+# === Inspect ===
+
+# Query record count in DuckLake (requires stack running)
+[group('inspect')]
+count:
+    docker compose exec arrow-consumer sh -c 'duckdb -c " \
+        LOAD httpfs; LOAD ducklake; LOAD postgres; \
+        SET s3_endpoint=\"minio:9000\"; SET s3_access_key_id=\"minioadmin\"; \
+        SET s3_secret_access_key=\"minioadmin\"; SET s3_use_ssl=false; SET s3_url_style=\"path\"; \
+        ATTACH \"ducklake:postgres:host=postgres port=5432 dbname=ducklake user=ducklake password=ducklake\" AS lake; \
+        SELECT count(*) AS total_records FROM lake.main.events_arrow;"'
+
+# Show consumer group lag
+[group('inspect')]
+lag:
+    docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+        --bootstrap-server kafka:9094 --group millpond-arrow-events --describe
