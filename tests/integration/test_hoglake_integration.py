@@ -14,6 +14,7 @@ Run explicitly:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import re
@@ -72,6 +73,9 @@ class HogCfg:
     hoglake_max_retry_count: int = 8
     hoglake_request_timeout_s: float = 45.0
     sort_by: tuple[str, ...] | None = None
+    typed_columns: tuple[tuple[str, str], ...] | None = None
+    # Named in every DDL message.
+    topic: str = "events_json"
     ordinal: int = 0
     table_label: str = field(default="events")
     # Named in every commit message; a real string, because the sink
@@ -118,6 +122,12 @@ def client(hog_stack):
     )
     yield c
     c.close()
+
+
+# A drop is destructive DDL, and hoglake refuses one without both
+# fields (422). These drops stand in for an operator acting behind the
+# sink's back, so they are attributed to one rather than to the sink.
+_EXTERNAL_DROP = {"author": "millpond-it/operator", "message": "integration test: drop the table under a live writer"}
 
 
 def _fresh(**overrides) -> HogCfg:
@@ -179,16 +189,26 @@ def _delete_object(uri: str) -> None:
         _minio().delete_file(uri.removeprefix("s3://"))
 
 
-def _snapshots(client, cfg) -> list:
-    """This table's snapshots, oldest first.
+def _authored(client, cfg) -> list:
+    """Every snapshot this sink authored, DDL included, oldest first.
 
     The feed is `GET /v1/catalogs/{catalog}/snapshots`, which pyhoglake
     wraps — and it is CATALOG-wide: every table in this session shares
     it. The author carries the table name, so filtering on it is what
-    makes "the snapshot this flush wrote" a well-defined thing here.
+    makes "the snapshots this sink wrote" a well-defined thing here.
     """
     author = f"millpond/{cfg.hoglake_table}/{cfg.ordinal}"
     return [s for s in client.catalog(cfg.hoglake_catalog).snapshots() if s.author == author]
+
+
+def _snapshots(client, cfg) -> list:
+    """This table's DATA snapshots, oldest first — the commits.
+
+    The DDL the sink issues carries the same author, so the author alone
+    no longer tells a flush from the create that preceded it; a commit
+    is the snapshot whose changes insert into the table.
+    """
+    return [s for s in _authored(client, cfg) if any(c.kind == "table_inserted_into" for c in s.changes)]
 
 
 def _read_all(client, cfg) -> pa.Table:
@@ -603,7 +623,7 @@ class TestRestartAndReset:
         sink = HoglakeSink(cfg)
         try:
             sink.write(_batch(2))
-            _table(client, cfg).drop()
+            _table(client, cfg).drop(**_EXTERNAL_DROP)
             # The cached handle names a table that no longer resolves.
             # WHICH refusal depends on how far the flush gets, and all of
             # them are retryable, so the test accepts the family rather
@@ -650,7 +670,7 @@ class TestRestartAndReset:
         try:
             assert sink.write(_batch(2), kafka_offsets=(("events", 0, 0, 1),)) == 2
             dead = _table(client, cfg).table_uuid
-            _table(client, cfg).drop()
+            _table(client, cfg).drop(**_EXTERNAL_DROP)
             ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
             reborn = ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
             assert reborn.table_uuid != dead
@@ -865,7 +885,7 @@ class TestNewProcessReplay:
         offsets = {("events", 0): (12, 16)}
         self._flush_as_new_process(cfg, batch, offsets)
         assert _record_count(client, cfg) == 5
-        _table(client, cfg).drop()
+        _table(client, cfg).drop(**_EXTERNAL_DROP)
         self._flush_as_new_process(cfg, batch, offsets)
         assert _record_count(client, cfg) == 5, "the recreated table answered from its predecessor's receipt"
 
@@ -1072,7 +1092,7 @@ class TestPrepareOrphanAccounting:
             sink.write(_batch(2))
             before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
             ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
-            ns.table(cfg.hoglake_table).drop()
+            ns.table(cfg.hoglake_table).drop(**_EXTERNAL_DROP)
             ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
             sink._table.invalidate()
             with pytest.raises(IncarnationChangedError) as caught:
@@ -1101,7 +1121,7 @@ class TestPrepareOrphanAccounting:
             sink.write(_batch(2))
             before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
             ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
-            ns.table(cfg.hoglake_table).drop()
+            ns.table(cfg.hoglake_table).drop(**_EXTERNAL_DROP)
             ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
             with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
                 with pytest.raises(HoglakeSinkError, match="recreated") as caught:
@@ -1704,3 +1724,97 @@ class TestCommitMessage:
         assert snapshots[0].message.split("\n")[1] == (
             f"offsets {self.TOPIC} p3:4128819-4155470 p19:4130021-4156802 (2)"
         )
+
+
+class TestDdlAttribution:
+    """Every DDL the sink issues reaches the server with an author and a
+    message, and the server keeps them on the snapshot. The unit tests
+    pin the text; these pin that it is on the wire (the request body as
+    sent, not the keywords handed to pyhoglake) and in the catalog's
+    snapshot feed afterwards."""
+
+    def _record_requests(self, monkeypatch) -> list[tuple[str, str, dict]]:
+        """Every catalog request with a JSON body, as (method, path,
+        body) decoded from the bytes httpx actually sent. Patched on the
+        class because the catalog is created inside the sink's
+        constructor, before any instance hook could be installed."""
+        sent: list[tuple[str, str, dict]] = []
+        real = httpx.Client.request
+
+        def request(self, method, url, **kwargs):
+            response = real(self, method, url, **kwargs)
+            if response.request.content:
+                sent.append((method, response.request.url.path, json.loads(response.request.content)))
+            return response
+
+        monkeypatch.setattr(httpx.Client, "request", request)
+        return sent
+
+    def test_bootstrap_and_evolution_are_attributed_on_the_wire_and_in_the_catalog(
+        self, hog_stack, client, monkeypatch
+    ):
+        tag = uuid.uuid4().hex[:8]
+        cfg = _fresh(
+            hoglake_catalog=f"millpond-it-ddl-{tag}",
+            hoglake_data_path=f"s3://{BUCKET}/ddl-{tag}/",
+            hoglake_namespace="ddl",
+            hoglake_partition_by=(("team_id", "identity", None),),
+            sort_by=("uuid",),
+            typed_columns=(("team_id", "bigint"),),
+        )
+        author = f"millpond/{cfg.hoglake_table}/0"
+        sent = self._record_requests(monkeypatch)
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2, extra_cols={"count": pa.array([1, 2], pa.int32())}))
+            # One flush carrying both evolution ops: a new column and a
+            # widening of `count` int -> long.
+            sink.write(_batch(2, extra_cols={"count": pa.array([2**40, 3], pa.int64()), "extra": ["x", "y"]}))
+        finally:
+            sink.close()
+
+        create_table = (
+            f"first flush of events_json: create table ddl.{cfg.hoglake_table} with 6 columns from the batch; "
+            "HOGLAKE_PARTITION_BY=identity(team_id); MILLPOND_SORT_BY=uuid; MILLPOND_TYPED_COLUMNS=team_id:bigint"
+        )
+        declare = (
+            "first flush of events_json: declare partition spec and sort order; "
+            "HOGLAKE_PARTITION_BY=identity(team_id); MILLPOND_SORT_BY=uuid"
+        )
+        add = "schema evolution from events_json: add column extra (string)"
+        promote = "schema evolution from events_json: promote column count from int to long"
+        expected = {
+            "/v1/catalogs": (
+                f"startup for events_json: create catalog {cfg.hoglake_catalog}; "
+                f"HOGLAKE_DATA_PATH={cfg.hoglake_data_path}"
+            ),
+            f"/v1/catalogs/{cfg.hoglake_catalog}/namespaces": "first flush of events_json: create namespace ddl",
+            f"/v1/catalogs/{cfg.hoglake_catalog}/namespaces/ddl/tables": create_table,
+        }
+        ddl = [(path, body) for method, path, body in sent if method == "POST" and not path.endswith("/commit")]
+        for path, message in expected.items():
+            bodies = [body for p, body in ddl if p == path]
+            assert len(bodies) == 1, f"expected one POST {path}, saw {[p for p, _ in ddl]}"
+            assert (bodies[0].get("author"), bodies[0].get("message")) == (author, message)
+        alters = [body for p, body in ddl if p.endswith(f"/tables/{cfg.hoglake_table}/alter")]
+        assert [(body.get("author"), body.get("message")) for body in alters] == [
+            (author, declare),
+            (author, add),
+            (author, promote),
+        ]
+
+        # And persisted: the server records both fields on the snapshot
+        # each DDL produced, read back from GET /v1/catalogs/{c}/snapshots.
+        # Catalog creation is the exception — it precedes the catalog's
+        # snapshot history, so its attribution lands in the server's
+        # audit log only, which the API does not serve; the wire check
+        # above is all that can be asserted for it from here.
+        recorded = [s.message for s in _authored(client, cfg) if s not in _snapshots(client, cfg)]
+        for message in (
+            expected[f"/v1/catalogs/{cfg.hoglake_catalog}/namespaces"],
+            create_table,
+            declare,
+            add,
+            promote,
+        ):
+            assert message in recorded, f"{message!r} not on any snapshot; snapshots carry {recorded}"

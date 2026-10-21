@@ -986,8 +986,12 @@ class HoglakeSink:
             self._client._http.event_hooks["response"].append(self._note_response)
         except Exception:  # noqa: BLE001 - optional enhancement, never fatal
             log.debug("Could not install the Retry-After hook; backoff falls back to the exponential curve")
-        # Commit author recorded on every snapshot — the pipeline
-        # identity plus the pod ordinal, for multi-writer forensics.
+        # Author recorded on every snapshot this pod makes — the pipeline
+        # identity plus the pod ordinal, for multi-writer forensics. One
+        # name for the data commits AND the DDL (catalog, namespace and
+        # table creation, spec declaration, schema evolution), so "which
+        # pod created this table" and "which pod wrote this file" are the
+        # same question against the snapshot listing.
         self._author = f"millpond/{cfg.table_label}/{cfg.ordinal}"
         # The running version, named in every commit message and read
         # ONCE. `cfg.service_version` already holds it (the package
@@ -1959,7 +1963,16 @@ class HoglakeSink:
                     f"millpond create it"
                 ) from None
             try:
-                catalog = self._client.create_catalog(cfg.hoglake_catalog, cfg.hoglake_data_path)
+                catalog = self._client.create_catalog(
+                    cfg.hoglake_catalog,
+                    cfg.hoglake_data_path,
+                    author=self._author,
+                    message=self._ddl_message(
+                        f"startup for {cfg.topic}",
+                        f"create catalog {cfg.hoglake_catalog}",
+                        "HOGLAKE_DATA_PATH",
+                    ),
+                )
                 log.info("Created hoglake catalog %s (data_path=%s)", cfg.hoglake_catalog, cfg.hoglake_data_path)
                 return catalog
             except AlreadyExistsError:
@@ -2089,7 +2102,13 @@ class HoglakeSink:
             ns = catalog.namespace(cfg.hoglake_namespace)
         except NotFoundError:
             try:
-                ns = catalog.create_namespace(cfg.hoglake_namespace)
+                ns = catalog.create_namespace(
+                    cfg.hoglake_namespace,
+                    author=self._author,
+                    message=self._ddl_message(
+                        f"first flush of {cfg.topic}", f"create namespace {cfg.hoglake_namespace}"
+                    ),
+                )
                 log.info("Created hoglake namespace %s", cfg.hoglake_namespace)
             except AlreadyExistsError:
                 ns = catalog.namespace(cfg.hoglake_namespace)
@@ -2113,7 +2132,23 @@ class HoglakeSink:
         cfg = self._cfg
         schema = table_schema_for_batch(batch_schema)
         try:
-            table = ns.create_table(cfg.hoglake_table, schema)
+            # The message names the layout knobs even though the specs
+            # land in the alter that follows: they are part of the
+            # definition this config produced, and the snapshot that
+            # created the table is where an operator looks for it.
+            table = ns.create_table(
+                cfg.hoglake_table,
+                schema,
+                author=self._author,
+                message=self._ddl_message(
+                    f"first flush of {cfg.topic}",
+                    f"create table {cfg.hoglake_namespace}.{cfg.hoglake_table} with {len(schema)} columns "
+                    f"from the batch",
+                    "HOGLAKE_PARTITION_BY",
+                    "MILLPOND_SORT_BY",
+                    "MILLPOND_TYPED_COLUMNS",
+                ),
+            )
             log.info(
                 "Created hoglake table %s.%s with %d columns",
                 cfg.hoglake_namespace,
@@ -2132,10 +2167,10 @@ class HoglakeSink:
             return table
 
         self._adopt_columns(table.columns)
-        self._declare_specs(table)
+        self._declare_specs(table, why=f"first flush of {cfg.topic}")
         return table
 
-    def _declare_specs(self, table, *, partition: bool = True, sort: bool = True) -> None:
+    def _declare_specs(self, table, *, why: str, partition: bool = True, sort: bool = True) -> None:
         """Declare the configured partition spec + sort order in ONE
         alter, then VERIFY the result.
 
@@ -2144,6 +2179,11 @@ class HoglakeSink:
         carries is not free: it is a DDL commit through the per-catalog
         lock, it races every other writer's DDL, and it re-versions a
         layout nobody asked to change.
+
+        `why` opens the alter's snapshot message: a fresh table and an
+        existing one that lost its spec to a failed bootstrap are the
+        same ops for different reasons, and only the second is an
+        incident worth reading about later.
 
         Creation is two round trips and the gap between them is the
         hazard: the table exists before its layout does. Only a
@@ -2158,8 +2198,25 @@ class HoglakeSink:
         spec_ops = self._spec_ops(partition=partition, sort=sort)
         if not spec_ops:
             return
+        # Named from the ops actually sent, not from the knobs: a sort
+        # field missing from the schema drops the sort op, and the
+        # message must not claim a declaration that never happened.
+        declared = {op.op for op in spec_ops}
+        halves = [
+            (label, setting)
+            for op, label, setting in (
+                ("set_partition_spec", "partition spec", "HOGLAKE_PARTITION_BY"),
+                ("set_sort_order", "sort order", "MILLPOND_SORT_BY"),
+            )
+            if op in declared
+        ]
+        message = self._ddl_message(
+            why,
+            "declare " + " and ".join(label for label, _ in halves),
+            *(setting for _, setting in halves),
+        )
         try:
-            info = table.alter(spec_ops)
+            info = table.alter(spec_ops, author=self._author, message=message)
             log.info("Declared hoglake table specs: %s", ", ".join(op.op for op in spec_ops))
         except CommitConflictError as e:
             # Concurrent DDL (another pod racing the same specs). The
@@ -2229,7 +2286,7 @@ class HoglakeSink:
                 self._cfg.hoglake_namespace,
                 self._cfg.hoglake_table,
             )
-            self._declare_specs(table)
+            self._declare_specs(table, why=f"recovery for {self._cfg.topic} (table exists without its partition spec)")
         elif want_sort and not live_sort:
             log.warning(
                 "Hoglake table %s.%s exists with no sort order but MILLPOND_SORT_BY is set; declaring it now",
@@ -2238,7 +2295,11 @@ class HoglakeSink:
             )
             # The sort alone: the partition spec is already live and
             # already matches (the mismatch check above ran first).
-            self._declare_specs(table, partition=False)
+            self._declare_specs(
+                table,
+                why=f"recovery for {self._cfg.topic} (table exists without its sort order)",
+                partition=False,
+            )
         # The verdict, recorded against the shape it was reached ON —
         # `self._live_info` rather than `info`, because a declaration
         # above re-adopts a post-alter shape and THAT is what the next
@@ -2313,6 +2374,34 @@ class HoglakeSink:
         return ", ".join(
             f"{t}({c}{', ' + str(p) if p is not None else ''})" for c, t, p in (self._cfg.hoglake_partition_by or ())
         )
+
+    def _ddl_message(self, why: str, what: str, *settings: str) -> str:
+        """The `message` of a DDL snapshot: `<why>: <what>` and then each
+        named setting as `; NAME=value`, in the order given.
+
+        The data commits say WHAT landed and where it came from in
+        Kafka (`format_commit_message`); a DDL snapshot has to say which
+        configuration produced the definition, because that is the
+        question its snapshot gets asked later — "why is this column
+        uuid", "who asked for this partition spec", "is this table from
+        before or after the MILLPOND_SORT_BY change". So the settings are
+        named by their environment variable, in their own grammar, and
+        an unset one reads `unset` rather than vanishing: a table created
+        unpartitioned because the knob was missing is exactly the case
+        worth being able to see.
+
+        DETERMINISTIC for a given config and change: no clock, no
+        counter, nothing per-attempt. A retry after a lost response and a
+        second pod racing the same DDL describe it identically.
+        """
+        cfg = self._cfg
+        values = {
+            "HOGLAKE_DATA_PATH": cfg.hoglake_data_path,
+            "HOGLAKE_PARTITION_BY": self._describe_configured_partition(),
+            "MILLPOND_SORT_BY": ",".join(cfg.sort_by or ()),
+            "MILLPOND_TYPED_COLUMNS": ",".join(f"{name}:{type_}" for name, type_ in (cfg.typed_columns or ())),
+        }
+        return "; ".join([f"{why}: {what}", *(f"{name}={values[name] or 'unset'}" for name in settings)])
 
     def _spec_ops(self, *, partition: bool = True, sort: bool = True) -> list[AlterOp]:
         """Partition-spec + sort-order alter ops, built from the same
@@ -2707,6 +2796,7 @@ class HoglakeSink:
             return []
         add_ops: list[AlterOp] = []
         addable: list[pa.Field] = []
+        added: list[str] = []
         failed: list[str] = []
         for field in fields:
             try:
@@ -2724,12 +2814,21 @@ class HoglakeSink:
             log.info("Schema evolution: adding hoglake column %s (%s)", field.name, type_name)
             add_ops.append(ops.add_column(field.name, field.type))
             addable.append(field)
+            added.append(f"{field.name} ({type_name})")
 
         if not add_ops:
             return failed
         if len(add_ops) > 1:
             try:
-                self._adopt_info(table.alter(add_ops))
+                self._adopt_info(
+                    table.alter(
+                        add_ops,
+                        author=self._author,
+                        message=self._ddl_message(
+                            f"schema evolution from {self._cfg.topic}", "add columns " + ", ".join(added)
+                        ),
+                    )
+                )
                 metrics.schema_columns_added_total.inc(len(add_ops))
                 return failed
             except HoglakeError as e:
@@ -2749,7 +2848,15 @@ class HoglakeSink:
             return False
         log.info("Schema evolution: adding hoglake column %s (%s)", field.name, type_name)
         try:
-            self._adopt_info(table.alter([ops.add_column(field.name, field.type)]))
+            self._adopt_info(
+                table.alter(
+                    [ops.add_column(field.name, field.type)],
+                    author=self._author,
+                    message=self._ddl_message(
+                        f"schema evolution from {self._cfg.topic}", f"add column {field.name} ({type_name})"
+                    ),
+                )
+            )
             metrics.schema_columns_added_total.inc()
             return True
         except CommitConflictError:
@@ -2773,7 +2880,16 @@ class HoglakeSink:
         cast decides per value."""
         log.info("Schema evolution: promoting hoglake column %s from %s to %s", name, from_type, to_type)
         try:
-            self._adopt_info(table.alter([ops.promote_column(name, to_type)]))
+            self._adopt_info(
+                table.alter(
+                    [ops.promote_column(name, to_type)],
+                    author=self._author,
+                    message=self._ddl_message(
+                        f"schema evolution from {self._cfg.topic}",
+                        f"promote column {name} from {from_type} to {to_type}",
+                    ),
+                )
+            )
             metrics.schema_columns_widened_total.inc()
         except CommitConflictError:
             self._adopt_info(table.info(totals=False))

@@ -58,6 +58,8 @@ def _cfg(**overrides) -> MagicMock:
     cfg.hoglake_max_retry_count = 8
     cfg.hoglake_request_timeout_s = 30.0
     cfg.sort_by = None
+    cfg.typed_columns = None
+    cfg.topic = "events_json"
     cfg.ordinal = 0
     cfg.table_label = "events"
     # A real string: the sink reads it once at construction and writes it
@@ -167,7 +169,7 @@ def _wire_dynamic_alter(table, state: _FakeInfo):
     the ops to the live table state and return the post-alter info,
     exactly as pyhoglake's Table.alter does (one atomic DDL commit)."""
 
-    def do_alter(ops_list):
+    def do_alter(ops_list, *, author=None, message=None):
         cols = list(state.columns)
         for op in ops_list:
             if op.op == "add_column":
@@ -1307,7 +1309,12 @@ class TestBootstrap:
         client.create_catalog.return_value = created
         with patch("millpond.hoglake.HoglakeClient", return_value=client):
             s = hoglake.HoglakeSink(_cfg(hoglake_data_path="s3://bucket/millpond/"))
-        client.create_catalog.assert_called_once_with("millpond", "s3://bucket/millpond/")
+        client.create_catalog.assert_called_once_with(
+            "millpond",
+            "s3://bucket/millpond/",
+            author="millpond/events/0",
+            message="startup for events_json: create catalog millpond; HOGLAKE_DATA_PATH=s3://bucket/millpond/",
+        )
         assert s.write(_batch()) == 1
 
     def test_concurrent_catalog_creation_tolerated(self):
@@ -1323,7 +1330,9 @@ class TestBootstrap:
         catalog.namespace.side_effect = NotFoundError("no ns", status_code=404)
         catalog.create_namespace.return_value = ns
         s.write(_batch())
-        catalog.create_namespace.assert_called_once_with("analytics")
+        catalog.create_namespace.assert_called_once_with(
+            "analytics", author="millpond/events/0", message="first flush of events_json: create namespace analytics"
+        )
 
     def test_concurrent_namespace_creation_tolerated(self):
         s, client, catalog, ns, table = _sink()
@@ -1505,7 +1514,7 @@ class TestSpecDeclarationIsAtomicOrRecoverable:
         # must not write to.
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
         s, ns, table = self._create_flow(cfg)
-        table.alter.side_effect = lambda ops_list: _FakeInfo(columns=tuple(_EVENTS_COLUMNS))
+        table.alter.side_effect = lambda ops_list, **_attribution: _FakeInfo(columns=tuple(_EVENTS_COLUMNS))
         with pytest.raises(RuntimeError, match="partition spec"):
             s.write(_batch())
 
@@ -1516,7 +1525,9 @@ class TestSpecDeclarationIsAtomicOrRecoverable:
         # checked, not assumed — for both halves of the alter.
         cfg = _cfg(sort_by=("team_id",))
         s, ns, table = self._create_flow(cfg)
-        table.alter.side_effect = lambda ops_list: _FakeInfo(columns=tuple(_EVENTS_COLUMNS), sort_spec=_sort("uuid"))
+        table.alter.side_effect = lambda ops_list, **_attribution: _FakeInfo(
+            columns=tuple(_EVENTS_COLUMNS), sort_spec=_sort("uuid")
+        )
         with pytest.raises(RuntimeError, match="sort order"):
             s.write(_batch())
 
@@ -1524,7 +1535,7 @@ class TestSpecDeclarationIsAtomicOrRecoverable:
         cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),), sort_by=("team_id",))
         s, ns, table = self._create_flow(cfg)
         # Partition applied, sort silently absent.
-        table.alter.side_effect = lambda ops_list: _FakeInfo(
+        table.alter.side_effect = lambda ops_list, **_attribution: _FakeInfo(
             columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "identity"))
         )
         with pytest.raises(RuntimeError, match="sort order"):
@@ -1589,6 +1600,244 @@ class TestExistingTableReconciliation:
         cfg = _cfg(sort_by=("not_there",))
         s, client, catalog, ns, table = _sink(cfg, sort_spec=_sort("team_id"))
         assert s.write(_batch()) == 1
+
+
+_AUTHOR = "millpond/events/0"
+
+
+def _attribution(call) -> tuple[str | None, str | None]:
+    """The (author, message) one recorded DDL call carried."""
+    return call.kwargs.get("author"), call.kwargs.get("message")
+
+
+class TestDdlAttribution:
+    """Every DDL the sink issues names its writer and the configuration
+    that produced it (pyhoglake 1.4.0 `author` / `message`). The author is
+    the commits' `millpond/<table>/<ordinal>`, so one snapshot listing
+    answers "who wrote this file" and "who created this table" alike; the
+    message names each setting by its environment variable.
+
+    The concurrent-creation and concurrent-DDL arms are asserted here as
+    well: attribution is two keywords on calls whose failure handling is
+    load-bearing, and none of that handling may move."""
+
+    _LAYOUT = dict(
+        hoglake_partition_by=(("team_id", "identity", None), ("_inserted_at", "day", None)),
+        sort_by=("team_id", "uuid"),
+        typed_columns=(("uuid", "uuid"), ("team_id", "bigint")),
+    )
+
+    def _create_flow(self, cfg):
+        s, client, catalog, ns, table = _sink(cfg)
+        ns.table.side_effect = NotFoundError("no table", status_code=404)
+        return s, ns, table
+
+    def test_table_creation_names_the_topic_the_schema_and_the_layout_knobs(self):
+        s, ns, table = self._create_flow(_cfg(**self._LAYOUT))
+        s.write(_batch())
+        assert _attribution(ns.create_table.call_args) == (
+            _AUTHOR,
+            "first flush of events_json: create table analytics.events with 5 columns from the batch; "
+            "HOGLAKE_PARTITION_BY=identity(team_id), day(_inserted_at); MILLPOND_SORT_BY=team_id,uuid; "
+            "MILLPOND_TYPED_COLUMNS=uuid:uuid,team_id:bigint",
+        )
+
+    def test_unset_knobs_read_unset_rather_than_vanishing(self):
+        # An unpartitioned table created because HOGLAKE_PARTITION_BY was
+        # missing is the case worth being able to see afterwards.
+        s, ns, table = self._create_flow(_cfg())
+        s.write(_batch())
+        assert _attribution(ns.create_table.call_args)[1] == (
+            "first flush of events_json: create table analytics.events with 5 columns from the batch; "
+            "HOGLAKE_PARTITION_BY=unset; MILLPOND_SORT_BY=unset; MILLPOND_TYPED_COLUMNS=unset"
+        )
+
+    def test_concurrent_table_creation_still_loses_to_the_winner(self):
+        s, ns, table = self._create_flow(_cfg())
+        ns.table.side_effect = [NotFoundError("no table", status_code=404), table]
+        ns.create_table.side_effect = AlreadyExistsError("exists", status_code=409)
+        assert s.write(_batch()) == 1
+        assert _attribution(ns.create_table.call_args)[0] == _AUTHOR
+        assert ns.table.call_count == 2  # the loser re-resolved the winner's table
+        table.alter.assert_not_called()  # and declared nothing on it
+
+    def test_concurrent_catalog_creation_still_resolves_the_winner(self):
+        client, catalog, ns, table = _mock_stack(_EVENTS_COLUMNS)
+        client.catalog.side_effect = [NotFoundError("no catalog", status_code=404), catalog]
+        client.create_catalog.side_effect = AlreadyExistsError("exists", status_code=409)
+        with patch("millpond.hoglake.HoglakeClient", return_value=client):
+            s = hoglake.HoglakeSink(_cfg(hoglake_data_path="s3://bucket/millpond/"))
+        assert _attribution(client.create_catalog.call_args)[0] == _AUTHOR
+        assert client.catalog.call_count == 2
+        assert s.write(_batch()) == 1
+
+    def test_concurrent_namespace_creation_still_resolves_the_winner(self):
+        s, client, catalog, ns, table = _sink()
+        catalog.namespace.side_effect = [NotFoundError("no ns", status_code=404), ns]
+        catalog.create_namespace.side_effect = AlreadyExistsError("exists", status_code=409)
+        assert s.write(_batch()) == 1
+        assert _attribution(catalog.create_namespace.call_args)[0] == _AUTHOR
+        assert catalog.namespace.call_count == 2
+
+    def test_spec_declaration_names_both_knobs(self):
+        s, ns, table = self._create_flow(_cfg(**self._LAYOUT))
+        s.write(_batch())
+        assert _attribution(table.alter.call_args) == (
+            _AUTHOR,
+            "first flush of events_json: declare partition spec and sort order; "
+            "HOGLAKE_PARTITION_BY=identity(team_id), day(_inserted_at); MILLPOND_SORT_BY=team_id,uuid",
+        )
+
+    def test_spec_declaration_names_only_the_ops_it_sent(self):
+        # A sort field missing from the schema drops the sort op, and the
+        # message must not claim a sort order that was never declared.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),), sort_by=("not_there",))
+        s, ns, table = self._create_flow(cfg)
+        s.write(_batch())
+        assert [o.op for o in table.alter.call_args.args[0]] == ["set_partition_spec"]
+        assert _attribution(table.alter.call_args)[1] == (
+            "first flush of events_json: declare partition spec; HOGLAKE_PARTITION_BY=identity(team_id)"
+        )
+
+    def test_a_spec_ddl_race_still_verifies_the_winner(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, ns, table = self._create_flow(cfg)
+        table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "identity"))))
+        assert s.write(_batch()) == 1
+        assert _attribution(table.alter.call_args)[0] == _AUTHOR
+        assert table.info.called
+
+    def test_recovering_a_missing_partition_spec_says_so(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),), sort_by=("uuid",))
+        s, client, catalog, ns, table = _sink(cfg)
+        assert s.write(_batch()) == 1
+        assert _attribution(table.alter.call_args) == (
+            _AUTHOR,
+            "recovery for events_json (table exists without its partition spec): declare partition spec "
+            "and sort order; HOGLAKE_PARTITION_BY=identity(team_id); MILLPOND_SORT_BY=uuid",
+        )
+
+    def test_recovering_a_missing_sort_order_names_the_sort_alone(self):
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),), sort_by=("uuid",))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        assert s.write(_batch()) == 1
+        assert _attribution(table.alter.call_args) == (
+            _AUTHOR,
+            "recovery for events_json (table exists without its sort order): declare sort order; MILLPOND_SORT_BY=uuid",
+        )
+
+    def test_a_retried_declaration_describes_itself_identically(self):
+        # Deterministic: no clock, no attempt counter. Attempt 1 creates,
+        # attempts 2 and 3 find the unspecced table and recover — the two
+        # recoveries must read the same.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "month", None),))
+        s, client, catalog, ns, table = _sink(cfg)
+        ns.table.side_effect = [NotFoundError("not found", status_code=404), table, table]
+        table.alter.side_effect = ValidationError("bad transform", status_code=422)
+        for _ in range(3):
+            with pytest.raises(HoglakeError):
+                s.write(_batch())
+            s.reset_caches()
+        messages = [_attribution(c)[1] for c in table.alter.call_args_list]
+        assert messages[0].startswith("first flush of events_json: declare partition spec;")
+        assert messages[1] == messages[2]
+        assert messages[1].startswith("recovery for events_json (table exists without its partition spec)")
+
+    @patch("millpond.hoglake.metrics")
+    def test_batched_add_names_every_column_and_its_type(self, mock_metrics):
+        s, *_, table = _sink()
+        s.write(pa.table({"uuid": ["a"], "c1": ["x"], "c2": [1], "c3": [1.5]}))
+        assert _attribution(table.alter.call_args) == (
+            _AUTHOR,
+            "schema evolution from events_json: add columns c1 (string), c2 (long), c3 (double)",
+        )
+
+    @patch("millpond.hoglake.metrics")
+    def test_per_column_fallback_attributes_each_column(self, mock_metrics):
+        s, *_, table = _sink()
+        applied = table.alter.side_effect
+
+        def alter(ops_list, **attribution):
+            if len(ops_list) > 1:
+                raise ValidationError("validation", status_code=422)
+            return applied(ops_list, **attribution)
+
+        table.alter.side_effect = alter
+        s.write(pa.table({"uuid": ["a"], "c1": ["x"], "c2": [1]}))
+        assert [_attribution(c) for c in table.alter.call_args_list] == [
+            (_AUTHOR, "schema evolution from events_json: add columns c1 (string), c2 (long)"),
+            (_AUTHOR, "schema evolution from events_json: add column c1 (string)"),
+            (_AUTHOR, "schema evolution from events_json: add column c2 (long)"),
+        ]
+
+    @patch("millpond.hoglake.metrics")
+    def test_conflicting_add_still_reresolves(self, mock_metrics):
+        cols_after = _EVENTS_COLUMNS + [_col("new_col", "string", 6, 6)]
+        s, client, catalog, ns, table = _sink()
+        table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
+        _set_info_sequence(
+            table,
+            [_FakeInfo(columns=tuple(_EVENTS_COLUMNS)), _FakeInfo(columns=tuple(cols_after))],
+        )
+        s.write(pa.table({"uuid": ["a"], "new_col": ["x"]}))
+        assert _attribution(table.alter.call_args) == (
+            _AUTHOR,
+            "schema evolution from events_json: add column new_col (string)",
+        )
+        assert "new_col" in _published(table).column_names
+
+    @patch("millpond.hoglake.metrics")
+    def test_promote_names_both_types(self, mock_metrics):
+        cols = [_col("uuid", "string", 1, 1), _col("count", "int", 2, 2), _col("_inserted_at", "timestamptz", 3, 3)]
+        s, *_, table = _sink(columns=cols)
+        s.write(pa.table({"uuid": ["a"], "count": [2**40]}))
+        assert _attribution(table.alter.call_args) == (
+            _AUTHOR,
+            "schema evolution from events_json: promote column count from int to long",
+        )
+
+    @patch("millpond.hoglake.metrics")
+    def test_conflicting_promote_still_reresolves(self, mock_metrics):
+        cols_before = _EVENTS_COLUMNS + [_col("count", "int", 6, 6)]
+        cols_after = _EVENTS_COLUMNS + [_col("count", "long", 6, 6)]
+        s, client, catalog, ns, table = _sink(columns=cols_before)
+        table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
+        _set_info_sequence(
+            table,
+            [_FakeInfo(columns=tuple(cols_before)), _FakeInfo(columns=tuple(cols_after))],
+        )
+        s.write(pa.table({"uuid": ["a"], "count": pa.array([7], pa.int64())}))
+        assert _attribution(table.alter.call_args)[0] == _AUTHOR
+        assert _published(table).column("count").type == pa.int64()
+        mock_metrics.schema_columns_widened_total.inc.assert_called_once()
+
+    def test_every_ddl_call_is_attributed(self):
+        # The sweep: a cold bootstrap through every creation, the spec
+        # declaration, and both evolution ops. Nothing reaches the
+        # catalog without an author and a message.
+        client, catalog, ns, table = _mock_stack(
+            [_col("uuid", "string", 1, 1), _col("count", "int", 2, 2), _col("_inserted_at", "timestamptz", 3, 3)]
+        )
+        client.catalog.side_effect = [NotFoundError("no catalog", status_code=404)]
+        client.create_catalog.return_value = catalog
+        catalog.namespace.side_effect = NotFoundError("no ns", status_code=404)
+        catalog.create_namespace.return_value = ns
+        ns.table.side_effect = NotFoundError("no table", status_code=404)
+        with patch("millpond.hoglake.HoglakeClient", return_value=client):
+            s = hoglake.HoglakeSink(_cfg(hoglake_data_path="s3://bucket/lake/", sort_by=("uuid",)))
+        s.write(pa.table({"uuid": ["a"], "count": [2**40], "extra": ["x"]}))
+        calls = [
+            client.create_catalog.call_args,
+            catalog.create_namespace.call_args,
+            ns.create_table.call_args,
+            *table.alter.call_args_list,
+        ]
+        assert len(table.alter.call_args_list) == 3  # sort order, add, promote
+        for call in calls:
+            author, message = _attribution(call)
+            assert author == _AUTHOR
+            assert message and message.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1728,12 +1977,12 @@ class TestEvolution:
         s, *_, table = _sink()
         applied = table.alter.side_effect  # the helper that mutates the mock's live columns
 
-        def alter(ops_list):
+        def alter(ops_list, **attribution):
             if len(ops_list) > 1:
                 raise ValidationError("validation", status_code=422)
             if ops_list[0].body.get("column", {}).get("name") == "bad_col":
                 raise ValidationError("validation", status_code=422)
-            return applied(ops_list)
+            return applied(ops_list, **attribution)
 
         table.alter.side_effect = alter
         s.write(pa.table({"uuid": ["a"], "good_col": ["x"], "bad_col": ["y"]}))
