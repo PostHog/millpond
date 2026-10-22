@@ -159,7 +159,7 @@ exclude-newer = "7 days"
 # this date is bumped alongside an intentional version bump. Bumped for
 # 1.4.0, published 2026-10-21, for the `author` / `message` keywords on
 # every DDL call.
-exclude-newer-package = { pyducklake = "2026-08-14T00:00:00Z", pyhoglake = "2026-10-22T00:00:00Z" }
+exclude-newer-package = { pyducklake = "2026-08-14T00:00:00Z", pyhoglake = "2026-10-22T00:00:00Z", certifi = "1 day" }
 constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",
