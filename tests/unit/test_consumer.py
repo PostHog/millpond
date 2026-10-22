@@ -145,6 +145,8 @@ def _make_cfg(**overrides) -> Config:
         hoglake_partition_by=None,
         hoglake_max_retry_count=None,
         hoglake_request_timeout_s=None,
+        hoglake_compression=None,
+        hoglake_compression_level=None,
         bootstrap_servers="localhost:9092",
         topic="test-topic",
         group_id="test-group",

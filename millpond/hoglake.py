@@ -868,6 +868,7 @@ def format_commit_message(
     trigger: str | None,
     version: str,
     table_uuid: str | None,
+    codec: str,
     kafka_offsets: Sequence[tuple[str, int, int, int]] = (),
     limit: int = _MESSAGE_OFFSETS_LIMIT,
 ) -> str:
@@ -901,6 +902,10 @@ def format_commit_message(
     a range published into each produces two byte-identical messages
     with nothing in the catalog to tell them apart.
 
+    `codec` is the parquet codec every object of the flush was encoded
+    with (`codec_token`), so a codec rollout or rollback can be audited
+    from the catalog's snapshot log without reading a footer.
+
     DETERMINISTIC for a given flush: the same rows, files, trigger,
     incarnation and offsets produce the same text, on a retry in this
     process and on a rebuild in a new one. Nothing compares messages —
@@ -909,7 +914,7 @@ def format_commit_message(
     operator reconciling a gap should never have to ask.
     """
     summary = (
-        f"records={records} files={files} partitions={partitions} arrow_bytes={arrow_bytes} "
+        f"records={records} files={files} partitions={partitions} arrow_bytes={arrow_bytes} codec={codec} "
         f"trigger={_MESSAGE_TRIGGERS.get(trigger, _UNKNOWN_TRIGGER)} millpond={_message_token(version)} "
         f"table={_message_token(table_uuid or 'unknown')}"
     )
@@ -917,6 +922,13 @@ def format_commit_message(
     for topic, partition, first, last in kafka_offsets or ():
         by_topic.setdefault(topic, []).append((partition, first, last))
     return "\n".join([summary, *(_offsets_line(topic, sorted(by_topic[topic]), limit) for topic in sorted(by_topic))])
+
+
+def codec_token(compression: str | None, level: int | None) -> str:
+    """`zstd-3`, `snappy`, `none`: the codec as one space-free token, for
+    the commit message and the startup log."""
+    name = compression or "default"
+    return name if level is None else f"{name}-{level}"
 
 
 class HoglakeSink:
@@ -1002,6 +1014,8 @@ class HoglakeSink:
         # put a metadata lookup in the write path for a value that
         # cannot change while the process lives.
         self._version = _message_token(cfg.service_version or "unknown")
+        self._codec = codec_token(cfg.hoglake_compression, cfg.hoglake_compression_level)
+        log.info("hoglake parquet codec: %s", self._codec)
         # Resolved lazily on first write; reset_caches() drops them so the
         # retry path re-resolves (another pod may have created/altered the
         # table, or it may have been dropped+recreated).
@@ -1492,6 +1506,7 @@ class HoglakeSink:
             trigger=facts.trigger,
             version=self._version,
             table_uuid=self._table_uuid,
+            codec=self._codec,
             kafka_offsets=facts.kafka_offsets,
         )
         try:
@@ -1510,6 +1525,10 @@ class HoglakeSink:
                 # re-resolves and `_reconcile_specs` finally runs against
                 # the table we are writing to.
                 expected_table_uuid=self._table_uuid,
+                # Explicit, never left to pyhoglake: its default is
+                # pyarrow's SNAPPY. See config._hoglake_compression.
+                compression=self._cfg.hoglake_compression,
+                compression_level=self._cfg.hoglake_compression_level,
             )
         except Exception as e:
             # ONE arm, because there is now one question and pyhoglake

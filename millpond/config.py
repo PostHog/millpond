@@ -121,6 +121,12 @@ class Config:
     # default is a hardcoded 30s with no way to change it from the
     # constructor's caller unless it is passed explicitly.
     hoglake_request_timeout_s: float | None
+    # Parquet codec (and level) for every object a hoglake flush writes,
+    # passed to `prepare_append_tables`. millpond defaults to zstd level 3
+    # because pyhoglake does NOT: its default is pyarrow's, SNAPPY, which
+    # measured ~4x larger on prod-us events. See _hoglake_compression.
+    hoglake_compression: str | None
+    hoglake_compression_level: int | None
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
@@ -674,6 +680,8 @@ _NONE_HOGLAKE_FIELDS: dict = dict.fromkeys(
         "hoglake_partition_by",
         "hoglake_max_retry_count",
         "hoglake_request_timeout_s",
+        "hoglake_compression",
+        "hoglake_compression_level",
     )
 )
 
@@ -912,6 +920,58 @@ def _check_upload_concurrency() -> None:
         )
 
 
+# Parquet codec for hoglake objects. pyhoglake's own default is pyarrow's,
+# SNAPPY, and it keeps it on purpose; millpond overrides it because on the
+# events firehose SNAPPY is ~4x larger than zstd-3 (one 413K-row prod-us
+# slice: 1,138 MB vs 281 MB). The cost is encode time on the flush path:
+# zstd-3 encoded ~1.9x slower than snappy on a synthetic events benchmark
+# (0.27 s vs 0.14 s per 112 MB of Arrow), a few seconds per 2 GiB flush.
+#
+# The codec is permanent only for objects at or over the 512 MiB compaction
+# target: smaller ones are rewritten by compaction in the server's codec.
+# On prod-us events that is the daytime size-triggered objects (~560-620 MiB
+# as SNAPPY); zstd puts them under the target, so they become compaction
+# candidates for the first time.
+#
+# What is allowed (zstd 1-9, snappy, none) is pyhoglake's decision, made by
+# `pyhoglake.parquet_write_options`, which is also what the write path runs.
+# millpond calls it here rather than mirroring the rules, so the two cannot
+# drift, and a pyhoglake too old to take a codec fails the pod at start
+# (ImportError) instead of on its first flush (TypeError, non-retryable).
+_HOGLAKE_DEFAULT_CODEC = "zstd"
+_HOGLAKE_DEFAULT_ZSTD_LEVEL = 3
+
+
+def _hoglake_compression() -> tuple[str, int | None]:
+    """HOGLAKE_COMPRESSION / HOGLAKE_COMPRESSION_LEVEL, validated by pyhoglake.
+
+    Unset codec is zstd. Unset level is 3 for zstd and none otherwise.
+    `snappy` with no level reproduces the pre-knob bytes exactly, which is
+    the rollback.
+    """
+    # Imported here, not at module top: config.py loads in every pod,
+    # including DuckLake ones, and only the hoglake path needs it.
+    from pyhoglake import ValidationError, parquet_write_options
+
+    codec = os.environ.get("HOGLAKE_COMPRESSION", "").strip().lower() or _HOGLAKE_DEFAULT_CODEC
+    raw_level = os.environ.get("HOGLAKE_COMPRESSION_LEVEL", "").strip()
+    if not raw_level:
+        level = _HOGLAKE_DEFAULT_ZSTD_LEVEL if codec == "zstd" else None
+    else:
+        try:
+            level = int(raw_level)
+        except ValueError:
+            raise RuntimeError(f"HOGLAKE_COMPRESSION_LEVEL must be an integer, got {raw_level!r}") from None
+    try:
+        parquet_write_options(codec, level)
+    except ValidationError as e:
+        raise RuntimeError(
+            f"HOGLAKE_COMPRESSION={codec!r} HOGLAKE_COMPRESSION_LEVEL={level!r} is refused by pyhoglake: "
+            f"{e.message}. pyhoglake would refuse it permanently on the first flush."
+        ) from None
+    return codec, level
+
+
 _S3_URI = re.compile(r"^s3://[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9](/.*)?$")
 
 
@@ -1050,9 +1110,12 @@ def _load_hoglake_fields() -> dict:
             "DUCKLAKE_PARTITION_BY to confirm the table is meant to be unpartitioned."
         )
     s3_access_key, s3_secret_key = _hoglake_s3_keys()
+    compression, compression_level = _hoglake_compression()
     return {
         "hoglake_max_retry_count": max_retries,
         "hoglake_request_timeout_s": timeout_s,
+        "hoglake_compression": compression,
+        "hoglake_compression_level": compression_level,
         "hoglake_url": _require("HOGLAKE_URL"),
         "hoglake_catalog": catalog,
         "hoglake_namespace": names["HOGLAKE_NAMESPACE"],
