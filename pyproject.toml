@@ -16,8 +16,8 @@ license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",
-    # Pinned exactly, and matched to pyducklake's own duckdb pin. The DuckDB
-    # version selects the ducklake extension channel: 1.5.2's channel is
+    # Pinned exactly. The DuckDB version selects the ducklake extension
+    # channel: 1.5.2's channel is
     # frozen at build 415a9ebd (2026-04-09), whose per-connection
     # stats/schemas caches grow unbounded as catalog snapshots advance —
     # the leak that OOM-killed viaduck every 4-6h (A/B-verified there:
@@ -29,14 +29,6 @@ dependencies = [
     # extension as a drift canary. Bumping this DuckDB pin (or letting the
     # extension SHA move) requires updating that canary explicitly.
     "duckdb==1.5.5",
-    # Our DuckLake Python API (jghoman/pyducklake). Nothing imports it yet —
-    # it is here as a deliberate lockstep canary: pyducklake hard-pins its
-    # duckdb version (==1.5.5 as of 1.0.17, the first release on the safe
-    # extension channel above), so a future bump of either duckdb or
-    # pyducklake that the other hasn't matched makes `uv lock` unresolvable
-    # instead of silently splitting the two DuckLake stacks. Adoption of the
-    # API itself comes later.
-    "pyducklake>=1.0.17",
     # Hoglake destination client: owns the writer path (parquet with field
     # ids, footer-stat extraction, registration via footer-shipping
     # commits). 1.1.0 brought partitioned fanout appends and the atomic
@@ -78,7 +70,12 @@ dependencies = [
     # both on catalog, namespace and table creation and on every alter,
     # and an older client refuses the keywords outright (TypeError), so
     # this is a floor, not a preference.
-    "pyhoglake[fast-upload]>=1.4.0",
+    # 1.4.4 adds `compression=` / `compression_level=` on
+    # `prepare_append_tables` and `parquet_write_options`. The sink passes
+    # the codec on every flush and config.load() validates through
+    # `parquet_write_options`, so an older client fails the pod at start
+    # (ImportError) — also a floor.
+    "pyhoglake[fast-upload]>=1.4.4",
     # 21 because pyhoglake 1.3.0 requires it. Declared here rather than left
     # to resolve transitively: millpond imports pyarrow directly on every
     # path, so its floor is millpond's business to state.
@@ -146,20 +143,16 @@ norecursedirs = ["lakekeeper", ".venv", "node_modules"]
 
 [tool.uv]
 exclude-newer = "7 days"
-# Cooldown carve-out for our own package (jghoman/pyducklake): 1.0.17 was
-# published 2026-08-13 and is needed now for the safe ducklake extension
-# channel. Fixed date, not a rolling window — future pyducklake releases
-# re-enter the cooldown until this date is bumped alongside an intentional
-# version bump.
-# Same carve-out shape for pyhoglake: 1.3.7 was published 2026-10-01 and
+# Cooldown carve-out for our own package pyhoglake: 1.3.7 was published 2026-10-01 and
 # is needed now for `prepare_append_tables` (buffer encode + concurrent
 # single-request uploads), the typed commit refusals that retire the
 # per-flush table read, and `info(totals=False)`. Fixed date, not a
 # rolling window — future pyhoglake releases re-enter the cooldown until
 # this date is bumped alongside an intentional version bump. Bumped for
 # 1.4.0, published 2026-10-21, for the `author` / `message` keywords on
-# every DDL call.
-exclude-newer-package = { pyducklake = "2026-08-14T00:00:00Z", pyhoglake = "2026-10-22T00:00:00Z", certifi = "1 day" }
+# every DDL call. Bumped for 1.4.4, published 2026-10-23T03:19Z, for the
+# parquet codec keywords and `parquet_write_options`.
+exclude-newer-package = { pyhoglake = "2026-10-23T04:00:00Z", certifi = "1 day" }
 constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",

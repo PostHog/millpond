@@ -616,7 +616,6 @@ Prometheus metrics and health checks on port 8000 via a custom `http.server.HTTP
 |---------|-----|
 | `confluent-kafka>=2.6` | librdkafka Python wrapper |
 | `duckdb==1.5.5` | DuckDB Python client (pinned; the ducklake extension is sensitive to minor-version moves) |
-| `pyducklake>=1.0.17` | Our DuckLake Python API (unused yet; lockstep canary for the duckdb pin) |
 | `pyarrow>=21.0` | Arrow tables, zero-copy DuckDB integration (floor set by pyhoglake 1.3.0) |
 | `pyhoglake[fast-upload]>=1.4.0` | Hoglake destination client. 1.3.0 was the first floor, so a uuid column's parquet carries the UUID logical annotation; 1.3.7 adds `prepare_append_tables` (Arrow -> buffer -> one `PutObject`, 64 uploads in flight), the typed commit refusals that let the sink stop re-reading the table before every commit, and `info(totals=False)`; 1.4.0 adds `author` / `message` on every DDL call, which the sink passes on creation and every alter. The `fast-upload` extra is boto3: without it pyhoglake warns and falls back to pyarrow's three-request multipart writer for every small object |
 | `orjson>=3.10` | Fast JSON parsing (Rust) |
@@ -637,8 +636,8 @@ wire contract is the server's OpenAPI spec, pinned per release tag:
 - A live server also serves its own copy at `/openapi.yaml`.
 
 The `[tool.uv]` `exclude-newer` cooldown excludes a fresh release, so
-`exclude-newer-package` carries a fixed-date carve-out for `pyhoglake`
-alongside the pyducklake one. BUMP BOTH TOGETHER: the version floor in
+`exclude-newer-package` carries a fixed-date carve-out for `pyhoglake`.
+BUMP BOTH TOGETHER: the version floor in
 `[project].dependencies` and that date. A floor the cooldown cannot
 reach makes `uv lock` fail with a resolution error that says nothing
 about the date.

@@ -72,6 +72,9 @@ class HogCfg:
     hoglake_partition_by: tuple[tuple[str, str, int | None], ...] | None = None
     hoglake_max_retry_count: int = 8
     hoglake_request_timeout_s: float = 45.0
+    # config.load()'s defaults: millpond always passes a codec.
+    hoglake_compression: str | None = "zstd"
+    hoglake_compression_level: int | None = 3
     sort_by: tuple[str, ...] | None = None
     typed_columns: tuple[tuple[str, str], ...] | None = None
     # Named in every DDL message.
@@ -492,6 +495,32 @@ class TestAppendVisibility:
         assert data.column("team_id").to_pylist() == [42, 42, 42]
         assert data.column("properties").to_pylist() == ['{"k": 1}'] * 3
         assert data.column("_inserted_at").null_count == 0
+
+
+class TestCompression:
+    """The codec is shown in the written bytes, not in mock kwargs: the
+    object's footer names it, and so does the snapshot message."""
+
+    @pytest.mark.parametrize(
+        ("codec", "level", "footer", "token"),
+        [("zstd", 3, "ZSTD", "zstd-3"), ("snappy", None, "SNAPPY", "snappy")],
+    )
+    def test_the_written_object_carries_the_codec(self, hog_stack, client, codec, level, footer, token):
+        cfg = _fresh(hoglake_compression=codec, hoglake_compression_level=level)
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3, teams=(42,)))
+        finally:
+            sink.close()
+        (live,) = _table(client, cfg).files()
+        with _minio().open_input_file(live.path.removeprefix("s3://")) as f:
+            metadata = pq.read_metadata(f)
+        assert {
+            metadata.row_group(r).column(c).compression
+            for r in range(metadata.num_row_groups)
+            for c in range(metadata.num_columns)
+        } == {footer}
+        assert f" codec={token} " in _snapshots(client, cfg)[-1].message.split("\n")[0]
 
 
 class TestSchemaEvolution:
@@ -1653,7 +1682,7 @@ class TestCommitMessage:
         summary, offsets = snapshots[0].message.split("\n")
         live_uuid = _table(client, cfg).info().table_uuid
         assert summary == (
-            f"records=4 files=1 partitions=0 arrow_bytes={batch.nbytes} trigger=size "
+            f"records=4 files=1 partitions=0 arrow_bytes={batch.nbytes} codec=zstd-3 trigger=size "
             f"millpond={cfg.service_version} table={live_uuid}"
         )
         assert offsets == f"offsets {self.TOPIC} p3:4128819-4155470 p19:4130021-4156802 (2)"
@@ -1672,7 +1701,9 @@ class TestCommitMessage:
         summary = _snapshots(client, cfg)[-1].message.split("\n")[0]
         # Three tuples, one file each; `time` is the metric's name for
         # the interval trigger and the message says `interval`.
-        assert summary.startswith(f"records=9 files=3 partitions=3 arrow_bytes={batch.nbytes} trigger=interval ")
+        assert summary.startswith(
+            f"records=9 files=3 partitions=3 arrow_bytes={batch.nbytes} codec=zstd-3 trigger=interval "
+        )
         assert len(_table(client, cfg).files()) == 3
 
     def test_main_flush_labels_the_trigger_all_the_way_through(self, hog_stack, client):

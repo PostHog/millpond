@@ -57,6 +57,8 @@ def _cfg(**overrides) -> MagicMock:
     cfg.hoglake_partition_by = None
     cfg.hoglake_max_retry_count = 8
     cfg.hoglake_request_timeout_s = 30.0
+    cfg.hoglake_compression = "zstd"
+    cfg.hoglake_compression_level = 3
     cfg.sort_by = None
     cfg.typed_columns = None
     cfg.topic = "events_json"
@@ -1196,6 +1198,29 @@ class TestArrowErrorsAreNotRetryable:
 # ---------------------------------------------------------------------------
 # write(): reserved collisions and column hygiene
 # ---------------------------------------------------------------------------
+
+
+class TestCompression:
+    """The codec is always passed explicitly. pyhoglake's default is
+    pyarrow's SNAPPY, so a sink that dropped these arguments would write
+    ~4x larger objects with nothing failing."""
+
+    @pytest.mark.parametrize(("codec", "level", "token"), [("zstd", 3, "zstd-3"), ("snappy", None, "snappy")])
+    def test_the_configured_codec_reaches_prepare_and_the_message(self, codec, level, token):
+        s, client, catalog, ns, table = _sink(_cfg(hoglake_compression=codec, hoglake_compression_level=level))
+        assert s.write(pa.table({"uuid": ["a"], "event": ["e"]})) == 1
+        kwargs = table.prepare_append_tables.call_args.kwargs
+        assert kwargs["compression"] == codec
+        assert kwargs["compression_level"] == level
+        # The snapshot message names it, so a rollout is auditable from
+        # the catalog without reading a footer.
+        message = catalog.commit_prepared.call_args.args[0]["message"]
+        assert f" codec={token} " in message.split("\n")[0]
+
+    def test_codec_token(self):
+        assert hoglake.codec_token("zstd", 3) == "zstd-3"
+        assert hoglake.codec_token("snappy", None) == "snappy"
+        assert hoglake.codec_token(None, None) == "default"
 
 
 class TestReservedCollision:
@@ -3771,6 +3796,7 @@ class TestCommitMessageFormat:
         trigger="size",
         version="1.2.3",
         table_uuid=TABLE_UUID,
+        codec="zstd-3",
         kafka_offsets=(
             ("clickhouse_events_json", 3, 4128819, 4155470),
             ("clickhouse_events_json", 19, 4130021, 4156802),
@@ -3779,7 +3805,7 @@ class TestCommitMessageFormat:
 
     def test_fixed_vector(self):
         assert hoglake.format_commit_message(**self.VECTOR) == (
-            "records=26402 files=31 partitions=31 arrow_bytes=268435456 trigger=size "
+            "records=26402 files=31 partitions=31 arrow_bytes=268435456 codec=zstd-3 trigger=size "
             f"millpond=1.2.3 table={TABLE_UUID}\n"
             "offsets clickhouse_events_json p3:4128819-4155470 p19:4130021-4156802 (2)"
         )
@@ -3857,7 +3883,7 @@ class TestCommitMessageFormat:
         # order for anything that reads the line by whitespace.
         summary = hoglake.format_commit_message(**dict(self.VECTOR, version="v1 dirty")).split("\n")[0]
         assert " millpond=v1_dirty " in summary
-        assert len(summary.split(" ")) == 7
+        assert len(summary.split(" ")) == 8
 
     def test_an_empty_version_is_named_unknown(self):
         summary = hoglake.format_commit_message(**dict(self.VECTOR, version="")).split("\n")[0]
@@ -3952,7 +3978,8 @@ class TestCommitMessageOnThePayload:
         message = _committed(catalog)["message"]
         summary, offsets = message.split("\n")
         assert summary == (
-            f"records=2 files=1 partitions=0 arrow_bytes={batch.nbytes} trigger=size millpond=1.2.3 table={TABLE_UUID}"
+            f"records=2 files=1 partitions=0 arrow_bytes={batch.nbytes} codec=zstd-3 trigger=size "
+            f"millpond=1.2.3 table={TABLE_UUID}"
         )
         assert offsets == "offsets events p0:30-41 p1:9-17 (2)"
 

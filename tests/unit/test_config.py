@@ -1110,6 +1110,68 @@ class TestHoglakeConfig:
         with pytest.raises(RuntimeError, match=var):
             load()
 
+    def test_compression_defaults_to_zstd_3(self):
+        # NOT pyhoglake's default, which is pyarrow's SNAPPY (~4x larger
+        # on events). See _hoglake_compression.
+        cfg = load()
+        assert (cfg.hoglake_compression, cfg.hoglake_compression_level) == ("zstd", 3)
+
+    @pytest.mark.parametrize(
+        ("codec", "level", "expected"),
+        [
+            ("ZSTD", "", ("zstd", 3)),
+            (" zstd ", "", ("zstd", 3)),
+            ("zstd", "9", ("zstd", 9)),
+            ("zstd", " 1 ", ("zstd", 1)),
+            ("snappy", "", ("snappy", None)),
+            ("none", "", ("none", None)),
+        ],
+    )
+    def test_compression_passes_through(self, monkeypatch, codec, level, expected):
+        monkeypatch.setenv("HOGLAKE_COMPRESSION", codec)
+        monkeypatch.setenv("HOGLAKE_COMPRESSION_LEVEL", level)
+        cfg = load()
+        assert (cfg.hoglake_compression, cfg.hoglake_compression_level) == expected
+
+    @pytest.mark.parametrize(
+        ("codec", "level", "match"),
+        [
+            # Compaction cannot decode brotli; gzip is too slow for the
+            # flush path. pyhoglake decides; millpond names the variables.
+            ("brotli", "", "not allowed"),
+            ("gzip", "6", "not allowed"),
+            ("lzo", "", "not allowed"),
+            ("zstd", "three", "must be an integer"),
+            ("zstd", "3.0", "must be an integer"),
+            ("snappy", "3", "takes no compression_level"),
+            ("none", "1", "takes no compression_level"),
+            ("zstd", "0", r"outside \[1, 9\]"),
+            ("zstd", "-1", r"outside \[1, 9\]"),
+            ("zstd", "10", r"outside \[1, 9\]"),
+        ],
+    )
+    def test_a_bad_compression_is_refused_at_load(self, monkeypatch, codec, level, match):
+        # pyhoglake refuses these as a permanent client-side error on the
+        # first flush; refusing at load names the variable instead.
+        monkeypatch.setenv("HOGLAKE_COMPRESSION", codec)
+        monkeypatch.setenv("HOGLAKE_COMPRESSION_LEVEL", level)
+        with pytest.raises(RuntimeError, match=match) as excinfo:
+            load()
+        assert "HOGLAKE_COMPRESSION" in str(excinfo.value)
+
+    def test_the_installed_pyhoglake_takes_a_codec(self):
+        # The pin guard. millpond passes compression= and
+        # compression_level= on every flush; a pyhoglake without them
+        # raises TypeError there, which is_retryable calls permanent, so
+        # every hoglake pod would crash on its first flush. The unit suite
+        # otherwise only ever sees a MagicMock table.
+        import inspect
+
+        from pyhoglake import Table
+
+        params = inspect.signature(Table.prepare_append_tables).parameters
+        assert {"compression", "compression_level"} <= params.keys()
+
     def test_retry_knobs_nulled_for_ducklake(self, monkeypatch):
         monkeypatch.setenv("MILLPOND_DESTINATION", "ducklake")
         monkeypatch.setenv("DUCKLAKE_TABLE", "events")
@@ -1121,6 +1183,8 @@ class TestHoglakeConfig:
         cfg = load()
         assert cfg.hoglake_max_retry_count is None
         assert cfg.hoglake_request_timeout_s is None
+        assert cfg.hoglake_compression is None
+        assert cfg.hoglake_compression_level is None
 
     def test_optionals_pass_through(self, monkeypatch):
         monkeypatch.setenv("HOGLAKE_DATA_PATH", "s3://bucket/millpond/")
