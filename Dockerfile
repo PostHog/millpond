@@ -12,24 +12,27 @@ ARG MILLPOND_VERSION=0.0.0.dev0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=$MILLPOND_VERSION
 RUN uv sync --frozen --no-dev --extra msk-iam
 
-# Install DuckDB CLI from the upstream GitHub release. duckdb-cli is a single
+# Install DuckDB CLI from the PostHog GitHub release. duckdb-cli is a single
 # static binary, so we avoid `uv tool install` here: that path installs a full
 # Python venv just to PATH a self-contained C++ binary, and its default install
 # location (/root/.local, mode 700 on python:3.12-slim) is unreachable by the
-# non-root `millpond` runtime user. Pin the version from pyproject.toml so the
-# CLI tracks the duckdb Python package.
+# non-root `millpond` runtime user.
 #
 # TARGETARCH is set by buildx for each platform in the build matrix
 # (linux/amd64 → amd64, linux/arm64 → arm64). DuckDB names its release
 # assets with the same suffix, so this drops in directly. -j on unzip
 # extracts only the `duckdb` binary; the release zip also ships a LICENSE
 # we don't want polluting /usr/local/bin.
+# PostHog build of the same DuckDB version: carries the CVE-2026-111497 fix for
+# the vendored Brotli decoder (upstream 1.5.5 still ships the pre-fix decoder, so
+# a crafted brotli stream can corrupt its parquet reads). Keep in step with the
+# wheel URLs in pyproject.toml's [tool.uv.sources].
+ARG DUCKDB_RELEASE=v1.5.5-posthog.6
 ARG TARGETARCH
 RUN test -n "$TARGETARCH" \
     && case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
-    && V=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print(next(x.split('==')[1] for x in d if x.startswith('duckdb==')))") \
     && apt-get update && apt-get install -y --no-install-recommends curl unzip \
-    && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${V}/duckdb_cli-linux-${TARGETARCH}.zip" -o /tmp/duckdb.zip \
+    && curl -fsSL "https://github.com/PostHog/duckdb/releases/download/${DUCKDB_RELEASE}/duckdb_cli-linux-${TARGETARCH}.zip" -o /tmp/duckdb.zip \
     && unzip -j -d /usr/local/bin /tmp/duckdb.zip duckdb \
     && chmod 0755 /usr/local/bin/duckdb \
     && rm /tmp/duckdb.zip \

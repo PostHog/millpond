@@ -1,14 +1,21 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12"
+resolution-markers = [
+    "platform_machine == 'x86_64' and platform_machine not in 'x86_64,aarch64' and sys_platform == 'linux'",
+    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and platform_machine not in 'x86_64,aarch64') or sys_platform != 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and platform_machine in 'x86_64,aarch64' and sys_platform == 'linux'",
+    "platform_machine == 'x86_64' and platform_machine in 'x86_64,aarch64' and sys_platform == 'linux'",
+    "platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
 
 [options]
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
-certifi = { timestamp = "0001-01-01T00:00:00Z", span = "P1D" }
 pyhoglake = "2026-10-23T04:00:00Z"
+certifi = { timestamp = "0001-01-01T00:00:00Z", span = "P1D" }
 
 [manifest]
 constraints = [
@@ -215,6 +222,10 @@ wheels = [
 name = "duckdb"
 version = "1.5.5"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and platform_machine not in 'x86_64,aarch64') or sys_platform != 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 'x86_64' and platform_machine in 'x86_64,aarch64' and sys_platform == 'linux'",
+]
 sdist = { url = "https://files.pythonhosted.org/packages/7d/19/e57151753576373c6696a12022648546cca6038e8833fda2908ee2342d9b/duckdb-1.5.5.tar.gz", hash = "sha256:72f33ee57ca7595b23957671a2cc7f7fe2be0ecc2d68f63abedcfcaa3a5c1238", size = 18066741, upload-time = "2026-07-22T10:55:17.819Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d6/40/2e05d324400fdaa5656c9f48d6298da421cb034d85e509fa0e6e325cf04b/duckdb-1.5.5-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:d4dd65f8941a604b947e0b9b4b4f7165988e29a23ec0b69b4038520956d9933e", size = 32753858, upload-time = "2026-07-22T10:54:05.514Z" },
@@ -239,6 +250,51 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/91/41/fc7c829172c60ca22485251eab285f4f1a0d87b486a024c726f21471d86e/duckdb-1.5.5-cp314-cp314-win_amd64.whl", hash = "sha256:9dc826c4b50e64f6c4e4d07a3a9cb075ef70ba3899dc43ec5493dc3d7b04b353", size = 13691858, upload-time = "2026-07-22T10:55:11.181Z" },
     { url = "https://files.pythonhosted.org/packages/e1/2c/95d9216b79e9273689d7ebce125a54503ed0c9bd7da931f0265888e99779/duckdb-1.5.5-cp314-cp314-win_arm64.whl", hash = "sha256:63e48d4b74b15aeacd688976432a7225163df8c226eddeb8536bba2d4d4ff433", size = 14470180, upload-time = "2026-07-22T10:55:14.445Z" },
 ]
+
+[[package]]
+name = "duckdb"
+version = "1.5.5"
+source = { url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_aarch64.whl" }
+resolution-markers = [
+    "platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
+wheels = [
+    { url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_aarch64.whl", hash = "sha256:ae78b58ec49b4f5e9c25d37c37d787b47a5eb9bf2656a74b6634edadc8158df9" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "adbc-driver-manager", marker = "extra == 'all'" },
+    { name = "fsspec", marker = "extra == 'all'" },
+    { name = "ipython", marker = "extra == 'all'" },
+    { name = "numpy", marker = "extra == 'all'" },
+    { name = "pandas", marker = "extra == 'all'" },
+    { name = "pyarrow", marker = "extra == 'all'" },
+]
+provides-extras = ["all"]
+
+[[package]]
+name = "duckdb"
+version = "1.5.5"
+source = { url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_x86_64.whl" }
+resolution-markers = [
+    "platform_machine == 'x86_64' and platform_machine not in 'x86_64,aarch64' and sys_platform == 'linux'",
+    "platform_machine == 'x86_64' and platform_machine in 'x86_64,aarch64' and sys_platform == 'linux'",
+]
+wheels = [
+    { url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_x86_64.whl", hash = "sha256:514a61748d384336147768adec6efaa9e2d128b458e24f9bcca178b7cd1c8bc3" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "adbc-driver-manager", marker = "extra == 'all'" },
+    { name = "fsspec", marker = "extra == 'all'" },
+    { name = "ipython", marker = "extra == 'all'" },
+    { name = "numpy", marker = "extra == 'all'" },
+    { name = "pandas", marker = "extra == 'all'" },
+    { name = "pyarrow", marker = "extra == 'all'" },
+]
+provides-extras = ["all"]
 
 [[package]]
 name = "googleapis-common-protos"
@@ -321,7 +377,9 @@ name = "millpond"
 source = { editable = "." }
 dependencies = [
     { name = "confluent-kafka" },
-    { name = "duckdb" },
+    { name = "duckdb", version = "1.5.5", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
+    { name = "duckdb", version = "1.5.5", source = { url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_aarch64.whl" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
+    { name = "duckdb", version = "1.5.5", source = { url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_x86_64.whl" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-logging" },
     { name = "opentelemetry-sdk" },
@@ -350,7 +408,10 @@ dev = [
 requires-dist = [
     { name = "aws-msk-iam-sasl-signer-python", marker = "extra == 'msk-iam'", specifier = ">=1.0.0" },
     { name = "confluent-kafka", specifier = ">=2.6" },
-    { name = "duckdb", specifier = "==1.5.5" },
+    { name = "duckdb", marker = "(platform_machine != 'aarch64' and platform_machine not in 'x86_64,aarch64') or sys_platform != 'linux'", specifier = "==1.5.5", index = "https://pypi.org/simple" },
+    { name = "duckdb", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_aarch64.whl" },
+    { name = "duckdb", marker = "platform_machine != 'aarch64' and platform_machine != 'x86_64' and platform_machine in 'x86_64,aarch64' and sys_platform == 'linux'", specifier = "==1.5.5" },
+    { name = "duckdb", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_x86_64.whl" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.30" },
     { name = "opentelemetry-instrumentation-logging", specifier = ">=0.50b0,<0.64" },
     { name = "opentelemetry-sdk", specifier = ">=1.30" },
