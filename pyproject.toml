@@ -157,3 +157,21 @@ constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",
 ]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[tool.uv.sources]
+# DuckDB's vendored Brotli decoder is affected by CVE-2026-111497 (malformed
+# streams corrupt the decoder's own state; the fix makes DecodeBlockTypeAndLength
+# return an error instead of conflating it with needs-more-input). Upstream PyPI
+# duckdb 1.5.5 still ships the vulnerable decoder, so take the PostHog build of
+# the same version for the platforms this image ships. macOS/Windows developers
+# keep resolving duckdb from PyPI via the fallback entry below.
+duckdb = [
+    { url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { url = "https://github.com/PostHog/duckdb/releases/download/v1.5.5-posthog.6/duckdb-1.5.5-cp312-cp312-linux_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+    { index = "pypi", marker = "(platform_machine != 'aarch64' and platform_machine not in 'x86_64,aarch64') or sys_platform != 'linux'" },
+]
