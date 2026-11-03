@@ -1172,6 +1172,53 @@ class TestHoglakeConfig:
         params = inspect.signature(Table.prepare_append_tables).parameters
         assert {"compression", "compression_level"} <= params.keys()
 
+    def test_deferred_stats_defaults_on(self):
+        # NOT pyhoglake's default (False: ship inline). `false` is the
+        # rollback. See _hoglake_deferred_stats.
+        assert load().hoglake_deferred_stats is True
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("true", True), ("TRUE", True), (" True ", True), ("false", False), ("FALSE", False), ("", True)],
+    )
+    def test_deferred_stats_parses(self, monkeypatch, raw, expected):
+        monkeypatch.setenv("HOGLAKE_DEFERRED_STATS", raw)
+        assert load().hoglake_deferred_stats is expected
+
+    @pytest.mark.parametrize("raw", ["1", "0", "yes", "no", "on", "off", "ture", "deferred", "t"])
+    def test_a_bad_deferred_stats_is_refused_at_load(self, monkeypatch, raw):
+        monkeypatch.setenv("HOGLAKE_DEFERRED_STATS", raw)
+        with pytest.raises(RuntimeError, match="HOGLAKE_DEFERRED_STATS"):
+            load()
+
+    def test_the_installed_pyhoglake_takes_deferred_stats(self):
+        # The pin guard: the sink passes deferred_stats= on every flush,
+        # and a pyhoglake without it raises a permanent TypeError there.
+        import inspect
+
+        from pyhoglake import IdlessFilesPresentError, Table
+
+        assert "deferred_stats" in inspect.signature(Table.prepare_append_tables).parameters
+        # The alter path catches this by type; without it the refusal
+        # falls into the generic arm, which drops the column.
+        from pyhoglake import CommitConflictError
+
+        assert IdlessFilesPresentError.retryable is False
+        assert not issubclass(IdlessFilesPresentError, CommitConflictError)
+
+    def test_a_pyhoglake_without_deferred_stats_is_refused_at_load(self, monkeypatch):
+        import pyhoglake
+
+        def old(self, groups, *, idempotency_key, compression=None, compression_level=None):
+            raise AssertionError("not called")
+
+        monkeypatch.setattr(pyhoglake.Table, "prepare_append_tables", old)
+        with pytest.raises(
+            RuntimeError,
+            match=r"HOGLAKE_DEFERRED_STATS needs a pyhoglake whose `prepare_append_tables` takes `deferred_stats=`",
+        ):
+            load()
+
     def test_retry_knobs_nulled_for_ducklake(self, monkeypatch):
         monkeypatch.setenv("MILLPOND_DESTINATION", "ducklake")
         monkeypatch.setenv("DUCKLAKE_TABLE", "events")
@@ -1185,6 +1232,7 @@ class TestHoglakeConfig:
         assert cfg.hoglake_request_timeout_s is None
         assert cfg.hoglake_compression is None
         assert cfg.hoglake_compression_level is None
+        assert cfg.hoglake_deferred_stats is None
 
     def test_optionals_pass_through(self, monkeypatch):
         monkeypatch.setenv("HOGLAKE_DATA_PATH", "s3://bucket/millpond/")
@@ -1341,10 +1389,20 @@ class TestHoglakeConfig:
         monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
         # Even a malformed hoglake partition expression must not matter.
         monkeypatch.setenv("HOGLAKE_PARTITION_BY", "truncate(")
+        # Nor a malformed deferred-stats flag, nor a pyhoglake whose
+        # prepare_append_tables predates it: a DuckLake pod never asks.
+        monkeypatch.setenv("HOGLAKE_DEFERRED_STATS", "bogus")
+        import pyhoglake
+
+        def old_prepare(self, tables, **kwargs):
+            raise AssertionError("not called")
+
+        monkeypatch.setattr(pyhoglake.Table, "prepare_append_tables", old_prepare)
         cfg = load()
         assert cfg.destination == "ducklake"
         assert cfg.hoglake_url is None
         assert cfg.hoglake_partition_by is None
+        assert cfg.hoglake_deferred_stats is None
 
 
 class TestHoglakePartitionBy:

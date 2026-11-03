@@ -71,6 +71,9 @@ services:
       # Keep the stack deterministic: no background compaction rewriting
       # files while a test is counting them.
       HOGLAKE_COMPACTION_INTERVAL_MS: "0"
+      # Likewise no hydrator sweep: deferred-stats files must stay
+      # `pending` for the tests that assert it.
+      HOGLAKE_HYDRATOR_INTERVAL_MS: "0"
     ports:
       - "127.0.0.1:28080:8080"
     depends_on:

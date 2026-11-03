@@ -1808,3 +1808,49 @@ class TestOffsetSequencing:
         kafka.commit.side_effect = lambda *_a, **_k: order.append("commit")
         _flush(sink, cfg, kafka, table, 100, 3, offsets, 1.0)
         assert order == ["write", "commit"]
+
+
+class TestFinalFlushAfterPermanentFailure:
+    """A write the sink judged permanent is tagged on the way out of
+    `_write_with_retry`, and main()'s shutdown path then skips the
+    `final` flush of the same pending batch instead of repeating the
+    refusal."""
+
+    class _Permanent(Exception):
+        pass
+
+    def _sink(self, retryable: bool):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "is_retryable", "write_retry_budget"])
+        sink.write.side_effect = self._Permanent("refused")
+        sink.is_retryable.return_value = retryable
+        sink.write_retry_budget.return_value = (3, 0.0)
+        return sink
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.metrics")
+    def test_a_permanent_failure_is_tagged(self, _metrics, _time):
+        from millpond.main import _is_permanent_write_failure, _write_with_retry
+
+        with pytest.raises(self._Permanent) as excinfo:
+            _write_with_retry(self._sink(retryable=False), pa.table({"a": [1]}), destination="hoglake")
+        assert _is_permanent_write_failure(excinfo.value)
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.metrics")
+    def test_exhausting_the_ladder_is_not(self, _metrics, _time):
+        from millpond.main import _is_permanent_write_failure, _write_with_retry
+
+        with pytest.raises(self._Permanent) as excinfo:
+            _write_with_retry(self._sink(retryable=True), pa.table({"a": [1]}), destination="hoglake")
+        assert not _is_permanent_write_failure(excinfo.value)
+
+    def test_the_decision(self):
+        from millpond.main import _PERMANENT_WRITE_ATTR, _final_flush_decision
+
+        permanent = RuntimeError("refused")
+        setattr(permanent, _PERMANENT_WRITE_ATTR, True)
+        assert _final_flush_decision(5, permanent, started=True) == "skip"
+        assert _final_flush_decision(5, RuntimeError("transient"), started=True) == "flush"
+        assert _final_flush_decision(5, None, started=True) == "flush"
+        assert _final_flush_decision(5, None, started=False) == "none"
+        assert _final_flush_decision(0, permanent, started=True) == "none"

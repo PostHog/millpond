@@ -49,7 +49,10 @@ S3_SECRET_KEY = "hoglake123"
 # locally before pushing, and say in the commit message what changed on
 # the server side. HOGLAKE_SERVER_IMAGE overrides this for a one-off run
 # against a locally built server (e.g. while developing a server change).
-DEFAULT_IMAGE = "ghcr.io/posthog/hoglake-server@sha256:b9cc595e7584a7be29e6206a1a98e2283df361deb192be3c213c13a679c73b22"
+# hoglake 1.4.7 (54e3393): 1.4.6's DDL
+# guard counts only files PROVEN id-less, so add_column over deferred-
+# stats (pending) files lands, which TestDeferredStats asserts.
+DEFAULT_IMAGE = "ghcr.io/posthog/hoglake-server@sha256:9d18d1ef0047f599f7fe0fc1c1f569dcafe8d375354171458f89b6d6309c2ec7"
 
 # CI sets this. Without it, a machine with no Docker (or no access to
 # ghcr.io) skips the docker-gated suites so local unit-test runs stay

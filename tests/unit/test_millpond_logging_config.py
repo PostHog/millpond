@@ -51,6 +51,7 @@ def _minimal_config() -> Config:
         hoglake_request_timeout_s=None,
         hoglake_compression=None,
         hoglake_compression_level=None,
+        hoglake_deferred_stats=None,
         bootstrap_servers="localhost:9092",
         topic="clickhouse_events_json",
         group_id="millpond-test",

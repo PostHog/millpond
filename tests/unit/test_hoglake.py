@@ -23,6 +23,7 @@ from pyhoglake import (
     DdlSinceReadSnapshotError,
     ExpiredError,
     HoglakeError,
+    IdlessFilesPresentError,
     IncarnationChangedError,
     MalformedResponseError,
     NotFoundError,
@@ -59,6 +60,7 @@ def _cfg(**overrides) -> MagicMock:
     cfg.hoglake_request_timeout_s = 30.0
     cfg.hoglake_compression = "zstd"
     cfg.hoglake_compression_level = 3
+    cfg.hoglake_deferred_stats = True
     cfg.sort_by = None
     cfg.typed_columns = None
     cfg.topic = "events_json"
@@ -1221,6 +1223,200 @@ class TestCompression:
         assert hoglake.codec_token("zstd", 3) == "zstd-3"
         assert hoglake.codec_token("snappy", None) == "snappy"
         assert hoglake.codec_token(None, None) == "default"
+
+
+class TestDeferredStats:
+    """`deferred_stats=` is always passed explicitly: pyhoglake's default
+    is False (ship stats inline), so a sink that dropped the argument
+    would silently put the per-file stats work back under the catalog's
+    commit lock."""
+
+    @pytest.mark.parametrize(("deferred", "token"), [(True, "deferred"), (False, "shipped")])
+    def test_the_flag_reaches_prepare_and_the_message(self, deferred, token):
+        s, client, catalog, ns, table = _sink(_cfg(hoglake_deferred_stats=deferred))
+        assert s.write(pa.table({"uuid": ["a"], "event": ["e"]})) == 1
+        assert table.prepare_append_tables.call_args.kwargs["deferred_stats"] is deferred
+        summary = catalog.commit_prepared.call_args.args[0]["message"].split("\n")[0]
+        assert f" codec=zstd-3 stats={token} " in summary
+
+    def test_prepare_is_the_only_append_path(self):
+        # Every pyhoglake append entry point other than the one that
+        # carries the flag would ship stats inline with the flag on.
+        s, client, catalog, ns, table = _sink()
+        s.write(pa.table({"uuid": ["a"], "event": ["e"]}))
+        table.prepare_append_tables.assert_called_once()
+        import pyhoglake
+
+        # Every append entry point the installed client has, so a new one
+        # is covered without editing this list.
+        others = [n for n in dir(pyhoglake.Table) if "append" in n and not n.startswith("_")]
+        others.remove("prepare_append_tables")
+        assert others, "pyhoglake.Table exposes no other append entry point to check"
+        for other in others:
+            getattr(table, other).assert_not_called()
+
+    def test_the_mode_is_logged_at_startup(self, caplog):
+        with caplog.at_level(logging.INFO, logger="millpond.hoglake"):
+            _sink(_cfg(hoglake_deferred_stats=True))
+            _sink(_cfg(hoglake_deferred_stats=False))
+        assert "hoglake column stats: deferred (HOGLAKE_DEFERRED_STATS=true)" in caplog.text
+        assert "hoglake column stats: shipped (HOGLAKE_DEFERRED_STATS=false)" in caplog.text
+
+    def test_stats_token(self):
+        assert hoglake.stats_token(True) == "deferred"
+        assert hoglake.stats_token(False) == "shipped"
+        assert hoglake.stats_token(None) == "shipped"
+
+
+_IDLESS_DETAIL = (
+    "cannot add column 'new_col': 3 live data file(s) without parquet field IDs "
+    "may bind columns by name; rewrite or retire them first"
+)
+
+
+def _idless() -> IdlessFilesPresentError:
+    return IdlessFilesPresentError("idless_files_present", status_code=409, detail=_IDLESS_DETAIL)
+
+
+class TestIdlessFilesPresent:
+    """`add_column` refused 409 `idless_files_present`: the table holds a
+    live file proven to lack field ids (hoglake 1.4.6+). Retrying never
+    clears it. The column must never be dropped for it: that would
+    publish the batch without the column and commit the offsets over the
+    lost values. The flush fails instead, permanently, on the first
+    refusal."""
+
+    OFFSETS = {("events_json", 3): (100, 102)}
+
+    def _flush(self, s, *, sleeps=None):
+        """Drive main._flush against the real sink with the clock and
+        the sleeps stubbed; returns the kafka mock."""
+        from millpond import main
+
+        kafka = self.kafka = MagicMock()
+        with (
+            patch("millpond.main.time") as mock_time,
+            patch("millpond.main.server"),
+            patch("millpond.main.metrics") as main_metrics,
+        ):
+            mock_time.monotonic.return_value = 0.0
+            try:
+                main._flush(s, s._cfg, kafka, pa.table({"uuid": ["a"], "new_col": ["x"]}), 100, 1, self.OFFSETS, 1.0)
+            finally:
+                if sleeps is not None:
+                    sleeps.extend(c.args[0] for c in mock_time.sleep.call_args_list)
+                self.labels = [c.kwargs.get("type") for c in main_metrics.errors_total.labels.call_args_list]
+        return kafka
+
+    @staticmethod
+    def _refuse_adds(table, times: int | None):
+        """Refuse every add_column alter `times` times (None: forever),
+        then defer to the dynamic alter."""
+        applied = table.alter.side_effect
+        state = {"left": times}
+
+        def alter(ops_list, **attribution):
+            if any(o.op == "add_column" for o in ops_list) and (state["left"] is None or state["left"] > 0):
+                if state["left"] is not None:
+                    state["left"] -= 1
+                raise _idless()
+            return applied(ops_list, **attribution)
+
+        table.alter.side_effect = alter
+
+    def _add_calls(self, table):
+        return [c for c in table.alter.call_args_list if any(o.op == "add_column" for o in c.args[0])]
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_write_fails_permanently_and_nothing_is_prepared(self, mock_metrics):
+        s, *_, table = _sink()
+        self._refuse_adds(table, None)
+        with pytest.raises(hoglake.IdlessFilesLiveError) as excinfo:
+            s.write(pa.table({"uuid": ["a"], "new_col": ["x"]}), kafka_offsets=(("events_json", 3, 100, 102),))
+        assert s.is_retryable(excinfo.value) is False
+        assert _IDLESS_DETAIL in str(excinfo.value)
+        # The flush stopped at the alter: no encode, no upload, no commit.
+        table.prepare_append_tables.assert_not_called()
+        # Not booked as a schema degradation: nothing was degraded.
+        for call in mock_metrics.errors_total.labels.call_args_list:
+            assert call.kwargs.get("type") != "schema"
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_refusal_is_logged_at_error_with_the_server_detail(self, mock_metrics, caplog):
+        s, *_, table = _sink()
+        self._refuse_adds(table, None)
+        with (
+            caplog.at_level(logging.WARNING, logger="millpond.hoglake"),
+            pytest.raises(hoglake.IdlessFilesLiveError),
+        ):
+            s.write(pa.table({"uuid": ["a"], "new_col": ["x"]}))
+        records = [r for r in caplog.records if "idless_files_present" in r.getMessage()]
+        assert records and records[0].levelno == logging.ERROR
+        assert _IDLESS_DETAIL in records[0].getMessage()
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_flush_fails_on_the_first_refusal_without_committing_offsets(self, mock_metrics):
+        # A retry budget of 6, and an alter that WOULD land on a second
+        # attempt: the loop must not take it. The refusal is permanent.
+        s, *_, table = _sink(_cfg(hoglake_max_retry_count=6))
+        self._refuse_adds(table, 1)
+        sleeps: list[float] = []
+        with pytest.raises(hoglake.IdlessFilesLiveError):
+            self._flush(s, sleeps=sleeps)
+        # One alter, no backoff...
+        assert len(self._add_calls(table)) == 1
+        assert sleeps == []
+        # ...counted once under its own type...
+        assert self.labels == ["hoglake_idless_files_present"]
+        # ...never degraded into a publication without the column...
+        table.prepare_append_tables.assert_not_called()
+        assert not _WRITTEN
+        # ...and the offsets stay where they were: the restart re-consumes.
+        self.kafka.commit.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_batched_add_is_not_split_into_per_column_drops(self, mock_metrics):
+        # The batched alter's generic fallback re-issues per column, and
+        # the per-column HoglakeError arm drops. The refusal must skip
+        # both.
+        s, *_, table = _sink()
+        self._refuse_adds(table, None)
+        with pytest.raises(hoglake.IdlessFilesLiveError):
+            s.write(pa.table({"uuid": ["a"], "c1": ["x"], "c2": [1]}))
+        assert len(self._add_calls(table)) == 1
+        assert [o.body["column"]["name"] for o in self._add_calls(table)[0].args[0]] == ["c1", "c2"]
+        table.prepare_append_tables.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_genuine_conflict_still_degrades(self, mock_metrics):
+        # Unchanged: a CommitConflictError whose re-resolve does not show
+        # the column is a lost DDL race, and the flush proceeds without it.
+        s, *_, table = _sink()
+        table.alter.side_effect = CommitConflictError("concurrent DDL", status_code=409)
+        _set_info(table, _FakeInfo(columns=tuple(_EVENTS_COLUMNS)))
+        assert s.write(pa.table({"uuid": ["a"], "new_col": ["x"]})) == 1
+        assert "new_col" not in _published(table).column_names
+        mock_metrics.errors_total.labels.assert_any_call(type="schema")
+
+    def test_pyhoglake_maps_the_servers_409_code_to_the_caught_type(self):
+        # The sink catches IdlessFilesPresentError by type; the mapping
+        # from the wire code to that type is pyhoglake's. If it ever
+        # stopped holding, the refusal would reach the generic 409
+        # (CommitConflictError) arm, which degrades by dropping the column.
+        import httpx
+        from pyhoglake import HoglakeClient
+
+        resp = httpx.Response(409, json={"error": "idless_files_present", "detail": _IDLESS_DETAIL})
+        with pytest.raises(IdlessFilesPresentError) as excinfo:
+            HoglakeClient._raise(resp, CommitConflictError)
+        assert not isinstance(excinfo.value, CommitConflictError)
+        assert excinfo.value.detail == _IDLESS_DETAIL
+
+    def test_main_labels_the_attempt_by_the_sinks_type(self):
+        from millpond.main import _classify_write_error
+
+        exc = hoglake.IdlessFilesLiveError("refused")
+        assert _classify_write_error(exc, "hoglake") == "hoglake_idless_files_present"
 
 
 class TestReservedCollision:
@@ -3797,6 +3993,7 @@ class TestCommitMessageFormat:
         version="1.2.3",
         table_uuid=TABLE_UUID,
         codec="zstd-3",
+        stats="deferred",
         kafka_offsets=(
             ("clickhouse_events_json", 3, 4128819, 4155470),
             ("clickhouse_events_json", 19, 4130021, 4156802),
@@ -3805,7 +4002,7 @@ class TestCommitMessageFormat:
 
     def test_fixed_vector(self):
         assert hoglake.format_commit_message(**self.VECTOR) == (
-            "records=26402 files=31 partitions=31 arrow_bytes=268435456 codec=zstd-3 trigger=size "
+            "records=26402 files=31 partitions=31 arrow_bytes=268435456 codec=zstd-3 stats=deferred trigger=size "
             f"millpond=1.2.3 table={TABLE_UUID}\n"
             "offsets clickhouse_events_json p3:4128819-4155470 p19:4130021-4156802 (2)"
         )
@@ -3883,7 +4080,7 @@ class TestCommitMessageFormat:
         # order for anything that reads the line by whitespace.
         summary = hoglake.format_commit_message(**dict(self.VECTOR, version="v1 dirty")).split("\n")[0]
         assert " millpond=v1_dirty " in summary
-        assert len(summary.split(" ")) == 8
+        assert len(summary.split(" ")) == 9
 
     def test_an_empty_version_is_named_unknown(self):
         summary = hoglake.format_commit_message(**dict(self.VECTOR, version="")).split("\n")[0]
@@ -3978,7 +4175,7 @@ class TestCommitMessageOnThePayload:
         message = _committed(catalog)["message"]
         summary, offsets = message.split("\n")
         assert summary == (
-            f"records=2 files=1 partitions=0 arrow_bytes={batch.nbytes} codec=zstd-3 trigger=size "
+            f"records=2 files=1 partitions=0 arrow_bytes={batch.nbytes} codec=zstd-3 stats=deferred trigger=size "
             f"millpond=1.2.3 table={TABLE_UUID}"
         )
         assert offsets == "offsets events p0:30-41 p1:9-17 (2)"
