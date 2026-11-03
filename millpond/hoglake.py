@@ -86,6 +86,7 @@ from pyhoglake import (
     ExpiredError,
     HoglakeClient,
     HoglakeError,
+    IdlessFilesPresentError,
     IncarnationChangedError,
     MalformedResponseError,
     NotFoundError,
@@ -869,6 +870,7 @@ def format_commit_message(
     version: str,
     table_uuid: str | None,
     codec: str,
+    stats: str,
     kafka_offsets: Sequence[tuple[str, int, int, int]] = (),
     limit: int = _MESSAGE_OFFSETS_LIMIT,
 ) -> str:
@@ -906,6 +908,10 @@ def format_commit_message(
     with (`codec_token`), so a codec rollout or rollback can be audited
     from the catalog's snapshot log without reading a footer.
 
+    `stats` is how the flush's files registered their column stats
+    (`stats_token`): `deferred` (left to the hydrator, files `pending`)
+    or `shipped` (inline in the commit). Same reason as `codec`.
+
     DETERMINISTIC for a given flush: the same rows, files, trigger,
     incarnation and offsets produce the same text, on a retry in this
     process and on a rebuild in a new one. Nothing compares messages —
@@ -914,8 +920,9 @@ def format_commit_message(
     operator reconciling a gap should never have to ask.
     """
     summary = (
-        f"records={records} files={files} partitions={partitions} arrow_bytes={arrow_bytes} codec={codec} "
-        f"trigger={_MESSAGE_TRIGGERS.get(trigger, _UNKNOWN_TRIGGER)} millpond={_message_token(version)} "
+        f"records={records} files={files} partitions={partitions} arrow_bytes={arrow_bytes} "
+        f"codec={codec} stats={stats} trigger={_MESSAGE_TRIGGERS.get(trigger, _UNKNOWN_TRIGGER)} "
+        f"millpond={_message_token(version)} "
         f"table={_message_token(table_uuid or 'unknown')}"
     )
     by_topic: dict[str, list[tuple[int, int, int]]] = {}
@@ -929,6 +936,46 @@ def codec_token(compression: str | None, level: int | None) -> str:
     the commit message and the startup log."""
     name = compression or "default"
     return name if level is None else f"{name}-{level}"
+
+
+def stats_token(deferred_stats: bool | None) -> str:
+    """`deferred` or `shipped`: how a flush's files registered their
+    column stats, for the commit message and the startup log."""
+    return "deferred" if deferred_stats else "shipped"
+
+
+class IdlessFilesLiveError(HoglakeSinkError):
+    """An `add_column` the server refused 409 `idless_files_present`.
+
+    The server refuses `add_column` / `rename_column` while the table
+    holds a live file PROVEN to lack parquet field ids: a column that
+    binds by name could adopt another column's values. Since hoglake
+    1.4.6 (a SERVER version; no client floor checks it) pending or
+    failed hydration does not count, so deferred stats never trigger it;
+    every pyhoglake writer stamps field ids. Seeing it means some other
+    writer registered an id-less file, or the server predates 1.4.6.
+    Retrying does not clear it (pyhoglake's `IdlessFilesPresentError` is
+    `retryable=False`) until the file is compacted or rewritten, or its
+    table retired.
+
+    It is NOT a reason to drop the column from the batch. Dropping it and
+    publishing the rest would commit the Kafka offsets over rows whose
+    value for that column was never written: silent, permanent loss of
+    one column for every record in the flush. So the sink fails the
+    FLUSH instead, permanently (`is_retryable` is False, so
+    `main._write_with_retry` re-raises on the first attempt and main()
+    skips the `final` flush of the same batch): offsets not committed,
+    the pod crashes, and every restart is refused the same way until the
+    file is dealt with. Loud and lossless.
+
+    `errors_total_type` labels it in `millpond_errors_total`, read
+    duck-typed by main.py.
+    """
+
+    errors_total_type = "hoglake_idless_files_present"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, retryable=False)
 
 
 class HoglakeSink:
@@ -1016,6 +1063,12 @@ class HoglakeSink:
         self._version = _message_token(cfg.service_version or "unknown")
         self._codec = codec_token(cfg.hoglake_compression, cfg.hoglake_compression_level)
         log.info("hoglake parquet codec: %s", self._codec)
+        self._stats = stats_token(cfg.hoglake_deferred_stats)
+        log.info(
+            "hoglake column stats: %s (HOGLAKE_DEFERRED_STATS=%s)",
+            self._stats,
+            "true" if cfg.hoglake_deferred_stats else "false",
+        )
         # Resolved lazily on first write; reset_caches() drops them so the
         # retry path re-resolves (another pod may have created/altered the
         # table, or it may have been dropped+recreated).
@@ -1507,6 +1560,7 @@ class HoglakeSink:
             version=self._version,
             table_uuid=self._table_uuid,
             codec=self._codec,
+            stats=self._stats,
             kafka_offsets=facts.kafka_offsets,
         )
         try:
@@ -1529,6 +1583,11 @@ class HoglakeSink:
                 # pyarrow's SNAPPY. See config._hoglake_compression.
                 compression=self._cfg.hoglake_compression,
                 compression_level=self._cfg.hoglake_compression_level,
+                # Explicit as well: pyhoglake's default is False (ship
+                # inline). `bool()` so an unset field on a hand-built
+                # Config ships stats rather than passing None through.
+                # See config._hoglake_deferred_stats.
+                deferred_stats=bool(self._cfg.hoglake_deferred_stats),
             )
         except Exception as e:
             # ONE arm, because there is now one question and pyhoglake
@@ -2643,6 +2702,12 @@ class HoglakeSink:
         table columns the batch lacks (DuckLake's `INSERT BY NAME`
         equivalent). Name matching is EXACT — hoglake identifiers are
         case-sensitive, unlike DuckDB's case-insensitive resolution.
+
+        ONE add failure is fatal to the flush, deliberately: an
+        `add_column` refused `idless_files_present` (a live file without
+        field ids) raises `IdlessFilesLiveError` rather than
+        degrading, because the degradation — drop the column, publish the
+        rest, commit the offsets — loses that column's values for good.
         """
         failed: list[str] = list(
             self._add_columns(table, [f for f in batch.schema if f.name not in self._live_columns])
@@ -2809,7 +2874,9 @@ class HoglakeSink:
         The batch is an optimization and never a semantics change: one
         unacceptable column fails the whole transaction (nothing
         applies), so a failure falls back to the per-column loop, where
-        each column degrades on its own exactly as before.
+        each column degrades on its own exactly as before. Except for
+        `idless_files_present`, which is about the TABLE rather than any
+        one column: it raises from here (see IdlessFilesLiveError).
         """
         if not fields:
             return []
@@ -2850,6 +2917,11 @@ class HoglakeSink:
                 )
                 metrics.schema_columns_added_total.inc(len(add_ops))
                 return failed
+            except IdlessFilesPresentError as e:
+                # Before the generic arm: the per-column fallback would
+                # be refused the same way, and its HoglakeError arm drops
+                # the column. See IdlessFilesLiveError.
+                raise self._idless_refusal([f.name for f in addable], e) from e
             except HoglakeError as e:
                 log.info("Batched add of %d column(s) failed (%s); retrying per column", len(add_ops), e)
         for field in addable:
@@ -2878,6 +2950,11 @@ class HoglakeSink:
             )
             metrics.schema_columns_added_total.inc()
             return True
+        except IdlessFilesPresentError as e:
+            # Not a concurrent-DDL conflict and not a reason to degrade:
+            # fail the flush so the column is never dropped. See
+            # IdlessFilesLiveError.
+            raise self._idless_refusal([field.name], e) from e
         except CommitConflictError:
             # Concurrent DDL — typically another pod adding the same
             # column. Re-resolve; present means someone won the race.
@@ -2892,6 +2969,23 @@ class HoglakeSink:
             log.warning("Failed to add column %s: %s", field.name, e)
             metrics.errors_total.labels(type="schema").inc()
             return False
+
+    def _idless_refusal(self, columns: list[str], e: IdlessFilesPresentError) -> IdlessFilesLiveError:
+        """Log the server's `idless_files_present` refusal and build the
+        permanent flush failure that replaces dropping the column(s)."""
+        detail = e.detail or str(e)
+        log.error(
+            "Adding hoglake column(s) %s refused: idless_files_present (%s). The table holds a live file "
+            "without parquet field ids, or the server is older than hoglake 1.4.6 (which also counts files "
+            "pending hydration); failing the flush (offsets not committed). Retrying does not clear it: "
+            "compact or rewrite the file, or retire the table",
+            ", ".join(columns),
+            detail,
+        )
+        return IdlessFilesLiveError(
+            f"add_column {', '.join(columns)} refused by the server (idless_files_present: {detail}); "
+            "the flush is refused rather than published without the column"
+        )
 
     def _promote_column(self, table, name: str, from_type: str, to_type: str) -> None:
         """Widen a live column (int->long / float->double); failures are

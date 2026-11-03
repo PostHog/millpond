@@ -127,6 +127,10 @@ class Config:
     # measured ~4x larger on prod-us events. See _hoglake_compression.
     hoglake_compression: str | None
     hoglake_compression_level: int | None
+    # Register every hoglake file with its column stats DEFERRED to the
+    # server's hydrator (`prepare_append_tables(deferred_stats=True)`)
+    # instead of shipped inline in the commit. See _hoglake_deferred_stats.
+    hoglake_deferred_stats: bool | None
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
@@ -682,6 +686,7 @@ _NONE_HOGLAKE_FIELDS: dict = dict.fromkeys(
         "hoglake_request_timeout_s",
         "hoglake_compression",
         "hoglake_compression_level",
+        "hoglake_deferred_stats",
     )
 )
 
@@ -972,6 +977,66 @@ def _hoglake_compression() -> tuple[str, int | None]:
     return codec, level
 
 
+# Column stats for hoglake objects: shipped inline in the commit, or left
+# to the server's hydrator. With `deferred_stats=True` pyhoglake leaves
+# `column_stats` out of every file registration; the server registers
+# each file `stats_state='pending'` and its hydrator reads the footer
+# later, outside the per-catalog commit lock. What that buys is the
+# per-file stats work the server otherwise does INSIDE the lock, which on
+# a wide, heavily partitioned flush (hundreds of files x hundreds of
+# columns) is most of the time the commit holds it — and every other
+# writer to the catalog queues behind it.
+#
+# What it costs:
+#   * readers see no column bounds for a file until the hydrator has
+#     swept it (its cadence: seconds to minutes);
+#   * files under the hydrator's size floor never get stats rows at all
+#     (they register `provided` with none, until compaction rewrites
+#     them).
+#
+# Pending files do NOT block `add_column` / `rename_column` on a hoglake
+# 1.4.6+ server: its 409 `idless_files_present` counts only files PROVEN
+# to lack field ids, which pyhoglake never writes. If another writer
+# leaves one, the sink fails the flush rather than dropping the column
+# (see HoglakeSink._add_columns and IdlessFilesLiveError).
+#
+# Default ON. `false` ships stats inline exactly as before: the rollback.
+_HOGLAKE_DEFAULT_DEFERRED_STATS = True
+_BOOLS = {"true": True, "false": False}
+
+
+def _hoglake_deferred_stats() -> bool:
+    """HOGLAKE_DEFERRED_STATS: `true` (default) or `false`, case-insensitive.
+
+    Strict on purpose: `0`, `no`, `off` and typos are refused rather than
+    guessed, because the two readings of a guess are a commit-lock
+    regression one way and a fleet-wide stats change the other.
+
+    Also refuses a pyhoglake whose `prepare_append_tables` cannot take
+    the keyword: the sink passes it on every flush, and the TypeError an
+    older client raises there is permanent, so the pod would start clean
+    and crash on its first flush instead of here.
+    """
+    raw = os.environ.get("HOGLAKE_DEFERRED_STATS", "").strip()
+    if not raw:
+        value = _HOGLAKE_DEFAULT_DEFERRED_STATS
+    else:
+        try:
+            value = _BOOLS[raw.lower()]
+        except KeyError:
+            raise RuntimeError(f"HOGLAKE_DEFERRED_STATS={raw!r} must be `true` or `false`") from None
+    import inspect
+
+    from pyhoglake import Table
+
+    if "deferred_stats" not in inspect.signature(Table.prepare_append_tables).parameters:
+        raise RuntimeError(
+            "HOGLAKE_DEFERRED_STATS needs a pyhoglake whose `prepare_append_tables` takes `deferred_stats=` (1.4.5+); "
+            "the installed client would refuse every flush."
+        )
+    return value
+
+
 _S3_URI = re.compile(r"^s3://[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9](/.*)?$")
 
 
@@ -1111,11 +1176,13 @@ def _load_hoglake_fields() -> dict:
         )
     s3_access_key, s3_secret_key = _hoglake_s3_keys()
     compression, compression_level = _hoglake_compression()
+    deferred_stats = _hoglake_deferred_stats()
     return {
         "hoglake_max_retry_count": max_retries,
         "hoglake_request_timeout_s": timeout_s,
         "hoglake_compression": compression,
         "hoglake_compression_level": compression_level,
+        "hoglake_deferred_stats": deferred_stats,
         "hoglake_url": _require("HOGLAKE_URL"),
         "hoglake_catalog": catalog,
         "hoglake_namespace": names["HOGLAKE_NAMESPACE"],

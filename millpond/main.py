@@ -555,7 +555,15 @@ def _classify_write_error(exc: BaseException, destination: str = "ducklake") -> 
     through). Labeling that `ducklake_commit_contention` would fire a
     DuckLake alert from a pod that has no DuckLake. Everything else is a
     plain write_retry.
+
+    A sink exception may name its own label as `errors_total_type`
+    (HoglakeSink's `IdlessFilesLiveError`: an add_column refused because
+    the table holds a live file without field ids). Read duck-typed for the same reason as
+    the pyhoglake check, and first, because it is the most specific.
     """
+    label = getattr(exc, "errors_total_type", None)
+    if isinstance(label, str):
+        return label
     if getattr(exc, "retryable", None) is True and type(exc).__module__.startswith("pyhoglake"):
         return "hoglake_commit_contention"
     if destination == "ducklake" and _is_commit_contention(exc):
@@ -618,6 +626,30 @@ def _retry_delay(sink, attempt: int, base: float) -> float:
         if seconds is not None:
             delay = max(delay, min(float(seconds), _RETRY_AFTER_MAX_S))
     return min(delay + random.uniform(0.0, delay * _RETRY_JITTER), _RETRY_AFTER_MAX_S)
+
+
+# Set on an exception `_write_with_retry` re-raised as permanent (the
+# sink's `is_retryable` said no). main()'s shutdown path reads it to skip
+# the `final` flush: that flush re-writes the same pending batch, which
+# the sink has already judged cannot succeed, so it would only repeat
+# the refusal (and its log line and error count) before the crash.
+_PERMANENT_WRITE_ATTR = "_millpond_write_permanent"
+
+
+def _is_permanent_write_failure(exc: BaseException | None) -> bool:
+    return exc is not None and getattr(exc, _PERMANENT_WRITE_ATTR, False) is True
+
+
+def _final_flush_decision(pending_records: int, loop_error: BaseException | None, started: bool) -> str:
+    """What main()'s shutdown path does with the pending buffer:
+    `none` (nothing pending, or startup never got a sink and consumer),
+    `skip` (the loop died on a permanent write failure of this very
+    batch), or `flush`."""
+    if pending_records <= 0:
+        return "none"
+    if _is_permanent_write_failure(loop_error):
+        return "skip"
+    return "flush" if started else "none"
 
 
 def _flush_deadline(sink) -> tuple[float, float] | None:
@@ -697,6 +729,10 @@ def _write_with_retry(
                     error_type,
                     exc_info=True,
                 )
+                try:
+                    setattr(exc, _PERMANENT_WRITE_ATTR, True)
+                except AttributeError:
+                    pass  # an exception type with __slots__: the final flush just runs
                 raise
             if attempt == max_attempts - 1:
                 raise
@@ -943,6 +979,7 @@ def main():
     last_flush = time.monotonic()
     last_lag_sample = 0.0  # force immediate first sample
     last_heartbeat = time.monotonic()
+    loop_error: BaseException | None = None
 
     try:
         http = server.start(cfg.http_port)
@@ -1076,7 +1113,8 @@ def main():
                 metrics.pending_bytes.set(0)
                 last_flush = time.monotonic()
 
-    except Exception:
+    except Exception as exc:
+        loop_error = exc
         log.exception("Fatal error in main loop")
         raise
     finally:
@@ -1088,7 +1126,14 @@ def main():
 
         # Final flush only makes sense if both sink and kafka were created;
         # if startup failed earlier, there's no consumed data to flush.
-        if pending_records > 0 and sink is not None and kafka is not None:
+        decision = _final_flush_decision(pending_records, loop_error, sink is not None and kafka is not None)
+        if decision == "skip":
+            log.error(
+                "Skipping final flush: the pending batch (%d records) failed permanently; "
+                "offsets not committed, it replays from Kafka on restart",
+                pending_records,
+            )
+        elif decision == "flush":
             try:
                 consolidated = pa.concat_tables(pending, promote_options="default")
                 elapsed = time.monotonic() - last_flush

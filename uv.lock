@@ -8,7 +8,7 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 certifi = { timestamp = "0001-01-01T00:00:00Z", span = "P1D" }
-pyhoglake = "2026-10-23T04:00:00Z"
+pyhoglake = "2026-10-24T04:00:00Z"
 
 [manifest]
 constraints = [
@@ -358,7 +358,7 @@ requires-dist = [
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pyarrow", specifier = ">=21.0" },
-    { name = "pyhoglake", extras = ["fast-upload"], specifier = ">=1.4.4" },
+    { name = "pyhoglake", extras = ["fast-upload"], specifier = ">=1.4.6" },
     { name = "pytz", specifier = ">=2024.1" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
@@ -695,16 +695,16 @@ wheels = [
 
 [[package]]
 name = "pyhoglake"
-version = "1.4.4"
+version = "1.4.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pyarrow" },
     { name = "thrift" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d4/f6/ceb497cd7486d9e61ba56945446a204ad0366d71860661a5de2fd1682d88/pyhoglake-1.4.4.tar.gz", hash = "sha256:de0252940b7957cfe463e7e100412324bdfbb5c5231a4bb96d53a7ef34756a70", size = 461860, upload-time = "2026-10-23T03:19:45.983Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/01/bd65c53a936380f076f56103a852a0faf9a5e15107bcc362392589bbce5b/pyhoglake-1.4.7.tar.gz", hash = "sha256:bd28cf170dadc89cba5d39699494a5264f56e7bcaab242c533460bdc0b3f3bb6", size = 466972, upload-time = "2026-10-24T03:11:58.825Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3b/de/0805963c35c35c21e0960bac7caf839c51642e4313f51c6bcf464fe59538/pyhoglake-1.4.4-py3-none-any.whl", hash = "sha256:fa1124b981f50718f31a777726759efcd2e51e18f290a5242c733e3e66c3810a", size = 159569, upload-time = "2026-10-23T03:19:44.365Z" },
+    { url = "https://files.pythonhosted.org/packages/47/06/8d1e5b8901917535ce8afd3122293cd51df28cfd3900cab0bf2878b10ff9/pyhoglake-1.4.7-py3-none-any.whl", hash = "sha256:ddc0485b7b4b979fc794862e665cd207db0bf74382953b7598b9879e2900821f", size = 162159, upload-time = "2026-10-24T03:11:57.233Z" },
 ]
 
 [package.optional-dependencies]

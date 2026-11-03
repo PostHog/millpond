@@ -75,7 +75,15 @@ dependencies = [
     # the codec on every flush and config.load() validates through
     # `parquet_write_options`, so an older client fails the pod at start
     # (ImportError) — also a floor.
-    "pyhoglake[fast-upload]>=1.4.4",
+    # 1.4.5 adds `deferred_stats=` on `prepare_append_tables` and the
+    # typed `IdlessFilesPresentError` for the add/rename refusal it
+    # implies. The alter path catches that type by name (an ImportError at
+    # start on an older client) and config.load() refuses a client whose
+    # prepare_append_tables lacks the keyword — a floor. 1.4.6 documents
+    # the hoglake SERVER 1.4.6 narrowing of that refusal to a PROVEN
+    # id-less file, which the sink treats as permanent; the server
+    # version itself is a deployment requirement no client floor checks.
+    "pyhoglake[fast-upload]>=1.4.6",
     # 21 because pyhoglake 1.3.0 requires it. Declared here rather than left
     # to resolve transitively: millpond imports pyarrow directly on every
     # path, so its floor is millpond's business to state.
@@ -151,8 +159,12 @@ exclude-newer = "7 days"
 # this date is bumped alongside an intentional version bump. Bumped for
 # 1.4.0, published 2026-10-21, for the `author` / `message` keywords on
 # every DDL call. Bumped for 1.4.4, published 2026-10-23T03:19Z, for the
-# parquet codec keywords and `parquet_write_options`.
-exclude-newer-package = { pyhoglake = "2026-10-23T04:00:00Z", certifi = "1 day" }
+# parquet codec keywords and `parquet_write_options`. Bumped for 1.4.5,
+# published 2026-10-23T19:48Z, for `deferred_stats=` and
+# `IdlessFilesPresentError`. Bumped for 1.4.7, published
+# 2026-10-24T03:11Z: 1.4.6 narrows `IdlessFilesPresentError`; 1.4.7 is
+# a version bump.
+exclude-newer-package = { pyhoglake = "2026-10-24T04:00:00Z", certifi = "1 day" }
 constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",

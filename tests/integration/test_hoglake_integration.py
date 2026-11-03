@@ -21,6 +21,7 @@ import re
 import tempfile
 import threading
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
@@ -75,6 +76,8 @@ class HogCfg:
     # config.load()'s defaults: millpond always passes a codec.
     hoglake_compression: str | None = "zstd"
     hoglake_compression_level: int | None = 3
+    # Mirrors config.load()'s default (test_deferred_stats_defaults_on pins it).
+    hoglake_deferred_stats: bool | None = True
     sort_by: tuple[str, ...] | None = None
     typed_columns: tuple[tuple[str, str], ...] | None = None
     # Named in every DDL message.
@@ -464,7 +467,8 @@ class TestBootstrap:
 
 class TestAppendVisibility:
     def test_rows_queryable_with_stats(self, hog_stack, client):
-        cfg = _fresh()
+        # Shipped stats: the deferred mode is TestDeferredStats.
+        cfg = _fresh(hoglake_deferred_stats=False)
         sink = HoglakeSink(cfg)
         try:
             sink.write(_batch(5))
@@ -474,7 +478,7 @@ class TestAppendVisibility:
         table = _table(client, cfg)
         files = table.files()
         assert sorted(f.record_count for f in files) == [5, 7]
-        # Stats shipped with the commit (never deferred): the server
+        # Stats shipped with the commit (HOGLAKE_DEFERRED_STATS=false): the server
         # marks them provided/loaded, not pending.
         assert all(f.stats_state != "pending" for f in files)
         # Scan planning sees the same files.
@@ -521,6 +525,46 @@ class TestCompression:
             for c in range(metadata.num_columns)
         } == {footer}
         assert f" codec={token} " in _snapshots(client, cfg)[-1].message.split("\n")[0]
+
+
+class TestDeferredStats:
+    """`deferred_stats` read back from the catalog: each file's
+    `stats_state`, the snapshot message, and an add_column over files
+    still `pending` (hoglake 1.4.6+ refuses only PROVEN id-less files).
+    The stack disables the hydrator (HOGLAKE_HYDRATOR_INTERVAL_MS=0 in
+    tests/hoglake_stack/docker-compose.yaml), so `pending` stays `pending`."""
+
+    @pytest.mark.parametrize(("deferred", "token"), [(True, "deferred"), (False, "shipped")])
+    def test_the_files_register_in_the_configured_stats_state(self, hog_stack, client, deferred, token):
+        cfg = _fresh(hoglake_deferred_stats=deferred, hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(6, teams=(1, 2, 3)))
+        finally:
+            sink.close()
+        files = _table(client, cfg).files()
+        assert len(files) == 3
+        states = {f.stats_state for f in files}
+        if deferred:
+            assert states == {"pending"}
+        else:
+            assert "pending" not in states
+        assert f" stats={token} " in _snapshots(client, cfg)[-1].message.split("\n")[0]
+
+    def test_an_add_column_over_pending_files_lands(self, hog_stack, client):
+        cfg = _fresh()  # HogCfg's default: deferred, as config.load()'s
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2), kafka_offsets=(("events", 0, 0, 1),))
+            assert {f.stats_state for f in _table(client, cfg).files()} == {"pending"}
+            sink.write(_batch(2, extra_cols={"extra": ["a", "b"]}), kafka_offsets=(("events", 0, 2, 3),))
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 4
+        assert "extra" in {c.name for c in _table(client, cfg).columns}
+        # The values landed, not just the column: null for the first
+        # flush's rows, the batch's own for the second's.
+        assert Counter(_read_all(client, cfg).column("extra").to_pylist()) == Counter(["a", "b", None, None])
 
 
 class TestSchemaEvolution:
@@ -1682,7 +1726,7 @@ class TestCommitMessage:
         summary, offsets = snapshots[0].message.split("\n")
         live_uuid = _table(client, cfg).info().table_uuid
         assert summary == (
-            f"records=4 files=1 partitions=0 arrow_bytes={batch.nbytes} codec=zstd-3 trigger=size "
+            f"records=4 files=1 partitions=0 arrow_bytes={batch.nbytes} codec=zstd-3 stats=deferred trigger=size "
             f"millpond={cfg.service_version} table={live_uuid}"
         )
         assert offsets == f"offsets {self.TOPIC} p3:4128819-4155470 p19:4130021-4156802 (2)"
@@ -1702,7 +1746,7 @@ class TestCommitMessage:
         # Three tuples, one file each; `time` is the metric's name for
         # the interval trigger and the message says `interval`.
         assert summary.startswith(
-            f"records=9 files=3 partitions=3 arrow_bytes={batch.nbytes} codec=zstd-3 trigger=interval "
+            f"records=9 files=3 partitions=3 arrow_bytes={batch.nbytes} codec=zstd-3 stats=deferred trigger=interval "
         )
         assert len(_table(client, cfg).files()) == 3
 
