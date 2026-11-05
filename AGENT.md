@@ -470,7 +470,7 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | Risk | Mitigation |
 |------|------------|
 | Duplicate writes on crash (INSERT succeeds, commitSync doesn't) | At-least-once is the design point. Duplicates bounded by flush interval. Downstream consumers must tolerate duplicates. |
-| Shutdown sequencing must be explicit | SIGTERM sets shutdown flag → exit loop → flush pending → commit → close consumer. `terminationGracePeriodSeconds: 120` covers S3 latency. |
+| Shutdown sequencing must be explicit | SIGTERM sets shutdown flag → exit loop → flush pending → commit → close consumer. `terminationGracePeriodSeconds: 120` covers S3 latency. The `millpond` entry point is `main.run`: main(), then `os._exit`, skipping atexit hooks. pyarrow's atexit S3 finalization never returns with IRSA web-identity credentials and a live S3FileSystem (apache/arrow#50188), and it holds the GIL while it blocks, so it can't be bounded from Python; before this, every hoglake pod sat out its full grace period. |
 | Offset tracking must be max-per-partition across accumulated batches | Track `dict[TopicPartition, offset]`, update with max on each batch append. |
 
 ### Medium
