@@ -11,7 +11,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from millpond import arrow_converter
 from millpond.arrow_converter import (
+    OversizedValueError,
     _decode_value,
     _drop_null_typed_columns,
     _to_uuid,
@@ -302,6 +304,19 @@ class TestLz4FramedValues:
     def test_a_magic_prefix_is_not_the_magic(self):
         value = b"\x04\x22\x4d{}"
         assert _decode_value(value) is value
+
+    def test_decoding_stops_past_the_limit(self):
+        decoded = b'{"team_id":2,"pad":"' + b"0123456789" * 500_000 + b'"}'
+        assert _decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded)) == decoded
+        with pytest.raises(OversizedValueError):
+            _decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded) - 1)
+
+    def test_a_frame_decompressing_past_the_limit_is_skipped(self, monkeypatch, caplog):
+        monkeypatch.setattr(arrow_converter, "MAX_DECODED_VALUE_BYTES", 1024 * 1024)
+        with caplog.at_level(logging.WARNING, logger="millpond.arrow_converter"):
+            table = convert([_BENTO_TWO_BLOCKS, _BENTO_LZ4_FRAME])
+        assert table.to_pylist() == [{"team_id": 2, "event": "signup"}]
+        assert any("decompresses past 1048576 bytes" in r.getMessage() for r in caplog.records)
 
     def test_empty_and_whitespace_values(self):
         assert convert([b""]) is None

@@ -489,18 +489,40 @@ def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], 
 # check cannot misread a plain value.
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
 
+# The largest decompressed LZ4-framed value. Capture caps a produced event at
+# 10 MiB, so no real event comes near it; it bounds what one value can expand to
+# (the consumer's queue and flush limits count compressed bytes).
+MAX_DECODED_VALUE_BYTES = 32 * 1024 * 1024
+_DECODE_CHUNK_BYTES = 1024 * 1024
 
-def _decode_value(raw: bytes) -> bytes:
+
+class OversizedValueError(Exception):
+    """An LZ4-framed value decompresses past the limit."""
+
+
+def _decode_value(raw: bytes, limit: int | None = None) -> bytes:
     """The JSON bytes of a message value: an LZ4-framed value is decompressed,
     any other value is returned unchanged.
 
     pyarrow's streaming reader handles frames without a content-size field,
     which is what Bento's lz4 codec writes. The one-shot `pa.decompress`
-    needs the decompressed size up front. Raises OSError on a corrupt frame.
+    needs the decompressed size up front. Reads in chunks and stops past
+    `limit` (default `MAX_DECODED_VALUE_BYTES`) with OversizedValueError.
+    Raises OSError on a corrupt frame.
     """
     if raw[:4] != _LZ4_FRAME_MAGIC:
         return raw
-    return pa.CompressedInputStream(pa.BufferReader(raw), "lz4").read()
+    if limit is None:
+        limit = MAX_DECODED_VALUE_BYTES
+    stream = pa.CompressedInputStream(pa.BufferReader(raw), "lz4")
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := stream.read(min(_DECODE_CHUNK_BYTES, limit + 1 - total)):
+        total += len(chunk)
+        if total > limit:
+            raise OversizedValueError(f"decompresses past {limit} bytes")
+        chunks.append(chunk)
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
 def convert(messages: list[bytes]) -> pa.Table | None:
@@ -517,7 +539,7 @@ def convert(messages: list[bytes]) -> pa.Table | None:
     for raw in messages:
         try:
             raw = _decode_value(raw)
-        except OSError as e:
+        except (OSError, OversizedValueError) as e:
             # Counted with the unparseable values (records_skipped_total
             # reason=json_parse): the caller counts every value convert drops.
             log.warning("Skipping undecodable LZ4-framed value (%d bytes): %s", len(raw), e)
