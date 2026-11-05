@@ -335,6 +335,11 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     # `ducklake_snapshot_pkey` duplicate-key violations. Loaded from
     # DUCKLAKE_MAX_RETRY_COUNT env (default 100).
     conn.execute(f"SET ducklake_max_retry_count = {int(cfg.ducklake_max_retry_count)}")
+    # And the wait between them (see Config.ducklake_retry_wait_ms):
+    # DuckLake's default 1.5x backoff is uncapped and sleeps past the
+    # liveness deadline after ~20 retries.
+    conn.execute(f"SET ducklake_retry_wait_ms = {int(cfg.ducklake_retry_wait_ms)}")
+    conn.execute(f"SET ducklake_retry_backoff = {float(cfg.ducklake_retry_backoff)}")
 
     # Optional memory cap (DUCKDB_MEMORY_LIMIT). Without it DuckDB budgets
     # ~80% of the cgroup limit and races the Arrow pending buffer for RSS
