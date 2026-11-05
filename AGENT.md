@@ -244,9 +244,10 @@ Both time-based and size-based:
 
 Ported from ducklake-kafka-connect's `SinkRecordToArrowConverter`:
 
-1. Parse JSON via `orjson` (Rust, ~1GB/s)
-2. `pa.Table.from_pylist()` builds the columnar batch — PyArrow infers the superset schema across all dicts
-3. v1 types: integers → INT64, floats → FLOAT64, all strings → VARCHAR, nested objects → JSON. No timestamp detection (see Deferred Complexity)
+1. Decompress LZ4-framed values: a value that starts with the LZ4 frame magic (`04 22 4d 18`) is decompressed with pyarrow's streaming LZ4 reader (`_decode_value`); any other value passes through untouched. WarpStream pipelines that repartition `clickhouse_events_json` (`team_split_ws`, `team_event_partitioned_ws`) write LZ4-framed values, because WarpStream bills writes and storage on uncompressed bytes. A corrupt frame, or one that decompresses past 32 MiB (`MAX_DECODED_VALUE_BYTES`; capture caps an event at 10 MiB), is skipped and counted with unparseable values (`records_skipped_total{reason="json_parse"}`). Decoding costs ~3 µs for a 10 KB event, against ~8 µs for its JSON parse.
+2. Parse JSON via `orjson` (Rust, ~1GB/s)
+3. `pa.Table.from_pylist()` builds the columnar batch — PyArrow infers the superset schema across all dicts
+4. v1 types: integers → INT64, floats → FLOAT64, all strings → VARCHAR, nested objects → JSON. No timestamp detection (see Deferred Complexity)
 
 **Important**: `orjson` parses JSON integers as Python `int`, so `pa.Table.from_pylist()` infers INT64 for integer-only columns. A column that's INT64 in batch N and FLOAT64 in batch N+1 (because one value was `1.5`) causes type wobble. `_normalize_numeric_types()` casts all integers to INT64 and all floats to FLOAT64 after `from_pylist()` to prevent this.
 
@@ -435,7 +436,7 @@ Prometheus via `prometheus_client`, HTTP on port 8000.
 | `millpond_records_consumed_total` | Counter | Records polled (by partition) |
 | `millpond_records_written_total` | Counter | Records written to the lake |
 | `millpond_batches_flushed_total` | Counter | Flush cycles completed (by trigger: `size` or `time`) |
-| `millpond_records_skipped_total` | Counter | Records skipped (by reason: json_parse, schema) |
+| `millpond_records_skipped_total` | Counter | Records skipped (by reason: json_parse (incl. corrupt or oversized LZ4 frames), unsafe_field_name, variant_companion_collision, filter_*) |
 | `millpond_errors_total` | Counter | Errors by type (kafka, write_retry, offset_commit, schema, …) |
 | `millpond_arrow_conversion_seconds` | Histogram | Time to convert JSON to Arrow table |
 | `millpond_flush_duration_seconds` | Histogram | Time per lake write |

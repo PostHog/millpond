@@ -481,10 +481,55 @@ def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], 
     return pa.table(dict(zip([f.name for f in new_fields], new_columns)), schema=pa.schema(new_fields))
 
 
+# The LZ4 frame magic number (0x184D2204, little-endian). WarpStream pipelines
+# that repartition clickhouse_events_json (team_split_ws,
+# team_event_partitioned_ws in posthog-cloud-infra) write LZ4-framed values,
+# because WarpStream bills writes and storage on uncompressed bytes and the
+# framed value is what it sees. No JSON document starts with byte 0x04, so the
+# check cannot misread a plain value.
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+
+# The largest decompressed LZ4-framed value. Capture caps a produced event at
+# 10 MiB, so no real event comes near it; it bounds what one value can expand to
+# (the consumer's queue and flush limits count compressed bytes).
+MAX_DECODED_VALUE_BYTES = 32 * 1024 * 1024
+_DECODE_CHUNK_BYTES = 1024 * 1024
+
+
+class OversizedValueError(Exception):
+    """An LZ4-framed value decompresses past the limit."""
+
+
+def _decode_value(raw: bytes, limit: int | None = None) -> bytes:
+    """The JSON bytes of a message value: an LZ4-framed value is decompressed,
+    any other value is returned unchanged.
+
+    pyarrow's streaming reader handles frames without a content-size field,
+    which is what Bento's lz4 codec writes. The one-shot `pa.decompress`
+    needs the decompressed size up front. Reads in chunks and stops past
+    `limit` (default `MAX_DECODED_VALUE_BYTES`) with OversizedValueError.
+    Raises OSError on a corrupt frame.
+    """
+    if raw[:4] != _LZ4_FRAME_MAGIC:
+        return raw
+    if limit is None:
+        limit = MAX_DECODED_VALUE_BYTES
+    stream = pa.CompressedInputStream(pa.BufferReader(raw), "lz4")
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := stream.read(min(_DECODE_CHUNK_BYTES, limit + 1 - total)):
+        total += len(chunk)
+        if total > limit:
+            raise OversizedValueError(f"decompresses past {limit} bytes")
+        chunks.append(chunk)
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+
 def convert(messages: list[bytes]) -> pa.Table | None:
     """Convert raw Kafka message values to an Arrow table.
 
-    Parses JSON via orjson, builds a PyArrow table using the union of all keys
+    Decompresses LZ4-framed values (see `_decode_value`), then parses JSON via
+    orjson, builds a PyArrow table using the union of all keys
     across all records, normalizes numeric types, and handles mixed-type fields
     by coercing to string. Nested dicts/lists are serialized to JSON strings.
 
@@ -492,6 +537,13 @@ def convert(messages: list[bytes]) -> pa.Table | None:
     """
     records = []
     for raw in messages:
+        try:
+            raw = _decode_value(raw)
+        except (OSError, OversizedValueError) as e:
+            # Counted with the unparseable values (records_skipped_total
+            # reason=json_parse): the caller counts every value convert drops.
+            log.warning("Skipping undecodable LZ4-framed value (%d bytes): %s", len(raw), e)
+            continue
         try:
             parsed = orjson.loads(raw)
         except orjson.JSONDecodeError:

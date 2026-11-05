@@ -1,6 +1,9 @@
+import base64
 import io
+import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import orjson
@@ -8,7 +11,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from millpond import arrow_converter
 from millpond.arrow_converter import (
+    OversizedValueError,
+    _decode_value,
     _drop_null_typed_columns,
     _to_uuid,
     coerce_typed_columns,
@@ -228,6 +234,95 @@ class TestConvert:
         assert len(merged) == 2
         assert "b" in merged.schema.names
         assert merged.column("b").to_pylist() == [None, "new"]
+
+
+# An LZ4 frame written by Bento's lz4 codec (WarpStream pipelines): no
+# content-size field. Decompresses to {"team_id":2,"event":"signup"}.
+_BENTO_LZ4_FRAME = base64.b64decode("BCJNGGRwuR4AAIB7InRlYW1faWQiOjIsImV2ZW50Ijoic2lnbnVwIn0AAAAA1wZZsQ==")
+
+# The same codec on {"team_id":2,"pad":"0123456789"*500000} (5,000,022
+# bytes): two blocks under Bento's 4 MiB block size, 19,712 bytes.
+_BENTO_TWO_BLOCKS = (Path(__file__).parent / "data" / "bento_lz4_two_blocks.lz4").read_bytes()
+
+
+def _lz4_frame(value: bytes) -> bytes:
+    sink = pa.BufferOutputStream()
+    with pa.CompressedOutputStream(sink, "lz4") as out:
+        out.write(value)
+    return sink.getvalue().to_pybytes()
+
+
+class TestLz4FramedValues:
+    def test_a_bento_frame_is_decompressed(self):
+        table = convert([_BENTO_LZ4_FRAME])
+        assert table is not None
+        assert table.to_pylist() == [{"team_id": 2, "event": "signup"}]
+
+    def test_framed_and_plain_values_mix_in_one_batch(self):
+        plain = orjson.dumps({"team_id": 1, "event": "a"})
+        framed = _lz4_frame(orjson.dumps({"team_id": 2, "event": "b", "extra": "x"}))
+        table = convert([plain, framed])
+        assert table is not None
+        assert table.column("team_id").to_pylist() == [1, 2]
+        assert table.column("extra").to_pylist() == [None, "x"]
+
+    def test_a_framed_value_converts_like_its_plain_json(self):
+        value = orjson.dumps({"team_id": 7, "properties": {"a": 1, "b": [1, 2]}, "n": 1.5})
+        assert convert([_lz4_frame(value)]).equals(convert([value]))
+
+    def test_a_corrupt_frame_is_skipped_and_the_rest_converts(self, caplog):
+        corrupt = b"\x04\x22\x4d\x18" + b"not an lz4 frame"
+        truncated = _BENTO_LZ4_FRAME[:12]
+        good = orjson.dumps({"team_id": 3})
+        with caplog.at_level(logging.WARNING, logger="millpond.arrow_converter"):
+            table = convert([corrupt, truncated, good])
+        assert table is not None
+        assert table.column("team_id").to_pylist() == [3]
+        assert sum("undecodable LZ4-framed value" in r.getMessage() for r in caplog.records) == 2
+
+    def test_a_framed_value_holding_bad_json_is_skipped(self):
+        assert convert([_lz4_frame(b"not json")]) is None
+
+    def test_plain_values_are_not_touched(self):
+        value = orjson.dumps({"team_id": 1})
+        assert _decode_value(value) is value
+
+    def test_a_multi_block_bento_frame_is_decompressed_whole(self):
+        table = convert([_BENTO_TWO_BLOCKS])
+        assert table.to_pylist() == [{"team_id": 2, "pad": "0123456789" * 500_000}]
+
+    def test_a_bad_content_checksum_is_skipped(self, caplog):
+        bad = _BENTO_LZ4_FRAME[:-1] + bytes([_BENTO_LZ4_FRAME[-1] ^ 1])
+        with caplog.at_level(logging.WARNING, logger="millpond.arrow_converter"):
+            assert convert([bad]) is None
+        assert any("undecodable LZ4-framed value" in r.getMessage() for r in caplog.records)
+
+    def test_the_magic_alone_is_undecodable(self):
+        with pytest.raises(OSError):
+            _decode_value(b"\x04\x22\x4d\x18")
+
+    def test_a_magic_prefix_is_not_the_magic(self):
+        value = b"\x04\x22\x4d{}"
+        assert _decode_value(value) is value
+
+    def test_decoding_stops_past_the_limit(self):
+        decoded = b'{"team_id":2,"pad":"' + b"0123456789" * 500_000 + b'"}'
+        assert _decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded)) == decoded
+        with pytest.raises(OversizedValueError):
+            _decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded) - 1)
+
+    def test_a_frame_decompressing_past_the_limit_is_skipped(self, monkeypatch, caplog):
+        monkeypatch.setattr(arrow_converter, "MAX_DECODED_VALUE_BYTES", 1024 * 1024)
+        with caplog.at_level(logging.WARNING, logger="millpond.arrow_converter"):
+            table = convert([_BENTO_TWO_BLOCKS, _BENTO_LZ4_FRAME])
+        assert table.to_pylist() == [{"team_id": 2, "event": "signup"}]
+        assert any("decompresses past 1048576 bytes" in r.getMessage() for r in caplog.records)
+
+    def test_empty_and_whitespace_values(self):
+        assert convert([b""]) is None
+        ws = b' \n\t{"team_id": 1}'
+        assert _decode_value(ws) is ws
+        assert convert([ws]).to_pylist() == [{"team_id": 1}]
 
 
 class TestDropNullTypedColumns:
