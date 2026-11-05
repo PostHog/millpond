@@ -265,6 +265,8 @@ Metrics: `millpond_buffer_fullness` and `millpond_consume_batch_size_current`.
 
 The hot path is all C/C++: librdkafka → orjson → PyArrow → DuckDB (zero-copy Arrow scan). Python is glue.
 
+Message values may be plain JSON or LZ4-framed JSON (what the WarpStream repartition pipelines write); a framed value is decompressed before parsing, and plain values are untouched.
+
 ## Resource Footprint
 
 | | Kafka Connect worker | Millpond pod |
