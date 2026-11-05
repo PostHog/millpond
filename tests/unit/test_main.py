@@ -1,4 +1,9 @@
 import logging
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import duckdb
@@ -1854,3 +1859,99 @@ class TestFinalFlushAfterPermanentFailure:
         assert _final_flush_decision(5, None, started=True) == "flush"
         assert _final_flush_decision(5, None, started=False) == "none"
         assert _final_flush_decision(0, permanent, started=True) == "none"
+
+
+
+_EXIT_PRELUDE = """
+import atexit, logging, sys, time
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+# Stands in for pyarrow's atexit S3 finalization, which never returns
+# with IRSA web-identity credentials and a live S3FileSystem.
+atexit.register(time.sleep, 600)
+"""
+
+
+def _spawn(body: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-c", _EXIT_PRELUDE + textwrap.dedent(body)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+
+class TestRunEntryPoint:
+    """`millpond` (the console script) is `run`: main(), then os._exit, so
+    no atexit hook can hold a terminating pod for its whole grace period."""
+
+    @pytest.mark.parametrize(
+        ("main_body", "code"),
+        [
+            ("return 0", 0),
+            ("raise RuntimeError('loop died')", 1),
+            ("raise KeyboardInterrupt", 130),
+            ("raise SystemExit", 0),
+            ("raise SystemExit(3)", 3),
+            ("raise SystemExit('fatal: bad config')", 1),
+        ],
+    )
+    def test_exits_with_mains_code_without_running_atexit_hooks(self, main_body, code):
+        r = _spawn(f"""
+            from millpond import main as m
+            def fake_main():
+                print("last words")
+                {main_body}
+            m.main = fake_main
+            m.run()
+        """)
+        assert r.returncode == code, r.stderr
+        assert "last words" in r.stdout  # stdout flushed before os._exit
+        if "RuntimeError" in main_body or "KeyboardInterrupt" in main_body:
+            assert "Traceback" in r.stderr
+        if "bad config" in main_body:
+            assert "fatal: bad config" in r.stderr
+
+    def test_a_handler_whose_flush_hangs_is_not_flushed(self):
+        r = _spawn("""
+            class OtlpLike(logging.Handler):
+                def emit(self, record): pass
+                def flush(self): time.sleep(600)
+            logging.getLogger().addHandler(OtlpLike())
+            from millpond import main as m
+            m.main = lambda: 0
+            m.run()
+        """)
+        assert r.returncode == 0, r.stderr
+
+    @pytest.mark.parametrize("error", ["BrokenPipeError", "ValueError"])
+    def test_a_stream_whose_flush_raises_still_exits(self, error):
+        r = _spawn(f"""
+            class Broken:
+                def write(self, s): return len(s)
+                def flush(self): raise {error}("gone")
+            from millpond import main as m
+            m.main = lambda: 0
+            sys.stdout = Broken()
+            m.run()
+        """)
+        assert r.returncode == 0, r.stderr
+
+    def test_python_dash_m_goes_through_run(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("KAFKA_", "MILLPOND_", "HOGLAKE_", "DUCKLAKE_"))}
+        r = _spawn(
+            """
+            import runpy
+            runpy.run_module("millpond.main", run_name="__main__", alter_sys=True)
+            """,
+            env=env,
+        )
+        assert r.returncode == 1, r.stderr
+        assert "Required environment variable KAFKA_TOPIC is not set" in r.stderr
+
+    def test_the_console_script_is_run(self):
+        import tomllib
+
+        with open(Path(__file__).parents[2] / "pyproject.toml", "rb") as f:
+            scripts = tomllib.load(f)["project"]["scripts"]
+        assert scripts["millpond"] == "millpond.main:run"

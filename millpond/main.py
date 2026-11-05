@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 import signal
 import sys
@@ -1189,5 +1190,61 @@ def main():
     return 0
 
 
+def run() -> None:
+    """The process entry point: main(), then exit without the interpreter's
+    atexit hooks or finalizers.
+
+    By the time main() returns or raises, offsets are committed and the
+    sink, consumer and logger provider are closed; nothing is left to run.
+    What used to run next is pyarrow's atexit S3 finalization, and with
+    web-identity credentials (IRSA) and an S3FileSystem still alive it
+    never returns (apache/arrow#50188): every hoglake pod sat out its
+    whole termination grace period after "shutdown complete" and was
+    SIGKILLed. It cannot be bounded from Python either: the finalize call
+    holds the GIL while it blocks. So it is not run at all.
+
+    Exit codes follow `sys.exit(main())`: main()'s return value, a
+    SystemExit's code (its message printed), 130 for KeyboardInterrupt,
+    1 with a traceback for any other uncaught error."""
+    code = 1
+    try:
+        code = main() or 0
+    except SystemExit as e:
+        if e.code is None or isinstance(e.code, int):
+            code = e.code or 0
+        else:
+            print(e.code, file=sys.stderr)
+            code = 1
+    except KeyboardInterrupt:
+        import traceback
+
+        traceback.print_exc()
+        code = 130
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()
+        code = 1
+    finally:
+        try:
+            # Plain stream handlers only: the OTLP handler's provider is
+            # already shut down, and flushing it is not guaranteed to return.
+            for handler in logging.getLogger().handlers:
+                if type(handler) is logging.StreamHandler:
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+        finally:
+            # Unconditional: a flush that raises (a broken pipe, a closed
+            # stream) must not hand the exit back to the interpreter.
+            os._exit(code)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    run()

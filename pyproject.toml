@@ -121,7 +121,7 @@ dependencies = [
 msk-iam = ["aws-msk-iam-sasl-signer-python>=1.0.0"]
 
 [project.scripts]
-millpond = "millpond.main:main"
+millpond = "millpond.main:run"
 
 [dependency-groups]
 dev = [
