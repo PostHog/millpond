@@ -1226,17 +1226,24 @@ def run() -> None:
         traceback.print_exc()
         code = 1
     finally:
-        # Plain stream handlers only: the OTLP handler's provider is
-        # already shut down, and flushing it is not guaranteed to return.
-        for handler in logging.getLogger().handlers:
-            if type(handler) is logging.StreamHandler:
+        try:
+            # Plain stream handlers only: the OTLP handler's provider is
+            # already shut down, and flushing it is not guaranteed to return.
+            for handler in logging.getLogger().handlers:
+                if type(handler) is logging.StreamHandler:
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
+            for stream in (sys.stdout, sys.stderr):
                 try:
-                    handler.flush()
+                    stream.flush()
                 except Exception:
                     pass
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(code)
+        finally:
+            # Unconditional: a flush that raises (a broken pipe, a closed
+            # stream) must not hand the exit back to the interpreter.
+            os._exit(code)
 
 
 if __name__ == "__main__":

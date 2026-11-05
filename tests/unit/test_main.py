@@ -1924,6 +1924,19 @@ class TestRunEntryPoint:
         """)
         assert r.returncode == 0, r.stderr
 
+    @pytest.mark.parametrize("error", ["BrokenPipeError", "ValueError"])
+    def test_a_stream_whose_flush_raises_still_exits(self, error):
+        r = _spawn(f"""
+            class Broken:
+                def write(self, s): return len(s)
+                def flush(self): raise {error}("gone")
+            from millpond import main as m
+            m.main = lambda: 0
+            sys.stdout = Broken()
+            m.run()
+        """)
+        assert r.returncode == 0, r.stderr
+
     def test_python_dash_m_goes_through_run(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("KAFKA_", "MILLPOND_", "HOGLAKE_", "DUCKLAKE_"))}
         r = _spawn(
