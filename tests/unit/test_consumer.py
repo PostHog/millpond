@@ -164,6 +164,8 @@ def _make_cfg(**overrides) -> Config:
         rds_password="pass",
         partition_by=None,
         ducklake_max_retry_count=100,
+        ducklake_retry_wait_ms=250,
+        ducklake_retry_backoff=1.0,
         duckdb_memory_limit=None,
         flush_size=100,
         flush_interval_ms=1000,

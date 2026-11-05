@@ -104,6 +104,8 @@ class TestConnect:
         cfg = MagicMock()
         cfg.ducklake_connection = ":memory:"
         cfg.ducklake_max_retry_count = 100
+        cfg.ducklake_retry_wait_ms = 250
+        cfg.ducklake_retry_backoff = 1.0
         cfg.duckdb_memory_limit = None
         cfg.ducklake_data_path = "s3://bucket/prefix"
         conn = MagicMock()
@@ -112,6 +114,28 @@ class TestConnect:
             assert connect(cfg) is conn
         statements = [c.args[0] for c in conn.execute.call_args_list]
         assert any(s.strip() == "SET TimeZone = 'UTC'" for s in statements)
+
+    def test_the_commit_retry_ladder_is_set(self):
+        """DuckLake's own retry backoff (1.5x, uncapped) sleeps past the
+        liveness deadline after ~20 lost commit races; connect() must
+        replace all three settings, not just the count."""
+        from millpond.ducklake import connect
+
+        cfg = MagicMock()
+        cfg.ducklake_connection = ":memory:"
+        cfg.ducklake_max_retry_count = 100
+        cfg.ducklake_retry_wait_ms = 250
+        cfg.ducklake_retry_backoff = 1.0
+        cfg.duckdb_memory_limit = None
+        cfg.ducklake_data_path = "s3://bucket/prefix"
+        conn = MagicMock()
+        with patch("millpond.ducklake.duckdb") as mock_duckdb:
+            mock_duckdb.connect.return_value = conn
+            connect(cfg)
+        statements = [c.args[0].strip() for c in conn.execute.call_args_list]
+        assert "SET ducklake_max_retry_count = 100" in statements
+        assert "SET ducklake_retry_wait_ms = 250" in statements
+        assert "SET ducklake_retry_backoff = 1.0" in statements
 
 
 def _sample_batch() -> pa.Table:

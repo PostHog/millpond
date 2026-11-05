@@ -174,6 +174,51 @@ class TestLoad:
         with pytest.raises(RuntimeError, match="DUCKLAKE_MAX_RETRY_COUNT.*positive integer"):
             load()
 
+    def test_ducklake_retry_wait_defaults_to_a_flat_250ms(self):
+        # DuckLake's own 1.5x backoff is uncapped: retry 22 alone sleeps
+        # ~8 min, past the liveness deadline (the prod ws-events hangs).
+        cfg = load()
+        assert cfg.ducklake_retry_wait_ms == 250
+        assert cfg.ducklake_retry_backoff == 1.0
+
+    def test_ducklake_retry_knobs_explicit_values(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_RETRY_WAIT_MS", "50")
+        monkeypatch.setenv("DUCKLAKE_RETRY_BACKOFF", "1.05")
+        cfg = load()
+        assert cfg.ducklake_retry_wait_ms == 50
+        assert cfg.ducklake_retry_backoff == 1.05
+
+    @pytest.mark.parametrize(("var", "value"), [("DUCKLAKE_RETRY_WAIT_MS", "0"), ("DUCKLAKE_RETRY_BACKOFF", "0.9")])
+    def test_ducklake_retry_knobs_out_of_range_rejected(self, monkeypatch, var, value):
+        monkeypatch.setenv(var, value)
+        with pytest.raises(RuntimeError, match=var):
+            load()
+
+    def test_duckdbs_default_backoff_is_refused(self, monkeypatch):
+        # 100 retries at DuckLake's own 100 ms x 1.5^n: the config that
+        # hung prod. Refused at load, not discovered by a SIGKILL.
+        monkeypatch.setenv("DUCKLAKE_RETRY_WAIT_MS", "100")
+        monkeypatch.setenv("DUCKLAKE_RETRY_BACKOFF", "1.5")
+        with pytest.raises(RuntimeError, match="liveness deadline"):
+            load()
+
+    def test_the_ducklake_defaults_fit_inside_the_liveness_budget(self):
+        from millpond.config import _LIVENESS_BUDGET_S, _ducklake_worst_case_flush_s
+
+        cfg = load()
+        worst = _ducklake_worst_case_flush_s(
+            cfg.ducklake_max_retry_count, cfg.ducklake_retry_wait_ms, cfg.ducklake_retry_backoff
+        )
+        # 3 outer attempts x 100 x 250 ms + the outer ladder: ~79 s.
+        assert worst <= _LIVENESS_BUDGET_S - 120.0
+
+    def test_the_ducklake_model_prices_the_inner_ladder_per_outer_attempt(self):
+        from millpond.config import _ducklake_worst_case_flush_s
+
+        flat = _ducklake_worst_case_flush_s(10, 1000, 1.0)
+        assert flat - _ducklake_worst_case_flush_s(9, 1000, 1.0) == pytest.approx(3.0)
+        assert _ducklake_worst_case_flush_s(10, 1000, 1.5) > flat
+
     def test_partition_by_default_none(self):
         cfg = load()
         assert cfg.partition_by is None

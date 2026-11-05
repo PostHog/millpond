@@ -58,7 +58,7 @@ Millpond writes to one of two destinations, selected by `MILLPOND_DESTINATION` (
 | `_inserted_at` column | Added at INSERT via DuckDB `NOW()` (per-row, microsecond drift possible within a flush) | Stamped Arrow-side, one timestamptz value per flush (every row in a flush shares it) |
 | Multi-pod concurrent writes | Native; idempotent DDL handles races | Native; appends never conflict with appends. Each commit carries the `read_snapshot` its files were built against, so DDL landing in between is refused as `ddl_since_read_snapshot` — not a wrong file — and the flush rebuilds against a fresh read; the incarnation guard (`expected_table_uuid`) refuses cross-incarnation appends atomically |
 | Startup validation | Connects in the sink constructor | Resolves the catalog in the sink constructor, so a bad URL, bad credentials or a missing catalog fails before the pod claims readiness |
-| Commit retries | `DUCKLAKE_MAX_RETRY_COUNT` (inner loop, default 100) under millpond's 3 outer attempts | `HOGLAKE_MAX_RETRY_COUNT` outer attempts (default 6; there is no inner loop), honoring the server's `Retry-After` on 503 backpressure as a floor under the exponential curve |
+| Commit retries | `DUCKLAKE_MAX_RETRY_COUNT` (inner loop, default 100, a flat 250 ms apart) under millpond's 3 outer attempts | `HOGLAKE_MAX_RETRY_COUNT` outer attempts (default 6; there is no inner loop), honoring the server's `Retry-After` on 503 backpressure as a floor under the exponential curve |
 
 Both sinks (`millpond/ducklake.py`, `millpond/hoglake.py`) implement the `Sink` protocol (`millpond/sink.py`) and expose three methods to `main.py`: `write(batch) -> int`, `reset_caches()`, `close()`. `make_sink(cfg)` dispatches on the destination with lazy backend imports.
 
@@ -366,6 +366,8 @@ All configuration via environment variables.
 | `DUCKLAKE_RDS_USERNAME` | no | `ducklake` | Postgres username |
 | `DUCKLAKE_RDS_PASSWORD` | yes | | Postgres password |
 | `DUCKLAKE_MAX_RETRY_COUNT` | no | `100` | DuckLake commit-retry budget (`SET ducklake_max_retry_count`). DuckLake's own default of 10 starves multi-writer deployments — losers of the snapshot-id race surface as `ducklake_snapshot_pkey` duplicate-key errors. Must be positive. |
+| `DUCKLAKE_RETRY_WAIT_MS` | no | `250` | Wait before each DuckLake commit retry (`SET ducklake_retry_wait_ms`). Must be positive. |
+| `DUCKLAKE_RETRY_BACKOFF` | no | `1.0` | Growth factor of that wait per retry (`SET ducklake_retry_backoff`). DuckLake's own default, 1.5, is uncapped: retry 22 alone sleeps ~8 min, on the consume loop's only thread, so the pod goes silent and is killed by the liveness probe. Must be >= 1.0. Startup refuses a count / wait / backoff whose worst-case sleep (x 3 outer attempts) exceeds the 480 s liveness deadline. |
 | `DUCKLAKE_PARTITION_BY` | no | | Hive-style partition expression (e.g. `year(_inserted_at),month(_inserted_at),day(_inserted_at),hour(_inserted_at)`). Applied via `ALTER TABLE SET PARTITIONED BY` on first write. |
 | `DUCKDB_S3_ACCESS_KEY_ID` | yes | | Static S3 access key for DuckDB |
 | `DUCKDB_S3_SECRET_ACCESS_KEY` | yes | | Static S3 secret for DuckDB |

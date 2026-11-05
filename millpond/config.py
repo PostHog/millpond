@@ -73,6 +73,17 @@ class Config:
     # 100 default (the value DuckLake's own error message suggests).
     ducklake_max_retry_count: int | None
 
+    # The wait between those retries: DuckLake sleeps retry_wait_ms x
+    # retry_backoff^n before retry n+1, with no cap. Its default backoff
+    # (1.5) makes retry 22 alone sleep 8 minutes, past the liveness
+    # deadline, so a writer that loses ~20 commit races in a row is
+    # SIGKILLed mid-sleep. A flat wait (backoff 1.0) keeps the whole ladder
+    # bounded: 100 retries x 250 ms = 25 s. Loaded from
+    # DUCKLAKE_RETRY_WAIT_MS / DUCKLAKE_RETRY_BACKOFF and checked against
+    # the liveness budget at load.
+    ducklake_retry_wait_ms: int | None
+    ducklake_retry_backoff: float | None
+
     # Optional DuckDB memory_limit (e.g. "6GB"). Unset, DuckDB budgets
     # ~80% of the cgroup limit and competes with the Arrow pending buffer
     # for RSS during the partitioned INSERT — at large FLUSH_SIZE the sum
@@ -634,6 +645,13 @@ def _load_ducklake_fields() -> dict[str, str | None]:
     ducklake_max_retry_count = int(os.environ.get("DUCKLAKE_MAX_RETRY_COUNT", "100"))
     if ducklake_max_retry_count <= 0:
         raise RuntimeError(f"DUCKLAKE_MAX_RETRY_COUNT={ducklake_max_retry_count!r} must be a positive integer")
+    ducklake_retry_wait_ms = int(os.environ.get("DUCKLAKE_RETRY_WAIT_MS", "250"))
+    if ducklake_retry_wait_ms <= 0:
+        raise RuntimeError(f"DUCKLAKE_RETRY_WAIT_MS={ducklake_retry_wait_ms!r} must be a positive integer")
+    ducklake_retry_backoff = float(os.environ.get("DUCKLAKE_RETRY_BACKOFF", "1.0"))
+    if not ducklake_retry_backoff >= 1.0:
+        raise RuntimeError(f"DUCKLAKE_RETRY_BACKOFF={ducklake_retry_backoff!r} must be >= 1.0")
+    _check_ducklake_liveness_budget(ducklake_max_retry_count, ducklake_retry_wait_ms, ducklake_retry_backoff)
 
     return {
         "ducklake_schema": ducklake_schema,
@@ -647,6 +665,8 @@ def _load_ducklake_fields() -> dict[str, str | None]:
         "rds_password": _require("DUCKLAKE_RDS_PASSWORD"),
         "partition_by": partition_by,
         "ducklake_max_retry_count": ducklake_max_retry_count,
+        "ducklake_retry_wait_ms": ducklake_retry_wait_ms,
+        "ducklake_retry_backoff": ducklake_retry_backoff,
         "duckdb_memory_limit": os.environ.get("DUCKDB_MEMORY_LIMIT") or None,
     }
 
@@ -667,6 +687,8 @@ _NONE_DUCKLAKE_FIELDS: dict = dict.fromkeys(
         "rds_password",
         "partition_by",
         "ducklake_max_retry_count",
+        "ducklake_retry_wait_ms",
+        "ducklake_retry_backoff",
         "duckdb_memory_limit",
     )
 )
@@ -788,6 +810,8 @@ _LIVENESS_BUDGET_S = 480.0
 _BACKOFF_BASE_S = 1.0
 _BACKOFF_CAP_S = 30.0
 _BACKOFF_JITTER = 0.25
+# main.py's outer attempts around a DuckLake write (_WRITE_MAX_RETRIES).
+_DUCKLAKE_OUTER_ATTEMPTS = 3
 
 
 # Local work every hoglake attempt does before it issues its commit, and
@@ -819,6 +843,34 @@ def _hoglake_worst_case_flush_s(max_retries: int, timeout_s: float) -> float:
     backoff ladder between them."""
     ladder = sum(min(_BACKOFF_BASE_S * (2**attempt), _BACKOFF_CAP_S) for attempt in range(max(0, max_retries - 1)))
     return max_retries * (timeout_s + _PREPARE_ALLOWANCE_S) + ladder * (1 + _BACKOFF_JITTER)
+
+
+def _ducklake_worst_case_flush_s(max_retries: int, wait_ms: int, backoff: float) -> float:
+    """Longest a single sink.write() can sleep: DuckLake's inner ladder
+    (wait x backoff^n before each of its retries) in every one of
+    main.py's outer attempts, plus the outer backoff ladder between them.
+    Sleep only: the commits themselves are not priced."""
+    attempts = _DUCKLAKE_OUTER_ATTEMPTS
+    inner = sum(wait_ms / 1000.0 * backoff**n for n in range(max_retries))
+    ladder = sum(min(_BACKOFF_BASE_S * (2**attempt), _BACKOFF_CAP_S) for attempt in range(attempts - 1))
+    return attempts * inner + ladder * (1 + _BACKOFF_JITTER)
+
+
+def _check_ducklake_liveness_budget(max_retries: int, wait_ms: int, backoff: float) -> None:
+    """Refuse a DuckLake retry ladder that can sleep past the liveness
+    deadline. DuckLake's inner commit retry sleeps inside the INSERT, on
+    the consume loop's only thread, with no log line, so springing it
+    looks like a pod that goes silent and is SIGKILLed ~28 minutes later
+    (480 s poll age + 40 failed probes)."""
+    worst = _ducklake_worst_case_flush_s(max_retries, wait_ms, backoff)
+    if worst <= _LIVENESS_BUDGET_S:
+        return
+    raise RuntimeError(
+        f"DUCKLAKE_MAX_RETRY_COUNT={max_retries} with DUCKLAKE_RETRY_WAIT_MS={wait_ms} and "
+        f"DUCKLAKE_RETRY_BACKOFF={backoff} allows a single flush to sleep up to {worst:.0f}s inside "
+        f"sink.write(), past the {_LIVENESS_BUDGET_S:.0f}s liveness deadline "
+        f"(server.HealthState.max_poll_age_s). Lower one of the three."
+    )
 
 
 # How much of the liveness budget the runtime deadline refuses to spend,
