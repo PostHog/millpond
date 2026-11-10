@@ -94,10 +94,18 @@ _uuid_filter_values_warned: set[tuple[str, int, str]] = set()
 _uuid_filter_values_memo: tuple | None = None
 
 
-def _convert_batch(values: list[bytes]) -> pa.Table | None:
+def _json_text_columns(sink) -> frozenset[str]:
+    """The sink's columns whose mixed-type values the converter must
+    JSON-serialize rather than `str()`: the hoglake sink's live variant
+    columns. Duck-typed like the retry hooks; DuckLake has none."""
+    hook = getattr(sink, "json_text_columns", None)
+    return frozenset() if hook is None else hook()
+
+
+def _convert_batch(values: list[bytes], sink=None) -> pa.Table | None:
     """Convert raw message values to Arrow, timing the conversion."""
     t0 = time.monotonic()
-    table = arrow_converter.convert(values)
+    table = arrow_converter.convert(values, json_text_columns=_json_text_columns(sink))
     if table is not None:
         duration = time.monotonic() - t0
         metrics.arrow_conversion_seconds.observe(duration)
@@ -713,7 +721,6 @@ def _write_with_retry(
     write_kwargs = write_kwargs or {}
     max_attempts, base_delay = _write_retry_budget(sink)
     classify_retryable = getattr(sink, "is_retryable", None)
-    deadline = _flush_deadline(sink)
     started = now()
     for attempt in range(max_attempts):
         try:
@@ -738,6 +745,13 @@ def _write_with_retry(
             if attempt == max_attempts - 1:
                 raise
             delay = _retry_delay(sink, attempt, base_delay)
+            # Read AFTER the failed attempt, every time: the hoglake
+            # sink's reservation is derived from the duration of the
+            # prepare it just ran, so the first attempt of a 2 GiB
+            # variant flush is what tells the loop what the second will
+            # cost. Read once up front it would price every attempt at
+            # the pre-flush floor.
+            deadline = _flush_deadline(sink)
             if deadline is not None:
                 budget_s, attempt_cost_s = deadline
                 elapsed = now() - started
@@ -1059,7 +1073,7 @@ def main():
 
                 if values:
                     skipped = 0
-                    table = _convert_batch(values)
+                    table = _convert_batch(values, sink)
                     if table is not None:
                         skipped = len(values) - len(table)
                         table = _coerce_columns(table, cfg)

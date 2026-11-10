@@ -263,6 +263,150 @@ _variant_write_fallback_total = Counter(
     "Flushes written string-only after the VARIANT projection failed",
     ["pipeline", "broker_source"],
 )
+# Hoglake destination only: what pyhoglake's encoder did with the rows of
+# the destination's live `variant` columns, read off the `VariantReport`
+# of each `prepare_append_tables` (hoglake._observe_variant_*). Named as
+# millrace names the same counts (millrace/main.py's `variant_families`),
+# so one dashboard reads both.
+#
+# BOOKED ONCE PER PUBLISHED FLUSH, at the commit, not per prepare: a
+# commit the server refuses as `ddl_since_read_snapshot` is REBUILT, and
+# the rebuild re-encodes the same rows with a fresh report. Booking per
+# prepare counted them twice. The encode-time histogram and the codec
+# counters below are the exception — they are costs the attempt really
+# spent, so they are booked per prepare.
+#
+# `rows_total` and `invalid_total` count COLUMN-ROWS summed over every
+# variant column of the flush — pyhoglake fills one report per prepare
+# and does not split rows or invalid reasons by column — so a table with
+# seven variant columns books seven per row. `outcome`: `encoded` (a
+# Variant value, a JSON `null` included), `sql_null` (the source was SQL
+# NULL: the key was absent, or another writer's column), `invalid` (the
+# text could not be encoded and landed as SQL NULL under
+# MILLPOND_HOGLAKE_VARIANT_ON_INVALID=null; under `raise` the flush
+# failed and nothing is booked). `reason` is the encoder's closed
+# vocabulary (`pyhoglake.variant.InvalidReason`: `invalid_json`,
+# `duplicate_key`, `non_finite_number`, `integer_out_of_range`,
+# `invalid_unicode`, `nesting_too_deep`, ...).
+_variant_rows_total = Counter(
+    "millpond_variant_rows_total",
+    "Variant column-rows encoded for hoglake, by outcome (encoded|sql_null|invalid)",
+    ["pipeline", "broker_source", "outcome"],
+)
+_variant_invalid_total = Counter(
+    "millpond_variant_invalid_total",
+    "Variant column-rows that could not be encoded and landed as SQL NULL, by the encoder's reason",
+    ["pipeline", "broker_source", "reason"],
+)
+# Per DECLARED path of each variant column: how well the immutable
+# shredding declaration fits the data. `typed` went to the path's
+# `typed_value` leaf; `fallback` stayed in `value` because its type did
+# not match (a string under an int64, an int under a double); and
+# `variant_null` is a present JSON null, counted apart so an often-null key
+# does not read as a mismatch. A missing key is in none of them. Labels
+# come from the catalog's declaration (at most 1000 paths per column,
+# fixed for the column's life), never from a payload key, so the series
+# set is bounded by the table. A rising `fallback` share on a path means
+# the declaration is wrong for the data and the column needs replacing.
+_variant_values_total = Counter(
+    "millpond_variant_values_total",
+    "Variant values per declared shredding path, by where they landed (typed|fallback|variant_null)",
+    ["pipeline", "broker_source", "column", "path", "outcome"],
+)
+# Wall seconds pyhoglake's encoder spent per PREPARE (one observation per
+# attempt, a rebuild included), across every group and variant column,
+# apart from the parquet write and the uploads: the encode's own share of
+# the flush pause. `backend` is the codec in use (`native` for the Rust
+# pyhoglake-variant-codec, `python` for the reference encoder, `unknown`
+# if pyhoglake stopped saying), fixed per process by
+# PYHOGLAKE_VARIANT_CODEC. Buckets are sized for the whales writer's
+# 2 GiB / ~155k-row flush (~13.8 KB/row, seven variant columns): the
+# Rust codec at ~27 us/row on an M4 and ~50-65 us/row on prod's Graviton
+# is ~4-10 s, the Python encoder at 6-10x that is ~50-85 s on the M4 and
+# several minutes on prod, and the top bucket is the 480 s liveness
+# deadline itself, so an encode that would have been fatal is visible as
+# one rather than lost in +Inf. The low end still resolves a
+# time-triggered trickle.
+_variant_encode_seconds = Histogram(
+    "millpond_variant_encode_seconds",
+    "Wall seconds per prepare spent encoding variant columns, by codec backend",
+    ["pipeline", "broker_source", "backend"],
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120, 240, 480],
+)
+# Transitional, while pyhoglake carries both codecs. Four counters off
+# pyhoglake's `_variant_backend` process counters (`ENCODE_FALLBACKS`,
+# `DECODE_FALLBACKS`, `ROUTED`, `SHADOWED`), synced after every prepare,
+# with the same names and labels as millrace's so one dashboard reads
+# both pipelines; every label set is pre-created at 0 when the sink is
+# built so `increase()` sees a pod's first.
+#
+# `codec_fallback_total`: encode calls whose Rust result was not used and
+# Python encoded again (`mismatch`, `type`, `panic`, `shadow_mismatch`).
+# The output is correct either way; nonzero is a codec bug report for
+# hoglake, and the CPU of the call twice.
+_variant_codec_fallback_total = Counter(
+    "millpond_variant_codec_fallback_total",
+    "Variant encodes Python redid for the Rust codec, by reason, per process (transitional)",
+    ["pipeline", "broker_source", "reason"],
+)
+# `codec_decode_fallback_total`: storage reads where the Python codec's
+# verdict replaced the Rust codec's (`mismatch`, `panic`). The sink never
+# reads storage itself, but pyhoglake checks every Rust-encoded chunk
+# with `structure_fault` before using it, which is a read.
+_variant_codec_decode_fallback_total = Counter(
+    "millpond_variant_codec_decode_fallback_total",
+    "Variant storage reads the Python codec decided where the Rust codec disagreed or panicked, "
+    "by reason, per process (transitional)",
+    ["pipeline", "broker_source", "reason"],
+)
+# `codec_routed_to_python_total`: THE SILENT-PYTHON SIGNAL. Under
+# PYHOGLAKE_VARIANT_CODEC=auto a call the Rust codec does not take goes
+# to Python without a fallback being counted: `encode` for `unavailable`
+# (no importable wheel), `plan` (a declaration it does not take) or
+# `not_utf8`; `decode` for `unavailable` or `storage`. The process-level
+# `backend` label says `native` the whole time. A nonzero rate here on a
+# `native` pod is a pod paying the Python encoder's CPU per call.
+_variant_codec_routed_to_python_total = Counter(
+    "millpond_variant_codec_routed_to_python_total",
+    "Variant encodes and storage reads PYHOGLAKE_VARIANT_CODEC=auto gave the Python codec, "
+    "by op and reason, per process (transitional)",
+    ["pipeline", "broker_source", "op", "reason"],
+)
+# The shadow (PYHOGLAKE_VARIANT_SHADOW): how many calls and rows the
+# Python encoder re-encoded to compare, and the wall seconds it spent
+# doing so (NOT in `encode_seconds`; pure CPU on the flush thread).
+_variant_shadow_calls_total = Counter(
+    "millpond_variant_shadow_calls_total",
+    "Variant encodes PYHOGLAKE_VARIANT_SHADOW compared, per process; "
+    "codec_fallback reason shadow_mismatch counts the ones that differed (transitional)",
+    ["pipeline", "broker_source"],
+)
+_variant_shadow_rows_total = Counter(
+    "millpond_variant_shadow_rows_total",
+    "Variant rows PYHOGLAKE_VARIANT_SHADOW encoded in Python again and compared, per process (transitional)",
+    ["pipeline", "broker_source"],
+)
+_variant_shadow_seconds_total = Counter(
+    "millpond_variant_shadow_seconds_total",
+    "Seconds PYHOGLAKE_VARIANT_SHADOW spent encoding variant columns in Python again, per prepare (transitional)",
+    ["pipeline", "broker_source"],
+)
+# Invalid rows nested past a JSON parser's recursion bound, whose verdict
+# is the Python codec's. Not a fallback (nothing is encoded twice) and a
+# hostile row can cause one, so it is counted apart.
+_variant_codec_recursion_bound_rows_total = Counter(
+    "millpond_variant_codec_recursion_bound_rows_total",
+    "Invalid variant rows past a JSON parser's recursion bound, whose verdict is the Python codec's, "
+    "per prepare (transitional)",
+    ["pipeline", "broker_source"],
+)
+# The codec this process encodes variant columns with, as a labelled 1,
+# so a dashboard can `sum by (backend)` the fleet without scraping logs.
+_variant_codec_info = Gauge(
+    "millpond_variant_codec_info",
+    "The codec encoding variant columns: native (Rust) or python (PYHOGLAKE_VARIANT_CODEC; transitional)",
+    ["pipeline", "broker_source", "backend"],
+)
 # Hoglake destination only: parquet files registered per append commit.
 # Partitioned fanout writes one file per partition tuple per flush, so
 # this is the compaction-debt feed rate on the hoglake side. Stays at
@@ -404,6 +548,18 @@ columns_coerced_total = _columns_coerced_total
 variant_companion_columns_dropped_total = _variant_companion_columns_dropped_total
 variant_write_fallback_total = _variant_write_fallback_total
 variant_values_coerced_total = _variant_values_coerced_total
+variant_rows_total = _variant_rows_total
+variant_invalid_total = _variant_invalid_total
+variant_values_total = _variant_values_total
+variant_encode_seconds = _variant_encode_seconds
+variant_codec_fallback_total = _variant_codec_fallback_total
+variant_codec_decode_fallback_total = _variant_codec_decode_fallback_total
+variant_codec_routed_to_python_total = _variant_codec_routed_to_python_total
+variant_shadow_calls_total = _variant_shadow_calls_total
+variant_shadow_rows_total = _variant_shadow_rows_total
+variant_shadow_seconds_total = _variant_shadow_seconds_total
+variant_codec_recursion_bound_rows_total = _variant_codec_recursion_bound_rows_total
+variant_codec_info = _variant_codec_info
 hoglake_files_written_total = _hoglake_files_written_total
 hoglake_commit_replays_total = _hoglake_commit_replays_total
 hoglake_orphaned_files_total = _hoglake_orphaned_files_total
@@ -436,6 +592,10 @@ def init(pipeline: str, broker_source: str = ""):
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total, variant_companion_columns_dropped_total
     global variant_write_fallback_total, variant_values_coerced_total, hoglake_files_written_total
+    global variant_rows_total, variant_invalid_total, variant_values_total
+    global variant_encode_seconds, variant_codec_fallback_total, variant_codec_decode_fallback_total
+    global variant_codec_routed_to_python_total, variant_shadow_calls_total, variant_shadow_rows_total
+    global variant_shadow_seconds_total, variant_codec_recursion_bound_rows_total, variant_codec_info
     global hoglake_commit_replays_total, hoglake_orphaned_files_total
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
@@ -495,6 +655,20 @@ def init(pipeline: str, broker_source: str = ""):
     hoglake_commit_replays_total = _AutoCommonLabels(_hoglake_commit_replays_total, pipeline, bs)
     hoglake_orphaned_files_total = _AutoCommonLabels(_hoglake_orphaned_files_total, pipeline, bs)
     variant_values_coerced_total = _variant_values_coerced_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_rows_total = _AutoCommonLabels(_variant_rows_total, pipeline, bs)
+    variant_invalid_total = _AutoCommonLabels(_variant_invalid_total, pipeline, bs)
+    variant_values_total = _AutoCommonLabels(_variant_values_total, pipeline, bs)
+    variant_encode_seconds = _AutoCommonLabels(_variant_encode_seconds, pipeline, bs)
+    variant_codec_fallback_total = _AutoCommonLabels(_variant_codec_fallback_total, pipeline, bs)
+    variant_codec_decode_fallback_total = _AutoCommonLabels(_variant_codec_decode_fallback_total, pipeline, bs)
+    variant_codec_routed_to_python_total = _AutoCommonLabels(_variant_codec_routed_to_python_total, pipeline, bs)
+    variant_shadow_calls_total = _variant_shadow_calls_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_shadow_rows_total = _variant_shadow_rows_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_shadow_seconds_total = _variant_shadow_seconds_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_codec_recursion_bound_rows_total = _variant_codec_recursion_bound_rows_total.labels(
+        pipeline=pipeline, broker_source=bs
+    )
+    variant_codec_info = _AutoCommonLabels(_variant_codec_info, pipeline, bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_size = _rdkafka_msg_size.labels(pipeline=pipeline, broker_source=bs)

@@ -142,6 +142,16 @@ class Config:
     # server's hydrator (`prepare_append_tables(deferred_stats=True)`)
     # instead of shipped inline in the commit. See _hoglake_deferred_stats.
     hoglake_deferred_stats: bool | None
+    # What a hoglake flush does with a row whose JSON text cannot be
+    # encoded into a live `variant` column: `null` (the row lands with SQL
+    # NULL in that column, counted) or `raise` (the flush fails). See
+    # _hoglake_variant_on_invalid.
+    hoglake_variant_on_invalid: str | None
+    # Whether a pod whose variant codec resolved to pyhoglake's Python
+    # encoder may start (MILLPOND_ALLOW_PYTHON_VARIANT_CODEC). Default
+    # False: the Rust codec is a dependency, not an optimisation. See
+    # _hoglake_allow_python_variant_codec.
+    hoglake_allow_python_variant_codec: bool | None
 
     # Flush triggers
     flush_size: int  # bytes of accumulated Arrow data
@@ -709,6 +719,8 @@ _NONE_HOGLAKE_FIELDS: dict = dict.fromkeys(
         "hoglake_compression",
         "hoglake_compression_level",
         "hoglake_deferred_stats",
+        "hoglake_variant_on_invalid",
+        "hoglake_allow_python_variant_codec",
     )
 )
 
@@ -822,19 +834,37 @@ _DUCKLAKE_OUTER_ATTEMPTS = 3
 # a `ddl_since_read_snapshot` refusal is now a routine per-attempt cost
 # while a producer rollout adds columns under a running fleet.
 #
-# BASIS, so the number is auditable rather than round: the local-stack
-# integration suite flushes 9 rows over 3 partitions and the slowest
-# observed `_prepare` in those runs is well under a second, which says
-# nothing about production. The figure that does is the hoglake-side
-# measurement the upload path was built from — ~4.3 s to encode and
-# ~5 waves of round trips to upload the prod-us events writer's ~105K
-# rows over ~271 partitions, call it ~10 s with the object store
-# misbehaving — doubled for headroom. It is NOT measured on this side;
-# it is a deliberate over-estimate whose only job is to stop the default
-# budget from sitting inside the measurement error of the liveness
-# deadline. Re-derive it from a real prod flush profile before trusting
-# it to more than that.
+# BASIS, so the number is auditable rather than round. Two flush shapes:
+#
+# * The prod-us events writer (string columns): ~4.3 s to encode and
+#   ~5 waves of round trips to upload ~105K rows over ~271 partitions,
+#   call it ~10 s with the object store misbehaving — doubled.
+# * The whales writer (seven VARIANT columns, ~13.8 KB/row, 2 GiB Arrow
+#   / ~155k rows / ~532 partition groups per flush): the Rust codec
+#   encodes at ~27 us/row on an M4, ~50-65 us/row on prod's Graviton
+#   (1.8-2.5x slower per core), so ~4-10 s of local work per attempt on
+#   the laptop and ~10-25 s on prod, before uploads. The Python encoder
+#   is 6-10x that (~50-85 s on the M4, several minutes on prod) and a
+#   variant table is REFUSED under it for exactly this reason (see
+#   `_hoglake_allow_python_variant_codec`): a constant that covered it
+#   would not fit six attempts inside the liveness budget at all.
+#
+# So this is a FLOOR for the native codec, not a ceiling for any flush:
+# the runtime deadline (`hoglake_flush_deadline`) replaces it with the
+# MEASURED duration of the sink's last prepare times `_PREPARE_SAFETY`
+# whenever that is larger, so a pod whose flushes really take 40 s
+# reserves 60 s per attempt and stops its ladder early rather than
+# starting an attempt the probe will kill. The startup model below keeps
+# the floor only, because it has nothing measured yet; its job is to
+# refuse a budget that is obviously impossible, not to be the
+# enforcement.
 _PREPARE_ALLOWANCE_S = 20.0
+# What a measured prepare is multiplied by to become the next attempt's
+# reservation. The next attempt rebuilds the same batch, so its encode is
+# the same work; what varies is the object store, and 1.5x covers one
+# bad upload wave without reserving so much that a healthy ladder is cut
+# short.
+_PREPARE_SAFETY = 1.5
 
 
 def _hoglake_worst_case_flush_s(max_retries: int, timeout_s: float) -> float:
@@ -880,12 +910,23 @@ def _check_ducklake_liveness_budget(max_retries: int, wait_ms: int, backoff: flo
 _FLUSH_DEADLINE_MARGIN_S = 30.0
 
 
-def hoglake_flush_deadline(timeout_s: float) -> tuple[float, float]:
+def hoglake_flush_deadline(timeout_s: float, measured_prepare_s: float | None = None) -> tuple[float, float]:
     """(wall-clock budget for one flush, cost to reserve per attempt).
 
     The RUNTIME half of the liveness story, read by
-    `main._write_with_retry` before every backoff sleep. The startup
-    model below cannot see what a real flush actually spends:
+    `main._write_with_retry` before every backoff sleep — re-read each
+    time, because the reservation MOVES: `measured_prepare_s` is the
+    wall time the sink's most recent prepare (encode + upload, success
+    or failure) actually took, and the next attempt is charged
+    `max(_PREPARE_ALLOWANCE_S, measured x _PREPARE_SAFETY)` on top of its
+    request timeout. A VARIANT flush is what made the constant
+    insufficient: the encode is per-attempt work (a rebuild after
+    `ddl_since_read_snapshot` redoes it) and its size is the batch's,
+    not a property of the code — 2 GiB of whale rows is seconds under
+    the Rust codec and a minute or more under Python, and a fixed 20 s
+    would let the loop start an attempt the liveness probe kills halfway
+    through. None (no prepare yet) is the floor alone. The startup model
+    below cannot see what a real flush actually spends:
 
     * `_retry_delay` floors each gap with the server's own `Retry-After`
       and clamps only the GAP (30 s), not the sum — six attempts and
@@ -905,7 +946,10 @@ def hoglake_flush_deadline(timeout_s: float) -> tuple[float, float]:
     model — budget, margin and per-attempt reservation — stays in the
     file that owns the arithmetic.
     """
-    return _LIVENESS_BUDGET_S - _FLUSH_DEADLINE_MARGIN_S, timeout_s + _PREPARE_ALLOWANCE_S
+    allowance = _PREPARE_ALLOWANCE_S
+    if measured_prepare_s is not None:
+        allowance = max(allowance, measured_prepare_s * _PREPARE_SAFETY)
+    return _LIVENESS_BUDGET_S - _FLUSH_DEADLINE_MARGIN_S, timeout_s + allowance
 
 
 def _check_hoglake_liveness_budget(max_retries: int, timeout_s: float) -> None:
@@ -1089,6 +1133,129 @@ def _hoglake_deferred_stats() -> bool:
     return value
 
 
+# What a flush does with a row whose JSON text cannot be encoded into a
+# live `variant` column of the destination (text that is not JSON, a
+# duplicate key, NaN/Infinity, an integer of more than 38 digits, nesting
+# deeper than 128 — pyhoglake's encoder decides, millpond only chooses the
+# consequence). Passed as `variant_on_invalid=` to every
+# `prepare_append_tables`:
+#
+#   null  — the row lands with SQL NULL in that column, the other columns
+#           intact, and is counted on
+#           `millpond_variant_invalid_total{reason}`. The default, and
+#           millrace's posture: one bad row is one null, never a stuck
+#           partition.
+#   raise — pyhoglake raises `VariantEncodingError` at the first such row,
+#           before anything is uploaded; it is a `ValidationError`, so the
+#           sink's classifier calls it permanent and the pod crashes on
+#           the batch. The partition does not advance until the row is
+#           gone from the topic. For a pipeline where a silent null is
+#           worse than an outage.
+#
+# pyhoglake refuses `null` when any live variant column is NOT NULL (an
+# invalid row would have nowhere to go); the sink refuses that destination
+# at resolve rather than on the first flush (HoglakeSink._adopt_columns).
+_HOGLAKE_DEFAULT_VARIANT_ON_INVALID = "null"
+_HOGLAKE_VARIANT_ON_INVALID = ("null", "raise")
+
+
+def _hoglake_variant_on_invalid() -> str:
+    """MILLPOND_HOGLAKE_VARIANT_ON_INVALID: `null` (default) or `raise`,
+    case-insensitive. Anything else is refused: the two readings of a
+    guess are a crash-looping partition one way and silently nulled
+    columns the other."""
+    raw = os.environ.get("MILLPOND_HOGLAKE_VARIANT_ON_INVALID", "").strip()
+    if not raw:
+        return _HOGLAKE_DEFAULT_VARIANT_ON_INVALID
+    value = raw.lower()
+    if value not in _HOGLAKE_VARIANT_ON_INVALID:
+        raise RuntimeError(
+            f"MILLPOND_HOGLAKE_VARIANT_ON_INVALID={raw!r} must be one of {', '.join(_HOGLAKE_VARIANT_ON_INVALID)}"
+        )
+    return value
+
+
+def variant_codec_backend() -> str:
+    """Which codec pyhoglake encodes variant rows with, for THIS process:
+    `native` (the Rust pyhoglake-variant-codec, the `variant-codec`
+    extra), `python` (its reference encoder), or `unknown`.
+
+    Read through pyhoglake's own selector, `_variant_backend`, which is
+    private — so this is best effort and never raises: a pyhoglake that
+    moves the module answers `unknown` rather than refusing startup. The
+    answer is fixed per process: pyhoglake reads PYHOGLAKE_VARIANT_CODEC
+    ONCE, at import, into `MODE` — so that constant is what is read here,
+    not the environment again, which may have changed since. `auto` (its
+    default) is reported as whichever codec it resolved to. The same
+    rule millrace's `variant_codec()` applies, so the two pipelines'
+    `backend` labels mean the same thing.
+
+    Only the process-level resolution. Under `auto` pyhoglake can still
+    route an individual encode call to Python (a plan the Rust codec
+    does not take, text that is not UTF-8); those are counted per call
+    on `millpond_variant_codec_routed_to_python_total`, not here.
+    """
+    try:
+        from pyhoglake import _variant_backend as backend
+
+        if backend.MODE == "python" or backend.native()[0] is None:
+            return "python"
+        return "native"
+    except Exception:  # noqa: BLE001 - a label, never a failure
+        return "unknown"
+
+
+def _hoglake_allow_python_variant_codec() -> bool:
+    """MILLPOND_ALLOW_PYTHON_VARIANT_CODEC: `true` or `false` (default),
+    case-insensitive; anything else is refused.
+
+    The gate on the one silent CPU regression this destination has. The
+    Rust codec encodes a whale-shaped row (~13.8 KB, seven variant
+    columns) in ~27 us on an M4 (~50-65 us on prod's Graviton); the
+    Python encoder takes ~172 us (~310-430 us), 6-10x, which turns a
+    2 GiB flush from seconds into a minute or more of pause on the
+    consume thread and halves a pod's throughput. The image asserts the
+    wheel is importable at build, and `pyhoglake[variant-codec]` pins it,
+    so a pod that resolves to Python is a broken image or a laptop; the
+    default refuses to WRITE A VARIANT TABLE with it rather than letting
+    the pod run slow with nothing in its logs but a `backend="python"`
+    label. `true` is for a deliberate canary, or a platform the wheel
+    does not cover yet.
+
+    Only parsed here. The refusal is the sink's, at resolve
+    (`HoglakeSink._check_variant_columns`): it fires when the destination
+    is found to have a variant column — the first write, an alter
+    receipt, a TTL re-read — and never for a string-only table, so a
+    pod that encodes nothing is not coupled to the codec it would never
+    use. The codec the process resolved to is logged at load either way.
+    """
+    raw = os.environ.get("MILLPOND_ALLOW_PYTHON_VARIANT_CODEC", "").strip()
+    if not raw:
+        return False
+    try:
+        return _BOOLS[raw.lower()]
+    except KeyError:
+        raise RuntimeError(f"MILLPOND_ALLOW_PYTHON_VARIANT_CODEC={raw!r} must be `true` or `false`") from None
+
+
+def python_variant_codec_refusal() -> str:
+    """The one message for a pod whose variant codec resolved to Python
+    and whose table has a variant column (`HoglakeSink._check_variant_columns`)."""
+    try:
+        from pyhoglake import _variant_backend as backend
+
+        mode, (_module, why) = backend.MODE, backend.native()
+    except Exception:  # noqa: BLE001 - diagnostics only
+        mode, why = "?", "pyhoglake's codec selector could not be read"
+    return (
+        f"the variant codec resolved to pyhoglake's Python encoder (PYHOGLAKE_VARIANT_CODEC={mode}; "
+        f"{why or 'the Rust codec is not in use'}), which encodes a whale-shaped row at 6-10x the Rust codec's "
+        f"CPU and would turn every 2 GiB flush into a minute or more of consume-thread pause. Install the "
+        f"`variant-codec` extra (pyhoglake-variant-codec; the image asserts it at build), or set "
+        f"MILLPOND_ALLOW_PYTHON_VARIANT_CODEC=true to run on the Python encoder deliberately."
+    )
+
+
 _S3_URI = re.compile(r"^s3://[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9](/.*)?$")
 
 
@@ -1235,6 +1402,8 @@ def _load_hoglake_fields() -> dict:
         "hoglake_compression": compression,
         "hoglake_compression_level": compression_level,
         "hoglake_deferred_stats": deferred_stats,
+        "hoglake_variant_on_invalid": _hoglake_variant_on_invalid(),
+        "hoglake_allow_python_variant_codec": _hoglake_allow_python_variant_codec(),
         "hoglake_url": _require("HOGLAKE_URL"),
         "hoglake_catalog": catalog,
         "hoglake_namespace": names["HOGLAKE_NAMESPACE"],
@@ -1372,15 +1541,23 @@ def load() -> Config:
     _require_uuid_filter_values(typed_columns, filter_drop_field, filter_drop_values, "MILLPOND_FILTER_DROP_VALUES")
     variant_columns = _load_variant_columns()
     if destination == "hoglake" and variant_columns is not None:
-        # Hoglake has no VARIANT column type; the DuckLake dual-write
-        # feature cannot port. Refuse loudly rather than silently
-        # skipping the companions — silent config no-ops are how mixed
-        # fleets rot. Revisit when hoglake grows a variant/json path
-        # millpond can target.
+        # MILLPOND_VARIANT_COLUMNS is the DuckLake dual-write: a `_variant`
+        # COMPANION column beside the string, projected in SQL. The hoglake
+        # sink has no companions and no knob. A live `variant` column of
+        # the destination is written from the same-named source field
+        # directly (the whales table keeps the source names: `properties`
+        # is a variant column, not `properties_variant` beside a string),
+        # and which columns those are is the TABLE's declaration — a
+        # setup script creates them with their shredding, millpond never
+        # does. Refuse rather than ignore: a silent config no-op is how a
+        # mixed fleet rots, and an operator who set this expected a
+        # companion that will never appear.
         raise RuntimeError(
-            "MILLPOND_VARIANT_COLUMNS is not supported with MILLPOND_DESTINATION=hoglake "
-            "(hoglake has no VARIANT column type; events land as text). Remove the "
-            "variant config or use the ducklake destination."
+            "MILLPOND_VARIANT_COLUMNS is the DuckLake dual-write (a `_variant` companion column "
+            "beside the string) and has no meaning with MILLPOND_DESTINATION=hoglake. A hoglake "
+            "destination's live `variant` columns are written automatically from the same-named "
+            "source field — declare them on the table (with their shredding) and remove this "
+            "setting; see README 'VARIANT columns' under the hoglake destination."
         )
 
     cfg = Config(
@@ -1450,5 +1627,13 @@ def load() -> Config:
         log.info(
             "Dual-write VARIANT columns: %s",
             ", ".join(f"{n} -> {n}{VARIANT_COLUMN_SUFFIX}" for n in cfg.variant_columns),
+        )
+    if cfg.hoglake_variant_on_invalid is not None:
+        log.info(
+            "Hoglake variant columns: invalid JSON -> %s (MILLPOND_HOGLAKE_VARIANT_ON_INVALID); codec: %s "
+            "(PYHOGLAKE_VARIANT_CODEC; MILLPOND_ALLOW_PYTHON_VARIANT_CODEC=%s)",
+            cfg.hoglake_variant_on_invalid,
+            variant_codec_backend(),
+            "true" if cfg.hoglake_allow_python_variant_codec else "false",
         )
     return cfg

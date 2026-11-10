@@ -252,6 +252,40 @@ class TestFlushDeadline:
         # would be cutting healthy flushes short rather than doomed ones.
         assert budget_s >= 6 * attempt_cost_s
 
+    def test_the_deadline_is_re_read_after_every_failed_attempt(self):
+        # The hoglake sink's reservation is derived from the prepare it
+        # just ran, so the loop must ask again after each failure: a
+        # 2 GiB variant flush whose first attempt took 270 s is priced at
+        # the floor only if the hook was read once, up front. Here the
+        # hook answers 445 s (270 s x 1.5 plus the timeout) from the
+        # first reading: 5 s elapsed + ~1 s backoff + 445 s > 450 s, so
+        # there is no room for a second attempt.
+        sink = self._sink(budget_s=450.0, attempt_cost_s=445.0)
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(5.0))
+        assert sink.write.call_count == 1
+        # Read AFTER the failure, once per failed attempt — never before
+        # the first attempt, which has nothing measured to price it with.
+        assert sink.write_flush_deadline.call_count == 1
+
+    def test_a_reservation_that_grows_stops_the_ladder_where_the_floor_would_not(self):
+        # The same 60 s/reading clock, two reservations: at the floor the
+        # whole ladder runs (the fifth failure sees 300 + 16 + 65 < 450);
+        # at a measured 150 s per attempt it stops after the fifth
+        # attempt (300 + 16 + 150 > 450).
+        floor = self._sink(budget_s=450.0, attempt_cost_s=65.0)
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(floor, pa.table({"a": [1]}), destination="hoglake", now=self._clock(60.0))
+        assert floor.write.call_count == 6
+        measured = self._sink(budget_s=450.0, attempt_cost_s=150.0)
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(measured, pa.table({"a": [1]}), destination="hoglake", now=self._clock(60.0))
+        assert measured.write.call_count == 5
+        # Every failed attempt re-read the hook (the sixth attempt of the
+        # floor run raises on exhaustion before reading it).
+        assert measured.write_flush_deadline.call_count == 5
+        assert floor.write_flush_deadline.call_count == 5
+
 
 class TestWriteWithRetryErrorLabels:
     """The metric label distinguishes catalog-contention retries from
@@ -414,6 +448,21 @@ class TestArrowConversionTiming:
         observed = mock_metrics.arrow_conversion_seconds.observe.call_args[0][0]
         assert isinstance(observed, float)
         assert observed >= 0
+
+    @patch("millpond.main.metrics")
+    @patch("millpond.main.arrow_converter")
+    def test_the_sinks_json_text_columns_reach_the_converter(self, mock_converter, _metrics):
+        # The hoglake sink names its live variant columns; a sink without
+        # the hook (DuckLake) gives the converter an empty set.
+        mock_converter.convert.return_value = pa.table({"a": [1]})
+        hoglake_like = MagicMock(spec=["json_text_columns"])
+        hoglake_like.json_text_columns.return_value = frozenset({"properties"})
+        _convert_batch([b"{}"], hoglake_like)
+        assert mock_converter.convert.call_args.kwargs["json_text_columns"] == frozenset({"properties"})
+        _convert_batch([b"{}"], MagicMock(spec=["write"]))
+        assert mock_converter.convert.call_args.kwargs["json_text_columns"] == frozenset()
+        _convert_batch([b"{}"])
+        assert mock_converter.convert.call_args.kwargs["json_text_columns"] == frozenset()
 
     @patch("millpond.main.metrics")
     @patch("millpond.main.arrow_converter")
@@ -1861,7 +1910,6 @@ class TestFinalFlushAfterPermanentFailure:
         assert _final_flush_decision(0, permanent, started=True) == "none"
 
 
-
 _EXIT_PRELUDE = """
 import atexit, logging, sys, time
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -1938,7 +1986,9 @@ class TestRunEntryPoint:
         assert r.returncode == 0, r.stderr
 
     def test_python_dash_m_goes_through_run(self):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("KAFKA_", "MILLPOND_", "HOGLAKE_", "DUCKLAKE_"))}
+        env = {
+            k: v for k, v in os.environ.items() if not k.startswith(("KAFKA_", "MILLPOND_", "HOGLAKE_", "DUCKLAKE_"))
+        }
         r = _spawn(
             """
             import runpy

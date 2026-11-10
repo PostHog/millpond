@@ -1,4 +1,5 @@
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -779,6 +780,19 @@ class TestVariantColumnsConfig:
         monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
         monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
 
+    def test_hoglake_variant_knobs_are_inert_on_ducklake(self, monkeypatch):
+        # Set for a hoglake pipeline and left in a values file the
+        # DuckLake destination also reads: accepted and ignored, never
+        # validated, never handed to the DuckLake sink. Both fields stay
+        # None, which is how `_NONE_HOGLAKE_FIELDS` says "not this
+        # destination's".
+        monkeypatch.setenv("MILLPOND_HOGLAKE_VARIANT_ON_INVALID", "raise")
+        monkeypatch.setenv("MILLPOND_ALLOW_PYTHON_VARIANT_CODEC", "not-a-bool")
+        cfg = load()
+        assert cfg.destination == "ducklake"
+        assert cfg.hoglake_variant_on_invalid is None
+        assert cfg.hoglake_allow_python_variant_codec is None
+
     def test_unset_yields_none(self):
         cfg = load()
         assert cfg.variant_columns is None
@@ -1217,6 +1231,94 @@ class TestHoglakeConfig:
         params = inspect.signature(Table.prepare_append_tables).parameters
         assert {"compression", "compression_level"} <= params.keys()
 
+    def test_variant_on_invalid_defaults_to_null(self):
+        # millrace's posture: one unencodable row is one SQL NULL in that
+        # column, never a wedged partition. See _hoglake_variant_on_invalid.
+        assert load().hoglake_variant_on_invalid == "null"
+
+    @pytest.mark.parametrize("raw, expected", [("raise", "raise"), ("RAISE", "raise"), (" null ", "null")])
+    def test_variant_on_invalid_parses(self, monkeypatch, raw, expected):
+        monkeypatch.setenv("MILLPOND_HOGLAKE_VARIANT_ON_INVALID", raw)
+        assert load().hoglake_variant_on_invalid == expected
+
+    @pytest.mark.parametrize("raw", ["skip", "true", "0", "NULL "])
+    def test_variant_on_invalid_refuses_anything_else(self, monkeypatch, raw):
+        monkeypatch.setenv("MILLPOND_HOGLAKE_VARIANT_ON_INVALID", raw if raw != "NULL " else "nul")
+        with pytest.raises(RuntimeError, match="MILLPOND_HOGLAKE_VARIANT_ON_INVALID"):
+            load()
+
+    def test_variant_columns_refusal_points_at_the_live_variant_columns(self, monkeypatch):
+        # Still refused on hoglake, for a different reason than before:
+        # the knob is the DuckLake companion dual-write, and a hoglake
+        # destination's variant columns are the table's declaration,
+        # written from the same-named source field with no config.
+        monkeypatch.setenv("MILLPOND_VARIANT_COLUMNS", "properties")
+        with pytest.raises(RuntimeError) as info:
+            load()
+        message = str(info.value)
+        assert "MILLPOND_VARIANT_COLUMNS" in message
+        assert "DuckLake dual-write" in message
+        assert "same-named source field" in message
+
+    def test_the_variant_codec_resolves_to_native_here(self):
+        # The `variant-codec` extra is a dependency, so the venv this
+        # suite runs in has the wheel, and `auto` resolves to the Rust
+        # codec. If this fails the extra did not install on this
+        # platform — the same thing the Dockerfile asserts for the image.
+        from millpond.config import variant_codec_backend
+
+        assert variant_codec_backend() == "native"
+        assert load().hoglake_allow_python_variant_codec is False
+
+    def test_the_backend_is_pyhoglakes_import_time_mode_not_the_environment(self, monkeypatch):
+        # pyhoglake reads PYHOGLAKE_VARIANT_CODEC once, into MODE; a
+        # process whose environment changed since encodes with MODE, so
+        # the label has to come from MODE too (millrace's `variant_codec`
+        # reads the same constant).
+        from millpond.config import variant_codec_backend
+
+        monkeypatch.setenv("PYHOGLAKE_VARIANT_CODEC", "python")
+        assert variant_codec_backend() == "native"
+        with patch("pyhoglake._variant_backend.MODE", "python"):
+            assert variant_codec_backend() == "python"
+        with patch("pyhoglake._variant_backend.native", return_value=(None, "no wheel")):
+            assert variant_codec_backend() == "python"
+        with patch("pyhoglake._variant_backend.native", side_effect=AttributeError("moved")):
+            assert variant_codec_backend() == "unknown"
+
+    def test_a_python_variant_codec_is_not_refused_at_load(self):
+        # The refusal is the sink's, at resolve of a table WITH a variant
+        # column (HoglakeSink._check_variant_columns): a string-only pod
+        # is not coupled to a codec it never uses. load() only parses the
+        # override and logs the codec.
+        with patch("pyhoglake._variant_backend.MODE", "python"):
+            cfg = load()
+        assert cfg.hoglake_allow_python_variant_codec is False
+
+    def test_the_python_variant_codec_can_be_allowed_explicitly(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_ALLOW_PYTHON_VARIANT_CODEC", "true")
+        with patch("pyhoglake._variant_backend.MODE", "python"):
+            assert load().hoglake_allow_python_variant_codec is True
+
+    @pytest.mark.parametrize("raw", ["1", "yes", "on", "allow", "ture"])
+    def test_a_bad_allow_python_codec_is_refused_at_load(self, monkeypatch, raw):
+        monkeypatch.setenv("MILLPOND_ALLOW_PYTHON_VARIANT_CODEC", raw)
+        with pytest.raises(RuntimeError, match="MILLPOND_ALLOW_PYTHON_VARIANT_CODEC"):
+            load()
+
+    def test_the_flush_deadline_reserves_the_measured_prepare_when_it_is_larger(self):
+        # The runtime reservation is max(floor, measured x safety): a
+        # pod whose prepares take 40 s reserves 60 s per attempt, one
+        # whose prepares take 2 s keeps the floor.
+        from millpond.config import _PREPARE_ALLOWANCE_S, _PREPARE_SAFETY, hoglake_flush_deadline
+
+        budget, floor_cost = hoglake_flush_deadline(45.0)
+        assert floor_cost == 45.0 + _PREPARE_ALLOWANCE_S
+        assert hoglake_flush_deadline(45.0, None) == (budget, floor_cost)
+        assert hoglake_flush_deadline(45.0, 2.0) == (budget, floor_cost)
+        assert hoglake_flush_deadline(45.0, 40.0) == (budget, 45.0 + 40.0 * _PREPARE_SAFETY)
+        assert _PREPARE_SAFETY > 1.0
+
     def test_deferred_stats_defaults_on(self):
         # NOT pyhoglake's default (False: ship inline). `false` is the
         # rollback. See _hoglake_deferred_stats.
@@ -1278,6 +1380,7 @@ class TestHoglakeConfig:
         assert cfg.hoglake_compression is None
         assert cfg.hoglake_compression_level is None
         assert cfg.hoglake_deferred_stats is None
+        assert cfg.hoglake_variant_on_invalid is None
 
     def test_optionals_pass_through(self, monkeypatch):
         monkeypatch.setenv("HOGLAKE_DATA_PATH", "s3://bucket/millpond/")
@@ -1448,6 +1551,7 @@ class TestHoglakeConfig:
         assert cfg.hoglake_url is None
         assert cfg.hoglake_partition_by is None
         assert cfg.hoglake_deferred_stats is None
+        assert cfg.hoglake_variant_on_invalid is None
 
 
 class TestHoglakePartitionBy:

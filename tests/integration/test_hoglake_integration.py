@@ -78,6 +78,10 @@ class HogCfg:
     hoglake_compression_level: int | None = 3
     # Mirrors config.load()'s default (test_deferred_stats_defaults_on pins it).
     hoglake_deferred_stats: bool | None = True
+    # Mirrors config.load()'s default (test_variant_on_invalid_defaults_to_null).
+    hoglake_variant_on_invalid: str | None = "null"
+    # Mirrors config.load()'s default: a Python-codec process is refused.
+    hoglake_allow_python_variant_codec: bool | None = False
     sort_by: tuple[str, ...] | None = None
     typed_columns: tuple[tuple[str, str], ...] | None = None
     # Named in every DDL message.
@@ -1893,3 +1897,423 @@ class TestDdlAttribution:
             promote,
         ):
             assert message in recorded, f"{message!r} not on any snapshot; snapshots carry {recorded}"
+
+
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    PROPERTIES_SV as _PROPERTIES_SV,
+)
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    TS_TYPE as _TS_TYPE,
+)
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    VARIANT_NAMES as _VARIANT_NAMES,
+)
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    precreate as _precreate_variant_table_in,
+)
+
+
+def _precreate_variant_table(client, cfg):
+    """The setup script's work (tests/hoglake_stack/variant_table.py); the
+    catalog is the sink's (constructing a HoglakeSink first ensures it)."""
+    return _precreate_variant_table_in(client, cfg.hoglake_catalog, cfg.hoglake_namespace, cfg.hoglake_table)
+
+
+def _variant_cfg(**overrides) -> HogCfg:
+    return _fresh(
+        hoglake_partition_by=(("team_id", "identity", None), ("timestamp", "month", None)),
+        sort_by=("timestamp",),
+        # Shipped stats: the stack runs no hydrator, and a `pending` file
+        # is neither mountable nor a compaction input. (Part 2 of the
+        # brief changes this: with an object prefix, deferred files
+        # register the prefix field's stats and are `provided` anyway.)
+        hoglake_deferred_stats=False,
+        **overrides,
+    )
+
+
+def _whale_rows(n: int, *, team: int = 1, month: str = "2026-09", start: int = 0) -> pa.Table:
+    """n events_json-shaped rows for one (team, month): every variant
+    source present as the JSON string the arrow_converter produces, with
+    the mix the encoder must handle — declared keys typed, undeclared
+    keys in the residual, a wrong-typed declared key (`age`), a JSON
+    `null`, SQL NULL (the key was absent), and invalid text. The group
+    columns are sparse: group0 on even rows, the rest absent."""
+    ts = pa.array([f"{month}-01T12:00:{(start + i) % 60:02d}Z" for i in range(n)]).cast(_TS_TYPE)
+
+    def props(i: int) -> str | None:
+        k = (start + i) % 6
+        if k == 4:
+            return None  # absent upstream -> SQL NULL
+        if k == 5:
+            return "not json {"  # invalid -> SQL NULL under `null`, counted
+        return json.dumps(
+            {
+                "$browser": ["Chrome", "Safari", "Firefox", "Edge"][k],
+                "$current_url": f"https://ex.am/ple/{start + i}",
+                "$lib": "web" if k else None,  # a JSON null under a declared key
+                "custom": {"depth": [1, 2, {"x": k}]},  # undeclared, nested
+                "n": start + i,
+            }
+        )
+
+    return pa.table(
+        {
+            "uuid": [f"u{start + i}" for i in range(n)],
+            "event": ["pageview"] * n,
+            "team_id": [team] * n,
+            "timestamp": ts,
+            "properties": [props(i) for i in range(n)],
+            "person_properties": [json.dumps({"email": f"p{start + i}@ex.am", "age": "thirty"}) for i in range(n)],
+            "group0_properties": [json.dumps({"name": "acme"}) if i % 2 == 0 else None for i in range(n)],
+        }
+    )
+
+
+def _server_metric(name: str) -> float:
+    """Sum of a server counter over its label sets, off the stack's
+    unauthenticated infra listener (HOGLAKE_METRICS_PORT in the compose
+    file). Absent from the exposition (never incremented) reads as 0."""
+    from prometheus_client.parser import text_string_to_metric_families
+
+    text = httpx.get("http://127.0.0.1:29090/metrics", timeout=10).text
+    total = 0.0
+    for family in text_string_to_metric_families(text):
+        for sample in family.samples:
+            if sample.name in (name, f"{name}_total"):
+                total += sample.value
+    return total
+
+
+def _compact(client, cfg) -> int:
+    """Run the server's compaction by hand (the stack's loop is off), as
+    pyhoglake's own compaction test does, until a sweep finds nothing."""
+    catalog = client.catalog(cfg.hoglake_catalog)
+    compacted = 0
+    for _ in range(5):
+        result = catalog._client._request("POST", catalog._path("/maintenance/compact"), params={"batch": 10})
+        compacted += result["groups_compacted"]
+        if result["groups_compacted"] == 0:
+            break
+    return compacted
+
+
+def _expected_rows(batches: list[pa.Table]) -> dict[str, int]:
+    """What `millpond_variant_rows_total{outcome}` must book for these
+    batches, exactly: column-rows over the seven variant columns. A
+    column the batch lacks is null-filled (SQL NULL every row); a None is
+    SQL NULL; the one invalid text is invalid; everything else encodes."""
+    counts = {"encoded": 0, "sql_null": 0, "invalid": 0}
+    for batch in batches:
+        for name in _VARIANT_NAMES:
+            if name not in batch.schema.names:
+                counts["sql_null"] += batch.num_rows
+                continue
+            for text in batch.column(name).to_pylist():
+                if text is None:
+                    counts["sql_null"] += 1
+                elif text == "not json {":
+                    counts["invalid"] += 1
+                else:
+                    counts["encoded"] += 1
+    return counts
+
+
+def _expected_values(batches: list[pa.Table]) -> dict[tuple[str, str, str], int]:
+    """What `millpond_variant_values_total{column,path,outcome}` must book
+    for the declared paths these tests assert on."""
+    props = [
+        json.loads(t) if t and t.startswith("{") else None for b in batches for t in b.column("properties").to_pylist()
+    ]
+    objects = [p for p in props if p is not None]
+    return {
+        ("properties", "$", "typed"): len(objects),
+        ("properties", "$.$browser", "typed"): sum(1 for p in objects if isinstance(p.get("$browser"), str)),
+        ("properties", "$.$lib", "variant_null"): sum(1 for p in objects if "$lib" in p and p["$lib"] is None),
+        ("properties", "$.$lib", "typed"): sum(1 for p in objects if isinstance(p.get("$lib"), str)),
+        # `age` is declared int64 and sent as text on every person row.
+        ("person_properties", "$.age", "fallback"): sum(b.num_rows for b in batches),
+        ("person_properties", "$.email", "typed"): sum(b.num_rows for b in batches),
+    }
+
+
+def _variant_metric_snapshot() -> dict[str, dict]:
+    """The variant series this suite asserts exact deltas on, read off the
+    live registry. Read inside the fixture, immediately before and after
+    the writes, so another class's writes cannot land in between."""
+    from millpond import metrics
+    from millpond.hoglake import _CODEC_ENCODE_REASONS, _CODEC_ROUTED
+
+    outcomes = ("encoded", "sql_null", "invalid")
+    return {
+        "rows": {o: metrics.variant_rows_total.labels(outcome=o)._value.get() for o in outcomes},
+        "invalid": {"invalid_json": metrics.variant_invalid_total.labels(reason="invalid_json")._value.get()},
+        "values": {
+            (c, p, o): metrics.variant_values_total.labels(column=c, path=p, outcome=o)._value.get()
+            for c, p, o in _expected_values([_whale_rows(1)]).keys()
+        },
+        "routed": {
+            (op, r): metrics.variant_codec_routed_to_python_total.labels(op=op, reason=r)._value.get()
+            for op, r in _CODEC_ROUTED
+        },
+        "fallback": {
+            r: metrics.variant_codec_fallback_total.labels(reason=r)._value.get() for r in _CODEC_ENCODE_REASONS
+        },
+        "encode_count": _registry_sum(metrics._variant_encode_seconds, "_count"),
+        "orphans": _registry_sum(metrics._hoglake_orphaned_files_total, "_total"),
+    }
+
+
+def _registry_sum(metric, suffix: str) -> float:
+    """Sum of one raw metric's samples with `suffix`, over every label set."""
+    return sum(s.value for m in metric.collect() for s in m.samples if s.name.endswith(suffix))
+
+
+def _delta(after: dict, before: dict) -> dict:
+    out = {}
+    for k, value in after.items():
+        out[k] = {kk: value[kk] - before[k][kk] for kk in value} if isinstance(value, dict) else value - before[k]
+    return out
+
+
+class TestVariantColumnsLive:
+    """The whales shape against a real server: a PRE-CREATED table whose
+    seven JSON columns are declared `variant` (D1, D2), written by the
+    sink from the same string columns the arrow_converter produces, read
+    back through pyhoglake's decoder. Every test here reads the fixture's
+    table and changes nothing about it; the compaction and raise-mode
+    tests below use tables of their own, so this class passes in any
+    order and under `-k`."""
+
+    @pytest.fixture(scope="class")
+    def written(self, hog_stack, client):
+        cfg = _variant_cfg()
+        sink = HoglakeSink(cfg)  # ensures the catalog
+        table = _precreate_variant_table(client, cfg)
+        column = {c.name: c for c in table.columns}
+        # Six flushes into ONE (team, month) group, plus one flush fanning
+        # out over two more teams and another month.
+        batches = [_whale_rows(12, team=1, month="2026-09", start=12 * i) for i in range(6)]
+        batches.append(
+            pa.concat_tables(
+                [
+                    _whale_rows(5, team=2, month="2026-09", start=100),
+                    _whale_rows(5, team=3, month="2026-10", start=200),
+                ]
+            )
+        )
+        before = _variant_metric_snapshot()
+        published = 0
+        for i, batch in enumerate(batches):
+            published += sink.write(batch, kafka_offsets=(("whales", 0, 100 * i, 100 * i + batch.num_rows - 1),))
+        after = _variant_metric_snapshot()
+        sink.close()
+        yield {
+            "cfg": cfg,
+            "table": table,
+            "column": column,
+            "batches": batches,
+            "published": published,
+            "metrics": _delta(after, before),
+            "codec": sink._variant_backend,
+        }
+
+    def _expected(self, batches: list[pa.Table], name: str) -> dict[str, object]:
+        """uuid -> the Python value `to_python` should give for `name`:
+        the parsed text, VARIANT_NULL for the text `null`, None for SQL
+        NULL and for text the encoder refused."""
+        from pyhoglake import variant
+
+        out: dict[str, object] = {}
+        for batch in batches:
+            texts = batch.column(name).to_pylist() if name in batch.schema.names else [None] * batch.num_rows
+            for uuid_, text in zip(batch.column("uuid").to_pylist(), texts, strict=True):
+                if text is None:
+                    out[uuid_] = None
+                    continue
+                try:
+                    value = json.loads(text)
+                except ValueError:
+                    out[uuid_] = None
+                    continue
+                out[uuid_] = variant.VARIANT_NULL if value is None else value
+        return out
+
+    def test_every_row_lands_and_the_table_keeps_its_declared_shape(self, client, written):
+        cfg, table = written["cfg"], written["table"]
+        assert written["published"] == sum(b.num_rows for b in written["batches"]) == 82
+        assert _record_count(client, cfg) == 82
+        # millpond altered nothing: the shape is the setup script's.
+        info = table.info()
+        assert {c.name: c.type for c in info.columns if c.type == "variant"} == dict.fromkeys(_VARIANT_NAMES, "variant")
+        assert info.columns[4].type_params == {"shredding": _PROPERTIES_SV}
+        assert [f.transform for f in info.partition_spec.fields] == ["identity", "month"]
+        assert len(_authored(client, cfg)) == len(_snapshots(client, cfg)), "the sink issued DDL on a pre-created table"
+
+    def test_files_are_provided_and_fanned_out_by_team_and_month(self, client, written):
+        # Wire form of `month(timestamp)` is the month ordinal since
+        # 1970-01 (Iceberg): 2026-09 is 680, 2026-10 is 681.
+        files = _table(client, written["cfg"]).files()
+        assert {f.stats_state for f in files} == {"provided"}
+        assert sorted(tuple(f.partition_values) for f in files) == sorted(
+            [("1", "680")] * 6 + [("2", "680"), ("3", "681")]
+        )
+
+    def test_variant_values_round_trip_through_the_decoder(self, client, written):
+        _back, decoded = _read_back_variant(client, written["cfg"], written["column"])
+        for name in _VARIANT_NAMES:
+            assert decoded[name] == self._expected(written["batches"], name), name
+
+    def test_declared_leaves_are_shredded_into_typed_value(self, client, written):
+        back, _decoded = _read_back_variant(client, written["cfg"], written["column"])
+        props = back.column("properties").combine_chunks()
+        assert set(props.type.names) == {"metadata", "value", "typed_value"}
+        typed = props.field("typed_value")
+        assert set(typed.type.names) == {f["name"] for f in _PROPERTIES_SV["fields"]}
+        texts = pa.concat_tables(written["batches"], promote_options="permissive").column("properties").to_pylist()
+        parsed = [json.loads(t) if t and t.startswith("{") else None for t in texts]
+        with_browser = sum(1 for p in parsed if p and isinstance(p.get("$browser"), str))
+        assert typed.field("$browser").field("typed_value").null_count == len(parsed) - with_browser
+        # `$lib` is a JSON null on every 6th row: a Variant null, kept in
+        # `value` (00), never in the typed leaf.
+        lib_null = sum(1 for p in parsed if p and "$lib" in p and p["$lib"] is None)
+        assert lib_null > 0
+        assert typed.field("$lib").field("value").null_count == len(parsed) - lib_null
+        # Undeclared keys stay in the object's residual `value`.
+        assert props.field("value").null_count == sum(1 for p in parsed if p is None)
+        # person_properties.age was declared int64 and sent as text: the
+        # value stays in the leaf's `value`, the typed side empty.
+        person = back.column("person_properties").combine_chunks().field("typed_value")
+        assert person.field("age").field("typed_value").null_count == len(parsed)
+        assert person.field("age").field("value").null_count == 0
+
+    def test_the_variant_metrics_describe_the_flushes_exactly(self, written):
+        # Deltas over the fixture's seven writes, read before and after
+        # them in the fixture itself: exact, not `>=`, and never an
+        # absolute off a counter other classes also move.
+        delta = written["metrics"]
+        batches = written["batches"]
+        assert delta["rows"] == _expected_rows(batches)
+        assert sum(delta["rows"].values()) == 82 * len(_VARIANT_NAMES)
+        assert delta["rows"]["invalid"] > 0
+        assert delta["invalid"] == {"invalid_json": delta["rows"]["invalid"]}
+        assert delta["values"] == _expected_values(batches)
+        # One encode observation per prepare: seven flushes, no rebuild.
+        assert delta["encode_count"] == len(batches)
+        assert delta["orphans"] == 0
+
+    def test_the_codec_was_native_for_every_call(self, written):
+        # The process resolved to the Rust codec AND no call was routed
+        # to Python under `auto` (a plan it does not take, text that is
+        # not UTF-8) or redone there (a fallback): the whales declaration
+        # is one the Rust codec takes whole.
+        from millpond import metrics
+
+        assert written["codec"] == "native"
+        assert metrics.variant_codec_info.labels(backend="native")._value.get() == 1
+        assert all(n == 0 for n in written["metrics"]["routed"].values()), written["metrics"]["routed"]
+        assert all(n == 0 for n in written["metrics"]["fallback"].values()), written["metrics"]["fallback"]
+
+
+def _read_back_variant(client, cfg, column) -> tuple[pa.Table, dict[str, dict[str, object]]]:
+    """Every live file as pyarrow reads it (variant storage as plain
+    structs), and per variant column uuid -> decoded value."""
+    from pyhoglake import variant
+
+    decoded: dict[str, dict[str, object]] = {name: {} for name in _VARIANT_NAMES}
+    tables = []
+    for f in _table(client, cfg).files():
+        back = _read_parquet(f.path)
+        tables.append(back)
+        uuids = back.column("uuid").to_pylist()
+        for name in _VARIANT_NAMES:
+            values = variant.to_python(back.column(name), column[name])
+            decoded[name].update(zip(uuids, values, strict=True))
+    return pa.concat_tables(tables, promote_options="permissive"), decoded
+
+
+class TestVariantCompactionLive:
+    """The server compacts millpond's variant files in their declared
+    layout (HOGLAKE_COMPACTION_VARIANT=true in the compose file). Its own
+    table, because compaction changes the file set every other test
+    reads; and the assertion is about THIS table's group, not about how
+    many groups the catalog-wide sweep happened to find."""
+
+    @pytest.fixture(scope="class")
+    def compacted(self, hog_stack, client):
+        cfg = _variant_cfg()
+        sink = HoglakeSink(cfg)
+        table = _precreate_variant_table(client, cfg)
+        column = {c.name: c for c in table.columns}
+        # Six provided files into the one (1, 2026-09) group: over the
+        # server's default HOGLAKE_COMPACTION_MIN_INPUT_FILES=5.
+        batches = [_whale_rows(12, team=1, month="2026-09", start=12 * i) for i in range(6)]
+        for i, batch in enumerate(batches):
+            sink.write(batch, kafka_offsets=(("whales-compact", 0, 100 * i, 100 * i + 11),))
+        sink.close()
+        inputs = _table(client, cfg).files()
+        _before, decoded_before = _read_back_variant(client, cfg, column)
+        mismatch_before = _server_metric("hoglake_compaction_variant_layout_mismatch_total")
+        swept = _compact(client, cfg)
+        return {
+            "cfg": cfg,
+            "column": column,
+            "batches": batches,
+            "inputs": inputs,
+            "decoded_before": decoded_before,
+            "mismatch_before": mismatch_before,
+            "swept": swept,
+        }
+
+    def test_this_tables_six_file_group_is_one_file(self, client, compacted):
+        cfg = compacted["cfg"]
+        group = ("1", "680")
+        assert sum(1 for f in compacted["inputs"] if tuple(f.partition_values) == group) == 6
+        files = _table(client, cfg).files()
+        assert sum(1 for f in files if tuple(f.partition_values) == group) == 1, [f.path for f in files]
+        assert {f.path for f in files}.isdisjoint({f.path for f in compacted["inputs"]})
+        assert compacted["swept"] >= 1
+
+    def test_the_layout_was_accepted_and_every_value_survives(self, client, compacted):
+        cfg = compacted["cfg"]
+        assert _server_metric("hoglake_compaction_variant_layout_mismatch_total") == compacted["mismatch_before"]
+        _after, decoded_after = _read_back_variant(client, cfg, compacted["column"])
+        assert decoded_after == compacted["decoded_before"]
+        assert _record_count(client, cfg) == 72
+
+
+class TestVariantRaiseModeLive:
+    """`raise` against the real prepare: the encoder refuses the row
+    before the first upload, so the flush fails with nothing in the
+    table, nothing in the bucket and nothing to orphan — and the next
+    batch without the row writes cleanly on the same sink."""
+
+    def test_an_invalid_row_fails_the_flush_leaving_nothing_behind(self, hog_stack, client):
+        from pyhoglake import VariantEncodingError
+
+        from millpond import metrics
+
+        cfg = _variant_cfg(hoglake_variant_on_invalid="raise")
+        sink = HoglakeSink(cfg)
+        _precreate_variant_table(client, cfg)
+        orphans_before = _registry_sum(metrics._hoglake_orphaned_files_total, "_total")
+        rows_before = {o: metrics.variant_rows_total.labels(outcome=o)._value.get() for o in ("encoded", "invalid")}
+        try:
+            # Rows 0..11 include the invalid text at global index 5.
+            with pytest.raises(VariantEncodingError) as info:
+                sink.write(_whale_rows(12, team=1), kafka_offsets=(("whales-raise", 0, 0, 11),))
+            assert info.value.reason == "invalid_json"
+            assert info.value.column == "properties"
+            assert is_retryable(info.value) is False
+            assert _table(client, cfg).files() == []
+            assert [o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")] == []
+            assert sink._prepared is None
+            assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before
+            # Nothing booked as encoded: the flush did not publish.
+            assert metrics.variant_rows_total.labels(outcome="encoded")._value.get() == rows_before["encoded"]
+            assert metrics.variant_rows_total.labels(outcome="invalid")._value.get() == rows_before["invalid"]
+            # The sink is not wedged, the ROW is: rows 0..3 are all valid.
+            assert sink.write(_whale_rows(4, team=1), kafka_offsets=(("whales-raise", 0, 12, 15),)) == 4
+            assert _record_count(client, cfg) == 4
+        finally:
+            sink.close()

@@ -1,4 +1,7 @@
 import logging
+import math
+from collections.abc import Collection
+from decimal import Decimal
 
 import orjson
 import pyarrow as pa
@@ -93,11 +96,77 @@ def _build_schema(records: list[dict]) -> pa.Schema:
     return pa.schema(fields)
 
 
+def json_text(value: object) -> str:
+    """One non-string value as the JSON text a hoglake `variant` column's
+    encoder reads back as the same value. The one place that decides it,
+    for the converter (variant-bound columns, `_jsonify_json_text_columns`)
+    and the sink (`hoglake._json_text_column`) alike.
+
+    orjson, with two deliberate departures from `str()` and from pyarrow's
+    string cast: a bool is `true`, not `True` (which is not JSON and would
+    be an `invalid_json` null); and a float keeps its point — `2.0` is
+    `2.0`, where pyarrow's cast renders `2`, which the encoder reads as an
+    INTEGER and then cannot put in a declared `double` leaf (it falls back
+    to `value`). NaN and the infinities, which JSON does not have, are
+    written as the literals `NaN` / `Infinity` / `-Infinity` so that
+    pyhoglake refuses the row as `non_finite_number` — counted, SQL NULL
+    under MILLPOND_HOGLAKE_VARIANT_ON_INVALID=null, a failed flush under
+    `raise` — rather than orjson's own rendering of them as `null`, which
+    would silently turn a bad number into a Variant null. A Decimal (a
+    decimal column the sink hands over) is its plain digits, a JSON number
+    rather than the quoted string `default=str` would make of it;
+    `default=str` covers what else orjson does not serialize natively.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return orjson.dumps(value, default=str).decode()
+
+
+def _jsonify_json_text_columns(records: list[dict], json_text_columns: Collection[str]) -> list[dict]:
+    """Every non-string value in a `json_text_columns` column becomes its
+    JSON text (`json_text`), strings kept as they are, so those columns
+    leave the converter STRING-typed on every poll.
+
+    These are the hoglake sink's live `variant` columns
+    (`HoglakeSink.json_text_columns`), whose text pyhoglake parses as JSON.
+    ALL non-string values, not only the mixed-type ones: a poll in which
+    every record carried a bool for the column would otherwise infer a
+    bool column, and `pa.concat_tables(promote_options="default")` in
+    main.py refuses to join it to the string column the next poll infers —
+    before the sink ever sees either. Nested values were already made JSON
+    text by `_flatten_nested_to_json`. Records are only copied when a
+    value changes.
+    """
+    if not json_text_columns:
+        return records
+    out = []
+    changed = False
+    for record in records:
+        needs = [k for k in json_text_columns if k in record and record[k] is not None and type(record[k]) is not str]
+        if not needs:
+            out.append(record)
+            continue
+        new_record = dict(record)
+        for k in needs:
+            new_record[k] = json_text(new_record[k])
+        out.append(new_record)
+        changed = True
+    return out if changed else records
+
+
 def _stringify_mixed_type_values(records: list[dict], schema: pa.Schema) -> list[dict]:
     """Coerce values to strings for fields where the inferred type doesn't match all values.
 
     JSON data from heterogeneous sources can have the same key as bool in one
     record and string in another. Rather than crash, stringify mismatched values.
+
+    `str()`, as always: Python's `True`, `1.5`, `50`. A column the hoglake
+    sink names as a live `variant` column never reaches this as a mixed
+    column — `_jsonify_json_text_columns` has already made every one of its
+    values JSON text — so DuckLake columns and hoglake string columns keep
+    the form they have always had.
     """
     # Build a map of field name -> expected Python types for the inferred Arrow type
     type_checks: dict[str, type | tuple[type, ...]] = {}
@@ -525,13 +594,18 @@ def _decode_value(raw: bytes, limit: int | None = None) -> bytes:
     return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
-def convert(messages: list[bytes]) -> pa.Table | None:
+def convert(messages: list[bytes], json_text_columns: Collection[str] = ()) -> pa.Table | None:
     """Convert raw Kafka message values to an Arrow table.
 
     Decompresses LZ4-framed values (see `_decode_value`), then parses JSON via
     orjson, builds a PyArrow table using the union of all keys
     across all records, normalizes numeric types, and handles mixed-type fields
     by coercing to string. Nested dicts/lists are serialized to JSON strings.
+
+    `json_text_columns` names columns whose every non-string value must be
+    JSON text rather than `str()` or an inferred bool/number column (see
+    `_jsonify_json_text_columns`): the hoglake sink's live variant columns.
+    Empty for DuckLake.
 
     Returns None if no valid records were parsed.
     """
@@ -558,6 +632,7 @@ def convert(messages: list[bytes]) -> pa.Table | None:
         return None
 
     records = _flatten_nested_to_json(records)
+    records = _jsonify_json_text_columns(records, json_text_columns)
     schema = _build_schema(records)
     patched = _stringify_mixed_type_values(records, schema)
     if patched is not records:
