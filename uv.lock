@@ -8,7 +8,7 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 certifi = { timestamp = "0001-01-01T00:00:00Z", span = "P1D" }
-pyhoglake = "2026-11-06T04:00:00Z"
+pyhoglake = "2026-11-10T22:00:00Z"
 pyhoglake-variant-codec = "2026-11-03T13:00:00Z"
 
 [manifest]
@@ -359,7 +359,7 @@ requires-dist = [
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pyarrow", specifier = ">=26.0.0" },
-    { name = "pyhoglake", extras = ["fast-upload", "variant-codec"], specifier = ">=1.4.8" },
+    { name = "pyhoglake", extras = ["fast-upload", "variant-codec"], specifier = ">=1.4.9" },
     { name = "pytz", specifier = ">=2024.1" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
@@ -696,16 +696,16 @@ wheels = [
 
 [[package]]
 name = "pyhoglake"
-version = "1.4.8"
+version = "1.4.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pyarrow" },
     { name = "thrift" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/99/ea/139a9e91de3adf471fdeb9b09be1fb6e3e853737164055525e71ec4b31fa/pyhoglake-1.4.8.tar.gz", hash = "sha256:66b5109de5b108dc088848e79ee7f2f4f1d2b6bce9e9af6a12ac847753174be0", size = 609457, upload-time = "2026-11-06T01:14:18.629Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/41/b8/b9b5bcf558a1d2165b7961e3c352d725f8806b9b9e1f614a53993a9a5805/pyhoglake-1.4.9.tar.gz", hash = "sha256:4211700640a7d341caf304db9044573470eca10e1f631a021e4194e6652abe96", size = 654315, upload-time = "2026-11-10T21:07:28.028Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/d7/0a617d83570f0b6369a6f619582df1f66286d646eada210087634d43faeb/pyhoglake-1.4.8-py3-none-any.whl", hash = "sha256:33c04fc7189c636230f4755e12e2b29774170facf2f1802869225c13685a99a9", size = 198616, upload-time = "2026-11-06T01:14:17.13Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/2e/6573219b5408567619af45f4c5446c6706b956006babc1ebdce18fb0904f/pyhoglake-1.4.9-py3-none-any.whl", hash = "sha256:a7c7d2518ea20fd0e16081bbb3e53e90a71d730ce1d470d03807d9ecc84060f5", size = 210063, upload-time = "2026-11-10T21:07:26.194Z" },
 ]
 
 [package.optional-dependencies]

@@ -28,6 +28,7 @@ from pyhoglake import (
     IncarnationChangedError,
     MalformedResponseError,
     NotFoundError,
+    ObjectPrefixViolationError,
     PartitionField,
     PartitionSpec,
     ReadSnapshotExpiredError,
@@ -103,6 +104,10 @@ class _FakeInfo:
     namespace: str = "analytics"
     name: str = "events"
     table_uuid: str = TABLE_UUID
+    # The object-prefix layout (`set_object_prefix_field`): None while the
+    # option is off, as every real TableInfo (pyhoglake >= 1.4.8) reports
+    # it. A fake without the field is an AttributeError on every resolve.
+    object_prefix_field: str | None = None
 
 
 def _wire_info(table, state):
@@ -5587,3 +5592,605 @@ class TestFailedPrepareBooksItsEncode:
         assert mock_metrics.variant_encode_seconds.labels.return_value.observe.call_count == 1
         mock_metrics.variant_rows_total.labels.assert_not_called()
         mock_metrics.variant_values_total.labels.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Object-prefix tables (Part 2 of the whales brief)
+# ---------------------------------------------------------------------------
+
+
+def _prefixed_sink(cfg=None, columns=_EVENTS_COLUMNS, spec=None, field="team_id"):
+    """A sink resolved against a table whose `object_prefix_field` is
+    `field` (`set_object_prefix_field` on the server), under `spec` —
+    `identity(team_id), month(_inserted_at)` by default, the whales
+    layout. The config matches the live spec unless `cfg` says
+    otherwise."""
+    spec = spec if spec is not None else _spec(("team_id", "identity"), ("_inserted_at", "month"))
+    cfg = cfg or _cfg(hoglake_partition_by=(("team_id", "identity", None), ("_inserted_at", "month", None)))
+    s, client, catalog, ns, table = _sink(cfg, columns=columns, partition_spec=spec)
+    # `_wire_info` answers the live state object itself, so the field
+    # set here is what every `table.info()` reports from now on.
+    table.state.object_prefix_field = field
+    return s, client, catalog, ns, table
+
+
+def _prefix_refusal(detail: str = "file is not under the object prefix team_id=1/") -> ObjectPrefixViolationError:
+    """The server's 422 as pyhoglake raises it: `message` is the CODE,
+    the sentence is in `detail`, `table` off the structured body."""
+    return ObjectPrefixViolationError(
+        "object_prefix_violation", status_code=422, detail=detail, table="analytics.events"
+    )
+
+
+class TestObjectPrefixUnplaceableGroups:
+    """D3: a partition group whose object-prefix value names no
+    `<field>=<value>/` prefix — null, negative, non-canonical, out of the
+    type's range, exactly what `object_prefix.parse_value` rejects and
+    pyhoglake refuses on — is skipped after the fanout and its rows
+    counted. The rows are lost and the offsets commit over them, as for
+    `unsafe_field_name`; no row is copied to decide it."""
+
+    OFFSETS = (("events", 0, 10, 14),)
+    REASON = "unplaceable_object_prefix_value"
+
+    @patch("millpond.hoglake.metrics")
+    def test_only_placeable_groups_reach_prepare_and_the_rest_are_counted(self, mock_metrics, caplog):
+        s, client, catalog, ns, table = _prefixed_sink()
+        # 2**63 does not fit the `long` column (pyarrow refuses the cast),
+        # so the in-range extreme stands in for it; `-1` and null are the
+        # two unplaceable shapes an int64 batch can carry.
+        batch = pa.table({"uuid": ["a", "b", "c", "d", "e"], "team_id": [1, -1, None, 2**63 - 1, 0]})
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            assert s.write(batch, kafka_offsets=self.OFFSETS) == 3
+        # Exactly the placeable groups, in batch order, with their wire values.
+        assert [v[0] for v, _ in _groups()] == ["1", str(2**63 - 1), "0"]
+        assert sorted(sum((g.column("uuid").to_pylist() for _, g in _groups()), [])) == ["a", "d", "e"]
+        # Counted once, under one reason, for both unplaceable rows; the
+        # commit landed, so the payload is gone and the rows published.
+        mock_metrics.records_skipped_total.labels.assert_called_once_with(reason=self.REASON)
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(2)
+        catalog.commit_prepared.assert_called_once()
+        assert s._prepared is None and s._prepared_skipped is None
+        # The commit message describes what was published, not what arrived.
+        message = catalog.commit_prepared.call_args.args[0]["message"]
+        assert message.startswith("records=3 files=3 partitions=3 ")
+        line = next(r for r in caplog.records if "names no object prefix" in r.getMessage())
+        assert "Skipped 2 record(s) in 2 partition group(s)" in line.getMessage()
+        assert "'team_id'" in line.getMessage()
+        assert "null, '-1'" in line.getMessage()
+        assert self.REASON in line.getMessage()
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_all_unplaceable_batch_publishes_nothing_and_is_not_an_error(self, mock_metrics):
+        s, client, catalog, ns, table = _prefixed_sink()
+        batch = pa.table({"uuid": ["a", "b", "c"], "team_id": pa.array([None, -5, None], pa.int64())})
+        assert s.write(batch, kafka_offsets=self.OFFSETS) == 0
+        table.prepare_append_tables.assert_not_called()
+        catalog.commit_prepared.assert_not_called()
+        # Booked right away: there is no commit to book it at.
+        mock_metrics.records_skipped_total.labels.assert_called_once_with(reason=self.REASON)
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(3)
+        assert s._prepared is None and s._prepared_skipped is None
+        # The sink is not wedged: the next flush publishes.
+        assert s.write(pa.table({"uuid": ["x"], "team_id": [1]}), kafka_offsets=(("events", 0, 15, 15),)) == 1
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_batch_that_lacks_the_column_is_skipped_whole(self, mock_metrics, caplog):
+        # Alignment null-fills a live column the batch lacks, so an
+        # upstream that stopped sending the field skips every row — at
+        # warning, per flush, rather than wedging on pyhoglake's refusal.
+        s, client, catalog, ns, table = _prefixed_sink()
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            assert s.write(pa.table({"uuid": ["a", "b"]}), kafka_offsets=self.OFFSETS) == 0
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(2)
+        assert any("Skipped 2 record(s) in 1 partition group(s)" in r.getMessage() for r in caplog.records)
+        table.prepare_append_tables.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_offsets_commit_over_the_skipped_rows(self, mock_metrics):
+        # Through main.py's flush: the skip is a counted loss, never a
+        # ValidationError the retry loop would have to classify.
+        from millpond.main import _flush
+
+        s, client, catalog, ns, table = _prefixed_sink()
+        kafka = MagicMock()
+        cfg = MagicMock(destination="hoglake", sort_by=None)
+        batch = pa.table({"uuid": ["a", "b", "c"], "team_id": [1, -1, None]})
+        with patch("millpond.main.metrics"), patch("millpond.main.time"):
+            _flush(s, cfg, kafka, batch, batch.nbytes, 3, {("events", 0): (10, 12)}, 0.0, "size")
+        kafka.commit.assert_called_once()
+        catalog.commit_prepared.assert_called_once()
+
+    @patch("millpond.hoglake.metrics")
+    def test_without_the_option_every_value_is_a_partition(self, mock_metrics):
+        # The same spec, no object prefix: Iceberg gives a null (and a
+        # negative) source value its own partition and pyhoglake writes
+        # the file. Nothing is skipped and nothing is counted.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None), ("_inserted_at", "month", None)))
+        s, client, catalog, ns, table = _sink(
+            cfg, partition_spec=_spec(("team_id", "identity"), ("_inserted_at", "month"))
+        )
+        batch = pa.table({"uuid": ["a", "b", "c"], "team_id": [1, None, -1]})
+        assert s.write(batch, kafka_offsets=self.OFFSETS) == 3
+        assert [v[0] for v, _ in _groups()] == ["1", None, "-1"]
+        mock_metrics.records_skipped_total.labels.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_nothing_unplaceable_means_no_log_no_metric(self, mock_metrics, caplog):
+        s, client, catalog, ns, table = _prefixed_sink()
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            assert s.write(pa.table({"uuid": ["a", "b"], "team_id": [1, 2]}), kafka_offsets=self.OFFSETS) == 2
+        mock_metrics.records_skipped_total.labels.assert_not_called()
+        assert not any("names no object prefix" in r.getMessage() for r in caplog.records)
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_skip_runs_before_the_variant_encode(self, mock_metrics):
+        # On the whales shape (variant columns + prefix) a skipped group's
+        # JSON is never encoded: pyhoglake receives only placeable groups,
+        # retyped to json as before.
+        spec = PartitionSpec(spec_id=1, fields=(PartitionField(3, "identity", None),))
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _prefixed_sink(cfg, columns=[*_VARIANT_COLUMNS], spec=spec)
+        assert s.write(_variant_batch(team_id=[1, None, 2]), kafka_offsets=self.OFFSETS) == 2
+        published = pa.concat_tables([g for _, g in _groups()])
+        assert published.column("uuid").to_pylist() == ["a", "c"]
+        assert published.schema.field("properties").type == pa.json_()
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(1)
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_rebuilt_flush_books_its_skipped_rows_once(self, mock_metrics):
+        # The first attempt is refused as a re-prepare and rebuilt; the
+        # rebuild skips the same group again. Booked at publication, once.
+        s, client, catalog, ns, table = _prefixed_sink()
+        catalog.commit_prepared.side_effect = [
+            DdlSinceReadSnapshotError(
+                "ddl_since_read_snapshot",
+                status_code=409,
+                detail="concurrent DDL since snapshot 41 on table(s): analytics.events",
+                tables=("analytics.events",),
+                read_snapshot=41,
+            ),
+            MagicMock(snapshot_id=8, schema_version=1),
+        ]
+        batch = pa.table({"uuid": ["a", "b", "c"], "team_id": [1, None, 2]})
+        with pytest.raises(hoglake.HoglakeSinkError):
+            s.write(batch, kafka_offsets=self.OFFSETS)
+        mock_metrics.records_skipped_total.labels.assert_not_called()  # nothing published yet
+        s.reset_caches()
+        assert s.write(batch, kafka_offsets=self.OFFSETS) == 2
+        mock_metrics.records_skipped_total.labels.assert_called_once_with(reason=self.REASON)
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(1)
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_receipt_books_the_skipped_rows_once_too(self, mock_metrics):
+        # The rows are in the lake from an earlier process; this one
+        # published nothing but the flush IS resolved, so its skip is
+        # booked here and nowhere else.
+        s, client, catalog, ns, table = _prefixed_sink()
+        catalog.commit_prepared.side_effect = ValidationError(
+            "validation", status_code=422, detail="idempotency_key reused with a different request"
+        )
+        batch = pa.table({"uuid": ["a", "b"], "team_id": [1, None]})
+        assert s.write(batch, kafka_offsets=self.OFFSETS) == 0
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(1)
+        assert s._prepared_skipped is None
+
+    def test_the_predicate_is_pyhoglakes(self):
+        # Hand-built groups through the module function: every shape
+        # `object_prefix.parse_value` rejects, and nothing it accepts.
+        from pyhoglake import object_prefix
+
+        info = _FakeInfo(
+            columns=tuple(_EVENTS_COLUMNS),
+            partition_spec=_spec(("team_id", "identity"), ("_inserted_at", "month")),
+            object_prefix_field="team_id",
+        )
+        part = pa.table({"uuid": ["x"]})
+        values = ("0", "7", "042", "+4", "-1", None, "", "4.0", str(2**63 - 1), str(2**63))
+        groups = [((v, "680"), part) for v in values]
+        kept, skipped = hoglake._skip_unplaceable_groups(groups, info)
+        assert [v[0] for v, _ in kept] == ["0", "7", str(2**63 - 1)]
+        assert skipped == {"042": 1, "+4": 1, "-1": 1, None: 1, "": 1, "4.0": 1, str(2**63): 1}
+        for v, _ in kept:
+            assert object_prefix.parse_value(v[0], "long") is not None
+        for v in skipped:
+            assert object_prefix.parse_value(v, "long") is None
+
+    def test_without_the_option_the_module_function_is_a_pass_through(self):
+        info = _FakeInfo(columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "identity")))
+        groups = [(("-1",), pa.table({"uuid": ["x"]})), ((None,), pa.table({"uuid": ["y"]}))]
+        assert hoglake._skip_unplaceable_groups(groups, info) == (groups, {})
+
+    def test_the_warning_names_a_bounded_list_of_values(self, caplog):
+        s, client, catalog, ns, table = _prefixed_sink()
+        s._live_info = _FakeInfo(columns=tuple(_EVENTS_COLUMNS), object_prefix_field="team_id")
+        s._prepared_skipped = {str(-i): 1 for i in range(1, 15)} | {None: 3}
+        with patch("millpond.hoglake.metrics") as mock_metrics, caplog.at_level(logging.WARNING):
+            s._book_skipped()
+        line = next(r.getMessage() for r in caplog.records if "names no object prefix" in r.getMessage())
+        assert "Skipped 17 record(s) in 15 partition group(s)" in line
+        assert line.count("'-") == 9 and "null" in line  # null first, then 9 of the 14 values
+        assert "and 5 more value(s)" in line
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(17)
+        assert s._prepared_skipped is None
+
+
+class TestObjectPrefixNotNullColumn:
+    """A NOT NULL object-prefix column. pyarrow refuses to cast nulls to a
+    non-nullable field, so without `_grouping_schema` one null `team_id`
+    (or a batch lacking the column, null-filled) failed the whole flush
+    before the skip ran and the partition stuck with every valid row.
+    Now the batch is grouped under a schema where only that field is
+    nullable, the unplaceable groups are skipped, and the retained groups
+    are cast to the strict catalog schema pyhoglake must see."""
+
+    OFFSETS = (("events", 0, 10, 14),)
+    REASON = "unplaceable_object_prefix_value"
+    COLUMNS = [_col("team_id", "long", 3, 3, nullable=False) if c.name == "team_id" else c for c in _EVENTS_COLUMNS]
+
+    def _sink(self, cfg=None):
+        return _prefixed_sink(cfg, columns=self.COLUMNS)
+
+    @patch("millpond.hoglake.metrics")
+    def test_mixed_nulls_publish_the_valid_groups_under_the_strict_schema(self, mock_metrics):
+        s, client, catalog, ns, table = self._sink()
+        batch = pa.table({"uuid": ["a", "b", "c", "d"], "team_id": [1, None, 2, None]})
+        assert s.write(batch, kafka_offsets=self.OFFSETS) == 2
+        assert [v[0] for v, _ in _groups()] == ["1", "2"]
+        for _, group in _groups():
+            field = group.schema.field("team_id")
+            # The exact catalog schema reaches pyhoglake: NOT NULL, field id.
+            assert field.nullable is False
+            assert field.metadata[b"PARQUET:field_id"] == b"3"
+            assert group.column("team_id").null_count == 0
+        mock_metrics.records_skipped_total.labels.assert_called_once_with(reason=self.REASON)
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(2)
+        catalog.commit_prepared.assert_called_once()
+        assert s._prepared is None
+
+    def test_the_strict_cast_of_a_retained_group_shares_its_buffers(self):
+        # Only nullability changes between the grouping schema and the
+        # strict one, so the second cast relabels: same data buffer.
+        from pyhoglake.types import columns_to_arrow_schema
+
+        info = _FakeInfo(
+            columns=tuple(self.COLUMNS), partition_spec=_spec(("team_id", "identity")), object_prefix_field="team_id"
+        )
+        strict = columns_to_arrow_schema(tuple(self.COLUMNS), variant="json")
+        loose = hoglake._grouping_schema(strict, info)
+        group = pa.table({c.name: [None] if c.name != "team_id" else [5] for c in self.COLUMNS}).cast(loose)
+        retained = group.cast(strict)
+        assert retained.schema.field("team_id").nullable is False
+        assert retained.schema.field("team_id").metadata[b"PARQUET:field_id"] == b"3"
+        before = group.column("team_id").chunk(0).buffers()[1].address
+        after = retained.column("team_id").chunk(0).buffers()[1].address
+        assert before == after
+
+    @patch("millpond.hoglake.metrics")
+    def test_all_null_publishes_nothing_and_commits_the_offsets(self, mock_metrics):
+        from millpond.main import _flush
+
+        s, client, catalog, ns, table = self._sink()
+        kafka = MagicMock()
+        cfg = MagicMock(destination="hoglake", sort_by=None)
+        batch = pa.table({"uuid": ["a", "b", "c"], "team_id": pa.array([None, None, None], pa.int64())})
+        with patch("millpond.main.metrics"), patch("millpond.main.time"):
+            _flush(s, cfg, kafka, batch, batch.nbytes, 3, {("events", 0): (10, 12)}, 0.0, "size")
+        kafka.commit.assert_called_once()
+        table.prepare_append_tables.assert_not_called()
+        catalog.commit_prepared.assert_not_called()
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(3)
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_batch_without_the_column_is_skipped_whole_not_failed(self, mock_metrics, caplog):
+        # `_null_fill_missing` fills the NOT NULL column with nulls; those
+        # must be skippable, not a cast failure.
+        s, client, catalog, ns, table = self._sink()
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            assert s.write(pa.table({"uuid": ["a", "b"]}), kafka_offsets=self.OFFSETS) == 0
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(2)
+        assert any("Skipped 2 record(s) in 1 partition group(s)" in r.getMessage() for r in caplog.records)
+        table.prepare_append_tables.assert_not_called()
+        # Not wedged: the next batch, with the column, publishes.
+        assert s.write(pa.table({"uuid": ["x"], "team_id": [1]}), kafka_offsets=(("events", 0, 15, 15),)) == 1
+
+    def test_the_variant_not_null_refusal_does_not_misfire(self):
+        # A NOT NULL prefix column is not a NOT NULL VARIANT column: the
+        # table resolves, and only a NOT NULL variant is refused.
+        spec = PartitionSpec(spec_id=1, fields=(PartitionField(3, "identity", None),))
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        columns = [
+            _col("team_id", "long", 3, 3, nullable=False) if c.name == "team_id" else c for c in _VARIANT_COLUMNS
+        ]
+        s, client, catalog, ns, table = _prefixed_sink(cfg, columns=columns, spec=spec)
+        assert s.write(_variant_batch(team_id=[1, None, 2]), kafka_offsets=self.OFFSETS) == 2
+        not_null_variant = [*columns[:3], _col("properties", "variant", 4, 4, nullable=False), *columns[4:]]
+        s2, *_ = _prefixed_sink(cfg, columns=not_null_variant, spec=spec)
+        with pytest.raises(hoglake.HoglakeSinkError, match="variant column\(s\) \['properties'\]"):
+            s2.write(_variant_batch(), kafka_offsets=self.OFFSETS)
+
+    def test_a_nullable_prefix_column_takes_the_single_cast(self):
+        # `_grouping_schema` is the identity there, so nothing changed for
+        # the nullable (production) shape.
+        from pyhoglake.types import columns_to_arrow_schema
+
+        info = _FakeInfo(
+            columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "identity")), object_prefix_field="team_id"
+        )
+        target = columns_to_arrow_schema(tuple(_EVENTS_COLUMNS), variant="json")
+        assert hoglake._grouping_schema(target, info) is target
+        info_not_null = _FakeInfo(
+            columns=tuple(self.COLUMNS), partition_spec=_spec(("team_id", "identity")), object_prefix_field="team_id"
+        )
+        strict = columns_to_arrow_schema(tuple(self.COLUMNS), variant="json")
+        loose = hoglake._grouping_schema(strict, info_not_null)
+        assert loose is not strict
+        assert loose.field("team_id").nullable is True
+        assert loose.field("team_id").metadata == strict.field("team_id").metadata
+        assert [f.with_nullable(True) for f in loose] == [f.with_nullable(True) for f in strict]
+        # Without the option: identity, NOT NULL or not.
+        plain = _FakeInfo(columns=tuple(self.COLUMNS), partition_spec=_spec(("team_id", "identity")))
+        assert hoglake._grouping_schema(strict, plain) is strict
+
+
+class TestObjectPrefixResolve:
+    """What the sink refuses at resolve on an object-prefix table, with
+    the reason, rather than letting pyhoglake or the server refuse the
+    first flush after the table is claimed."""
+
+    def test_a_config_without_the_identity_field_is_refused_before_any_alter(self):
+        # Item 4 of the brief: millpond never issues a spec alter that
+        # drops the identity field the prefix is named by. A config that
+        # would is refused at adopt, naming the field and the live spec,
+        # and no alter is built.
+        cfg = _cfg(hoglake_partition_by=(("_inserted_at", "month", None),))
+        s, client, catalog, ns, table = _prefixed_sink(cfg)
+        with pytest.raises(hoglake.HoglakeSinkError, match=r"does not carry identity\(team_id\)") as caught:
+            s.write(_rows(2), kafka_offsets=(("events", 0, 1, 2),))
+        # `_check_object_prefix`'s own sentence, not `_reconcile_specs`'
+        # generic spec mismatch (which would also fire, later, with a
+        # message that names neither the prefix nor why the field is
+        # load-bearing).
+        message = str(caught.value)
+        assert "names its object prefix by identity(team_id)" in message
+        assert "millpond will not ask for one" in message
+        assert "HOGLAKE_PARTITION_BY month(_inserted_at)" in message
+        assert "identity(team_id), month(_inserted_at)" in message
+        assert "Hoglake never re-specs a table behind your back" not in message
+        assert hoglake.is_retryable(caught.value) is False
+        table.alter.assert_not_called()
+        table.prepare_append_tables.assert_not_called()
+
+    def test_an_unset_partition_config_is_refused_the_same_way(self):
+        s, client, catalog, ns, table = _prefixed_sink(_cfg(hoglake_partition_by=None))
+        with pytest.raises(hoglake.HoglakeSinkError, match="is unset"):
+            s.write(_rows(2), kafka_offsets=(("events", 0, 1, 2),))
+        table.alter.assert_not_called()
+
+    def test_a_matching_config_reconciles_with_no_alter(self):
+        s, client, catalog, ns, table = _prefixed_sink()
+        assert s.write(_rows(3), kafka_offsets=(("events", 0, 1, 3),)) == 3
+        table.alter.assert_not_called()
+        assert s._reconciled_specs == hoglake._spec_identity(table.state)
+
+    def test_a_prefix_field_with_no_identity_spec_field_is_refused(self):
+        # A layout the server never installs; refused here with the table
+        # named rather than by pyhoglake at prepare with a group named.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "bucket", 16),))
+        s, client, catalog, ns, table = _prefixed_sink(cfg, spec=_spec(("team_id", "bucket", 16)))
+        with pytest.raises(hoglake.HoglakeSinkError, match="no single identity field"):
+            s.write(_rows(2), kafka_offsets=(("events", 0, 1, 2),))
+        table.prepare_append_tables.assert_not_called()
+
+    def test_a_prefix_field_of_a_non_integer_type_is_refused(self):
+        s, client, catalog, ns, table = _prefixed_sink(field="uuid")
+        with pytest.raises(hoglake.HoglakeSinkError, match="'string' column, not one of"):
+            s.write(_rows(2), kafka_offsets=(("events", 0, 1, 2),))
+
+    def test_a_prefix_field_that_is_not_a_column_is_refused(self):
+        s, client, catalog, ns, table = _prefixed_sink(field="tenant")
+        with pytest.raises(hoglake.HoglakeSinkError, match="not a live column"):
+            s.write(_rows(2), kafka_offsets=(("events", 0, 1, 2),))
+
+    def test_the_option_adopted_on_a_ttl_re_read_is_checked_too(self):
+        # The check runs on every adopt, like the variant checks: a
+        # layout that appears under a running pod is judged at the next
+        # re-read, not on the first flush after. (A layout the server
+        # would never install, so the refusal is reachable at all.)
+        s, client, catalog, ns, table = _sink(
+            _cfg(hoglake_partition_by=(("team_id", "identity", None),)),
+            partition_spec=_spec(("team_id", "identity")),
+        )
+        assert s.write(_rows(2), kafka_offsets=(("events", 0, 1, 2),)) == 2
+        table.state.object_prefix_field = "uuid"
+        s._live_info_read_at = -1e9  # past the TTL
+        with pytest.raises(hoglake.HoglakeSinkError, match="object-prefix field 'uuid'.*'string' column"):
+            s.write(_rows(2), kafka_offsets=(("events", 0, 3, 4),))
+
+    def test_the_peek_refuses_exactly_as_the_write_path_does(self):
+        # `json_text_columns()` adopts the shape read-only before the first
+        # conversion, through the same `_adopt_info`, so a layout this
+        # config cannot write is refused from the consume loop with the
+        # very message the write would raise — permanent either way, like
+        # the NOT NULL variant check.
+        cfg = _cfg(hoglake_partition_by=(("_inserted_at", "month", None),))
+        s, client, catalog, ns, table = _prefixed_sink(cfg)
+        with pytest.raises(hoglake.HoglakeSinkError, match=r"does not carry identity\(team_id\)") as peeked:
+            s.json_text_columns()
+        assert hoglake.is_retryable(peeked.value) is False
+        assert s._table is None  # nothing claimed
+        s2, client2, catalog2, ns2, table2 = _prefixed_sink(cfg)
+        with pytest.raises(hoglake.HoglakeSinkError) as written:
+            s2.write(_rows(2), kafka_offsets=(("events", 0, 1, 2),))
+        assert str(peeked.value) == str(written.value)
+        table.alter.assert_not_called()
+        table.prepare_append_tables.assert_not_called()
+        table2.prepare_append_tables.assert_not_called()
+
+
+class TestObjectPrefixCommitRefusal:
+    """422 `object_prefix_violation` at commit: the payload is abandoned
+    (its uploads are orphans), the cached shape dropped, and the flush
+    rebuilt against a fresh read ONCE — the server's `retry: re-prepare`.
+    A second refusal of the same flush is permanent."""
+
+    OFFSETS = (("events", 0, 30, 41),)
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_first_refusal_abandons_the_payload_and_is_retryable(self, mock_metrics):
+        s, client, catalog, ns, table = _prefixed_sink()
+        refused = _prefix_refusal()
+        catalog.commit_prepared.side_effect = refused
+        with pytest.raises(hoglake.HoglakeSinkError, match="rebuilds once") as caught:
+            s.write(pa.table({"uuid": ["a", "b"], "team_id": [1, 2]}), kafka_offsets=self.OFFSETS)
+        assert caught.value.__cause__ is refused
+        assert caught.value.retryable is True
+        assert hoglake.is_retryable(caught.value) is True
+        assert s._prepared is None
+        # The cached shape is dropped by `_commit_prepared` itself, before
+        # it branches on the refusal — so a direct caller that retries
+        # WITHOUT `reset_caches()` still rebuilds against a fresh read.
+        assert s._live_info is None
+        assert s._reconciled_specs is None
+        # Two files (two teams), both orphaned under the refusal's own
+        # reason label, which is what tells it from a re-spec on a
+        # dashboard.
+        assert _orphans(mock_metrics) == [("object_prefix_violation", 2)]
+        mock_metrics.hoglake_files_written_total.inc.assert_not_called()
+        table.info.reset_mock()
+        catalog.commit_prepared.side_effect = MagicMock(snapshot_id=8, schema_version=1)
+        assert s.write(pa.table({"uuid": ["a", "b"], "team_id": [1, 2]}), kafka_offsets=self.OFFSETS) == 2
+        assert table.info.call_count == 1  # rebuilt against a fresh read, no reset_caches() needed
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_retry_rebuilds_against_a_fresh_read_and_commits(self, mock_metrics):
+        s, client, catalog, ns, table = _prefixed_sink()
+        catalog.commit_prepared.side_effect = [_prefix_refusal(), MagicMock(snapshot_id=8, schema_version=1)]
+        with pytest.raises(hoglake.HoglakeSinkError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        table.info.reset_mock()
+        s.reset_caches()  # main.py's loop, between attempts
+        assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
+        assert table.prepare_append_tables.call_count == 2  # rebuilt, not replayed
+        assert table.info.call_count == 1  # read fresh
+        assert ns.table.call_count == 2  # re-resolved
+        # A landed commit clears the one-rebuild marker.
+        assert s._object_prefix_rebuilt_for is None
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_second_refusal_of_the_same_flush_is_permanent(self, mock_metrics):
+        s, client, catalog, ns, table = _prefixed_sink()
+        catalog.commit_prepared.side_effect = [_prefix_refusal(), _prefix_refusal("still under the root")]
+        with pytest.raises(hoglake.HoglakeSinkError) as first:
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert first.value.retryable is True
+        s.reset_caches()
+        with pytest.raises(hoglake.HoglakeSinkError, match="twice") as second:
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert second.value.retryable is False
+        assert hoglake.is_retryable(second.value) is False
+        assert "still under the root" in str(second.value)
+        assert "Not retried" in str(second.value)
+        # Both payloads were abandoned, and both fanouts (two teams, two
+        # files each) counted.
+        assert _orphans(mock_metrics) == [("object_prefix_violation", 2), ("object_prefix_violation", 2)]
+        assert s._prepared is None
+        assert table.prepare_append_tables.call_count == 2
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_marker_survives_reset_caches_but_not_a_landed_commit(self, mock_metrics):
+        s, client, catalog, ns, table = _prefixed_sink()
+        later = (("events", 0, 42, 50),)
+        catalog.commit_prepared.side_effect = [
+            _prefix_refusal(),  # flush A, first time: retryable
+            MagicMock(snapshot_id=8, schema_version=1),  # flush A lands
+            _prefix_refusal(),  # flush B, first time: retryable again
+            MagicMock(snapshot_id=9, schema_version=1),
+        ]
+        with pytest.raises(hoglake.HoglakeSinkError) as a1:
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert a1.value.retryable is True
+        s.reset_caches()
+        assert s._object_prefix_rebuilt_for == self.OFFSETS  # survived the reset
+        assert s.write(_rows(2), kafka_offsets=self.OFFSETS) == 2
+        with pytest.raises(hoglake.HoglakeSinkError) as b1:
+            s.write(_rows(2), kafka_offsets=later)
+        assert b1.value.retryable is True, "flush B inherited flush A's verdict"
+        s.reset_caches()
+        assert s.write(_rows(2), kafka_offsets=later) == 2
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_different_flush_refused_first_time_is_retryable(self, mock_metrics):
+        # Flush A is refused and never lands (a direct caller moves on);
+        # flush B's first refusal is still its own first.
+        s, client, catalog, ns, table = _prefixed_sink()
+        catalog.commit_prepared.side_effect = [_prefix_refusal(), _prefix_refusal()]
+        with pytest.raises(hoglake.HoglakeSinkError) as a1:
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert a1.value.retryable is True
+        with pytest.raises(hoglake.HoglakeSinkError) as b1:
+            s.write(_rows(2), kafka_offsets=(("events", 0, 42, 50),))
+        assert b1.value.retryable is True
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_anonymous_flush_is_identified_by_its_idempotency_key(self, mock_metrics):
+        # No offsets: `_flush_key` mints a fresh key per call, so every
+        # anonymous write is a new flush with its own one rebuild — and
+        # the marker never reads `()` or None, which two unrelated
+        # anonymous flushes would share.
+        s, client, catalog, ns, table = _prefixed_sink()
+        catalog.commit_prepared.side_effect = [_prefix_refusal(), _prefix_refusal()]
+        with pytest.raises(hoglake.HoglakeSinkError) as first:
+            s.write(_rows(2))
+        assert first.value.retryable is True
+        marker = s._object_prefix_rebuilt_for
+        assert marker[0] == "idempotency_key"
+        uuid.UUID(marker[1])
+        with pytest.raises(hoglake.HoglakeSinkError) as second:
+            s.write(_rows(2))
+        assert second.value.retryable is True
+        assert s._object_prefix_rebuilt_for != marker
+
+    def test_a_raw_object_prefix_violation_is_permanent(self):
+        # The pre-upload shape: pyhoglake's own placement check refused
+        # the batch (a null or non-canonical value the sink did not
+        # drop). It is a ValidationError, and a retry replays it.
+        assert hoglake.is_retryable(_prefix_refusal()) is False
+        assert hoglake.is_retryable(ValidationError("a group of analytics.events has a null 'team_id'")) is False
+
+    def test_the_generic_422_arm_still_discards_other_validation_refusals(self):
+        # The new arm is narrower than the one below it: a plain 422 keeps
+        # its "discard and raise permanent" behaviour.
+        s, client, catalog, ns, table = _prefixed_sink()
+        catalog.commit_prepared.side_effect = ValidationError("validation", status_code=422, detail="bad spec_id")
+        with pytest.raises(ValidationError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert s._prepared is None
+        assert s._object_prefix_rebuilt_for is None
+
+
+class TestObjectPrefixPrepareInputs:
+    """What reaches `prepare_append_tables` on an object-prefix table is
+    what reached it before: the placement, the footer proof and the D4
+    stats registration are pyhoglake's, driven by the TableInfo its own
+    read returns, and the sink passes no new keyword for them."""
+
+    def test_no_footer_stats_keyword_is_passed(self):
+        # The threshold is pyhoglake's default (1 MiB, the server's
+        # hydrator floor); a keyword would be a TypeError on a pyhoglake
+        # that does not place, which `_check_object_prefix` refuses with
+        # a better message first.
+        s, client, catalog, ns, table = _prefixed_sink()
+        s.write(pa.table({"uuid": ["a"], "team_id": [7]}), kafka_offsets=(("events", 0, 1, 1),))
+        kwargs = _prepare_kwargs(table)
+        assert "footer_stats_min_bytes" not in kwargs
+        assert kwargs["deferred_stats"] is True
+        assert kwargs["expected_table_uuid"] == TABLE_UUID
+
+    def test_the_groups_carry_the_identity_value_as_the_wire_string(self):
+        # pyhoglake reads the prefix value off the partition tuple the
+        # sink hands it (at `key_index`, as the transform's string form).
+        s, client, catalog, ns, table = _prefixed_sink()
+        s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [7, 7, 532]}), kafka_offsets=(("events", 0, 1, 3),))
+        assert [values[0] for values, _ in _groups()] == ["7", "532"]
+        assert [g.num_rows for _, g in _groups()] == [2, 1]
