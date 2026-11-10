@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Collection
 
 import orjson
 import pyarrow as pa
@@ -93,11 +94,22 @@ def _build_schema(records: list[dict]) -> pa.Schema:
     return pa.schema(fields)
 
 
-def _stringify_mixed_type_values(records: list[dict], schema: pa.Schema) -> list[dict]:
+def _stringify_mixed_type_values(
+    records: list[dict], schema: pa.Schema, json_text_columns: Collection[str] = ()
+) -> list[dict]:
     """Coerce values to strings for fields where the inferred type doesn't match all values.
 
     JSON data from heterogeneous sources can have the same key as bool in one
     record and string in another. Rather than crash, stringify mismatched values.
+
+    `str()`, as always, for every column but the `json_text_columns`: those
+    are the hoglake sink's live `variant` columns (`HoglakeSink.json_text_columns`),
+    whose text pyhoglake parses as JSON, so a non-string value there is its
+    JSON text instead — `True` is `true` (the Variant true; `True` would be an
+    `invalid_json` null), `1.5` is `1.5`, a string is kept as it is. (Nested
+    values were already serialized to JSON text by `_flatten_nested_to_json`,
+    so a dict never reaches this function.) DuckLake columns and hoglake
+    string columns are never in the set and keep `True`.
     """
     # Build a map of field name -> expected Python types for the inferred Arrow type
     type_checks: dict[str, type | tuple[type, ...]] = {}
@@ -129,8 +141,13 @@ def _stringify_mixed_type_values(records: list[dict], schema: pa.Schema) -> list
     for record in records:
         new_record = dict(record)
         for k in conflicting_keys:
-            if k in new_record and new_record[k] is not None:
-                new_record[k] = str(new_record[k])
+            value = new_record.get(k)
+            if value is None:
+                continue
+            if k in json_text_columns:
+                new_record[k] = value if isinstance(value, str) else orjson.dumps(value, default=str).decode()
+            else:
+                new_record[k] = str(value)
         patched.append(new_record)
     return patched
 
@@ -525,13 +542,17 @@ def _decode_value(raw: bytes, limit: int | None = None) -> bytes:
     return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
-def convert(messages: list[bytes]) -> pa.Table | None:
+def convert(messages: list[bytes], json_text_columns: Collection[str] = ()) -> pa.Table | None:
     """Convert raw Kafka message values to an Arrow table.
 
     Decompresses LZ4-framed values (see `_decode_value`), then parses JSON via
     orjson, builds a PyArrow table using the union of all keys
     across all records, normalizes numeric types, and handles mixed-type fields
     by coercing to string. Nested dicts/lists are serialized to JSON strings.
+
+    `json_text_columns` names columns whose mixed-type values must be JSON
+    text rather than `str()` (see `_stringify_mixed_type_values`): the hoglake
+    sink's live variant columns. Empty for DuckLake.
 
     Returns None if no valid records were parsed.
     """
@@ -559,7 +580,7 @@ def convert(messages: list[bytes]) -> pa.Table | None:
 
     records = _flatten_nested_to_json(records)
     schema = _build_schema(records)
-    patched = _stringify_mixed_type_values(records, schema)
+    patched = _stringify_mixed_type_values(records, schema, json_text_columns)
     if patched is not records:
         # Mixed types were found and coerced — re-infer schema with string types
         schema = _build_schema(patched)

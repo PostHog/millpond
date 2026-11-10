@@ -56,6 +56,8 @@ class TestMakeSinkDispatch:
         cfg.hoglake_table = "events"
         cfg.hoglake_s3_access_key = "ak"
         cfg.hoglake_s3_secret_key = "sk"
+        cfg.hoglake_variant_on_invalid = "null"
+        cfg.hoglake_allow_python_variant_codec = False
         with patch("millpond.hoglake.HoglakeClient"):
             from millpond.hoglake import HoglakeSink
 

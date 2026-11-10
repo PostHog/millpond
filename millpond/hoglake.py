@@ -31,8 +31,14 @@ this module owns everything millpond-shaped around it:
   `append()` (the null-fill mirrors DuckLake's `INSERT BY NAME`).
 
 Events land as TEXT — `properties` and friends stay JSON strings, exactly
-as the arrow_converter produces them. VARIANT is explicitly out of scope
-for this backend.
+as the arrow_converter produces them — UNLESS the destination declares a
+column `variant`. Then the same-named string column of the batch is fed
+to pyhoglake as `pa.json_()` text (a zero-copy retype, no parse here) and
+`prepare_append_tables` encodes it into the column's declared shredded
+layout, one group at a time, before the first upload. millpond never
+creates or alters a variant column: the table is pre-created with its
+declarations, and the sink only writes into what it finds (see
+`_prepare`, `_null_fill_missing`, `_observe_variant_rows`).
 
 At-least-once: `write()` raises on any failure; main.py's retry loop
 backs off, calls `reset_caches()` (which drops the resolved
@@ -75,6 +81,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import httpx
+import orjson
 import pyarrow as pa
 import pyarrow.compute as pc
 from pyhoglake import (
@@ -94,13 +101,15 @@ from pyhoglake import (
     S3Config,
     UnsupportedTypeError,
     ValidationError,
+    VariantEncodingError,
+    VariantReport,
     ops,
     transforms,
 )
 from pyhoglake.types import arrow_type_to_coltype, column_to_arrow_field, columns_to_arrow_schema
 
 from millpond import arrow_converter, metrics
-from millpond.config import Config
+from millpond.config import Config, python_variant_codec_refusal, variant_codec_backend
 from millpond.config import hoglake_flush_deadline as config_hoglake_flush_deadline
 from millpond.sink import SAFE_IDENTIFIER, check_reserved_collision
 
@@ -230,6 +239,113 @@ _PROMOTIONS: dict[tuple[str, str], str] = {
 # nothing else. See `_rewrite_column` for why these two and not the general
 # case.
 _UUID_REWRITES: frozenset[tuple[str, str]] = frozenset({("string", "uuid"), ("uuid", "string")})
+
+# The two values pyhoglake's `variant_on_invalid` takes; config.load()
+# validates MILLPOND_HOGLAKE_VARIANT_ON_INVALID against the same pair.
+_VARIANT_ON_INVALID: frozenset[str] = frozenset({"null", "raise"})
+
+
+def _variant_backend_label() -> str:
+    """Which codec pyhoglake encodes variant rows with, for this process:
+    `native`, `python` or `unknown`. `config.variant_codec_backend`, which
+    load() uses for the startup refusal; one reader, so the label on the
+    encode histogram and the refusal cannot disagree."""
+    return variant_codec_backend()
+
+
+# The label vocabularies pyhoglake counts the Rust codec's fallbacks and
+# `auto`'s routes to Python under (`pyhoglake._variant_backend`, module
+# docstring), the same tuples millrace exports at 0 from its first scrape.
+# Pre-created at 0 here too so `increase()` counts a pod's first.
+_CODEC_ENCODE_REASONS = ("mismatch", "type", "panic", "shadow_mismatch")
+_CODEC_DECODE_REASONS = ("mismatch", "panic")
+_CODEC_ROUTED = (
+    *(("encode", why) for why in ("unavailable", "plan", "not_utf8")),
+    *(("decode", why) for why in ("unavailable", "storage")),
+)
+# What `PYHOGLAKE_VARIANT_CODEC=native` raises when the Rust codec is not
+# importable or does not take the call: a bare `RuntimeError(f"{ENV}=native,
+# but {why}")` out of `prepare_append_tables`. Matched on its text because
+# that is all pyhoglake gives it; a typed exception would be better and is
+# pyhoglake's to add.
+_NATIVE_CODEC_REFUSAL_PREFIX = "PYHOGLAKE_VARIANT_CODEC=native, but "
+
+
+def _is_native_codec_refusal(exc: BaseException) -> bool:
+    """A `RuntimeError` from pyhoglake's codec switch saying the Rust codec
+    was required and is not there (or does not take this plan).
+    PERMANENT: the wheel does not appear by waiting, and the plan is the
+    table's declaration. `is_retryable` would otherwise read a bare
+    RuntimeError as "unknown, assume transient" and burn the ladder."""
+    return (
+        type(exc) is RuntimeError  # not a HoglakeSinkError, which subclasses it with its own verdict
+        and str(exc).startswith(_NATIVE_CODEC_REFUSAL_PREFIX)
+    )
+
+
+class _VariantCodecCounts:
+    """Mirror pyhoglake's process-wide codec counters onto millpond's
+    labelled Counters, by delta.
+
+    pyhoglake counts, per process and under its own lock, the calls
+    `auto` routed to Python (`ROUTED`, by (op, why)), the Rust results
+    Python redid (`ENCODE_FALLBACKS`, `DECODE_FALLBACKS`, by reason) and
+    what the shadow compared (`SHADOWED`: calls, rows). millrace exports
+    them straight from a custom collector at scrape time; millpond's
+    metrics are prometheus_client Counters behind the common
+    (pipeline, broker_source) labels, which cannot be set, only
+    incremented — so this keeps the last snapshot it mirrored and books
+    the difference. Synced after every prepare, success or failure (the
+    counters only move inside encode calls, and every encode call is
+    inside a prepare), and once at construction so the label sets exist
+    at 0 from the first scrape.
+
+    Best effort throughout: `_variant_backend` is private to pyhoglake,
+    and a pyhoglake that renames a counter must cost a metric, never a
+    flush.
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[tuple[str, tuple], int] = {}
+
+    def prime(self) -> None:
+        for reason in _CODEC_ENCODE_REASONS:
+            metrics.variant_codec_fallback_total.labels(reason=reason).inc(0)
+        for reason in _CODEC_DECODE_REASONS:
+            metrics.variant_codec_decode_fallback_total.labels(reason=reason).inc(0)
+        for op, reason in _CODEC_ROUTED:
+            metrics.variant_codec_routed_to_python_total.labels(op=op, reason=reason).inc(0)
+        metrics.variant_shadow_calls_total.inc(0)
+        metrics.variant_shadow_rows_total.inc(0)
+        self.sync()
+
+    def sync(self) -> None:
+        try:
+            from pyhoglake import _variant_backend as backend
+
+            with backend._COUNTING:
+                encode = dict(backend.ENCODE_FALLBACKS)
+                decode = dict(backend.DECODE_FALLBACKS)
+                routed = dict(backend.ROUTED)
+                shadowed = dict(backend.SHADOWED)
+        except Exception:  # noqa: BLE001 - a metric, never a flush
+            log.debug("Could not read pyhoglake's variant codec counters; the codec metrics stay where they are")
+            return
+        for reason, total in encode.items():
+            self._book("encode", (reason,), total, metrics.variant_codec_fallback_total.labels(reason=reason))
+        for reason, total in decode.items():
+            self._book("decode", (reason,), total, metrics.variant_codec_decode_fallback_total.labels(reason=reason))
+        for (op, reason), total in routed.items():
+            child = metrics.variant_codec_routed_to_python_total.labels(op=op, reason=reason)
+            self._book("routed", (op, reason), total, child)
+        self._book("shadow", ("calls",), shadowed.get("calls", 0), metrics.variant_shadow_calls_total)
+        self._book("shadow", ("rows",), shadowed.get("rows", 0), metrics.variant_shadow_rows_total)
+
+    def _book(self, family: str, key: tuple, total: int, child) -> None:
+        delta = total - self._seen.get((family, key), 0)
+        if delta > 0:
+            child.inc(delta)
+        self._seen[family, key] = total
 
 
 # 4xx codes that mean "not now" rather than "not ever". Everything else
@@ -640,6 +756,62 @@ def _is_alignment_refusal(exc: ValidationError) -> bool:
     """
     message = str(exc)
     return any(marker in message for marker in _ALIGNMENT_REFUSALS)
+
+
+def _json_text_column(column: pa.ChunkedArray) -> pa.ChunkedArray:
+    """A batch column headed for a live `variant` column, as JSON text
+    pyhoglake's encoder can take: `pa.string()` with SQL NULL where the
+    source had nothing to say.
+
+    * Text (string / large_string): returned AS IS — same object, so the
+      caller can tell nothing changed — unless it holds an empty string,
+      in which case every "" becomes SQL NULL (one vectorised pass).
+      "" is not JSON and would land as an `invalid_json` null; a
+      producer that writes "" for "nothing" meant SQL NULL, and the
+      count on `variant_invalid_total` would be a false alarm.
+    * Integers, floats, booleans: pyarrow's cast to string, which is
+      vectorised and already JSON (`5`, `1.5`, `true`). A float NaN or
+      Infinity casts to text JSON does not have and lands as an
+      `invalid_json` null, counted — the same thing the JSON producer's
+      own `NaN` does.
+    * Anything else (struct, list, map, timestamp, decimal, binary):
+      orjson per row. `cast(pa.string())` on a struct or list raises
+      `ArrowNotImplementedError`, which `is_retryable` reads as transient
+      — so one producer sending an object where the converter expected
+      text crash-looped the partition on the same batch. orjson
+      serializes dicts, lists, scalars, datetimes and UUIDs natively;
+      `default=str` covers the rest (a Decimal is its text, a valid JSON
+      number). Per-row Python, but only on a batch shaped this way, which
+      the arrow_converter never produces (it flattens nested values to
+      JSON text itself).
+    """
+    kind = column.type
+    if pa.types.is_string(kind) or pa.types.is_large_string(kind):
+        if not pc.any(pc.equal(column, "")).as_py():
+            return column
+        return pa.chunked_array([_null_empty_strings(chunk) for chunk in column.chunks], kind)
+    if pa.types.is_integer(kind) or pa.types.is_floating(kind) or pa.types.is_boolean(kind):
+        return column.cast(pa.string())
+    texts = [None if value is None else orjson.dumps(value, default=str).decode() for value in column.to_pylist()]
+    return pa.chunked_array([pa.array(texts, pa.string())])
+
+
+def _null_empty_strings(chunk: pa.Array) -> pa.Array:
+    """`chunk` (string / large_string) with every "" made null, WITHOUT
+    copying its text: the same offsets and data buffers under a new
+    validity bitmap. `pc.if_else` would rebuild the whole column — for a
+    9.6 KB-a-row `properties` that is the flush's size again, over one
+    producer's empty strings — while the bitmap is a bit a row.
+
+    The bitmap is computed over the slice as pyarrow sees it and then
+    padded by the chunk's offset, because `from_buffers` reads every
+    buffer, validity included, at that same offset."""
+    keep = pc.and_kleene(chunk.is_valid(), pc.invert(pc.fill_null(pc.equal(chunk, ""), False)))
+    if chunk.offset:
+        keep = pa.concat_arrays([pa.array([False] * chunk.offset, pa.bool_()), keep])
+    validity = keep.buffers()[1]
+    _old_validity, offsets, data = chunk.buffers()
+    return pa.Array.from_buffers(chunk.type, len(chunk), [validity, offsets, data], offset=chunk.offset)
 
 
 def table_schema_for_batch(batch_schema: pa.Schema) -> pa.Schema:
@@ -1069,6 +1241,52 @@ class HoglakeSink:
             self._stats,
             "true" if cfg.hoglake_deferred_stats else "false",
         )
+        # What a flush does with JSON a live variant column cannot encode.
+        # Guarded like the fields above: pyhoglake refuses anything but
+        # the two words, permanently, on the first flush — and a
+        # hand-built Config that skipped config.load() would otherwise
+        # start clean and crash there.
+        if cfg.hoglake_variant_on_invalid not in _VARIANT_ON_INVALID:
+            raise HoglakeSinkError(
+                f"HoglakeSink requires cfg.hoglake_variant_on_invalid in {sorted(_VARIANT_ON_INVALID)}, got "
+                f"{cfg.hoglake_variant_on_invalid!r}; config.load() should have enforced this"
+            )
+        self._variant_on_invalid: str = cfg.hoglake_variant_on_invalid
+        # Which codec pyhoglake will encode variant rows with, read once:
+        # it is decided by pyhoglake's own environment
+        # (PYHOGLAKE_VARIANT_CODEC) at import, so it cannot change while
+        # the process lives. It labels the encode-time histogram and the
+        # codec-info gauge — and when it says `python` it refuses, at
+        # resolve, a destination WITH a variant column
+        # (`_check_variant_columns`) unless
+        # MILLPOND_ALLOW_PYTHON_VARIANT_CODEC says otherwise: the Python
+        # encoder is 6-10x the Rust codec's CPU per whale row, and a pod
+        # running it looks healthy in every way but its throughput. A
+        # string-only table never encodes, so it is not refused.
+        self._variant_backend = _variant_backend_label()
+        log.info(
+            "hoglake variant columns: invalid JSON -> %s (MILLPOND_HOGLAKE_VARIANT_ON_INVALID); codec: %s "
+            "(PYHOGLAKE_VARIANT_CODEC; MILLPOND_ALLOW_PYTHON_VARIANT_CODEC=%s)",
+            self._variant_on_invalid,
+            self._variant_backend,
+            "true" if cfg.hoglake_allow_python_variant_codec else "false",
+        )
+        metrics.variant_codec_info.labels(backend=self._variant_backend).set(1)
+        # pyhoglake's per-process codec counters, mirrored after every
+        # prepare; primed now so every label set is on the first scrape.
+        self._codec_counts = _VariantCodecCounts()
+        self._codec_counts.prime()
+        # Wall seconds the most recent prepare took (encode + upload,
+        # whether it returned or raised), for `write_flush_deadline`: the
+        # next attempt of a rebuilt flush redoes that work, so its
+        # reservation is derived from it rather than from a constant that
+        # cannot know the batch. None until the first prepare.
+        self._last_prepare_s: float | None = None
+        # The `VariantReport` of the prepared payload, booked on the row
+        # metrics when the payload is PUBLISHED (not when it is prepared:
+        # a rebuild re-encodes the same rows), together with the aligned
+        # batch's variant columns. Cleared with the payload.
+        self._prepared_variant: VariantReport | None = None
         # Resolved lazily on first write; reset_caches() drops them so the
         # retry path re-resolves (another pod may have created/altered the
         # table, or it may have been dropped+recreated).
@@ -1233,8 +1451,29 @@ class HoglakeSink:
         key = self._flush_key(self._table_uuid, kafka_offsets)
         batch = self._evolve_and_align(table, batch)
         facts = _FlushFacts(kafka_offsets=identity or (), arrow_bytes=arrow_bytes, trigger=trigger)
+        # Timed as a whole, both prepares of the self-heal below included
+        # and whether or not it raises: this is what one attempt's local
+        # work costs for THIS batch, and `write_flush_deadline` reserves
+        # it for the next attempt. A prepare that raised partway is a
+        # lower bound on the next, which is the right direction to err.
+        prepare_started = self._monotonic()
         try:
-            payload = self._prepare(table, batch, key, facts)
+            payload = self._prepare_with_self_heal(table, batch, key, facts)
+        finally:
+            self._last_prepare_s = self._monotonic() - prepare_started
+        self._prepared = payload
+        self._prepared_rows = batch.num_rows
+        self._prepared_offsets = identity
+        self._prepared_sends = 0
+        return self._commit_prepared()
+
+    def _prepare_with_self_heal(self, table, batch: pa.Table, key: str, facts: _FlushFacts) -> dict:
+        """`_prepare`, retried ONCE after an alignment refusal against a
+        fresh read of the destination. Split out of `write()` so the
+        whole of an attempt's local work — both prepares, when there are
+        two — is timed as one for `write_flush_deadline`."""
+        try:
+            return self._prepare(table, batch, key, facts)
         except ValidationError as e:
             # Concurrent-DDL race (found by the live integration suite):
             # another writer's add_column can land between this sink's
@@ -1259,12 +1498,7 @@ class HoglakeSink:
             # This sink has never read one.
             self._adopt_info(table.info(totals=False))
             batch = self._null_fill_missing(batch)
-            payload = self._prepare(table, batch, key, facts)
-        self._prepared = payload
-        self._prepared_rows = batch.num_rows
-        self._prepared_offsets = identity
-        self._prepared_sends = 0
-        return self._commit_prepared()
+            return self._prepare(table, batch, key, facts)
 
     def reset_caches(self) -> None:
         """Drop the resolved table/schema handles so the next attempt
@@ -1333,6 +1567,25 @@ class HoglakeSink:
         deadline."""
         return self._cfg.hoglake_max_retry_count, _WRITE_BASE_DELAY_S
 
+    def json_text_columns(self) -> frozenset[str]:
+        """The destination's live `variant` columns, as this sink knows
+        them: the batch columns whose values must reach it as JSON text.
+
+        Read by main.py before every `arrow_converter.convert`, duck-typed
+        like the retry hooks, so the converter can JSON-serialize a
+        MIXED-TYPE value in one of these columns (`True` -> `true`) while
+        every other column keeps the `str()` form DuckLake and string
+        columns have always had. Empty until the destination is first
+        resolved — which is on the first write, after the first batch was
+        converted — so a mixed-type variant-bound column in a pod's very
+        first batch is str()-ed, and a bool in it lands as an
+        `invalid_json` null, counted. One batch, one edge, at pod start;
+        documented rather than closed, because closing it means resolving
+        the table in the constructor. Non-mixed columns are unaffected
+        either way: a column that is all bool or all struct is serialized
+        by the sink itself (`_json_text_column`)."""
+        return frozenset(name for name, column in self._live_columns.items() if column.type == "variant")
+
     def write_flush_deadline(self) -> tuple[float, float]:
         """(wall-clock budget for one flush, seconds to reserve for the
         next attempt) — the runtime liveness bound main.py enforces.
@@ -1353,8 +1606,18 @@ class HoglakeSink:
         crash, restart, replay from Kafka — except that it happens while
         the process can still say why. `DuckLakeSink` does not implement
         this: its inner loop has its own bound and its outer three
-        attempts cannot approach the deadline."""
-        return config_hoglake_flush_deadline(self._cfg.hoglake_request_timeout_s)
+        attempts cannot approach the deadline.
+
+        The reservation is MEASURED, not assumed, once there is a
+        measurement: the last prepare's wall time (encode + upload) times
+        a safety factor, floored at the config constant. A VARIANT flush
+        is why — its encode is per-attempt work whose size is the batch's
+        (a 2 GiB whale flush is seconds under the Rust codec, a minute or
+        more under Python), and a fixed 20 s would let main.py start an
+        attempt the liveness probe kills halfway through. main.py reads
+        this after every failed attempt, so the first attempt's cost
+        prices the second."""
+        return config_hoglake_flush_deadline(self._cfg.hoglake_request_timeout_s, self._last_prepare_s)
 
     def _note_response(self, response) -> None:
         """httpx response hook: remember a Retry-After from a response
@@ -1505,21 +1768,49 @@ class HoglakeSink:
         still comes from pyhoglake.transforms, so the Iceberg semantics
         have exactly one implementation.
 
-        Destinations with a `variant` column are refused by
-        `prepare_append_tables` (an Arrow rewrite drops the native
-        parquet VARIANT annotation). Nothing is done about that here and
-        nothing needs to be: millpond cannot produce such a destination
-        (`config.load()` rejects MILLPOND_VARIANT_COLUMNS for this
-        backend, and `table_schema_for_batch` has no variant mapping),
-        and pointing this sink at someone else's variant table already
-        failed one line later than it does now —
-        `columns_to_arrow_schema` raises `UnsupportedTypeError` for a
-        variant column. Either way it is a permanent refusal that names
-        the reason, which is the right answer for a destination this
-        backend does not support.
+        VARIANT. A live `variant` column has no one Arrow type, so the
+        target schema is built with `variant="json"`: the column is
+        `pa.json_()`, an extension over utf8 carrying the field id and
+        pyhoglake's variant marker. The batch's same-named column is the
+        JSON string the arrow_converter produced (an events_json
+        `properties` is a string holding JSON text), and `.cast(target)`
+        retypes it string -> json WITHOUT copying — same buffers, it is a
+        relabel — and without parsing anything here. pyhoglake then
+        encodes each group's JSON into the column's declared shredded
+        layout inside `prepare_append_tables` (`write_part`), group by
+        group, before the first upload, so an invalid row orphans
+        nothing. What happens to such a row is `variant_on_invalid`:
+        `null` lands SQL NULL in that column and counts it, `raise`
+        fails the flush with `VariantEncodingError` (a `ValidationError`,
+        so `is_retryable` calls it permanent). The `VariantReport`
+        collects every group's counts for `_observe_variant_rows`.
+        millpond never declares a variant column (`_add_columns` adds
+        strings and typed scalars only); it writes into what the table
+        declares.
+
+        THE MEMORY ACCOUNTING ABOVE DOES CHANGE for a variant column,
+        and not in the parquet term. The json relabel is free, but
+        pyhoglake encodes each group's text into the column's shredded
+        storage — a struct of binary and typed leaves, built in full
+        before it is written — so for the duration of the group's
+        `write_part` the encoded storage is alive beside the group's
+        Arrow text. Measured on the whales shape (seven variant columns,
+        ~13.8 KB/row): a transient of about +1.1x the group's Arrow size
+        (+603 MiB over a 540 MiB group; +1,762 MiB over 1,316 MiB of
+        input). Per group, not per flush, so with the 2 GiB flush split
+        over ~532 (team, month) groups the transient is a few MiB at a
+        time — but the groups are skewed (a handful of teams are most of
+        the rows), and the worst case is one group that is most of the
+        flush. Sizing rule, then: the three Arrow-sized copies above,
+        plus the parquet, plus 1.1x the LARGEST group; for a hot 2 GiB
+        flush that lands at roughly 8.5-9 GiB of peak RSS, which is why
+        the whales pods are 32 GiB and not 16. The CPU term grows too —
+        the encode is the parquet write's new dominant term, see README
+        "VARIANT columns".
         """
         info = self._table_info(table)
-        target = columns_to_arrow_schema(info.columns)
+        target = columns_to_arrow_schema(info.columns, variant="json")
+        report = VariantReport()
         # Null-fill against THESE columns, not the ones the caller
         # aligned to. `_evolve_and_align` filled against the schema it
         # resolved a round trip ago; a concurrent writer's add_column
@@ -1588,6 +1879,12 @@ class HoglakeSink:
                 # Config ships stats rather than passing None through.
                 # See config._hoglake_deferred_stats.
                 deferred_stats=bool(self._cfg.hoglake_deferred_stats),
+                # Only read when the destination has a variant column;
+                # harmless otherwise. The report is filled group by group
+                # and read below, after a SUCCESSFUL prepare — a prepare
+                # that raised may have counted part of its input.
+                variant_on_invalid=self._variant_on_invalid,
+                variant_report=report,
             )
         except Exception as e:
             # ONE arm, because there is now one question and pyhoglake
@@ -1635,6 +1932,21 @@ class HoglakeSink:
                 getattr(e, "uploaded_uris", ()),
                 reason="prepare_failed",
             )
+            # The codec counters move inside encode calls, which are
+            # inside this call: mirror them whether it returned or not,
+            # so a prepare that raised after routing to Python still
+            # shows the route.
+            self._codec_counts.sync()
+            if _is_native_codec_refusal(e):
+                # PYHOGLAKE_VARIANT_CODEC=native and the Rust codec is
+                # missing or does not take this table's declaration. A
+                # bare RuntimeError, which `is_retryable` would read as
+                # transient; it is config, and permanent.
+                raise HoglakeSinkError(
+                    f"{e}. The variant codec is required by PYHOGLAKE_VARIANT_CODEC=native and cannot encode "
+                    f"{self._cfg.hoglake_namespace}.{self._cfg.hoglake_table}; install pyhoglake-variant-codec "
+                    f"(the `variant-codec` extra) or set PYHOGLAKE_VARIANT_CODEC=auto. Not retried."
+                ) from e
             raise
         # `read_snapshot` STAYS ON THE PAYLOAD, and it is the conflict
         # basis the whole zero-read flush rests on: `prepare_append_*`
@@ -1661,7 +1973,168 @@ class HoglakeSink:
         # every attempt by construction rather than by the formatter
         # happening to be deterministic.
         payload["message"] = message
+        # Two bookings with two clocks, and the split is the point. The
+        # ENCODE's cost (wall seconds, the codec's routes and fallbacks)
+        # was spent by this attempt whether or not its commit lands, so
+        # it is booked here, per prepare. The ROWS it describes are
+        # booked when the payload is PUBLISHED (`_commit_prepared`): a
+        # commit refused as `ddl_since_read_snapshot` is rebuilt, the
+        # rebuild re-encodes the same rows into a fresh report, and
+        # booking per prepare counted them twice. Held on the sink
+        # beside the payload; `_clear_prepared` drops both.
+        #
+        # Both guarded, because both run AFTER the upload: a metrics
+        # failure raised from here would leave the objects just uploaded
+        # with no payload to register them and no orphan count — the
+        # exact gap `_count_orphans` exists to close — and the retry
+        # loop would call the TypeError transient.
+        has_variant = any(c.type == "variant" for c in info.columns)
+        self._prepared_variant = report if has_variant else None
+        if has_variant:
+            try:
+                self._observe_variant_encode(report)
+                self._log_invalid_rows(report, groups, info, facts)
+            except Exception:  # noqa: BLE001 - a metric or a log line, never an orphaned upload
+                log.exception("Could not book the variant encode of this flush; the upload is unaffected")
         return payload
+
+    def _observe_variant_encode(self, report: VariantReport) -> None:
+        """Book what one PREPARE spent on the variant encode: the wall
+        seconds (histogram, by codec), the shadow's seconds, the rows
+        whose verdict fell to the recursion bound, and pyhoglake's
+        per-process codec counters (routed, fallbacks, shadow calls).
+        Per attempt, deliberately — a rebuild spends it again."""
+        metrics.variant_encode_seconds.labels(backend=self._variant_backend).observe(report.encode_seconds)
+        if report.shadow_seconds:
+            metrics.variant_shadow_seconds_total.inc(report.shadow_seconds)
+        if report.recursion_bound_rows:
+            metrics.variant_codec_recursion_bound_rows_total.inc(report.recursion_bound_rows)
+        self._codec_counts.sync()
+        for reason, count in report.codec_fallbacks.items():
+            # Transitional, while both codecs exist: the Rust result was
+            # not used and Python encoded the call again. Correct output
+            # either way, so a warning, not an error; the count is on
+            # `variant_codec_fallback_total` via the sync above.
+            log.warning("Variant codec fell back to Python %d time(s) this prepare: %s", count, reason)
+
+    def _observe_variant_rows(self) -> None:
+        """Book the published flush's `VariantReport` on the row metrics.
+
+        pyhoglake fills ONE report for the whole prepare — every group,
+        every variant column — so the counts come in two shapes and the
+        metrics follow them honestly rather than inventing a split:
+
+        * `rows`, `sql_null_rows`, `invalid_rows` and `invalid_by_reason`
+          are summed over the destination's variant columns: a 1000-row
+          flush into a table with seven variant columns reports
+          `rows == 7000`. `millpond_variant_rows_total{outcome}` and
+          `millpond_variant_invalid_total{reason}` therefore count
+          COLUMN-ROWS and carry no `column` label — pyhoglake does not
+          say which column an invalid row was in, except for the first
+          (`first_invalid`, logged at prepare).
+        * `typed` / `fallback` / `variant_null` are keyed by
+          `(column, declared path)`, so `millpond_variant_values_total`
+          carries both. Paths are the declaration's (at most 1000 per
+          column, fixed for the column's life), never a payload key, so
+          the series set is bounded by the table, not the data.
+
+        Called once per PUBLISHED flush — after a commit the server
+        applied, and after one it answered from a receipt. The receipt
+        case is at-least-once, like everything else about it: if the
+        process that published died between its commit and its offset
+        commit, it booked these rows already and this replay books them
+        again; if it died between the upload and the commit response,
+        nobody did. The metric cannot tell the two apart any more than
+        `records_written_total` can, and a duplicate count on a pod
+        crash is the cheaper error. Never for a refused commit: its
+        rebuild books its own.
+        Guarded, because it runs after the rows are published and a
+        failure here must not make the loop replay a landed commit.
+        """
+        report = self._prepared_variant
+        if report is None:
+            return
+        try:
+            encoded = report.rows - report.sql_null_rows - report.invalid_rows
+            metrics.variant_rows_total.labels(outcome="encoded").inc(encoded)
+            metrics.variant_rows_total.labels(outcome="sql_null").inc(report.sql_null_rows)
+            metrics.variant_rows_total.labels(outcome="invalid").inc(report.invalid_rows)
+            for reason, count in report.invalid_by_reason.items():
+                metrics.variant_invalid_total.labels(reason=reason).inc(count)
+            for outcome, counts in (
+                ("typed", report.typed),
+                ("fallback", report.fallback),
+                ("variant_null", report.variant_null),
+            ):
+                for (column, path), count in counts.items():
+                    if count:
+                        metrics.variant_values_total.labels(column=column or "", path=path, outcome=outcome).inc(count)
+        except Exception:  # noqa: BLE001 - a metric, never a replayed commit
+            log.exception("Could not book the variant rows of this flush; the commit is unaffected")
+
+    def _log_invalid_rows(self, report: VariantReport, groups, info, facts: _FlushFacts) -> None:
+        """One warning per prepare with invalid rows, naming a record an
+        operator can find: the Kafka offset range(s) of the flush, and
+        — where the batch carries a `uuid` column — the uuid and partition
+        values of one invalid row.
+
+        pyhoglake's `first_invalid` is `(column, row, reason, path)` with
+        `row` an index INTO ITS GROUP, and the report does not say which
+        group. So the row is located here: every group long enough to
+        hold that index has its text at that index re-encoded on its own
+        (`variant.encode_json`, one value, `raise`), and the first whose
+        refusal matches the reported reason is the one. Hundreds of
+        single-value encodes at most, microseconds each, only on a
+        prepare that had an invalid row; and if no group matches (a
+        pyhoglake whose numbering changed) the line still carries the
+        offsets, which bound the search to one flush."""
+        if not report.invalid_rows:
+            return
+        column, row, reason, path = report.first_invalid or (None, -1, "unknown", None)
+        where = self._locate_invalid_row(groups, info, column, row, reason)
+        offsets = ", ".join(f"{t}[{p}]:{a}-{b}" for t, p, a, b in facts.kafka_offsets) or "unknown (anonymous flush)"
+        log.warning(
+            "Variant encode nulled %d value(s) this flush (%s); one such row: column %r%s (%s), %s; "
+            "Kafka offsets %s. The rows landed with SQL NULL in that column",
+            report.invalid_rows,
+            ", ".join(f"{r}={n}" for r, n in sorted(report.invalid_by_reason.items())),
+            column,
+            f" at {path}" if path else "",
+            reason,
+            where,
+            offsets,
+        )
+
+    @staticmethod
+    def _locate_invalid_row(groups, info, column: str | None, row: int, reason: str) -> str:
+        """`uuid=... partition=...` for the first group whose value at
+        `row` of `column` the encoder refuses for `reason`, or a note
+        that it could not be found. Best effort: never raises."""
+        try:
+            from pyhoglake import variant
+
+            live = next((c for c in info.columns if c.name == column), None)
+            if live is None or row < 0:
+                return f"row {row} of its partition group (uuid unknown)"
+            for partition_values, group in groups:
+                if row >= group.num_rows or column not in group.schema.names:
+                    continue
+                text = group.column(column)[row].as_py()
+                if text is None:
+                    continue
+                try:
+                    variant.encode_json([text], live, on_invalid="raise")
+                except VariantEncodingError as refused:
+                    if refused.reason != reason:
+                        continue
+                    uuid_ = group.column("uuid")[row].as_py() if "uuid" in group.schema.names else None
+                    return (
+                        f"uuid={uuid_!r} partition={list(partition_values) if partition_values is not None else None} "
+                        f"row {row} of its group"
+                    )
+            return f"row {row} of its partition group (uuid not located)"
+        except Exception as e:  # noqa: BLE001 - a log line, never a failure
+            return f"row {row} of its partition group (uuid not located: {e})"
 
     def _commit_prepared(self) -> int:
         """Publish the prepared request, or recognize that it is already
@@ -1756,6 +2229,9 @@ class HoglakeSink:
         # Fanout, off the same registered-file list and under the same
         # "only what the commit published" rule. See `_observe_fanout`.
         _observe_fanout(files)
+        # The variant row counts, under the same rule: once, for the rows
+        # this commit published.
+        self._observe_variant_rows()
         if replayed:
             # The healthy half of the replay story, and previously
             # invisible: a commit that was re-sent after an uncertain
@@ -1987,6 +2463,14 @@ class HoglakeSink:
             [f["path"] for f in files],
             reason="already_published",
         )
+        # The rows ARE in the lake, once, under this key. Whether the
+        # process that put them there booked them depends on where it
+        # died (after its commit landed: yes; before the response: no),
+        # so this may count them a second time — at-least-once, as the
+        # receipt path is for the rows themselves. Booked rather than
+        # skipped because a pod that dies mid-commit is the common case
+        # the receipt exists for, and an undercount there is silent.
+        self._observe_variant_rows()
         self._clear_prepared()
         return 0
 
@@ -2010,6 +2494,7 @@ class HoglakeSink:
         self._prepared_rows = 0
         self._prepared_offsets = None
         self._prepared_sends = 0
+        self._prepared_variant = None
 
     # -- metadata column ---------------------------------------------------
 
@@ -2515,6 +3000,62 @@ class HoglakeSink:
 
     def _adopt_columns(self, columns) -> None:
         self._live_columns = {c.name: c for c in columns}
+        self._check_variant_columns(columns)
+
+    def _check_variant_columns(self, columns) -> None:
+        """Refuse a destination with a `variant` column this process would
+        encode in Python (unless MILLPOND_ALLOW_PYTHON_VARIANT_CODEC), and
+        one with a NOT NULL `variant` column under EITHER invalid-row
+        policy.
+
+        millpond's contract for a column the batch does not carry is
+        SQL NULL (`_null_fill_missing`, the `INSERT BY NAME` rule), and an
+        events_json producer omits a key whenever it has nothing to say —
+        so a NOT NULL variant column is a column this sink WILL write a
+        SQL NULL into, on the first batch that lacks the key or carries
+        `null` for it. Under `null`, pyhoglake refuses the policy itself
+        (an invalid row would have nowhere to go). Under `raise` it
+        accepts the policy and then raises `sql_null_in_not_null` on that
+        row — permanently, every attempt, so the pod crash-loops on a
+        batch nothing upstream will change: a wedge whose cause is the
+        table's constraint, not a bad record. Both are refused here, with
+        the reason, rather than there, without it.
+
+        When: whenever a shape is adopted — the first resolve (which is
+        on the FIRST WRITE, not at construction: `_ensure_table` is lazy,
+        so the pod has passed its probes and taken its partitions by
+        then, same as every other resolve-time stop), every alter
+        receipt, and every TTL re-read, so a NOT NULL variant column
+        another writer adds under a running pod stops it at the next of
+        those rather than on the first flush after. What it buys over
+        pyhoglake's own refusal is the message and the moment: before the
+        table is claimed, before any group is encoded, before any upload
+        — nothing to orphan — and with the constraint named. Not
+        retryable: neither waiting nor re-resolving changes a column's
+        nullability.
+        """
+        variant = [c for c in columns if c.type == "variant"]
+        if variant and self._variant_backend == "python" and not self._cfg.hoglake_allow_python_variant_codec:
+            # The codec refusal lives here, with the table, and not at
+            # startup: a string-only pod never encodes and is not coupled
+            # to the codec it would never use, while a table that has (or
+            # gains, under a running pod) a variant column is refused at
+            # the same moment and under the same rule as the NOT NULL
+            # check below. See config._hoglake_allow_python_variant_codec.
+            raise HoglakeSinkError(
+                f"{self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} has variant column(s) "
+                f"{[c.name for c in variant]} and {python_variant_codec_refusal()}"
+            )
+        not_null = [c.name for c in variant if not c.nullable]
+        if not_null:
+            raise HoglakeSinkError(
+                f"variant column(s) {not_null} of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} are "
+                f"NOT NULL. millpond writes SQL NULL into a column the batch does not carry (an absent key, a "
+                f"JSON null, or under MILLPOND_HOGLAKE_VARIANT_ON_INVALID=null a row the encoder refused), so a "
+                f"NOT NULL variant column is one every such batch fails on — under `null` pyhoglake refuses the "
+                f"policy, under `raise` it raises sql_null_in_not_null on the row, forever. Make the column "
+                f"nullable."
+            )
 
     def _adopt_info(self, info):
         """Take a `TableInfo` as the destination's live shape, and stamp
@@ -2713,9 +3254,28 @@ class HoglakeSink:
             self._add_columns(table, [f for f in batch.schema if f.name not in self._live_columns])
         )
         rewrites: list[tuple[str, str, str]] = []
+        stringify: list[str] = []
         for field in batch.schema:
             live = self._live_columns.get(field.name)
             if live is None:
+                continue
+            if live.type == "variant":
+                # A string batch column against a live variant column is
+                # THE expected shape, not drift: the arrow_converter
+                # produces JSON text and `_prepare` retypes it to
+                # `pa.json_()` for pyhoglake to encode. No promotion (a
+                # variant is declared once and never altered), no
+                # rewrite, no warning, no metric. Two things are done
+                # here, both in `_json_text_column`: an empty string is
+                # made SQL NULL (it is not JSON, and a producer that
+                # writes "" for "nothing" should land as nothing, not as
+                # an invalid row — millrace's rule too); and a batch
+                # column that is not text at all is serialized to JSON
+                # text, so `5`, `true`, a struct or a list is the JSON
+                # value 5, true, {...} or [...]. An all-null column casts
+                # to json on its own.
+                if not pa.types.is_null(field.type):
+                    stringify.append(field.name)
                 continue
             try:
                 want, _params = arrow_type_to_coltype(field.type)
@@ -2741,6 +3301,15 @@ class HoglakeSink:
             batch = batch.drop_columns(failed)
         for name, live_type, want in rewrites:
             batch = self._rewrite_column(batch, name, live_type, want)
+        for name in stringify:
+            index = batch.schema.get_field_index(name)
+            column = _json_text_column(batch.column(index))
+            if column is not batch.column(index):
+                # The column's OWN type: a large_string column keeps its
+                # type through the "" -> null rewrite, and a field that
+                # said `string` over it is an ArrowInvalid the retry loop
+                # would call transient.
+                batch = batch.set_column(index, pa.field(name, column.type, nullable=True), column)
 
         return self._null_fill_missing(batch)
 
@@ -2850,10 +3419,17 @@ class HoglakeSink:
     def _null_fill_missing(self, batch: pa.Table) -> pa.Table:
         """Null-fill live table columns absent from the batch (removed or
         renamed upstream, or added by another writer) — the equivalent of
-        DuckLake's `INSERT BY NAME` filling unnamed columns with NULL."""
+        DuckLake's `INSERT BY NAME` filling unnamed columns with NULL.
+
+        `variant="json"`: a variant column has no one Arrow type and the
+        default form refuses it (`UnsupportedTypeError`). The json form
+        is the one `_prepare` casts to, so an all-null `pa.json_()`
+        column is what pyhoglake receives — every row SQL NULL, which it
+        accepts because `_check_variant_columns` has already refused any
+        NOT NULL variant column at resolve."""
         for name, col in self._live_columns.items():
             if name not in batch.schema.names:
-                arrow_field = column_to_arrow_field(col)
+                arrow_field = column_to_arrow_field(col, variant="json")
                 batch = batch.append_column(
                     pa.field(name, arrow_field.type, nullable=True),
                     pa.nulls(batch.num_rows, type=arrow_field.type),

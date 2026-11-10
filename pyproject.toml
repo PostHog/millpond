@@ -83,11 +83,34 @@ dependencies = [
     # the hoglake SERVER 1.4.6 narrowing of that refusal to a PROVEN
     # id-less file, which the sink treats as permanent; the server
     # version itself is a deployment requirement no client floor checks.
-    "pyhoglake[fast-upload]>=1.4.6",
-    # 21 because pyhoglake 1.3.0 requires it. Declared here rather than left
-    # to resolve transitively: millpond imports pyarrow directly on every
-    # path, so its floor is millpond's business to state.
-    "pyarrow>=21.0",
+    # 1.4.8 is the floor for VARIANT: `prepare_append_tables` encodes a
+    # `pa.json_()` column into a live `variant` column's declared shredded
+    # layout (`write_part`), takes `variant_on_invalid=` and
+    # `variant_report=`, and `columns_to_arrow_schema(columns,
+    # variant="json")` builds the target schema the sink casts to. An
+    # older client raises `UnsupportedTypeError` on the first variant
+    # column, so this is a floor. The `variant-codec` EXTRA pulls the Rust
+    # codec (pyhoglake-variant-codec, prebuilt wheels for linux
+    # x86_64/aarch64 and macOS, which is what the image and laptops are);
+    # pyhoglake picks it up by itself (`PYHOGLAKE_VARIANT_CODEC=auto`) and
+    # falls back to its Python codec where the wheel is absent. Without the
+    # extra every variant row encodes in Python: measured on the whales
+    # shape (~13.8 KB/row, seven variant columns, M4 Pro) the Rust codec
+    # is ~27 us/row and the Python encoder ~172 us/row, 6-10x, on the
+    # flush thread — a 2 GiB flush goes from seconds to over a minute of
+    # consume pause, and more on prod's Graviton (est. 1.8-2.5x slower per
+    # core). The same "silent 3x" posture as fast-upload, so it is part of
+    # the dependency spec, the image asserts it, and the sink refuses to
+    # resolve a variant table with a process that resolved to Python
+    # (MILLPOND_ALLOW_PYTHON_VARIANT_CODEC).
+    "pyhoglake[fast-upload,variant-codec]>=1.4.8",
+    # 26 because pyhoglake 1.4.8 requires it (its own floor for the VARIANT
+    # writer is 23: pyarrow 21 cannot open a file with a VARIANT group, and
+    # 21/22 cannot read the stats of an INT32/INT64 DECIMAL leaf). Declared
+    # here rather than left to resolve transitively: millpond imports
+    # pyarrow directly on every path, so its floor is millpond's business
+    # to state.
+    "pyarrow>=26.0.0",
     "orjson>=3.10",
     # Direct libpq for the drop-partitions maintenance op (postgres_execute
     # imposes REPEATABLE READ, returns no result sets, and its duckdb
@@ -141,6 +164,7 @@ select = ["E", "F", "I", "UP"]
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
     "e2e: marks tests as E2E tests requiring docker-compose stack",
+    "slow: scale measurements that need gigabytes and minutes; opt in with MILLPOND_RUN_SCALE=1, never CI-gating",
 ]
 pythonpath = ["tools"]
 testpaths = ["tests"]
@@ -163,8 +187,13 @@ exclude-newer = "7 days"
 # published 2026-10-23T19:48Z, for `deferred_stats=` and
 # `IdlessFilesPresentError`. Bumped for 1.4.7, published
 # 2026-10-24T03:11Z: 1.4.6 narrows `IdlessFilesPresentError`; 1.4.7 is
-# a version bump.
-exclude-newer-package = { pyhoglake = "2026-10-24T04:00:00Z", certifi = "1 day" }
+# a version bump. Bumped for 1.4.8, published 2026-11-06T01:14Z, for the
+# VARIANT write path (`variant_on_invalid=` / `variant_report=` on
+# `prepare_append_tables`, `columns_to_arrow_schema(variant="json")`).
+# pyhoglake-variant-codec is the Rust codec behind the `variant-codec`
+# extra; 0.1.0 was published 2026-11-03T12:14Z and the extra pins it
+# exactly, so it needs its own carve-out from the 7-day cooldown.
+exclude-newer-package = { pyhoglake = "2026-11-06T04:00:00Z", pyhoglake-variant-codec = "2026-11-03T13:00:00Z", certifi = "1 day" }
 constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",

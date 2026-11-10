@@ -74,8 +74,18 @@ services:
       # Likewise no hydrator sweep: deferred-stats files must stay
       # `pending` for the tests that assert it.
       HOGLAKE_HYDRATOR_INTERVAL_MS: "0"
+      # Compaction of VARIANT tables is off by default on the server; the
+      # variant suite triggers compaction by hand (`POST
+      # /maintenance/compact`, the loop above stays off) and asserts the
+      # files millpond wrote are accepted in their declared layout.
+      HOGLAKE_COMPACTION_VARIANT: "true"
+      # Prometheus exposition on the unauthenticated infra listener (the
+      # API port's /metrics is operator-only). The variant suite reads
+      # `hoglake_compaction_variant_layout_mismatch_total` off it.
+      HOGLAKE_METRICS_PORT: "9090"
     ports:
       - "127.0.0.1:28080:8080"
+      - "127.0.0.1:29090:9090"
     depends_on:
       postgres:
         condition: service_healthy

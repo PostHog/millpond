@@ -72,7 +72,7 @@ test-hoglake-integration:
 # Run the hoglake E2E (Kafka -> main.py -> hoglake, same throwaway stack).
 [group('test')]
 test-hoglake-e2e:
-    uv run python -m pytest tests/e2e/test_hoglake_e2e.py -v -s
+    uv run python -m pytest tests/e2e/test_hoglake_e2e.py tests/e2e/test_hoglake_variant_e2e.py -v -s
 
 # Full CI check
 [group('test')]

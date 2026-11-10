@@ -148,6 +148,8 @@ def _make_cfg(**overrides) -> Config:
         hoglake_compression=None,
         hoglake_compression_level=None,
         hoglake_deferred_stats=None,
+        hoglake_variant_on_invalid=None,
+        hoglake_allow_python_variant_codec=None,
         bootstrap_servers="localhost:9092",
         topic="test-topic",
         group_id="test-group",

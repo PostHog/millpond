@@ -10,6 +10,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -61,6 +62,12 @@ def _cfg(**overrides) -> MagicMock:
     cfg.hoglake_compression = "zstd"
     cfg.hoglake_compression_level = 3
     cfg.hoglake_deferred_stats = True
+    # config.load()'s default; a MagicMock here would be refused by the
+    # constructor guard (and would reach pyhoglake as `variant_on_invalid`).
+    cfg.hoglake_variant_on_invalid = "null"
+    # config.load()'s default too: a MagicMock is truthy and would let a
+    # python-codec process construct a sink the loader refuses.
+    cfg.hoglake_allow_python_variant_codec = False
     cfg.sort_by = None
     cfg.typed_columns = None
     cfg.topic = "events_json"
@@ -4310,3 +4317,920 @@ class TestTheMessageCannotOrphanAnUpload:
 
         body = inspect.getsource(hoglake.HoglakeSink._prepare)
         assert body.index("format_commit_message(") < body.index("prepare_append_tables(")
+
+
+# ---------------------------------------------------------------------------
+# VARIANT columns
+# ---------------------------------------------------------------------------
+
+from pyhoglake import VariantEncodingError, VariantReport, parquet_write_options, write_part  # noqa: E402
+
+_PROPS_DECL = {
+    "type": "object",
+    "fields": [{"name": "$browser", "type": "string"}, {"name": "n", "type": "int64"}],
+}
+
+# The whales shape in miniature: two live variant columns, one declared
+# (shredded) and one not, beside the string/long columns the batch always
+# carries. millpond never creates these; a setup script did.
+_VARIANT_COLUMNS = [
+    _col("uuid", "string", 1, 1),
+    _col("event", "string", 2, 2),
+    _col("team_id", "long", 3, 3),
+    _col("properties", "variant", 4, 4, type_params={"shredding": _PROPS_DECL}),
+    _col("person_properties", "variant", 5, 5),
+    _col("_inserted_at", "timestamptz", 6, 6),
+]
+
+
+def _wire_real_encode(table) -> None:
+    """Make the mock `prepare_append_tables` ENCODE every group through
+    pyhoglake's real `write_part` before answering with the fake payload.
+
+    The stock stand-in never serializes, which is right for every test
+    about the sink's bookkeeping and wrong for the variant ones: the
+    encoder is what decides that `not json` is invalid, what the
+    `VariantReport` says, and what `raise` raises. Running `write_part`
+    here with the kwargs the sink passed (`variant_on_invalid`,
+    `variant_report`, the codec) is the same call pyhoglake's own
+    `_prepare_append` makes per group, minus the upload."""
+    fake = table.prepare_append_tables.side_effect
+
+    def prepare(groups, *, idempotency_key, expected_table_uuid=None, **kwargs):
+        options = parquet_write_options(kwargs.get("compression"), kwargs.get("compression_level"))
+        for part, _values in groups:
+            write_part(
+                part,
+                table.state.columns,
+                write_options=options,
+                variant_on_invalid=kwargs["variant_on_invalid"],
+                variant_report=kwargs["variant_report"],
+            )
+        return fake(groups, idempotency_key=idempotency_key, expected_table_uuid=expected_table_uuid, **kwargs)
+
+    table.prepare_append_tables.side_effect = prepare
+
+
+def _variant_batch(**overrides) -> pa.Table:
+    cols = {
+        "uuid": ["a", "b", "c"],
+        "event": ["e"] * 3,
+        "team_id": [1, 1, 2],
+        "properties": ['{"$browser": "Chrome", "n": 1}', '{"$browser": "Safari", "n": "not an int"}', None],
+    }
+    cols.update(overrides)
+    return pa.table(cols)
+
+
+def _prepare_kwargs(table) -> dict:
+    return table.prepare_append_tables.call_args.kwargs
+
+
+class TestVariantColumns:
+    """A live `variant` column is written from the same-named string
+    column of the batch, retyped to `pa.json_()` for pyhoglake to encode.
+    millpond never declares one, never promotes to one, and never
+    reports the string-against-variant shape as drift."""
+
+    def test_the_string_batch_column_reaches_prepare_as_json(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        field = _published().schema.field("properties")
+        assert field.type == pa.json_()
+        assert field.metadata[b"PARQUET:field_id"] == b"4"
+        # pyhoglake's own marker, with the declaration: this is the
+        # schema `columns_to_arrow_schema(columns, variant="json")`
+        # builds, and the one `write_part` checks the footer against.
+        assert b"pyhoglake:variant" in field.metadata
+        assert b"$browser" in field.metadata[b"pyhoglake:variant"]
+        # The text is handed over unparsed.
+        assert _published().column("properties").to_pylist() == _variant_batch().column("properties").to_pylist()
+
+    def test_the_policy_and_a_report_reach_prepare(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        kwargs = _prepare_kwargs(table)
+        assert kwargs["variant_on_invalid"] == "null"
+        assert isinstance(kwargs["variant_report"], VariantReport)
+
+    def test_raise_is_passed_through_from_config(self):
+        s, client, catalog, ns, table = _sink(_cfg(hoglake_variant_on_invalid="raise"), columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        assert _prepare_kwargs(table)["variant_on_invalid"] == "raise"
+
+    def test_the_json_retype_is_zero_copy(self):
+        # `.cast(target)` from string to the json extension relabels the
+        # array: same validity, offsets and data buffers. An
+        # unpartitioned table's single group is the aligned batch itself
+        # (no filter), so the addresses survive to the prepared group.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        batch = _variant_batch()
+        s.write(batch)
+        # Chunk 0 on both sides: `combine_chunks` would concatenate, which
+        # copies even a single chunk and would hide what is being proved.
+        before = batch.column("properties").chunk(0).buffers()
+        after = _published().column("properties").chunk(0).storage.buffers()
+        assert [b.address for b in before if b is not None] == [b.address for b in after if b is not None]
+
+    @patch("millpond.hoglake.metrics")
+    def test_string_against_variant_is_not_drift(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        # No add, no promote, no rewrite: the table's alter was never
+        # called, and nothing was booked as a schema error.
+        table.alter.assert_not_called()
+        for call in mock_metrics.errors_total.labels.call_args_list:
+            assert call.kwargs.get("type") != "schema"
+
+    def test_a_missing_variant_column_is_null_filled_as_json(self):
+        # The batch never carries person_properties; the live column
+        # exists. `column_to_arrow_field` refuses a variant in its default
+        # form, so the fill has to ask for the json one.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        column = _published().column("person_properties")
+        assert column.type == pa.json_()
+        assert column.null_count == 3
+
+    def test_a_non_text_batch_column_against_a_variant_column_is_stringified(self):
+        # A producer that sent a bare number for every row: the converter
+        # infers int64, and pyarrow cannot cast int64 to the json
+        # extension. Text first, then json; `5` is the JSON value 5.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch(properties=[5, 6, None]))
+        column = _published().column("properties")
+        assert column.type == pa.json_()
+        assert column.to_pylist() == ["5", "6", None]
+
+    def test_an_all_null_batch_column_against_a_variant_column_casts(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch(properties=pa.nulls(3)))
+        column = _published().column("properties")
+        assert column.type == pa.json_()
+        assert column.null_count == 3
+
+    @patch("millpond.hoglake.metrics")
+    def test_invalid_json_lands_as_null_and_is_counted(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        batch = _variant_batch(properties=['{"$browser": "Chrome", "n": 1}', "not json", None])
+        assert s.write(batch) == 3
+        # One report for the whole prepare, summed over BOTH variant
+        # columns: 3 rows x 2 columns = 6 column-rows. properties: 1
+        # encoded, 1 invalid, 1 SQL NULL; person_properties (null-filled):
+        # 3 SQL NULL.
+        rows = {c.kwargs["outcome"]: c for c in mock_metrics.variant_rows_total.labels.call_args_list}
+        assert set(rows) == {"encoded", "sql_null", "invalid"}
+        inc = mock_metrics.variant_rows_total.labels.return_value.inc
+        booked = dict(zip([c.kwargs["outcome"] for c in rows.values()], [c.args[0] for c in inc.call_args_list]))
+        assert booked == {"encoded": 1, "sql_null": 4, "invalid": 1}
+        mock_metrics.variant_invalid_total.labels.assert_called_once_with(reason="invalid_json")
+        mock_metrics.variant_invalid_total.labels.return_value.inc.assert_called_once_with(1)
+
+    @patch("millpond.hoglake.metrics")
+    def test_declared_paths_are_booked_by_where_the_value_landed(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        s.write(_variant_batch())
+        calls = {
+            (c.kwargs["column"], c.kwargs["path"], c.kwargs["outcome"])
+            for c in mock_metrics.variant_values_total.labels.call_args_list
+        }
+        # Row 1 types both leaves; row 2 types $browser and keeps the
+        # string `n` in `value` (a fallback: the declaration said int64).
+        # Row 3 is SQL NULL and counts nowhere. The root `$` is the object
+        # itself, typed on both rows.
+        assert ("properties", "$.$browser", "typed") in calls
+        assert ("properties", "$.n", "typed") in calls
+        assert ("properties", "$.n", "fallback") in calls
+        assert ("properties", "$", "typed") in calls
+        # Zero counts are not booked, so no series appears for an outcome
+        # that did not happen.
+        assert ("properties", "$.$browser", "fallback") not in calls
+        # The undeclared column has no paths.
+        assert not any(column == "person_properties" for column, _p, _o in calls)
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_encode_time_is_observed_under_the_codec_label(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        s.write(_variant_batch())
+        mock_metrics.variant_encode_seconds.labels.assert_called_once_with(backend=s._variant_backend)
+        # `native`, not "one of the two": the `variant-codec` extra is a
+        # dependency and the venv has it, and a `python` here is the
+        # regression the startup refusal exists for.
+        assert s._variant_backend == "native"
+        (seconds,) = mock_metrics.variant_encode_seconds.labels.return_value.observe.call_args.args
+        assert seconds > 0
+
+    @patch("millpond.hoglake.metrics")
+    def test_nothing_variant_is_booked_for_a_table_without_variant_columns(self, mock_metrics):
+        s, client, catalog, ns, table = _sink()
+        s.write(_batch())
+        mock_metrics.variant_rows_total.labels.assert_not_called()
+        mock_metrics.variant_encode_seconds.labels.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_raise_mode_fails_the_flush_before_anything_is_uploaded(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(_cfg(hoglake_variant_on_invalid="raise"), columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        batch = _variant_batch(properties=['{"ok": 1}', "not json", "{}"])
+        with pytest.raises(VariantEncodingError) as info:
+            s.write(batch, kafka_offsets=(("events", 0, 1, 3),), trigger="size")
+        # Names the column, the row in its group and the reason: the
+        # operator's whole lead on a poison record.
+        assert "properties" in str(info.value)
+        assert info.value.reason == "invalid_json"
+        # Permanent: a `ValidationError`, and the retry loop must not
+        # burn its budget re-encoding the same text.
+        assert hoglake.is_retryable(info.value) is False
+        # Raised by the encoder before the first upload, so nothing to
+        # orphan: the real exception carries uploaded_files=0, and a zero
+        # count is not booked.
+        assert _orphans(mock_metrics) == []
+        catalog.commit_prepared.assert_not_called()
+        assert s._prepared is None
+        # And nothing was booked as encoded: the report of a prepare that
+        # raised may be partial, so it is not read.
+        mock_metrics.variant_rows_total.labels.assert_not_called()
+
+    def test_a_not_null_variant_column_is_refused_at_resolve_under_null(self):
+        columns = [*_VARIANT_COLUMNS[:3], _col("properties", "variant", 4, 4, nullable=False), _VARIANT_COLUMNS[-1]]
+        s, client, catalog, ns, table = _sink(columns=columns)
+        with pytest.raises(hoglake.HoglakeSinkError) as info:
+            s.write(_variant_batch())
+        message = str(info.value)
+        assert "properties" in message and "NOT NULL" in message
+        assert "MILLPOND_HOGLAKE_VARIANT_ON_INVALID" in message
+        assert hoglake.is_retryable(info.value) is False
+        # At resolve: no table was cached and nothing was prepared.
+        assert s._table is None
+        table.prepare_append_tables.assert_not_called()
+
+    def test_a_not_null_variant_column_is_refused_under_raise_too(self):
+        # Under `raise` pyhoglake accepts the policy and then raises
+        # `sql_null_in_not_null` on the first batch that lacks the key
+        # or carries a JSON null — permanently, every attempt: a wedge
+        # whose cause is the table's constraint. Refused at resolve with
+        # the constraint named, before anything is encoded or uploaded.
+        columns = [*_VARIANT_COLUMNS[:3], _col("properties", "variant", 4, 4, nullable=False), _VARIANT_COLUMNS[-1]]
+        s, client, catalog, ns, table = _sink(_cfg(hoglake_variant_on_invalid="raise"), columns=columns)
+        with pytest.raises(hoglake.HoglakeSinkError) as info:
+            s.write(_variant_batch(properties=["{}", "[]", "1"]))
+        assert "NOT NULL" in str(info.value) and "sql_null_in_not_null" in str(info.value)
+        assert hoglake.is_retryable(info.value) is False
+        table.prepare_append_tables.assert_not_called()
+
+    def test_without_the_resolve_check_a_not_null_variant_under_raise_wedges(self):
+        # The thing the check above prevents, shown through the real
+        # encoder: a NOT NULL variant column, `raise`, and a batch that
+        # lacks the key. pyhoglake raises on the null-filled row, as a
+        # `ValidationError` the loop calls permanent — so every restart
+        # replays the same batch into the same refusal.
+        columns = [*_VARIANT_COLUMNS[:3], _col("properties", "variant", 4, 4, nullable=False), _VARIANT_COLUMNS[-1]]
+        s, client, catalog, ns, table = _sink(_cfg(hoglake_variant_on_invalid="raise"), columns=columns)
+        _wire_real_encode(table)
+        batch = _variant_batch().drop_columns(["properties"])
+        # pyarrow refuses the cast of a null-filled column to the
+        # non-nullable target before pyhoglake's own `sql_null_in_not_null`
+        # is reached; either way a ValueError-class refusal the loop
+        # calls permanent, on a batch that replays identically.
+        with patch.object(s, "_check_variant_columns"), pytest.raises((ValueError, VariantEncodingError)) as info:
+            s.write(batch)
+        assert hoglake.is_retryable(info.value) is False
+        catalog.commit_prepared.assert_not_called()
+
+    def test_a_not_null_variant_column_adopted_later_stops_the_pod(self):
+        # The check runs on every adopted shape, not only the first
+        # resolve: a column another writer adds under a running pod is
+        # seen at the next alter receipt or re-read.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        table.state.columns = (*table.state.columns, _col("extra", "variant", 7, 7, nullable=False))
+        with pytest.raises(hoglake.HoglakeSinkError, match="extra"):
+            s._adopt_info(table.state)
+
+    def test_variant_columns_are_never_added_by_evolution(self):
+        # A new batch column is added as the type the arrow_converter
+        # produced (string), whatever its name suggests. Declaring a
+        # variant is the setup script's job (D2).
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch(group0_properties=['{"k": 1}'] * 3))
+        added = [op.body["column"] for ops_list in [c.args[0] for c in table.alter.call_args_list] for op in ops_list]
+        assert [(c["name"], c["type"]) for c in added] == [("group0_properties", "string")]
+
+    def test_the_constructor_refuses_an_unknown_invalid_policy(self):
+        with pytest.raises(hoglake.HoglakeSinkError, match="hoglake_variant_on_invalid"):
+            _sink(_cfg(hoglake_variant_on_invalid="skip"))
+
+    def test_the_policy_and_the_codec_are_logged_at_startup(self, caplog):
+        with caplog.at_level(logging.INFO, logger="millpond.hoglake"):
+            s, *_ = _sink(_cfg(hoglake_variant_on_invalid="raise"))
+        line = next(r.message for r in caplog.records if "hoglake variant columns" in r.message)
+        assert "invalid JSON -> raise" in line
+        assert s._variant_backend in line
+
+
+# The whole of what `_PROPS_DECL` declares, as the paths pyhoglake keys
+# `typed`/`fallback`/`variant_null` by: the root object and its two leaves.
+_PROPS_PATHS = {"$", "$.$browser", "$.n"}
+
+
+def _booked(mock_metrics, metric: str, label: str) -> dict:
+    """{label value: summed inc} for a labelled counter on a patched
+    metrics module. `labels()` and `inc()` are paired by call order,
+    which holds because every booking site labels and then increments."""
+    m = getattr(mock_metrics, metric)
+    keys = [c.kwargs[label] for c in m.labels.call_args_list]
+    incs = [c.args[0] for c in m.labels.return_value.inc.call_args_list]
+    assert len(keys) == len(incs), f"{metric}: {len(keys)} labels() against {len(incs)} inc()"
+    out: dict = {}
+    for k, n in zip(keys, incs, strict=True):
+        out[k] = out.get(k, 0) + n
+    return out
+
+
+class TestVariantInvalidVectors:
+    """The encoder's every refusal, through the sink under `null`: the
+    row lands with SQL NULL in that column, every other column intact,
+    and the reason is on `variant_invalid_total` in pyhoglake's own
+    vocabulary. The verdicts are pyhoglake's (its README D1-D19); what is
+    asserted here is that the sink carries them through unchanged."""
+
+    VECTORS = [
+        pytest.param('{"a": 1, "a": 2}', "duplicate_key", id="duplicate_key"),
+        pytest.param("NaN", "non_finite_number", id="NaN"),
+        pytest.param("Infinity", "non_finite_number", id="Infinity"),
+        pytest.param("1e400", "non_finite_number", id="1e400"),
+        pytest.param("1" + "0" * 39, "integer_out_of_range", id="40-digit-int"),
+        pytest.param('{"a":' * 129 + "1" + "}" * 129, "nesting_too_deep", id="depth-129"),
+        pytest.param('"\\ud800"', "invalid_unicode", id="lone-surrogate"),
+        pytest.param('{"a": 1} trailing', "invalid_json", id="trailing-garbage"),
+        pytest.param("not json {", "invalid_json", id="not-json"),
+    ]
+
+    @pytest.mark.parametrize(("text", "reason"), VECTORS)
+    @patch("millpond.hoglake.metrics")
+    def test_the_row_is_nulled_counted_and_the_rest_of_it_lands(self, mock_metrics, text, reason):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        batch = _variant_batch(properties=['{"$browser": "Chrome", "n": 1}', text, '{"n": 2}'])
+        assert s.write(batch, kafka_offsets=(("events", 0, 1, 3),)) == 3
+        # The other columns of the invalid row are untouched: the group
+        # handed to pyhoglake still carries uuid `b` and its team.
+        published = _published()
+        assert published.column("uuid").to_pylist() == ["a", "b", "c"]
+        assert published.column("team_id").to_pylist() == [1, 1, 2]
+        rows = _booked(mock_metrics, "variant_rows_total", "outcome")
+        # 3 rows x 2 variant columns: properties 2 encoded + 1 invalid;
+        # person_properties (null-filled) 3 SQL NULL.
+        assert rows == {"encoded": 2, "sql_null": 3, "invalid": 1}
+        assert _booked(mock_metrics, "variant_invalid_total", "reason") == {reason: 1}
+        # And the metrics module was never asked to label anything the
+        # table did not declare.
+        for call in mock_metrics.variant_values_total.labels.call_args_list:
+            assert call.kwargs["column"] == "properties"
+            assert call.kwargs["path"] in _PROPS_PATHS
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_empty_string_is_sql_null_not_invalid(self, mock_metrics):
+        # "" is not JSON, but a producer that writes "" for "nothing"
+        # meant nothing: it lands as SQL NULL, uncounted as invalid, the
+        # way millrace reads it. The retype is done before pyhoglake sees
+        # the column.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        assert s.write(_variant_batch(properties=['{"n": 1}', "", None])) == 3
+        column = _published().column("properties")
+        assert column.type == pa.json_()
+        assert column.to_pylist() == ['{"n": 1}', None, None]
+        rows = _booked(mock_metrics, "variant_rows_total", "outcome")
+        assert rows == {"encoded": 1, "sql_null": 5, "invalid": 0}
+        mock_metrics.variant_invalid_total.labels.assert_not_called()
+
+    def test_a_text_column_without_an_empty_string_is_passed_through_untouched(self):
+        # The "" scan must not cost a copy on the common path: the same
+        # buffers reach pyhoglake (see test_the_json_retype_is_zero_copy).
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        batch = _variant_batch()
+        s.write(batch)
+        before = batch.column("properties").chunk(0).buffers()
+        after = _published().column("properties").chunk(0).storage.buffers()
+        assert [b.address for b in before if b is not None] == [b.address for b in after if b is not None]
+
+    @patch("millpond.hoglake.metrics")
+    def test_non_object_roots_are_fallback_at_the_root_path(self, mock_metrics):
+        # The declaration says the root is an object. `[1]`, `5` and `"x"`
+        # are valid JSON of another type: encoded, kept in `value`, and
+        # counted as `fallback` at `$` — never invalid.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        assert s.write(_variant_batch(properties=["[1]", "5", '"x"'])) == 3
+        rows = _booked(mock_metrics, "variant_rows_total", "outcome")
+        assert rows == {"encoded": 3, "sql_null": 3, "invalid": 0}
+        mock_metrics.variant_invalid_total.labels.assert_not_called()
+        values = {
+            (c.kwargs["column"], c.kwargs["path"], c.kwargs["outcome"]): n
+            for c, n in zip(
+                mock_metrics.variant_values_total.labels.call_args_list,
+                [c.args[0] for c in mock_metrics.variant_values_total.labels.return_value.inc.call_args_list],
+                strict=True,
+            )
+        }
+        assert values == {("properties", "$", "fallback"): 3}
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_json_text_null_is_a_variant_null_not_sql_null(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        assert s.write(_variant_batch(properties=["null", "null", None])) == 3
+        rows = _booked(mock_metrics, "variant_rows_total", "outcome")
+        # Two Variant nulls are ENCODED rows; the absent one is SQL NULL
+        # (plus the three null-filled person_properties).
+        assert rows == {"encoded": 2, "sql_null": 4, "invalid": 0}
+        values = {
+            (c.kwargs["path"], c.kwargs["outcome"]) for c in mock_metrics.variant_values_total.labels.call_args_list
+        }
+        assert values == {("$", "variant_null")}
+
+    @patch("millpond.hoglake.metrics")
+    def test_every_label_is_a_declared_path_or_a_vocabulary_word(self, mock_metrics):
+        # The label sets are bounded by the TABLE, not the data: paths
+        # come from the declaration (plus `$`), reasons from pyhoglake's
+        # closed `InvalidReason`. Every vector above, one flush.
+        from typing import get_args
+
+        from pyhoglake.variant import InvalidReason
+
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        texts = [p.values[0] for p in self.VECTORS] + ['{"$browser": "x", "n": 1, "undeclared": {"k": [1]}}', "null"]
+        batch = _variant_batch(
+            uuid=[f"u{i}" for i in range(len(texts))],
+            event=["e"] * len(texts),
+            team_id=[1] * len(texts),
+            properties=texts,
+        )
+        assert s.write(batch) == len(texts)
+        reasons = {c.kwargs["reason"] for c in mock_metrics.variant_invalid_total.labels.call_args_list}
+        assert reasons and reasons <= set(get_args(InvalidReason))
+        for call in mock_metrics.variant_values_total.labels.call_args_list:
+            assert call.kwargs["column"] == "properties"
+            assert call.kwargs["path"] in _PROPS_PATHS
+            assert call.kwargs["outcome"] in {"typed", "fallback", "variant_null"}
+        assert set(_booked(mock_metrics, "variant_rows_total", "outcome")) == {"encoded", "sql_null", "invalid"}
+
+
+class TestVariantAlignment:
+    """What `_evolve_and_align` does to a batch column headed for a live
+    variant column: text passes, anything else becomes JSON text, and
+    none of it is drift."""
+
+    @pytest.mark.parametrize(
+        ("values", "expected"),
+        [
+            pytest.param(
+                [{"a": 1, "b": [1, 2]}, {"a": 2, "b": []}, None],
+                ['{"a":1,"b":[1,2]}', '{"a":2,"b":[]}', None],
+                id="struct",
+            ),
+            pytest.param([[1, 2], [], None], ["[1,2]", "[]", None], id="list"),
+            pytest.param([True, False, None], ["true", "false", None], id="bool"),
+            pytest.param([1.5, 2.0, None], ["1.5", "2", None], id="float"),
+        ],
+    )
+    @patch("millpond.hoglake.metrics")
+    def test_a_non_text_batch_column_is_json_text_not_a_crash(self, mock_metrics, values, expected):
+        # `cast(pa.string())` on a struct or list raises
+        # ArrowNotImplementedError, which `is_retryable` calls transient:
+        # a producer sending objects where text was expected crash-looped
+        # the partition on the same batch. Serialized instead, and the
+        # real encoder takes every one of them.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        assert s.write(_variant_batch(properties=pa.array(values))) == 3
+        column = _published().column("properties")
+        assert column.type == pa.json_()
+        assert column.to_pylist() == expected
+        table.alter.assert_not_called()
+        for call in mock_metrics.errors_total.labels.call_args_list:
+            assert call.kwargs.get("type") != "schema"
+        assert _booked(mock_metrics, "variant_rows_total", "outcome")["invalid"] == 0
+
+    def test_a_large_string_column_with_an_empty_string_keeps_its_type(self):
+        # The field written back over the rewritten column must be the
+        # column's own type: `string` over a large_string array is an
+        # ArrowInvalid the retry loop calls transient.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        texts = pa.chunked_array([pa.array(['{"n": 1}', "", None], pa.large_string())])
+        assert s.write(_variant_batch(properties=texts)) == 3
+        column = _published().column("properties")
+        assert column.type == pa.json_()
+        assert column.to_pylist() == ['{"n": 1}', None, None]
+
+    @pytest.mark.parametrize("kind", [pa.string(), pa.large_string()], ids=["string", "large_string"])
+    def test_nulling_empty_strings_shares_the_text_buffers(self, kind):
+        # Zero-copy: only the validity bitmap is new; the offsets and the
+        # data buffers are the input's own, at the same addresses — also
+        # for a sliced chunk, whose offset the bitmap has to honour.
+        values = pa.array(['{"a": 1}', "", None, "", '{"b": 2}', "x"], kind)
+        for chunk in (values, values.slice(1, 4)):
+            out = hoglake._null_empty_strings(chunk)
+            assert out.type == kind
+            assert out.to_pylist() == [None if v == "" else v for v in chunk.to_pylist()]
+            before, after = chunk.buffers(), out.buffers()
+            assert after[1].address == before[1].address and after[2].address == before[2].address
+            assert after[0] is not None and (before[0] is None or after[0].address != before[0].address)
+        column = pa.chunked_array([values, values.slice(2)], kind)
+        out = hoglake._json_text_column(column)
+        assert out.type == kind
+        assert [c.buffers()[2].address for c in out.chunks] == [c.buffers()[2].address for c in column.chunks]
+
+    def test_the_sink_names_its_variant_columns_for_the_converter(self):
+        # `json_text_columns()`: empty before the destination is resolved
+        # (the first batch is converted before the first write), the live
+        # variant columns after.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        assert s.json_text_columns() == frozenset()
+        s.write(_variant_batch())
+        assert s.json_text_columns() == frozenset({"properties", "person_properties"})
+        plain, *_ = _sink()
+        plain.write(_batch())
+        assert plain.json_text_columns() == frozenset()
+
+    def test_a_timestamp_batch_column_is_a_json_string(self):
+        # pyarrow's own cast would give `2026-01-01 00:00:00`, which is
+        # not JSON; orjson gives the ISO string, quoted, which is.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        stamps = pa.array([datetime(2026, 1, 1, tzinfo=UTC), None, datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)])
+        s.write(_variant_batch(properties=stamps))
+        assert _published().column("properties").to_pylist() == [
+            '"2026-01-01T00:00:00+00:00"',
+            None,
+            '"2026-01-02T03:04:05+00:00"',
+        ]
+
+    @patch("millpond.hoglake.metrics")
+    def test_type_drift_across_flushes_lands_without_alter_or_errors(self, mock_metrics):
+        # The same source as text, then as a bare integer for every row,
+        # then all-null: three flushes, three shapes, no DDL, no
+        # errors_total, every row encoded or SQL NULL.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        assert s.write(_variant_batch()) == 3
+        assert s.write(_variant_batch(properties=[1, 2, 3])) == 3
+        assert s.write(_variant_batch(properties=pa.nulls(3))) == 3
+        table.alter.assert_not_called()
+        for call in mock_metrics.errors_total.labels.call_args_list:
+            assert call.kwargs.get("type") != "schema"
+        rows = _booked(mock_metrics, "variant_rows_total", "outcome")
+        assert rows["invalid"] == 0
+        assert rows["encoded"] + rows["sql_null"] == 9 * 2
+        assert _published().column("properties").type == pa.json_()
+
+    def test_mixed_variant_and_typed_columns_on_an_unpartitioned_table(self):
+        # MILLPOND_TYPED_COLUMNS=timestamp:timestamptz beside the variant
+        # columns, on a table with no partition spec: one group, no
+        # partition values, the typed column cast and the variant column
+        # retyped, in the one prepared payload.
+        columns = [*_VARIANT_COLUMNS[:5], _col("timestamp", "timestamptz", 6, 6), _VARIANT_COLUMNS[-1]]
+        s, client, catalog, ns, table = _sink(_cfg(typed_columns=(("timestamp", "timestamptz"),)), columns=columns)
+        _wire_real_encode(table)
+        batch = coerce_typed_columns(
+            _variant_batch(timestamp=["2026-09-17 12:00:00.123", "2026-09-17 12:00:01", "2026-09-17 12:00:02"]),
+            (("timestamp", "timestamptz"),),
+        )
+        assert s.write(batch) == 3
+        groups = _groups()
+        assert len(groups) == 1 and groups[0][0] is None
+        published = _published()
+        assert published.schema.field("properties").type == pa.json_()
+        assert published.schema.field("person_properties").type == pa.json_()
+        assert published.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+        assert published.column("timestamp").null_count == 0
+
+    def test_a_table_without_variant_columns_prepares_the_same_payload_as_before(self):
+        # The golden: for a destination with no variant column the schema
+        # the sink casts to is byte-identical to origin/main's
+        # `columns_to_arrow_schema(info.columns)` (the `variant="json"`
+        # form changes nothing when there is nothing to change), and the
+        # group handed to pyhoglake is the batch.
+        from pyhoglake.types import columns_to_arrow_schema
+
+        s, client, catalog, ns, table = _sink()
+        batch = _batch()
+        s.write(batch)
+        published = _published()
+        assert columns_to_arrow_schema(_EVENTS_COLUMNS, variant="json") == columns_to_arrow_schema(_EVENTS_COLUMNS)
+        assert published.schema == columns_to_arrow_schema(_EVENTS_COLUMNS)
+        for name in batch.schema.names:
+            assert published.column(name).to_pylist() == batch.column(name).to_pylist()
+        # What DID change on the call, deliberately: the policy and a
+        # report ride along on every prepare, harmless to a table that
+        # has nothing to encode.
+        kwargs = _prepare_kwargs(table)
+        assert kwargs["variant_on_invalid"] == "null"
+        assert isinstance(kwargs["variant_report"], VariantReport)
+
+
+class TestVariantBookkeeping:
+    """When the variant metrics are booked, and what happens when the
+    booking itself fails."""
+
+    OFFSETS = (("events", 0, 30, 32),)
+    DDL = DdlSinceReadSnapshotError(
+        "ddl_since_read_snapshot",
+        status_code=409,
+        detail="concurrent DDL since snapshot 41 on table(s): analytics.events",
+        tables=("analytics.events",),
+        read_snapshot=41,
+    )
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_rebuild_after_a_ddl_refusal_books_the_rows_once(self, mock_metrics):
+        # The commit is refused, the payload discarded, the retry
+        # re-encodes the same rows: two prepares, two reports, ONE
+        # booking — rows x columns, not twice that.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        catalog.commit_prepared.side_effect = [self.DDL, MagicMock(snapshot_id=8, schema_version=1)]
+        with pytest.raises(hoglake.HoglakeSinkError):
+            s.write(_variant_batch(), kafka_offsets=self.OFFSETS)
+        # Nothing booked for the refused attempt: its rows did not land.
+        mock_metrics.variant_rows_total.labels.assert_not_called()
+        s.reset_caches()
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS) == 3
+        assert table.prepare_append_tables.call_count == 2
+        rows = _booked(mock_metrics, "variant_rows_total", "outcome")
+        assert sum(rows.values()) == 3 * 2
+        # properties: 2 encoded + 1 absent; person_properties: 3 null-filled.
+        assert rows == {"encoded": 2, "sql_null": 4, "invalid": 0}
+        # The ENCODE was spent twice, and is booked twice: it is a cost
+        # of the attempt, not a description of the rows.
+        assert mock_metrics.variant_encode_seconds.labels.return_value.observe.call_count == 2
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_permanently_refused_commit_books_no_rows(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        catalog.commit_prepared.side_effect = ValidationError("bad", status_code=422, detail="refused")
+        with pytest.raises(ValidationError):
+            s.write(_variant_batch(), kafka_offsets=self.OFFSETS)
+        mock_metrics.variant_rows_total.labels.assert_not_called()
+        mock_metrics.variant_values_total.labels.assert_not_called()
+        assert s._prepared is None and s._prepared_variant is None
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_commit_answered_from_a_receipt_books_the_rows_once(self, mock_metrics):
+        # The rows are in the lake under this key, put there by a process
+        # that died before it could book them: this process books them
+        # (and claims none on records_written_total, as before).
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        catalog.commit_prepared.side_effect = ValidationError(
+            "reused", status_code=422, detail=f"{hoglake._REUSED_KEY_MARKER}: idempotency key already used"
+        )
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS) == 0
+        assert sum(_booked(mock_metrics, "variant_rows_total", "outcome").values()) == 3 * 2
+        mock_metrics.hoglake_commit_replays_total.labels.assert_called_once_with(outcome="already_published")
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_metrics_failure_after_the_upload_neither_orphans_nor_fails_the_flush(self, mock_metrics, caplog):
+        # The booking runs after the objects are uploaded. If it raises,
+        # the flush must still carry its payload to the commit — a raise
+        # here used to leave the uploads with no payload, no orphan count
+        # and a "transient" TypeError for the retry loop to burn on.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        mock_metrics.variant_encode_seconds.labels.side_effect = TypeError("metrics broke")
+        mock_metrics.variant_rows_total.labels.side_effect = TypeError("metrics broke")
+        with caplog.at_level(logging.ERROR, logger="millpond.hoglake"):
+            assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS) == 3
+        catalog.commit_prepared.assert_called_once()
+        assert _orphans(mock_metrics) == []
+        assert s._prepared is None
+        assert sum(1 for r in caplog.records if "Could not book the variant" in r.message) == 2
+
+    def test_the_invalid_row_warning_names_the_uuid_partition_and_offsets(self, caplog):
+        # Row 1 of a 3-row batch, over two partition groups, invalid.
+        # The report says "row N of its group"; the line says WHICH row.
+        s, client, catalog, ns, table = _sink(
+            _cfg(hoglake_partition_by=(("team_id", "identity", None),)),
+            columns=_VARIANT_COLUMNS,
+            partition_spec=_spec(("team_id", "identity")),
+        )
+        _wire_real_encode(table)
+        batch = _variant_batch(properties=['{"n": 1}', '{"n": 2}', "not json"], team_id=[1, 2, 2])
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            s.write(batch, kafka_offsets=(("events", 0, 10, 11), ("events", 3, 7, 7)))
+        line = next(r.message for r in caplog.records if "Variant encode nulled" in r.message)
+        assert "uuid='c'" in line
+        assert "partition=['2']" in line
+        assert "invalid_json" in line
+        assert "events[0]:10-11, events[3]:7-7" in line
+
+    @patch("millpond.hoglake.metrics")
+    def test_pyhoglakes_codec_counters_are_mirrored_by_delta(self, mock_metrics):
+        # The silent-Python signal: `auto` routed a call to Python, which
+        # pyhoglake counts per process and the sink mirrors as a
+        # difference after every prepare. Every label set is primed at
+        # zero when the sink is built.
+        from collections import Counter
+
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        routed = mock_metrics.variant_codec_routed_to_python_total
+        primed = {(c.kwargs["op"], c.kwargs["reason"]) for c in routed.labels.call_args_list}
+        assert primed == set(hoglake._CODEC_ROUTED)
+        assert {c.kwargs["reason"] for c in mock_metrics.variant_codec_fallback_total.labels.call_args_list} == set(
+            hoglake._CODEC_ENCODE_REASONS
+        )
+        mock_metrics.variant_codec_info.labels.assert_called_once_with(backend="native")
+        mock_metrics.variant_codec_info.labels.return_value.set.assert_called_once_with(1)
+        routed.reset_mock()
+        with (
+            patch("pyhoglake._variant_backend.ROUTED", Counter({("encode", "plan"): 2})),
+            patch("pyhoglake._variant_backend.ENCODE_FALLBACKS", Counter({"panic": 1})),
+            patch("pyhoglake._variant_backend.SHADOWED", Counter({"calls": 4, "rows": 40})),
+        ):
+            s._codec_counts.sync()
+            s._codec_counts.sync()  # idempotent: the same totals book nothing more
+        routed.labels.assert_called_with(op="encode", reason="plan")
+        assert [c.args for c in routed.labels.return_value.inc.call_args_list] == [(2,)]
+        fallback = mock_metrics.variant_codec_fallback_total
+        assert [c.args for c in fallback.labels.return_value.inc.call_args_list if c.args != (0,)] == [(1,)]
+        assert [c.args for c in mock_metrics.variant_shadow_calls_total.inc.call_args_list if c.args != (0,)] == [(4,)]
+        assert [c.args for c in mock_metrics.variant_shadow_rows_total.inc.call_args_list if c.args != (0,)] == [(40,)]
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_report_with_shadow_time_and_bounded_rows_books_them(self, mock_metrics):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        report = VariantReport(encode_seconds=0.5, shadow_seconds=0.25, recursion_bound_rows=3)
+        s._observe_variant_encode(report)
+        mock_metrics.variant_shadow_seconds_total.inc.assert_called_once_with(0.25)
+        mock_metrics.variant_codec_recursion_bound_rows_total.inc.assert_called_once_with(3)
+        mock_metrics.variant_encode_seconds.labels.return_value.observe.assert_called_once_with(0.5)
+
+
+class TestVariantCodecGuards:
+    """A Python codec refuses a VARIANT table at resolve (not a string-only
+    one, and not at startup); a `native` refusal from the encoder is
+    permanent."""
+
+    def test_a_python_codec_refuses_a_variant_table_at_resolve(self):
+        with patch("millpond.hoglake._variant_backend_label", return_value="python"):
+            s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        with pytest.raises(hoglake.HoglakeSinkError) as info:
+            s.write(_variant_batch())
+        message = str(info.value)
+        assert "MILLPOND_ALLOW_PYTHON_VARIANT_CODEC=true" in message
+        assert "properties" in message and "person_properties" in message
+        assert hoglake.is_retryable(info.value) is False
+        # At resolve: nothing encoded, nothing uploaded, no table claimed.
+        table.prepare_append_tables.assert_not_called()
+        assert s._table is None
+
+    def test_a_python_codec_does_not_touch_a_string_only_table(self):
+        # No variant column, nothing to encode: the pod runs, labelled.
+        with patch("millpond.hoglake._variant_backend_label", return_value="python"):
+            s, client, catalog, ns, table = _sink()
+        assert s._variant_backend == "python"
+        assert s.write(_batch()) == 1
+
+    def test_a_variant_column_adopted_later_stops_a_python_codec_pod(self):
+        # Same rule as the NOT NULL check: every adopted shape is checked,
+        # so a table that GAINS a variant column under a running Python
+        # pod stops it at the next alter receipt or TTL re-read.
+        with patch("millpond.hoglake._variant_backend_label", return_value="python"):
+            s, client, catalog, ns, table = _sink()
+        s.write(_batch())
+        table.state.columns = (*table.state.columns, _col("extra", "variant", 7, 7))
+        with pytest.raises(hoglake.HoglakeSinkError, match="extra"):
+            s._adopt_info(table.state)
+
+    def test_an_allowed_python_codec_writes_a_variant_table_and_is_labelled(self, caplog):
+        with (
+            patch("millpond.hoglake._variant_backend_label", return_value="python"),
+            caplog.at_level(logging.INFO, logger="millpond.hoglake"),
+        ):
+            cfg = _cfg(hoglake_allow_python_variant_codec=True)
+            s, client, catalog, ns, table = _sink(cfg, columns=_VARIANT_COLUMNS)
+        assert s._variant_backend == "python"
+        assert s.write(_variant_batch()) == 3
+        line = next(r.message for r in caplog.records if "hoglake variant columns" in r.message)
+        assert "codec: python" in line and "MILLPOND_ALLOW_PYTHON_VARIANT_CODEC=true" in line
+
+    def test_an_unknown_codec_is_a_label_not_a_refusal(self):
+        with patch("millpond.hoglake._variant_backend_label", return_value="unknown"):
+            s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        assert s._variant_backend == "unknown"
+        assert s.write(_variant_batch()) == 3
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_native_codec_refusal_from_prepare_is_permanent(self, mock_metrics):
+        # PYHOGLAKE_VARIANT_CODEC=native with no wheel (or a plan it does
+        # not take): pyhoglake raises a bare RuntimeError, which
+        # `is_retryable` would call transient and burn the ladder on.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        refusal = RuntimeError("PYHOGLAKE_VARIANT_CODEC=native, but pyhoglake-variant-codec does not import (x)")
+        table.prepare_append_tables.side_effect = refusal
+        with pytest.raises(hoglake.HoglakeSinkError) as info:
+            s.write(_variant_batch(), kafka_offsets=(("events", 0, 1, 3),))
+        assert info.value.__cause__ is refusal
+        assert hoglake.is_retryable(info.value) is False
+        assert "PYHOGLAKE_VARIANT_CODEC=auto" in str(info.value)
+        assert hoglake.is_retryable(refusal) is True, "the bare RuntimeError alone still reads as transient"
+        assert _orphans(mock_metrics) == []
+        catalog.commit_prepared.assert_not_called()
+
+    def test_other_runtime_errors_keep_their_verdict(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        table.prepare_append_tables.side_effect = RuntimeError("something else entirely")
+        with pytest.raises(RuntimeError) as info:
+            s.write(_variant_batch())
+        assert type(info.value) is RuntimeError
+        assert not hoglake._is_native_codec_refusal(hoglake.HoglakeSinkError("PYHOGLAKE_VARIANT_CODEC=native, but x"))
+
+
+class TestVariantFlushDeadline:
+    """The per-attempt reservation follows the measured prepare."""
+
+    def test_the_reservation_is_the_floor_until_a_prepare_has_run(self):
+        from millpond.config import _PREPARE_ALLOWANCE_S
+
+        s, *_ = _sink(columns=_VARIANT_COLUMNS)
+        assert s._last_prepare_s is None
+        assert s.write_flush_deadline()[1] == 30.0 + _PREPARE_ALLOWANCE_S
+
+    def test_the_reservation_follows_a_measured_prepare(self):
+        from millpond.config import _PREPARE_ALLOWANCE_S, _PREPARE_SAFETY
+
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        # A clock that moves 40 s on every reading: a prepare spans at
+        # least one reading, so the measured duration is >= 40 s and
+        # the reservation is timeout + measured x safety, above the floor.
+        t = {"now": 0.0}
+
+        def clock():
+            t["now"] += 40.0
+            return t["now"]
+
+        s._monotonic = clock
+        s.write(_variant_batch())
+        assert s._last_prepare_s is not None and s._last_prepare_s >= 40.0
+        budget, reserve = s.write_flush_deadline()
+        assert reserve == 30.0 + s._last_prepare_s * _PREPARE_SAFETY
+        assert reserve > 30.0 + _PREPARE_ALLOWANCE_S
+
+    def test_a_prepare_that_raised_is_measured_too(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        table.prepare_append_tables.side_effect = OSError("S3 stalled")
+        t = {"now": 0.0}
+
+        def clock():
+            t["now"] += 40.0
+            return t["now"]
+
+        s._monotonic = clock
+        with pytest.raises(OSError):
+            s.write(_variant_batch())
+        assert s._last_prepare_s is not None and s._last_prepare_s >= 40.0
+
+
+class TestVariantRaiseWedge:
+    """`raise` through the retry loop: one attempt, tagged permanent, no
+    commit of rows or offsets, the final flush skipped. The partition
+    stays where it is until the record is gone from the topic — the
+    design, and the reason `null` is the default."""
+
+    @patch("millpond.main.metrics")
+    @patch("millpond.main.time")
+    def test_one_attempt_no_retry_tagged_permanent(self, _time, _metrics):
+        from millpond.main import _final_flush_decision, _is_permanent_write_failure, _write_with_retry
+
+        s, client, catalog, ns, table = _sink(_cfg(hoglake_variant_on_invalid="raise"), columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        batch = _variant_batch(properties=['{"ok": 1}', "not json", "{}"])
+        with pytest.raises(VariantEncodingError) as info:
+            kwargs = {"kafka_offsets": (("events", 0, 1, 3),), "trigger": "size"}
+            _write_with_retry(s, batch, destination="hoglake", write_kwargs=kwargs)
+        assert table.prepare_append_tables.call_count == 1, "retried a refusal that cannot change"
+        assert _is_permanent_write_failure(info.value)
+        assert _final_flush_decision(3, info.value, started=True) == "skip"
+        catalog.commit_prepared.assert_not_called()
+        assert s._prepared is None
+
+    @patch("millpond.main.metrics")
+    @patch("millpond.main.time")
+    def test_the_offsets_are_not_committed(self, _time, _metrics):
+        from millpond.main import _flush
+
+        s, client, catalog, ns, table = _sink(_cfg(hoglake_variant_on_invalid="raise"), columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        kafka = MagicMock()
+        cfg = MagicMock(destination="hoglake", sort_by=None)
+        batch = _variant_batch(properties=['{"ok": 1}', "not json", "{}"])
+        with pytest.raises(VariantEncodingError):
+            _flush(s, cfg, kafka, batch, batch.nbytes, 3, {("events", 0): (1, 3)}, 0.0, "size")
+        kafka.commit.assert_not_called()
