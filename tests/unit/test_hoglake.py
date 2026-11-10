@@ -797,7 +797,13 @@ class TestRetryBudgetAndBackpressure:
         cfg = _cfg(hoglake_request_timeout_s=12.5)
         with patch("millpond.hoglake.HoglakeClient") as mock_client:
             hoglake.HoglakeSink(cfg)
-        assert mock_client.call_args.kwargs["timeout"] == 12.5
+        # Two clients: the write path's at the configured timeout, and the
+        # shape peek's at its own short one (it runs on the consume
+        # thread before every conversion).
+        timeouts = [call.kwargs["timeout"] for call in mock_client.call_args_list]
+        assert timeouts == [12.5, 12.5]
+        # Both through one constructor, so auth/headers cannot diverge.
+        assert mock_client.call_args_list[0].kwargs["s3"] == mock_client.call_args_list[1].kwargs["s3"]
 
     def test_retry_after_header_is_captured_and_consumed_once(self):
         # pyhoglake drops Retry-After entirely (it maps status codes and
@@ -1600,7 +1606,9 @@ class TestBootstrap:
     def test_close_closes_client(self):
         s, client, *_ = _sink()
         s.close()
-        client.close.assert_called_once()
+        # Both clients (the mock stands in for both): the write path's and
+        # the shape peek's.
+        assert client.close.call_count == 2
 
 
 class TestBootstrapSpecs:
@@ -4796,7 +4804,7 @@ class TestVariantAlignment:
             ),
             pytest.param([[1, 2], [], None], ["[1,2]", "[]", None], id="list"),
             pytest.param([True, False, None], ["true", "false", None], id="bool"),
-            pytest.param([1.5, 2.0, None], ["1.5", "2", None], id="float"),
+            pytest.param([1.5, 2.0, None], ["1.5", "2.0", None], id="float"),
         ],
     )
     @patch("millpond.hoglake.metrics")
@@ -4847,17 +4855,28 @@ class TestVariantAlignment:
         assert out.type == kind
         assert [c.buffers()[2].address for c in out.chunks] == [c.buffers()[2].address for c in column.chunks]
 
-    def test_the_sink_names_its_variant_columns_for_the_converter(self):
-        # `json_text_columns()`: empty before the destination is resolved
-        # (the first batch is converted before the first write), the live
-        # variant columns after.
-        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
-        assert s.json_text_columns() == frozenset()
-        s.write(_variant_batch())
-        assert s.json_text_columns() == frozenset({"properties", "person_properties"})
-        plain, *_ = _sink()
-        plain.write(_batch())
-        assert plain.json_text_columns() == frozenset()
+    def test_a_float_column_keeps_its_point_so_a_double_leaf_is_typed(self):
+        # pyarrow's cast renders 2.0 as `2`, an integer to the encoder,
+        # which a declared double cannot take (fallback). Serialized as
+        # `2.0`, both rows land in the typed leaf; NaN is the literal the
+        # encoder refuses, counted, SQL NULL.
+        columns = [*_VARIANT_COLUMNS, _col("ratio", "variant", 7, 7, type_params={"shredding": {"type": "double"}})]
+        s, client, catalog, ns, table = _sink(columns=columns)
+        _wire_real_encode(table)
+        with patch("millpond.hoglake.metrics") as mock_metrics:
+            assert s.write(_variant_batch(ratio=pa.array([2.0, 1.5, float("nan")], pa.float64()))) == 3
+        assert _published().column("ratio").to_pylist() == ["2.0", "1.5", "NaN"]
+        values = {
+            (c.kwargs["column"], c.kwargs["path"], c.kwargs["outcome"]): n
+            for c, n in zip(
+                mock_metrics.variant_values_total.labels.call_args_list,
+                [c.args[0] for c in mock_metrics.variant_values_total.labels.return_value.inc.call_args_list],
+                strict=True,
+            )
+        }
+        assert values[("ratio", "$", "typed")] == 2
+        assert ("ratio", "$", "fallback") not in values
+        assert _booked(mock_metrics, "variant_invalid_total", "reason") == {"non_finite_number": 1}
 
     def test_a_timestamp_batch_column_is_a_json_string(self):
         # pyarrow's own cast would give `2026-01-01 00:00:00`, which is
@@ -5066,11 +5085,19 @@ class TestVariantBookkeeping:
     @patch("millpond.hoglake.metrics")
     def test_a_report_with_shadow_time_and_bounded_rows_books_them(self, mock_metrics):
         s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
-        report = VariantReport(encode_seconds=0.5, shadow_seconds=0.25, recursion_bound_rows=3)
+        report = VariantReport(rows=10, encode_seconds=0.5, shadow_seconds=0.25, recursion_bound_rows=3)
         s._observe_variant_encode(report)
         mock_metrics.variant_shadow_seconds_total.inc.assert_called_once_with(0.25)
         mock_metrics.variant_codec_recursion_bound_rows_total.inc.assert_called_once_with(3)
         mock_metrics.variant_encode_seconds.labels.return_value.observe.assert_called_once_with(0.5)
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_report_of_nothing_observes_no_encode_time(self, mock_metrics):
+        # A prepare that failed before any group was encoded: no rows, no
+        # 0 s observation pulling the histogram down.
+        s, *_ = _sink(columns=_VARIANT_COLUMNS)
+        s._observe_variant_encode(VariantReport())
+        mock_metrics.variant_encode_seconds.labels.assert_not_called()
 
 
 class TestVariantCodecGuards:
@@ -5234,3 +5261,329 @@ class TestVariantRaiseWedge:
         with pytest.raises(VariantEncodingError):
             _flush(s, cfg, kafka, batch, batch.nbytes, 3, {("events", 0): (1, 3)}, 0.0, "size")
         kafka.commit.assert_not_called()
+
+
+class _RecordingHttp:
+    """Stands in for pyhoglake's private httpx client: records every
+    timeout the sink sets on it."""
+
+    def __init__(self) -> None:
+        self.set: list = []
+
+    @property
+    def timeout(self):
+        return self.set[-1] if self.set else None
+
+    @timeout.setter
+    def timeout(self, value) -> None:
+        self.set.append(value)
+
+
+class TestJsonTextColumnsHook:
+    """`json_text_columns()` knows the live variant columns BEFORE the
+    first conversion, through a read-only resolve into the write path's
+    TTL'd cache; keeps a last-known answer across `reset_caches()`; and
+    fails only when it has never read anything."""
+
+    VARIANT = frozenset({"properties", "person_properties"})
+
+    def test_known_before_the_first_write_by_a_read_only_resolve(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        assert s.json_text_columns() == self.VARIANT
+        # One namespace GET, one table GET, one info read; nothing created,
+        # declared or claimed.
+        assert ns.table.call_count == 1
+        assert table.info.call_count == 1
+        ns.create_table.assert_not_called()
+        table.alter.assert_not_called()
+        assert s._table is None
+        # Cached: a second ask reads nothing, and the first write reuses
+        # the shape it adopted (no second info read).
+        assert s.json_text_columns() == self.VARIANT
+        assert table.info.call_count == 1
+        assert s.write(_variant_batch()) == 3
+        assert table.info.call_count == 1
+        table.alter.assert_not_called()
+
+    def test_the_peek_resolves_once_under_the_write_timeout_and_refreshes_cheaply(self):
+        # The resolve (`Namespace.table()`, the server's totals scan) runs
+        # once, under the write timeout; the handle is kept and every
+        # later peek is one `info(totals=False)` under the short timeout.
+        from millpond.config import _LIVENESS_BUDGET_S
+
+        client, catalog, ns, table = _mock_stack(_VARIANT_COLUMNS)
+        with patch("millpond.hoglake.HoglakeClient", return_value=client) as mock_client:
+            s = hoglake.HoglakeSink(_cfg(hoglake_request_timeout_s=45.0))
+        assert mock_client.call_args_list[1].kwargs["timeout"] == 45.0
+        assert s.json_text_columns() == self.VARIANT
+        assert s._peek_table is table
+        assert client._http.timeout == httpx.Timeout(hoglake._PEEK_TIMEOUT_S)
+        namespaces, tables, infos = catalog.namespace.call_count, ns.table.call_count, table.info.call_count
+        for _ in range(3):
+            s._live_info_read_at -= s._live_info_ttl_s() + 1
+            assert s.json_text_columns() == self.VARIANT
+        assert (catalog.namespace.call_count, ns.table.call_count) == (namespaces, tables)
+        assert table.info.call_count == infos + 3
+        # Never-read worst case against a hung catalog: the resolve chain
+        # (list_namespaces, table, info) at the resolve timeout, every
+        # attempt, plus the sleeps — inside the budget share by
+        # construction, whatever the write timeout.
+        backoff = sum(hoglake._PEEK_BACKOFF_S * (i + 1) for i in range(hoglake._PEEK_ATTEMPTS - 1))
+        worst = hoglake._PEEK_ATTEMPTS * hoglake._PEEK_RESOLVE_REQUESTS * hoglake._PEEK_RESOLVE_TIMEOUT_S + backoff
+        assert worst <= _LIVENESS_BUDGET_S * hoglake._PEEK_BUDGET_SHARE
+        assert hoglake._PEEK_RESOLVE_TIMEOUT_S > hoglake._PEEK_TIMEOUT_S
+
+    def test_the_resolve_timeout_is_clamped_below_a_long_write_timeout(self):
+        # config allows a write timeout of hundreds of seconds with
+        # HOGLAKE_MAX_RETRY_COUNT=1; the peek must not inherit it.
+        client, catalog, ns, table = _mock_stack(_VARIANT_COLUMNS)
+        client._http = _RecordingHttp()
+        with patch("millpond.hoglake.HoglakeClient", return_value=client) as mock_client:
+            s = hoglake.HoglakeSink(_cfg(hoglake_request_timeout_s=460.0))
+        clamped = hoglake._PEEK_RESOLVE_TIMEOUT_S
+        assert clamped < 460.0
+        assert mock_client.call_args_list[1].kwargs["timeout"] == clamped
+        assert s.json_text_columns() == self.VARIANT
+        assert client._http.set == [httpx.Timeout(clamped), httpx.Timeout(hoglake._PEEK_TIMEOUT_S)]
+        # And a short write timeout is not raised to the clamp.
+        client2, *_ = _mock_stack(_VARIANT_COLUMNS)
+        client2._http = _RecordingHttp()
+        with patch("millpond.hoglake.HoglakeClient", return_value=client2):
+            s2 = hoglake.HoglakeSink(_cfg(hoglake_request_timeout_s=12.0))
+        s2.json_text_columns()
+        assert client2._http.set[0] == httpx.Timeout(12.0)
+
+    def test_a_resolve_after_a_dropped_handle_runs_under_the_resolve_timeout(self):
+        # The handle was held (client at 5 s); the table went missing
+        # (handle dropped); the table comes back: the re-resolve, with its
+        # totals scan, must run under the resolve timeout again, not the
+        # 5 s the client was left at.
+        client, catalog, ns, table = _mock_stack(_VARIANT_COLUMNS)
+        client._http = _RecordingHttp()
+        with patch("millpond.hoglake.HoglakeClient", return_value=client):
+            s = hoglake.HoglakeSink(_cfg(hoglake_request_timeout_s=45.0))
+        assert s.json_text_columns() == self.VARIANT
+        resolve, short = httpx.Timeout(s._peek_resolve_timeout_s), httpx.Timeout(hoglake._PEEK_TIMEOUT_S)
+        assert client._http.set == [resolve, short]
+        s._live_info_read_at -= s._live_info_ttl_s() + 1
+        table.info.side_effect = NotFoundError("dropped")
+        assert s.json_text_columns() == frozenset()
+        assert s._peek_table is None and client._http.timeout == short
+        _wire_info(table, table.state)  # the table is back
+        s._peek_missing_at = None  # (the write path would have adopted it)
+        assert s.json_text_columns() == self.VARIANT
+        assert client._http.set == [resolve, short, resolve, short]
+
+    def test_a_client_without_http_warns_once_and_keeps_the_resolve_timeout(self, caplog):
+        client, catalog, ns, table = _mock_stack(_VARIANT_COLUMNS)
+        del client._http  # a pyhoglake that restructured its transport
+        with patch("millpond.hoglake.HoglakeClient", return_value=client):
+            s = hoglake.HoglakeSink(_cfg())
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            assert s.json_text_columns() == self.VARIANT
+            s._live_info_read_at -= s._live_info_ttl_s() + 1
+            assert s.json_text_columns() == self.VARIANT
+        warnings = [r for r in caplog.records if "Could not set the shape peek's request timeout" in r.message]
+        assert len(warnings) == 1
+
+    def test_a_missing_table_is_an_empty_set_cached_until_the_first_write(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        ns.table.side_effect = NotFoundError("no table")
+        for _ in range(5):
+            assert s.json_text_columns() == frozenset()
+        # Negative cache: one GET for five conversions, nothing created.
+        assert ns.table.call_count == 1
+        ns.create_table.assert_not_called()
+        catalog.create_namespace.assert_not_called()
+        # The first write creates the table (the mock's `ns.table` still
+        # says NotFound, so the create path runs) and the adopted shape
+        # ends the negative cache.
+        ns.create_table.return_value = table
+        assert s.write(_batch()) == 1
+        ns.create_table.assert_called_once()
+        # The mock's created table carries the fixture's variant columns
+        # (a real create would not): the adopted shape is the answer, and
+        # the hook read nothing more than the write's own resolve.
+        assert s.json_text_columns() == self.VARIANT
+        assert ns.table.call_count == 2
+        # And the peek RESUMES: the adopted shape ended the negative cache,
+        # so once the cache is stale the hook reads again (re-resolving
+        # the handle it dropped when the table was missing).
+        assert s._peek_missing_at is None
+        ns.table.side_effect = None
+        ns.table.return_value = table
+        infos = table.info.call_count
+        s._live_info_read_at -= s._live_info_ttl_s() + 1
+        assert s.json_text_columns() == self.VARIANT
+        assert ns.table.call_count == 3
+        assert table.info.call_count == infos + 1
+
+    def test_a_missing_namespace_is_an_empty_set(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        catalog.namespace.side_effect = NotFoundError("no namespace")
+        assert s.json_text_columns() == frozenset()
+        catalog.create_namespace.assert_not_called()
+
+    def test_a_table_dropped_under_a_cached_shape_answers_empty_and_drops_the_shape(self):
+        # S1: NotFound from the info read while the write path still holds
+        # the handle. Not a retryable error to exit on: the table is gone,
+        # the answer is "no variant columns", and the write path finds
+        # out on its own NotFound.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        s._live_info_read_at -= s._live_info_ttl_s() + 1  # stale, so the hook reads
+        table.info.side_effect = NotFoundError("dropped")
+        assert s.json_text_columns() == frozenset()
+        assert s._live_info is None and s._live_columns == {}
+        assert s._table is not None  # the write path's handle is its own business
+        # The peek's handle is dropped: the next read re-resolves.
+        assert s._peek_table is None
+
+    def test_a_string_only_table_is_an_empty_set(self):
+        s, *_ = _sink()
+        assert s.json_text_columns() == frozenset()
+
+    def test_after_a_reset_and_a_replay_the_hook_re_reads_and_the_replay_still_replays(self):
+        # The gap the review found: reset_caches() empties the shape, the
+        # retry REPLAYS the prepared payload (no resolve), so without a
+        # read of its own the hook would answer nothing for every poll
+        # until the next rebuild.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        offsets = (("events", 0, 1, 3),)
+        catalog.commit_prepared.side_effect = [httpx.ConnectError("lost"), MagicMock(snapshot_id=8, schema_version=1)]
+        with pytest.raises(httpx.ConnectError):
+            s.write(_variant_batch(), kafka_offsets=offsets)
+        s.reset_caches()
+        assert s._live_columns == {} and s._prepared is not None
+        reads_before = table.info.call_count
+        assert s.json_text_columns() == self.VARIANT
+        assert table.info.call_count == reads_before + 1
+        # The frozen payload is untouched: the retry replays it verbatim.
+        assert s._prepared is not None
+        assert s.write(_variant_batch(), kafka_offsets=offsets) == 3
+        assert table.prepare_append_tables.call_count == 1
+        assert catalog.commit_prepared.call_count == 2
+
+    @patch("millpond.hoglake.metrics")
+    @patch("millpond.hoglake.time.sleep")
+    def test_after_a_reset_a_failed_peek_answers_from_the_last_known_shape(self, mock_sleep, mock_metrics):
+        # reset_caches() dropped the shape; the catalog is down; the
+        # replay-only commit never re-resolves. The last-known answer is
+        # safe (declarations are immutable) and the write path's ladder
+        # owns the outage: no raise, no retry here, one attempt.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        s._live_info_read_at -= s._live_info_ttl_s() + 1
+        s.json_text_columns()  # a stale cache: the peek resolves and holds its handle
+        s.reset_caches()
+        assert s._live_columns == {}
+        assert s._peek_table is not None  # survives the reset, like the known answer
+        tables, infos = ns.table.call_count, table.info.call_count
+        table.info.side_effect = httpx.ConnectError("down")
+        assert s.json_text_columns() == self.VARIANT
+        assert ns.table.call_count == tables  # no re-resolve
+        assert table.info.call_count == infos + 1  # ONE refresh attempt
+        mock_sleep.assert_not_called()
+        mock_metrics.errors_total.labels.assert_any_call(type="hoglake_shape_peek")
+
+    @patch("millpond.hoglake.metrics")
+    @patch("millpond.hoglake.time.sleep")
+    def test_a_stale_cache_that_cannot_refresh_answers_from_the_cache(self, mock_sleep, mock_metrics, caplog):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        s._live_info_read_at -= s._live_info_ttl_s() + 1
+        s.json_text_columns()  # a stale cache: the peek resolves and holds its handle
+        t = {"now": s._monotonic()}
+        s._monotonic = lambda: t["now"]
+        t["now"] += s._live_info_ttl_s() + 1
+        infos = table.info.call_count
+        table.info.side_effect = httpx.ConnectError("down")
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            for _ in range(3):
+                assert s.json_text_columns() == self.VARIANT
+        mock_sleep.assert_not_called()
+        # Backoff window: ONE read attempt for three conversions, one
+        # count, one warning.
+        assert table.info.call_count == infos + 1
+        labels = mock_metrics.errors_total.labels.call_args_list
+        assert sum(1 for c in labels if c.kwargs == {"type": "hoglake_shape_peek"}) == 1
+        assert sum(1 for r in caplog.records if "Could not refresh the shape" in r.message) == 1
+        # Past the window: one more attempt.
+        t["now"] += hoglake._PEEK_RETRY_AFTER_S + 1
+        assert s.json_text_columns() == self.VARIANT
+        assert table.info.call_count == infos + 2
+        # The write path adopting a shape ends the window (and the
+        # staleness) at once.
+        _wire_info(table, table.state)
+        s._adopt_info(table.state)
+        assert s._peek_failed_at is None
+        assert s.json_text_columns() == self.VARIANT
+        assert table.info.call_count == infos + 2  # fresh again: no read
+
+    def test_a_stale_cache_is_re_read(self):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        s.write(_variant_batch())
+        reads = table.info.call_count
+        assert s.json_text_columns() == self.VARIANT
+        assert table.info.call_count == reads  # fresh: no read
+        s._live_info_read_at -= s._live_info_ttl_s() + 1
+        assert s.json_text_columns() == self.VARIANT
+        assert table.info.call_count == reads + 1
+
+    @patch("millpond.hoglake.time.sleep")
+    def test_never_read_a_transient_failure_is_retried_then_raised_permanent(self, mock_sleep):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        ns.table.side_effect = [httpx.ConnectError("blip"), table]
+        assert s.json_text_columns() == self.VARIANT
+        assert mock_sleep.call_count == 1
+        # A fresh sink that has never read: down for good, three bounded
+        # attempts, then a PERMANENT error (nothing retries it; nothing
+        # is buffered at a first conversion, so no final flush ladder).
+        s2, client2, catalog2, ns2, table2 = _sink(columns=_VARIANT_COLUMNS)
+        mock_sleep.reset_mock()
+        ns2.table.side_effect = httpx.ConnectError("down")
+        with pytest.raises(hoglake.HoglakeSinkError) as info:
+            s2.json_text_columns()
+        assert isinstance(info.value.__cause__, httpx.ConnectError)
+        assert hoglake.is_retryable(info.value) is False
+        assert ns2.table.call_count == hoglake._PEEK_ATTEMPTS
+        assert mock_sleep.call_count == hoglake._PEEK_ATTEMPTS - 1
+
+    @patch("millpond.hoglake.time.sleep")
+    def test_never_read_a_permanent_failure_is_raised_at_once(self, mock_sleep):
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        ns.table.side_effect = ValidationError("bad", status_code=422, detail="refused")
+        with pytest.raises(hoglake.HoglakeSinkError) as info:
+            s.json_text_columns()
+        assert isinstance(info.value.__cause__, ValidationError)
+        mock_sleep.assert_not_called()
+
+    def test_the_resolve_time_refusals_fire_here_too(self):
+        columns = [*_VARIANT_COLUMNS[:3], _col("properties", "variant", 4, 4, nullable=False), _VARIANT_COLUMNS[-1]]
+        s, *_ = _sink(columns=columns)
+        with pytest.raises(hoglake.HoglakeSinkError, match="NOT NULL"):
+            s.json_text_columns()
+
+
+class TestFailedPrepareBooksItsEncode:
+    @patch("millpond.hoglake.metrics")
+    def test_an_upload_failure_after_the_encode_books_the_encode_not_the_rows(self, mock_metrics):
+        # Every group encoded, then the upload failed: the attempt spent
+        # the encode, so its cost is observed; nothing published, so no
+        # row counts.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        encoded = table.prepare_append_tables.side_effect
+
+        def upload_fails(groups, **kwargs):
+            encoded(groups, **kwargs)
+            raise OSError("S3 down")
+
+        table.prepare_append_tables.side_effect = upload_fails
+        with pytest.raises(OSError):
+            s.write(_variant_batch(), kafka_offsets=(("events", 0, 1, 3),))
+        (seconds,) = mock_metrics.variant_encode_seconds.labels.return_value.observe.call_args.args
+        assert seconds > 0
+        assert mock_metrics.variant_encode_seconds.labels.return_value.observe.call_count == 1
+        mock_metrics.variant_rows_total.labels.assert_not_called()
+        mock_metrics.variant_values_total.labels.assert_not_called()

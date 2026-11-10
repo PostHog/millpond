@@ -160,6 +160,15 @@ def _event(i: int) -> dict:
         record["properties"] = properties
     if i % 2 == 0:
         record["group0_properties"] = json.dumps({"name": "acme"})
+    # A MIXED-TYPE variant-bound column from the very first poll: a bare
+    # bool in some records, JSON text in others. The converter can only
+    # make the bool JSON (`true`) if the sink already knows the column is
+    # variant (`json_text_columns`, read-only resolve before the first
+    # write); str()-ed it would be `True`, an invalid_json null.
+    if i % 10 == 0:
+        record["group1_properties"] = True
+    elif i % 10 == 5:
+        record["group1_properties"] = json.dumps({"name": "g1"})
     return record
 
 
@@ -340,6 +349,11 @@ def _expected(records: list[dict], name: str) -> dict[str, object]:
         if text is None:
             out[record["uuid"]] = None
             continue
+        if not isinstance(text, str):
+            # A bare value the producer sent: the converter's JSON text
+            # of it decodes back to the value itself.
+            out[record["uuid"]] = text
+            continue
         try:
             value = json.loads(text)
         except ValueError:
@@ -371,7 +385,7 @@ class TestHoglakeVariantE2E:
         assert proc.returncode == 0
 
     def test_the_table_is_still_the_setup_scripts(self, pipeline):
-        client, *_ = pipeline
+        client, *_, files_landed = pipeline
         info = _table(client).info()
         types = {c.name: c.type for c in info.columns}
         assert all(types[name] == "variant" for name in VARIANT_NAMES)
@@ -384,13 +398,20 @@ class TestHoglakeVariantE2E:
         assert {f.stats_state for f in files} == {"provided"}
         # `month(timestamp)` on the wire is the month ordinal since 1970-01: 2026-09 is 680.
         assert {tuple(f.partition_values) for f in files} == {(str(TEAM), "680")}
-        assert len(files) >= 5, "fewer files than compaction needs; lower FLUSH_SIZE"
+        # The count the fixture captured before compaction (which the
+        # compaction test below changes), so this holds in any order.
+        assert files_landed >= 5, "fewer files than compaction needs; lower FLUSH_SIZE"
 
     def test_variant_values_round_trip_and_declared_leaves_are_typed(self, pipeline):
         client, _table_, column, records, *_ = pipeline
         back, decoded = _decoded(client, column)
         for name in VARIANT_NAMES:
             assert decoded[name] == _expected(records, name), name
+        # The first poll's bare bools in group1_properties landed as the
+        # Variant true, not as `True` text nulled as invalid: the sink
+        # knew the column was variant before the first conversion.
+        bools = [r["uuid"] for r in records if r.get("group1_properties") is True]
+        assert bools and all(decoded["group1_properties"][u] is True for u in bools)
         props = back.column("properties").combine_chunks()
         typed = props.field("typed_value")
         assert set(typed.type.names) == {f["name"] for f in PROPERTIES_SV["fields"]}

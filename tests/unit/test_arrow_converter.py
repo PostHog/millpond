@@ -179,6 +179,68 @@ class TestConvert:
         encoded = variant.encode_json(texts[:5], shredding=None)
         assert variant.to_python(encoded.array, shredding=None) == [True, {"a": 1}, 1.5, 7, None]
 
+    def test_variant_bound_columns_are_string_typed_on_every_poll(self):
+        """Not only mixed polls: a poll in which every record carries a
+        bool for a variant-bound column is JSON text too, so two polls of
+        different shapes concatenate in main.py and decode to what the
+        producer sent."""
+        from pyhoglake import variant
+
+        all_bool = [orjson.dumps({"v": True, "k": 1}), orjson.dumps({"v": False, "k": 2})]
+        all_text = [orjson.dumps({"v": {"a": 1}, "k": 3}), orjson.dumps({"v": 2.0, "k": 4})]
+        # Without the hint: the first poll infers a bool column and the
+        # concat the consume loop does refuses the pair. This is the
+        # failure the hint exists to prevent.
+        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+            pa.concat_tables([convert(all_bool), convert(all_text)], promote_options="default")
+        first = convert(all_bool, json_text_columns={"v"})
+        second = convert(all_text, json_text_columns={"v"})
+        assert first.schema.field("v").type == second.schema.field("v").type == pa.string()
+        joined = pa.concat_tables([first, second], promote_options="default")
+        texts = joined.column("v").to_pylist()
+        assert texts == ["true", "false", '{"a":1}', "2.0"]
+        encoded = variant.encode_json(texts, shredding=None)
+        assert variant.to_python(encoded.array, shredding=None) == [True, False, {"a": 1}, 2.0]
+        # Other columns are untouched by the hint.
+        assert joined.column("k").to_pylist() == [1, 2, 3, 4]
+
+
+class TestJsonText:
+    """`json_text`: the one rendering of a non-string value for a variant
+    column, shared by the converter and the sink."""
+
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            (True, "true"),
+            (False, "false"),
+            (7, "7"),
+            (2.0, "2.0"),
+            (1.5, "1.5"),
+            (1e300, "1e+300"),
+            ({"a": [1, 2.0]}, '{"a":[1,2.0]}'),
+            (float("nan"), "NaN"),
+            (float("inf"), "Infinity"),
+            (float("-inf"), "-Infinity"),
+        ],
+    )
+    def test_renders(self, value, text):
+        assert arrow_converter.json_text(value) == text
+
+    def test_a_decimal_is_its_text(self):
+        from decimal import Decimal
+
+        assert arrow_converter.json_text(Decimal("1.50")) == "1.50"
+
+    def test_non_finite_floats_are_refused_by_the_encoder_not_nulled(self):
+        # orjson alone renders NaN as `null`, a Variant null nobody would
+        # count; the literal is what pyhoglake refuses as
+        # `non_finite_number`, so the bad number is a counted invalid row.
+        from pyhoglake import variant
+
+        encoded = variant.encode_json([arrow_converter.json_text(float("nan"))], shredding=None, on_invalid="null")
+        assert encoded.report.invalid_by_reason == {"non_finite_number": 1}
+
     def test_mixed_type_int_and_string(self):
         """Same field is int in one record and string in another."""
         messages = [

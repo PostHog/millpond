@@ -81,7 +81,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import httpx
-import orjson
 import pyarrow as pa
 import pyarrow.compute as pc
 from pyhoglake import (
@@ -109,7 +108,7 @@ from pyhoglake import (
 from pyhoglake.types import arrow_type_to_coltype, column_to_arrow_field, columns_to_arrow_schema
 
 from millpond import arrow_converter, metrics
-from millpond.config import Config, python_variant_codec_refusal, variant_codec_backend
+from millpond.config import _LIVENESS_BUDGET_S, Config, python_variant_codec_refusal, variant_codec_backend
 from millpond.config import hoglake_flush_deadline as config_hoglake_flush_deadline
 from millpond.sink import SAFE_IDENTIFIER, check_reserved_collision
 
@@ -269,6 +268,48 @@ _CODEC_ROUTED = (
 # that is all pyhoglake gives it; a typed exception would be better and is
 # pyhoglake's to add.
 _NATIVE_CODEC_REFUSAL_PREFIX = "PYHOGLAKE_VARIANT_CODEC=native, but "
+
+# `json_text_columns`' read-only resolve of the destination before a
+# conversion ("the peek"). It runs on the consume thread, so it is bounded
+# in two regimes:
+#
+# * RESOLVING the table handle, once per process (and again only after
+#   the table was found missing): `Namespace.table()` is `GET
+#   /tables/{name}` WITHOUT `totals=false`, i.e. the server's totals scan
+#   over every live file row — seconds on a big table, which is why it
+#   runs under the write path's request timeout (as `_ensure_table`'s
+#   own resolve does), clamped to `_PEEK_RESOLVE_TIMEOUT_S`, and never
+#   under the short one below: a 5 s cap on that scan would fail every
+#   pod's first peek on a healthy catalog. `_PEEK_ATTEMPTS` tries with a
+#   `_PEEK_BACKOFF_S` ladder when nothing has ever been read in this
+#   process; worst case against a hung catalog at pod start is by
+#   construction under `_PEEK_BUDGET_SHARE` of the liveness budget.
+# * REFRESHING a held handle: one `info(totals=False)` GET, no scan, under
+#   `_PEEK_TIMEOUT_S` (the peek client's timeout is lowered once the
+#   handle is held), ONE attempt, and after a failure not again for
+#   `_PEEK_RETRY_AFTER_S` (the known answer is served meanwhile), so a
+#   long outage costs the consume thread at most one short request a
+#   minute.
+_PEEK_ATTEMPTS = 2
+_PEEK_BACKOFF_S = 1.0
+_PEEK_TIMEOUT_S = 5.0
+_PEEK_RETRY_AFTER_S = 60.0
+# The resolve's per-request timeout: the write timeout, CLAMPED so the
+# never-read worst case (`_PEEK_ATTEMPTS` x `_PEEK_RESOLVE_REQUESTS`
+# requests, each hung to its timeout, plus the backoff) stays inside
+# `_PEEK_BUDGET_SHARE` of the liveness budget. config allows a write
+# timeout of several hundred seconds with HOGLAKE_MAX_RETRY_COUNT=1, and
+# the peek runs on the consume thread before the first poll is recorded.
+# At the defaults: (0.6 x 480 - 1) / (2 x 3) = 47.8 s, so the default 45 s
+# write timeout is not clamped.
+_PEEK_RESOLVE_REQUESTS = 3  # list_namespaces, the table GET, info
+_PEEK_BUDGET_SHARE = 0.6
+_PEEK_RESOLVE_TIMEOUT_S = (
+    _LIVENESS_BUDGET_S * _PEEK_BUDGET_SHARE - sum(_PEEK_BACKOFF_S * (i + 1) for i in range(_PEEK_ATTEMPTS - 1))
+) / (_PEEK_ATTEMPTS * _PEEK_RESOLVE_REQUESTS)
+# A failed peek with a last-known answer logs at most this often; the
+# count is on `millpond_errors_total{type="hoglake_shape_peek"}`.
+_PEEK_LOG_INTERVAL_S = 60.0
 
 
 def _is_native_codec_refusal(exc: BaseException) -> bool:
@@ -769,30 +810,30 @@ def _json_text_column(column: pa.ChunkedArray) -> pa.ChunkedArray:
       "" is not JSON and would land as an `invalid_json` null; a
       producer that writes "" for "nothing" meant SQL NULL, and the
       count on `variant_invalid_total` would be a false alarm.
-    * Integers, floats, booleans: pyarrow's cast to string, which is
-      vectorised and already JSON (`5`, `1.5`, `true`). A float NaN or
-      Infinity casts to text JSON does not have and lands as an
-      `invalid_json` null, counted — the same thing the JSON producer's
-      own `NaN` does.
-    * Anything else (struct, list, map, timestamp, decimal, binary):
-      orjson per row. `cast(pa.string())` on a struct or list raises
-      `ArrowNotImplementedError`, which `is_retryable` reads as transient
-      — so one producer sending an object where the converter expected
-      text crash-looped the partition on the same batch. orjson
-      serializes dicts, lists, scalars, datetimes and UUIDs natively;
-      `default=str` covers the rest (a Decimal is its text, a valid JSON
-      number). Per-row Python, but only on a batch shaped this way, which
-      the arrow_converter never produces (it flattens nested values to
-      JSON text itself).
+    * Integers and booleans: pyarrow's cast to string, which is
+      vectorised and already JSON (`5`, `true`).
+    * Floats and everything else (struct, list, map, timestamp, decimal,
+      binary): `arrow_converter.json_text` per row. Floats because
+      pyarrow's cast renders `2.0` as `2`, an INTEGER to the encoder,
+      which a declared `double` leaf then cannot take (fallback) — orjson
+      keeps the point; NaN and the infinities are written as the JSON
+      literals pyhoglake refuses (`non_finite_number`, counted) rather
+      than orjson's `null`. The rest because `cast(pa.string())` on a
+      struct or list raises `ArrowNotImplementedError`, which
+      `is_retryable` reads as transient — so one producer sending an
+      object where the converter expected text crash-looped the partition
+      on the same batch. Per-row Python, but only on a batch shaped this
+      way, which the arrow_converter does not produce for a column the
+      sink has named (`json_text_columns`): it serializes those itself.
     """
     kind = column.type
     if pa.types.is_string(kind) or pa.types.is_large_string(kind):
         if not pc.any(pc.equal(column, "")).as_py():
             return column
         return pa.chunked_array([_null_empty_strings(chunk) for chunk in column.chunks], kind)
-    if pa.types.is_integer(kind) or pa.types.is_floating(kind) or pa.types.is_boolean(kind):
+    if pa.types.is_integer(kind) or pa.types.is_boolean(kind):
         return column.cast(pa.string())
-    texts = [None if value is None else orjson.dumps(value, default=str).decode() for value in column.to_pylist()]
+    texts = [None if value is None else arrow_converter.json_text(value) for value in column.to_pylist()]
     return pa.chunked_array([pa.array(texts, pa.string())])
 
 
@@ -1191,19 +1232,10 @@ class HoglakeSink:
             )
         self._cfg = cfg
         self._credential_source = _STATIC_KEYS if cfg.hoglake_s3_access_key is not None else _DEFAULT_CHAIN
-        self._client = HoglakeClient(
-            cfg.hoglake_url,
-            s3=S3Config(
-                access_key=cfg.hoglake_s3_access_key,
-                secret_key=cfg.hoglake_s3_secret_key,
-                endpoint_override=cfg.hoglake_s3_endpoint,
-                region=cfg.hoglake_s3_region,
-            ),
-            # Otherwise pyhoglake's hardcoded 30s applies to every
-            # request including the commit, and an operator with a
-            # convoyed catalog has no knob at all.
-            timeout=cfg.hoglake_request_timeout_s,
-        )
+        # Otherwise pyhoglake's hardcoded 30s applies to every request
+        # including the commit, and an operator with a convoyed catalog
+        # has no knob at all.
+        self._client = self._make_client(cfg.hoglake_request_timeout_s)
         # Retry-After, captured off the raw response: pyhoglake maps
         # status codes to exception classes and discards headers, so the
         # server's own backoff advice (503 `commit_queue_timeout` answers
@@ -1276,6 +1308,35 @@ class HoglakeSink:
         # prepare; primed now so every label set is on the first scrape.
         self._codec_counts = _VariantCodecCounts()
         self._codec_counts.prime()
+        # The peek's own client — the same catalog and credentials, built
+        # by the same helper — because `json_text_columns` runs on the
+        # consume thread before every conversion and its REFRESHES must
+        # not spend the write path's 45 s per request there. It starts at
+        # the write timeout, for the one slow resolve (the totals scan in
+        # `Namespace.table()`), and is lowered to `_PEEK_TIMEOUT_S` once
+        # the table handle is held; see `_peek_live_shape`. The catalog
+        # and table handles are resolved lazily and kept.
+        self._peek_resolve_timeout_s = min(cfg.hoglake_request_timeout_s, _PEEK_RESOLVE_TIMEOUT_S)
+        self._peek_client = self._make_client(self._peek_resolve_timeout_s)
+        self._peek_catalog = None
+        self._peek_table = None
+        self._peek_timeout_warned = False
+        # When a peek with a known answer last failed: no read for
+        # `_PEEK_RETRY_AFTER_S` after it (cleared when any shape is
+        # adopted), so an outage costs one short request a minute.
+        self._peek_failed_at: float | None = None
+        # The variant column names of the LAST SHAPE THIS PROCESS READ, or
+        # None when it never read one. Set by `_adopt_columns`, never
+        # cleared — `reset_caches()` drops the shape, not this — so a peek
+        # that fails during a catalog outage has a safe answer: a variant
+        # declaration is immutable, and the only thing a stale answer can
+        # miss is a variant column added since, which the TTL window
+        # already accepts. See `json_text_columns`.
+        self._known_json_text_columns: frozenset[str] | None = None
+        # When the peek last found the table missing (negative cache, on
+        # the TTL clock), and when it last warned about a failed peek.
+        self._peek_missing_at: float | None = None
+        self._peek_warned_at: float | None = None
         # Wall seconds the most recent prepare took (encode + upload,
         # whether it returned or raised), for `write_flush_deadline`: the
         # next attempt of a rebuilt flush redoes that work, so its
@@ -1361,6 +1422,21 @@ class HoglakeSink:
         # 403 on the first upload — by which time the pod was ready,
         # held partitions and had built lag.
         self._probe_object_store(self._catalog)
+
+    def _make_client(self, timeout: float) -> HoglakeClient:
+        """A pyhoglake client for this destination. ONE constructor for the
+        write path's client and the peek's, so an auth, header or endpoint
+        setting added to one cannot miss the other."""
+        return HoglakeClient(
+            self._cfg.hoglake_url,
+            s3=S3Config(
+                access_key=self._cfg.hoglake_s3_access_key,
+                secret_key=self._cfg.hoglake_s3_secret_key,
+                endpoint_override=self._cfg.hoglake_s3_endpoint,
+                region=self._cfg.hoglake_s3_region,
+            ),
+            timeout=timeout,
+        )
 
     # -- Sink protocol -----------------------------------------------------
 
@@ -1543,6 +1619,7 @@ class HoglakeSink:
         # it leaves.
         self._discard_prepared("the sink closed before its commit resolved", reason="shutdown")
         self._client.close()
+        self._peek_client.close()
 
     # -- retry policy (read by main._write_with_retry) ---------------------
 
@@ -1568,23 +1645,190 @@ class HoglakeSink:
         return self._cfg.hoglake_max_retry_count, _WRITE_BASE_DELAY_S
 
     def json_text_columns(self) -> frozenset[str]:
-        """The destination's live `variant` columns, as this sink knows
-        them: the batch columns whose values must reach it as JSON text.
+        """The destination's live `variant` columns: the batch columns
+        whose values must reach this sink as JSON text.
 
-        Read by main.py before every `arrow_converter.convert`, duck-typed
-        like the retry hooks, so the converter can JSON-serialize a
-        MIXED-TYPE value in one of these columns (`True` -> `true`) while
-        every other column keeps the `str()` form DuckLake and string
-        columns have always had. Empty until the destination is first
-        resolved — which is on the first write, after the first batch was
-        converted — so a mixed-type variant-bound column in a pod's very
-        first batch is str()-ed, and a bool in it lands as an
-        `invalid_json` null, counted. One batch, one edge, at pod start;
-        documented rather than closed, because closing it means resolving
-        the table in the constructor. Non-mixed columns are unaffected
-        either way: a column that is all bool or all struct is serialized
-        by the sink itself (`_json_text_column`)."""
+        Read by main.py before EVERY `arrow_converter.convert`, duck-typed
+        like the retry hooks, so the converter serializes every
+        non-string value in these columns as JSON (`True` -> `true`, a
+        bool column -> a string column) while every other column keeps
+        the `str()` form DuckLake and string columns have always had.
+
+        KNOWN BEFORE THE FIRST CONVERSION, not after the first write. The
+        answer is normally the write path's cached shape (`_live_columns`,
+        filled at resolve and refreshed on every alter receipt and TTL
+        re-read). When that is empty — before the first write, or after
+        `reset_caches()` when the retry that followed REPLAYED a prepared
+        payload and never re-resolved — or past its TTL, the destination
+        is read here, READ-ONLY ("the peek", `_peek_live_shape`):
+        namespace and table GET plus one `info(totals=False)`, under the
+        peek's own short-timeout client, adopted into the same TTL'd
+        cache the write path reads (`_adopt_info`), so the next
+        `_table_info` costs no second request. No create, no DDL, no spec
+        declaration: those stay with `_ensure_table`, which still runs in
+        full on the write (the handle `self._table` is not set here). A
+        NOT NULL variant column, or a variant column under the Python
+        codec, is refused here with the same `HoglakeSinkError` the
+        resolve would raise, which is permanent either way.
+
+        A table that does not exist is an empty set — the write would
+        create it from the batch, with no variant column — and is
+        remembered for a TTL (negative cache) so a pipeline waiting for
+        its first flush does not GET the missing table on every poll.
+        A table that is found missing while a shape is cached (dropped
+        under the pod) drops the cached shape and answers empty too; the
+        write path re-resolves on its own NotFound.
+
+        A FAILED PEEK IS NOT A FATAL ERROR ONCE ANYTHING HAS BEEN READ.
+        A variant declaration is immutable, so the last shape this
+        process read (`_known_json_text_columns`, which survives
+        `reset_caches()`) is a safe answer during a catalog blip; the one
+        thing it can miss is a variant column added since, which the TTL
+        window already accepts. So: with a last-known answer the peek is
+        ONE short attempt, best effort — on failure it logs (at most once
+        a minute), counts `millpond_errors_total{type="hoglake_shape_peek"}`,
+        answers from what it knows and does not read again for
+        `_PEEK_RETRY_AFTER_S` (or until the write path adopts a shape),
+        leaving the outage to the write path's ladder, which is built
+        for it. Only when NOTHING has ever
+        been read — the pod's first conversion — is there no safe answer
+        (a str()-ed bool is a lost value under `null`, a wedged partition
+        under `raise`), and then the peek retries `_PEEK_ATTEMPTS` times
+        under the write timeout (the resolve is the totals-scanning GET,
+        see the constants) and raises a
+        `HoglakeSinkError` (permanent, so nothing retries it): the
+        consume loop exits, the pod restarts and the poll replays. There
+        is nothing in the pending buffer at a first conversion, so main's
+        final flush has nothing to attempt and no ladder to run.
+        """
+        if self._live_columns and self._live_info_is_fresh():
+            return self._json_text_columns_from_cache()
+        known = self._known_json_text_columns
+        if known is not None and (self._table_known_missing() or self._peek_recently_failed()):
+            return self._json_text_columns_from_cache() if self._live_columns else known
+        try:
+            self._peek_live_shape(attempts=_PEEK_ATTEMPTS if known is None else 1)
+        except HoglakeSinkError:
+            raise
+        except Exception as e:  # noqa: BLE001 - classified by `known`
+            if known is None:
+                raise HoglakeSinkError(
+                    f"could not read the shape of {self._cfg.hoglake_namespace}.{self._cfg.hoglake_table} before "
+                    f"this process's first conversion ({e}); a batch cannot be converted correctly without knowing "
+                    f"which columns are variant, so the pod stops and the poll replays"
+                ) from e
+            self._note_peek_failure(e)
+            return self._json_text_columns_from_cache() if self._live_columns else known
+        return self._json_text_columns_from_cache()
+
+    def _json_text_columns_from_cache(self) -> frozenset[str]:
         return frozenset(name for name, column in self._live_columns.items() if column.type == "variant")
+
+    def _peek_recently_failed(self) -> bool:
+        """A peek failed within `_PEEK_RETRY_AFTER_S` and no shape has been
+        adopted since: serve the known answer, do not read again yet."""
+        if self._peek_failed_at is None:
+            return False
+        return self._monotonic() - self._peek_failed_at < _PEEK_RETRY_AFTER_S
+
+    def _table_known_missing(self) -> bool:
+        """The peek found no table within the last TTL, and nothing has
+        adopted a shape since (`_adopt_columns` clears the stamp)."""
+        if self._peek_missing_at is None:
+            return False
+        return self._monotonic() - self._peek_missing_at < self._live_info_ttl_s()
+
+    def _peek_live_shape(self, *, attempts: int) -> None:
+        """Read the destination's shape into the TTL'd cache without
+        claiming, creating or altering anything. The table handle is
+        resolved ONCE (list_namespaces + the totals-scanning table GET,
+        under the write timeout) and kept; every later peek is one cheap
+        `info(totals=False)` under the short timeout. The handle is
+        dropped when the table is found missing. Raises after `attempts`
+        transient failures, or at once on a permanent one. See
+        `json_text_columns`."""
+        cfg = self._cfg
+        for attempt in range(attempts):
+            try:
+                if self._peek_table is None:
+                    self._set_peek_timeout(self._peek_resolve_timeout_s)
+                    if self._peek_catalog is None:
+                        self._peek_catalog = self._peek_client.catalog(cfg.hoglake_catalog)
+                    try:
+                        self._peek_table = self._peek_catalog.namespace(cfg.hoglake_namespace).table(cfg.hoglake_table)
+                    except NotFoundError:
+                        self._note_table_missing()
+                        return
+                    self._set_peek_timeout(_PEEK_TIMEOUT_S)
+                try:
+                    # Cheap: the handle's resolve already paid the totals
+                    # scan, and pyhoglake offers no public way at the
+                    # TableInfo it read; this asks without the totals.
+                    info = self._peek_table.info(totals=False)
+                except NotFoundError:
+                    self._peek_table = None
+                    self._note_table_missing()
+                    return
+                self._adopt_info(info)
+                return
+            except HoglakeSinkError:
+                raise
+            except Exception as e:  # noqa: BLE001 - classified below
+                if not is_retryable(e) or attempt == attempts - 1:
+                    raise
+                delay = _PEEK_BACKOFF_S * (attempt + 1)
+                log.warning(
+                    "Reading the shape of %s.%s before converting a batch failed (%s); retrying in %.0fs",
+                    cfg.hoglake_namespace,
+                    cfg.hoglake_table,
+                    e,
+                    delay,
+                )
+                time.sleep(delay)
+
+    def _set_peek_timeout(self, seconds: float) -> None:
+        """Change the peek client's request timeout: the (clamped) resolve
+        timeout for the one totals-scanning resolve, the short one for
+        refreshes. Through pyhoglake's private httpx client, so best
+        effort — a pyhoglake that restructures its transport leaves the
+        peek at the timeout it was built with (the resolve one), which is
+        slower, never wrong; said once, at WARNING, because it is a pin
+        on a private attribute that has quietly come loose."""
+        try:
+            self._peek_client._http.timeout = httpx.Timeout(seconds)
+        except Exception:  # noqa: BLE001 - optional, never fatal
+            if not self._peek_timeout_warned:
+                self._peek_timeout_warned = True
+                log.warning(
+                    "Could not set the shape peek's request timeout (pyhoglake's HoglakeClient no longer exposes "
+                    "_http); the peek keeps its %.0fs resolve timeout for every request",
+                    self._peek_resolve_timeout_s,
+                )
+
+    def _note_table_missing(self) -> None:
+        """The peek found no table: nothing to encode into until the first
+        write creates one (and millpond never creates a variant column).
+        Any cached shape belonged to a table that is gone."""
+        self._drop_cached_shape()
+        self._live_columns = {}
+        self._known_json_text_columns = frozenset()
+        self._peek_missing_at = self._monotonic()
+
+    def _note_peek_failure(self, error: BaseException) -> None:
+        metrics.errors_total.labels(type="hoglake_shape_peek").inc()
+        now = self._monotonic()
+        self._peek_failed_at = now
+        if self._peek_warned_at is not None and now - self._peek_warned_at < _PEEK_LOG_INTERVAL_S:
+            return
+        self._peek_warned_at = now
+        log.warning(
+            "Could not refresh the shape of %s.%s before converting a batch (%s); converting with the last shape "
+            "this process read (variant columns: %s). The write path will meet the same outage with its own retries",
+            self._cfg.hoglake_namespace,
+            self._cfg.hoglake_table,
+            error,
+            sorted(self._known_json_text_columns or ()),
+        )
 
     def write_flush_deadline(self) -> tuple[float, float]:
         """(wall-clock budget for one flush, seconds to reserve for the
@@ -1932,11 +2176,20 @@ class HoglakeSink:
                 getattr(e, "uploaded_uris", ()),
                 reason="prepare_failed",
             )
-            # The codec counters move inside encode calls, which are
-            # inside this call: mirror them whether it returned or not,
-            # so a prepare that raised after routing to Python still
-            # shows the route.
-            self._codec_counts.sync()
+            # The encode's COST was spent whether or not the prepare
+            # returned — an upload that failed after every group was
+            # encoded is the common shape — so the attempt's wall
+            # seconds, shadow seconds, recursion-bound rows and the
+            # codec counters (routes, fallbacks) are booked here too,
+            # under the same guard as on the success path. The ROW
+            # counts are not: they are booked when a payload publishes.
+            if any(c.type == "variant" for c in info.columns):
+                try:
+                    self._observe_variant_encode(report)
+                except Exception:  # noqa: BLE001 - a metric, never the error being raised
+                    log.exception("Could not book the variant encode of a failed prepare")
+            else:
+                self._codec_counts.sync()
             if _is_native_codec_refusal(e):
                 # PYHOGLAKE_VARIANT_CODEC=native and the Rust codec is
                 # missing or does not take this table's declaration. A
@@ -2004,7 +2257,10 @@ class HoglakeSink:
         whose verdict fell to the recursion bound, and pyhoglake's
         per-process codec counters (routed, fallbacks, shadow calls).
         Per attempt, deliberately — a rebuild spends it again."""
-        metrics.variant_encode_seconds.labels(backend=self._variant_backend).observe(report.encode_seconds)
+        if report.rows:
+            # A prepare that failed before any group was encoded has a
+            # report of nothing; a 0 s observation would say otherwise.
+            metrics.variant_encode_seconds.labels(backend=self._variant_backend).observe(report.encode_seconds)
         if report.shadow_seconds:
             metrics.variant_shadow_seconds_total.inc(report.shadow_seconds)
         if report.recursion_bound_rows:
@@ -2680,7 +2936,11 @@ class HoglakeSink:
             table = ns.table(cfg.hoglake_table)
             log.info("Hoglake table %s.%s already exists", cfg.hoglake_namespace, cfg.hoglake_table)
             self._adopt_columns(table.columns)
-            self._reconcile_specs(table)
+            # Against the shape `json_text_columns` read moments ago when
+            # it is still fresh (the same TTL the steady state trusts),
+            # so the first write does not read what the conversion
+            # before it already did; a cold cache reads here, as before.
+            self._reconcile_specs(table, self._live_info if self._live_info_is_fresh() else None)
         except NotFoundError:
             table = self._create_table(ns, batch_schema)
 
@@ -3000,6 +3260,11 @@ class HoglakeSink:
 
     def _adopt_columns(self, columns) -> None:
         self._live_columns = {c.name: c for c in columns}
+        # The table exists and this is its shape: the hook's last-known
+        # answer, and the end of any "table missing" negative cache.
+        self._known_json_text_columns = frozenset(c.name for c in columns if c.type == "variant")
+        self._peek_missing_at = None
+        self._peek_failed_at = None
         self._check_variant_columns(columns)
 
     def _check_variant_columns(self, columns) -> None:
