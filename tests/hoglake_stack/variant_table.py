@@ -67,13 +67,42 @@ def table_schema() -> pa.Schema:
     )
 
 
-def precreate(client, catalog: str, namespace: str, table: str, *, data_path: str | None = None):
+#: The whales table's object-prefix field: every data file sits under
+#: `team_id=<value>/` so one IAM statement grants one team's objects.
+OBJECT_PREFIX_FIELD = "team_id"
+
+
+def set_object_prefix_field_op(name: str):
+    """`ops.set_object_prefix_field(name)`: the one alter op the setup
+    script adds over the create, kept as a named helper so the suites
+    spell the option in one place."""
+    from pyhoglake import ops
+
+    return ops.set_object_prefix_field(name)
+
+
+def precreate(
+    client,
+    catalog: str,
+    namespace: str,
+    table: str,
+    *,
+    data_path: str | None = None,
+    object_prefix: bool = False,
+):
     """What the setup script does, with pyhoglake: the table with its
     declarations, `identity(team_id), month(timestamp)` and a `timestamp`
-    sort, in one create. The catalog and namespace are created when
-    missing (the catalog only with `data_path`), and a table that already
-    exists (a rerun after a killed run left the stack up) is returned as
-    it is rather than refused."""
+    sort, in one create — and with `object_prefix`, `set_object_prefix_field
+    team_id` while the table is still empty (Part 2 of the brief; the
+    server takes the op only on an empty table whose spec has exactly one
+    identity field on the column). The catalog and namespace are created
+    when missing (the catalog only with `data_path`), and a table that
+    already exists (a rerun after a killed run left the stack up) is
+    returned as it is — after its object-prefix option is checked against
+    `object_prefix`: set when asked and missing (the server refuses that
+    on a non-empty table, which is then the error), and refused outright
+    when present but not asked for, so no suite silently gets the other
+    layout."""
     from pyhoglake import AlreadyExistsError, NotFoundError, ops
 
     try:
@@ -87,7 +116,7 @@ def precreate(client, catalog: str, namespace: str, table: str, *, data_path: st
     except AlreadyExistsError:
         ns = cat.namespace(namespace)
     try:
-        return ns.create_table(
+        created = ns.create_table(
             table,
             table_schema(),
             partition_fields=[
@@ -99,4 +128,20 @@ def precreate(client, catalog: str, namespace: str, table: str, *, data_path: st
             message="variant suite: pre-create the whales-shaped table",
         )
     except AlreadyExistsError:
-        return ns.table(table)
+        created = ns.table(table)
+        live = created.info(totals=False).object_prefix_field
+        if live is not None and not object_prefix:
+            raise RuntimeError(
+                f"{namespace}.{table} already exists WITH object-prefix field {live!r}; this suite asked for a table "
+                "without one (the option cannot be unset: use another table name)"
+            )
+        if live is not None:
+            return created
+    if object_prefix:
+        created.alter(
+            [set_object_prefix_field_op(OBJECT_PREFIX_FIELD)],
+            author="setup",
+            message=f"variant suite: place every file under {OBJECT_PREFIX_FIELD}=<value>/",
+        )
+        assert created.info(totals=False).object_prefix_field == OBJECT_PREFIX_FIELD
+    return created

@@ -96,12 +96,14 @@ from pyhoglake import (
     IncarnationChangedError,
     MalformedResponseError,
     NotFoundError,
+    ObjectPrefixViolationError,
     ReadSnapshotExpiredError,
     S3Config,
     UnsupportedTypeError,
     ValidationError,
     VariantEncodingError,
     VariantReport,
+    object_prefix,
     ops,
     transforms,
 )
@@ -477,6 +479,25 @@ _DESTINATION_MOVED: tuple[type[HoglakeError], ...] = (
     ReadSnapshotExpiredError,
 )
 
+# `records_skipped_total{reason=}` for a row whose object-prefix value
+# names no `<field>=<value>/` prefix (D3): null, negative, not the
+# canonical decimal, out of the type's range — exactly what
+# `object_prefix.parse_value` rejects, which is the predicate pyhoglake
+# refuses a group on (a `ValidationError` before any upload, permanent
+# under `is_retryable`), so a batch that kept such a row would wedge its
+# partition on it. The group is skipped after the fanout and its rows
+# counted here instead. See `_skip_unplaceable_groups`.
+_UNPLACEABLE_REASON = "unplaceable_object_prefix_value"
+
+# How many distinct unplaceable values one warning line names.
+_UNPLACEABLE_VALUES_LOGGED = 10
+
+# `hoglake_orphaned_files_total{reason=}` for a payload the server refused
+# as 422 `object_prefix_violation`: files not placed where the table's
+# object-prefix layout admits them. See `_object_prefix_refused`.
+_OBJECT_PREFIX_REFUSED_REASON = "object_prefix_violation"
+
+
 # What the sink assumes the catalog's snapshot retention is when it
 # cannot read one, mirroring pyhoglake's own
 # `_ASSUMED_RETENTION_SECONDS`. Mirrored rather than imported because it
@@ -587,7 +608,17 @@ def is_retryable(exc: BaseException) -> bool:
         `AlreadyExistsError` (409 on a create), `ExpiredError` (410 — a
         read_snapshot below the catalog's expiry floor; only a fresh plan
         fixes that), `MalformedResponseError` (wire-contract violation),
-        and any other 4xx.
+        and any other 4xx. `ObjectPrefixViolationError` (422
+        `object_prefix_violation`, a `ValidationError`) is permanent HERE
+        too, deliberately: raised raw it means pyhoglake's own pre-upload
+        placement check refused the batch (a null or non-canonical prefix
+        value the sink did not drop), which a retry replays. The commit-
+        time shape — the server refusing files a stale layout placed
+        under the table root — is converted by `_commit_prepared` into a
+        `HoglakeSinkError(retryable=True)` exactly once per flush
+        (`_object_prefix_refused`), because a rebuild against a fresh
+        read is what the server's `retry: re-prepare` asks for; the
+        second refusal of the same flush is permanent.
 
     THE THREE TYPED COMMIT REFUSALS DO NOT REACH HERE, and that is why
     their classification below reads oddly: `DdlSinceReadSnapshotError`
@@ -953,6 +984,52 @@ def _partition_groups(data: pa.Table, info) -> list[tuple[tuple[str | None, ...]
             mask = field_mask if mask is None else pc.and_(mask, field_mask)
         out.append((values, data.filter(mask)))
     return out
+
+
+def _skip_unplaceable_groups(
+    groups: list[tuple[tuple[str | None, ...] | None, pa.Table]], info
+) -> tuple[list[tuple[tuple[str | None, ...] | None, pa.Table]], dict[str | None, int]]:
+    """D3: on an object-prefix table, the groups whose prefix value can be
+    placed, and `{value: rows}` for the ones that cannot.
+
+    A group's value is its partition tuple's entry at
+    `object_prefix.key_index` — the identity transform's wire string of
+    the source column — and it names a prefix exactly when
+    `object_prefix.parse_value(value, column.type)` says so: a canonical
+    decimal (no sign, no leading zero) in the type's non-negative range.
+    That is the predicate pyhoglake's own placement refuses on, used here
+    so the two cannot disagree; a group it rejects would otherwise be a
+    `ValidationError` before any upload, permanent under `is_retryable`,
+    and the batch would wedge its partition on the row forever. A null
+    (Iceberg's own null partition, the shape the events_json topic really
+    carries) and a negative `team_id` (a producer bug) both fail it.
+
+    Decided per GROUP, after the fanout, not per row before it: the
+    fanout already split the batch by this value, so the verdict is one
+    string parse per group and no row is copied, where a row-level
+    filter on a 2 GiB whale flush rebuilt the whole batch to drop a
+    handful of rows. The caller books the skipped rows once, when the
+    flush is published (`_book_skipped`), under
+    `records_skipped_total{reason="unplaceable_object_prefix_value"}`.
+
+    The layout (a live integer column, a single identity field on it) was
+    verified at adopt by `_check_object_prefix`, against the same
+    `TableInfo`, so the lookups here cannot miss.
+    """
+    field = info.object_prefix_field
+    if field is None:
+        return groups, {}
+    column = next(c for c in info.columns if c.name == field)
+    index = object_prefix.key_index(info.partition_spec.fields, column.field_id)
+    kept: list[tuple[tuple[str | None, ...] | None, pa.Table]] = []
+    skipped: dict[str | None, int] = {}
+    for values, part in groups:
+        raw = values[index] if values is not None else None
+        if object_prefix.parse_value(raw, column.type) is None:
+            skipped[raw] = skipped.get(raw, 0) + part.num_rows
+        else:
+            kept.append((values, part))
+    return kept, skipped
 
 
 def _partition_tuples(spec) -> tuple[tuple[int, str, int | None], ...]:
@@ -1348,6 +1425,12 @@ class HoglakeSink:
         # a rebuild re-encodes the same rows), together with the aligned
         # batch's variant columns. Cleared with the payload.
         self._prepared_variant: VariantReport | None = None
+        # `{value: rows}` of the prepared payload's unplaceable groups
+        # (D3, `_skip_unplaceable_groups`), booked on
+        # `records_skipped_total` and logged when the payload is
+        # PUBLISHED, for the same reason as the variant report: a rebuild
+        # re-skips the same rows. Cleared with the payload.
+        self._prepared_skipped: dict[str | None, int] | None = None
         # Resolved lazily on first write; reset_caches() drops them so the
         # retry path re-resolves (another pod may have created/altered the
         # table, or it may have been dropped+recreated).
@@ -1405,6 +1488,15 @@ class HoglakeSink:
         # from its receipt or applied it now, and either way the rows
         # published exactly once.
         self._prepared_sends: int = 0
+        # The Kafka identity of the one flush that has already been
+        # rebuilt after a 422 `object_prefix_violation` at commit. The
+        # server's `retry: re-prepare` buys exactly one rebuild against a
+        # fresh read of the layout; a second refusal of the same flush is
+        # the layout the sink writes disagreeing with the one the server
+        # enforces, and is permanent. Survives `reset_caches()` (main.py
+        # calls that between the two attempts); cleared when a commit
+        # lands. See `_object_prefix_refused`.
+        self._object_prefix_rebuilt_for: tuple | None = None
         # STARTUP network validation. Everything else in this class is
         # lazy, and that is fine — but the catalog is the one thing whose
         # absence config.py and the README both describe as a "startup
@@ -1537,13 +1629,22 @@ class HoglakeSink:
             payload = self._prepare_with_self_heal(table, batch, key, facts)
         finally:
             self._last_prepare_s = self._monotonic() - prepare_started
+        if payload is None:
+            # Every group's object-prefix value was unplaceable (D3):
+            # `_prepare` booked and logged the rows, nothing was uploaded,
+            # and a commit must register at least one row — so there is
+            # nothing to publish and nothing a retry could change. The
+            # offsets commit over the rows, as over any skipped record.
+            return 0
         self._prepared = payload
-        self._prepared_rows = batch.num_rows
+        # `_prepared_rows` was set by `_prepare`: the rows of the groups it
+        # kept, not the batch's — the unplaceable groups are not in the
+        # payload and must not be in `records_written_total`.
         self._prepared_offsets = identity
         self._prepared_sends = 0
         return self._commit_prepared()
 
-    def _prepare_with_self_heal(self, table, batch: pa.Table, key: str, facts: _FlushFacts) -> dict:
+    def _prepare_with_self_heal(self, table, batch: pa.Table, key: str, facts: _FlushFacts) -> dict | None:
         """`_prepare`, retried ONCE after an alignment refusal against a
         fresh read of the destination. Split out of `write()` so the
         whole of an attempt's local work — both prepares, when there are
@@ -1962,9 +2063,11 @@ class HoglakeSink:
         )
         return str(uuid.uuid5(_IDEMPOTENCY_NAMESPACE, name))
 
-    def _prepare(self, table, batch: pa.Table, key: str, facts: _FlushFacts) -> dict:
+    def _prepare(self, table, batch: pa.Table, key: str, facts: _FlushFacts) -> dict | None:
         """Encode the batch's parquet, upload it, and return the commit
-        request — WITHOUT publishing it.
+        request — WITHOUT publishing it. None when every partition group
+        was unplaceable under the table's object prefix (D3): nothing was
+        encoded or uploaded, and `write()` publishes nothing.
 
         The split is what makes the retry safe: after this returns, the
         objects exist in object storage and the request that registers
@@ -2051,6 +2154,38 @@ class HoglakeSink:
         the whales pods are 32 GiB and not 16. The CPU term grows too —
         the encode is the parquet write's new dominant term, see README
         "VARIANT columns".
+
+        OBJECT PREFIX. When `info.object_prefix_field` is set the
+        placement is pyhoglake's, not this module's: `prepare_append_tables`
+        reads each group's identity partition value for the field off the
+        tuple this fanout hands it, writes the file under
+        `<data_path>/data/<ns>/<table>/<field>=<value>/<idempotency_key>/
+        <uuid>-<i>.parquet`, and proves the value on the file's own footer
+        before the upload (both bounds equal to it, no nulls) — the check
+        the server repeats at commit. What changes here is one step
+        between the fanout and the prepare: `_skip_unplaceable_groups`
+        removes every group whose value names no prefix (null, negative,
+        non-canonical, out of range — pyhoglake's own predicate, D3), so
+        no group pyhoglake would refuse reaches it; the skipped rows are
+        booked on `records_skipped_total` when the flush publishes. The
+        stats registration is the other visible
+        difference (D4): with `deferred_stats=True` on such a table
+        pyhoglake never registers a file `pending`. A file at or over
+        `footer_stats_min_bytes` registers every stat, a smaller one the
+        prefix field's alone (`stats_field_ids={field_id}`), and either is
+        `provided` at commit — mountable and compactable with no hydrator
+        pass, which is what keeps a tenant-scoped mount from waiting on
+        hydrator throughput. The threshold is pyhoglake's default
+        (`DEFAULT_FOOTER_STATS_MIN_BYTES`, 1 MiB, the server's own
+        `HOGLAKE_HYDRATOR_MIN_FILE_BYTES` default) and is deliberately not
+        passed: no deployment has asked for another value, and a knob
+        nobody asked for is a knob to misconfigure.
+        The commit message still says `stats=deferred` for such a flush —
+        the token names the configuration, not the registration shape.
+        Orphans are unchanged in kind and changed in place: one request's
+        files sit in as many `<field>=<value>/<idempotency_key>/`
+        directories as it has values, which is one more reason
+        `_count_orphans` names uris and not a prefix.
         """
         info = self._table_info(table)
         target = columns_to_arrow_schema(info.columns, variant="json")
@@ -2067,7 +2202,15 @@ class HoglakeSink:
         # can then only ever narrow.
         batch = self._null_fill_missing(batch)
         aligned = batch.select(list(target.names)).cast(target)
-        groups = _partition_groups(aligned, info)
+        groups, skipped = _skip_unplaceable_groups(_partition_groups(aligned, info), info)
+        self._prepared_skipped = skipped or None
+        self._prepared_rows = sum(part.num_rows for _, part in groups)
+        if not groups:
+            # Every group unplaceable. Booked NOW rather than at a commit
+            # that will never happen: nothing was uploaded, so there is
+            # nothing to rebuild and no second booking to fear.
+            self._book_skipped()
+            return None
         # Formatted BEFORE the first byte is uploaded, and that ordering
         # is a safety property, not a style choice. Everything that can
         # fail after the upload has to account for the objects it
@@ -2085,9 +2228,11 @@ class HoglakeSink:
         # `hoglake_files_written_total`. `partitions` counts the tuples
         # themselves — every group but the unpartitioned table's single
         # `None`, so a `(None,)` tuple (a null source value, which
-        # Iceberg gives its own partition) IS counted.
+        # Iceberg gives its own partition) IS counted. Both counts, and
+        # `records`, are of the groups KEPT: an unplaceable group is in
+        # neither the payload nor the message.
         message = format_commit_message(
-            records=aligned.num_rows,
+            records=self._prepared_rows,
             files=len(groups),
             partitions=sum(1 for partition_values, _ in groups if partition_values is not None),
             arrow_bytes=facts.arrow_bytes,
@@ -2272,6 +2417,48 @@ class HoglakeSink:
             # either way, so a warning, not an error; the count is on
             # `variant_codec_fallback_total` via the sync above.
             log.warning("Variant codec fell back to Python %d time(s) this prepare: %s", count, reason)
+
+    def _book_skipped(self) -> None:
+        """Book the published flush's unplaceable rows (D3) on
+        `records_skipped_total{reason="unplaceable_object_prefix_value"}`
+        and log them once, naming the distinct values (bounded).
+
+        Once per PUBLISHED flush, like `_observe_variant_rows` and for the
+        same reason: a commit refused as a re-prepare is rebuilt and the
+        rebuild skips the same groups again, so booking per prepare would
+        count the rows twice. The all-unplaceable flush, which has no
+        commit, books from `_prepare` directly. Guarded: this runs after
+        the rows are published, and a metrics failure is not worth
+        raising over a flush that succeeded.
+        """
+        skipped = self._prepared_skipped
+        self._prepared_skipped = None
+        if not skipped:
+            return
+        try:
+            rows = sum(skipped.values())
+            values = sorted(skipped, key=lambda v: (v is not None, v or ""))
+            listed = ", ".join("null" if v is None else repr(v) for v in values[:_UNPLACEABLE_VALUES_LOGGED])
+            omitted = max(0, len(values) - _UNPLACEABLE_VALUES_LOGGED)
+            field = self._live_info.object_prefix_field if self._live_info is not None else "<field>"
+            log.warning(
+                "Skipped %d record(s) in %d partition group(s) whose %r names no object prefix of %s.%s "
+                "(every file sits under %s=<value>/; a null, negative, non-canonical or out-of-range value "
+                "cannot be placed): %s%s. Counted on records_skipped_total{reason=%r}; these records are "
+                "lost and the offsets commit over them.",
+                rows,
+                len(skipped),
+                field,
+                self._cfg.hoglake_namespace,
+                self._cfg.hoglake_table,
+                field,
+                listed,
+                f" and {omitted} more value(s)" if omitted else "",
+                _UNPLACEABLE_REASON,
+            )
+            metrics.records_skipped_total.labels(reason=_UNPLACEABLE_REASON).inc(rows)
+        except Exception:  # noqa: BLE001 - a metric or a log line, never a failed flush
+            log.exception("Could not book the skipped rows of this flush; the publication is unaffected")
 
     def _observe_variant_rows(self) -> None:
         """Book the published flush's `VariantReport` on the row metrics.
@@ -2474,9 +2661,18 @@ class HoglakeSink:
                 return self._accept_already_published(payload, files)
             if isinstance(e, _DESTINATION_MOVED):
                 raise self._destination_moved(e) from e
+            if isinstance(e, ObjectPrefixViolationError):
+                # Before the generic 422 arm: a `ValidationError` by
+                # class, but the server's `retry: re-prepare` on it is
+                # the rebuild recovery, once. See `_object_prefix_refused`.
+                raise self._object_prefix_refused(e) from e
             if _is_answered_refusal(e):
                 self._discard_prepared(f"the server refused the commit with a {e.status_code}", reason="commit_refused")
             raise
+        # A landed commit proves the layout the sink writes is the one the
+        # server enforces, so a later object-prefix refusal gets its own
+        # one rebuild rather than inheriting this flush's verdict.
+        self._object_prefix_rebuilt_for = None
         # One parquet per partition tuple per flush (fanout appends) —
         # the hoglake compaction-debt feed rate. Counted AFTER the commit
         # returns: files this process uploaded but did not get registered
@@ -2486,8 +2682,9 @@ class HoglakeSink:
         # "only what the commit published" rule. See `_observe_fanout`.
         _observe_fanout(files)
         # The variant row counts, under the same rule: once, for the rows
-        # this commit published.
+        # this commit published — and the rows it skipped as unplaceable.
         self._observe_variant_rows()
+        self._book_skipped()
         if replayed:
             # The healthy half of the replay story, and previously
             # invisible: a commit that was re-sent after an uncertain
@@ -2629,6 +2826,73 @@ class HoglakeSink:
             self._drop_cached_shape()
         return HoglakeSinkError(message, retryable=True)
 
+    def _object_prefix_refused(self, refused: ObjectPrefixViolationError) -> HoglakeSinkError:
+        """Turn the server's 422 `object_prefix_violation` on a prepared
+        commit into this sink's own stop: retryable ONCE per flush, then
+        permanent.
+
+        The refusal means the payload registered a file the table's
+        object-prefix layout does not admit — not under its value's
+        `<field>=<value>/`, or whose stats do not prove the value. Zero
+        rows were written, and replaying the payload cannot change the
+        answer (the paths are frozen in it), so like the three
+        `_DESTINATION_MOVED` refusals it is a re-prepare: the server says
+        so (`retry: re-prepare`, `re_prepare=True` on the class).
+
+        Unlike those three, a rebuild only helps for ONE cause: the sink
+        and pyhoglake resolved the table before the option was set on it
+        (the setup script's `set_object_prefix_field` racing the first
+        flush), prepared under the root layout, and the server now
+        enforces the prefixed one. A fresh read shows the field, pyhoglake
+        places the rebuilt files under it, and the commit lands. Every
+        other cause is permanent — the layout the client writes disagrees
+        with the one the server checks (a server rule newer than this
+        client's pyhoglake; damaged table metadata) — and a rebuild
+        reproduces the refusal
+        exactly, orphaning another fanout of objects each time until the
+        retry budget is spent. So the FIRST refusal of a flush abandons
+        the payload (its uploads are orphans, counted under
+        `object_prefix_violation`), drops the cached shape so the rebuild
+        reads fresh, and returns a retryable stop; the SECOND refusal of
+        the same flush returns a permanent one, with the server's detail
+        attached. "The same flush" is its Kafka identity, which survives
+        `reset_caches()` — main.py calls that between the attempts. An
+        ANONYMOUS flush (no offsets; direct callers only, main.py always
+        names its flushes) is identified by its idempotency key, which
+        `_flush_key` mints fresh per anonymous call: such a caller's
+        retry is a new flush by construction, so each gets its one
+        rebuild and none inherits another's verdict.
+
+        pyhoglake drops its own writer cache on this refusal
+        (`Catalog._commit`, `re_prepare`), and `_commit_prepared` dropped
+        this sink's cached shape before branching here, so the rebuild
+        reads fresh on both sides and its `read_snapshot` moves forward.
+        """
+        table_name = f"{self._cfg.hoglake_namespace}.{self._cfg.hoglake_table}"
+        identity = self._prepared_offsets or ("idempotency_key", (self._prepared or {}).get("idempotency_key"))
+        rebuilt_already = self._object_prefix_rebuilt_for == identity
+        self._discard_prepared(
+            "the server refused the commit as object_prefix_violation (files not under the table's "
+            "object-prefix layout)",
+            reason=_OBJECT_PREFIX_REFUSED_REASON,
+        )
+        if not rebuilt_already:
+            self._object_prefix_rebuilt_for = identity
+            return HoglakeSinkError(
+                f"the server refused this flush to {table_name} as object_prefix_violation ({refused}): the "
+                f"prepared files were not placed under the table's object-prefix layout, which the sink read "
+                f"before the option was set on the table. The prepared upload is abandoned; the flush rebuilds "
+                f"once against a fresh read of the layout.",
+                retryable=True,
+            )
+        return HoglakeSinkError(
+            f"the server refused this flush to {table_name} as object_prefix_violation twice — once against "
+            f"the cached layout and again after a rebuild against a fresh read ({refused}). The files pyhoglake "
+            f"places are not the files the server admits, so no retry can land them: the server's object-prefix "
+            f"rules are newer than this client's placement, or the table's layout is damaged. Not retried.",
+            retryable=False,
+        )
+
     def _accept_already_published(self, payload: dict, files: list) -> int:
         """The receipt exists and our request is not the one it was
         written for. Decide whether that means the rows are in the lake.
@@ -2727,6 +2991,7 @@ class HoglakeSink:
         # skipped because a pod that dies mid-commit is the common case
         # the receipt exists for, and an undercount there is silent.
         self._observe_variant_rows()
+        self._book_skipped()
         self._clear_prepared()
         return 0
 
@@ -2751,6 +3016,7 @@ class HoglakeSink:
         self._prepared_offsets = None
         self._prepared_sends = 0
         self._prepared_variant = None
+        self._prepared_skipped = None
 
     # -- metadata column ---------------------------------------------------
 
@@ -3066,7 +3332,15 @@ class HoglakeSink:
 
         The one divergence that is NOT an error is an unspecced table
         that config says should be specced: that is the create-then-alter
-        window reopening, and declaring the spec is the recovery.
+        window reopening, and declaring the spec is the recovery. On an
+        object-prefix table that recovery is unreachable by construction
+        — the server sets the option only on a spec with the identity
+        field and refuses every spec change that drops it, so the live
+        spec is never empty — and `_check_object_prefix` (run on the
+        adopt, before the compare below) has already refused a config
+        without `identity(<field>)`. The only alter this method can issue
+        on such a table is therefore none: the spec either matches config
+        and nothing is declared, or disagrees and the pod stops.
 
         `info` lets a caller that has JUST read the table hand its copy
         over instead of paying a second request — which is what
@@ -3342,7 +3616,68 @@ class HoglakeSink:
         self._live_info = info
         self._live_info_read_at = self._monotonic()
         self._adopt_columns(info.columns)
+        # After the columns: the check resolves the field through them.
+        self._check_object_prefix(info)
         return info
+
+    def _check_object_prefix(self, info) -> None:
+        """Refuse a destination whose object-prefix layout this sink cannot
+        write under, at adopt, with the reason.
+
+        `TableInfo.object_prefix_field` set means the server admits a
+        data file only under `<data_path>/data/<ns>/<table>/<field>=
+        <value>/`, value the file's identity partition value for the
+        field, proven by the file's own footer stats; pyhoglake's writers
+        (1.4.9+) do that placement from the same `TableInfo`. What is
+        checked here, cheaply and against the same read: the field is a
+        live column of an integer type the layout takes
+        (`object_prefix.MAX_VALUE`), the live spec has exactly one
+        identity field on it (`object_prefix.key_index`), and
+        HOGLAKE_PARTITION_BY carries that same `identity(<field>)`. The
+        first two are layouts the server never installs — pyhoglake would
+        refuse them at prepare as a `ValidationError` — and are here so
+        the message names the table rather than a group. The third is
+        millpond's half of "the spec never drops the identity field": a
+        config without it would fail `_reconcile_specs` anyway (a live
+        spec the config disagrees with), but this names the field and the
+        reason, and it runs before any spec alter could be built. The
+        server refuses such an alter too; this makes sure millpond never
+        asks.
+
+        When: every shape adoption, like `_check_variant_columns` — the
+        first resolve, every alter receipt, every TTL re-read, and the
+        read-only peek `json_text_columns` makes before a conversion,
+        which raises it from the consume loop exactly as the NOT NULL
+        check is. Not retryable: neither waiting nor re-reading changes
+        the config.
+        """
+        field = info.object_prefix_field
+        if field is None:
+            return
+        where = f"{self._cfg.hoglake_namespace}.{self._cfg.hoglake_table}"
+        column = self._live_columns.get(field)
+        if column is None or column.type not in object_prefix.MAX_VALUE:
+            found = "not a live column" if column is None else f"a {column.type!r} column"
+            raise HoglakeSinkError(
+                f"object-prefix field {field!r} of {where} is {found}, not one of "
+                f"{sorted(object_prefix.MAX_VALUE)}; no file can be placed under it. The server never installs "
+                f"this layout — the table's metadata is damaged or the server is newer than this client."
+            )
+        spec = info.partition_spec
+        if spec is None or object_prefix.key_index(spec.fields, column.field_id) is None:
+            raise HoglakeSinkError(
+                f"object-prefix field {field!r} of {where} has no single identity field in the live partition "
+                f"spec ({_describe_partition(spec, self._live_columns) or 'unpartitioned'}); the prefix is named "
+                f"by that value, so no file can be placed. The server never installs this layout."
+            )
+        if (field, "identity", None) not in (self._cfg.hoglake_partition_by or ()):
+            raise HoglakeSinkError(
+                f"{where} names its object prefix by identity({field}), but HOGLAKE_PARTITION_BY "
+                f"{self._describe_configured_partition() or 'is unset'} does not carry identity({field}). The "
+                f"server refuses any spec that drops that field and millpond will not ask for one: set "
+                f"HOGLAKE_PARTITION_BY to the live spec "
+                f"({_describe_partition(spec, self._live_columns)}), or point this pipeline at another table."
+            )
 
     def _live_info_ttl_s(self) -> float:
         """How long the cached shape may be used before it is re-read:

@@ -103,7 +103,14 @@ dependencies = [
     # the dependency spec, the image asserts it, and the sink refuses to
     # resolve a variant table with a process that resolved to Python
     # (MILLPOND_ALLOW_PYTHON_VARIANT_CODEC).
-    "pyhoglake[fast-upload,variant-codec]>=1.4.8",
+    #
+    # 1.4.9 for OBJECT-PREFIX tables (`TableInfo.object_prefix_field` set;
+    # the whales table): its writers place each file under
+    # `<field>=<value>/`, prove the value on the footer, and register the
+    # prefix field's stats under deferral so the file is `provided`. An
+    # older client writes under the table root and the server refuses
+    # every commit to such a table.
+    "pyhoglake[fast-upload,variant-codec]>=1.4.9",
     # 26 because pyhoglake 1.4.8 requires it (its own floor for the VARIANT
     # writer is 23: pyarrow 21 cannot open a file with a VARIANT group, and
     # 21/22 cannot read the stats of an INT32/INT64 DECIMAL leaf). Declared
@@ -190,10 +197,13 @@ exclude-newer = "7 days"
 # a version bump. Bumped for 1.4.8, published 2026-11-06T01:14Z, for the
 # VARIANT write path (`variant_on_invalid=` / `variant_report=` on
 # `prepare_append_tables`, `columns_to_arrow_schema(variant="json")`).
+# Bumped for 1.4.9, published 2026-11-10T21:07Z, for object-prefix
+# placement in `prepare_append_tables` / `Table.append` and
+# `ops.set_object_prefix_field`.
 # pyhoglake-variant-codec is the Rust codec behind the `variant-codec`
 # extra; 0.1.0 was published 2026-11-03T12:14Z and the extra pins it
 # exactly, so it needs its own carve-out from the 7-day cooldown.
-exclude-newer-package = { pyhoglake = "2026-11-06T04:00:00Z", pyhoglake-variant-codec = "2026-11-03T13:00:00Z", certifi = "1 day" }
+exclude-newer-package = { pyhoglake = "2026-11-10T22:00:00Z", pyhoglake-variant-codec = "2026-11-03T13:00:00Z", certifi = "1 day" }
 constraint-dependencies = [
     "pygments>=2.20.0",
     "requests>=2.33.0",

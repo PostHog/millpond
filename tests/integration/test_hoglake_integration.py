@@ -31,7 +31,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from pyarrow import fs as pafs
-from pyhoglake import CommitConflictError, IncarnationChangedError, NotFoundError, ValidationError
+from pyhoglake import (
+    CommitConflictError,
+    IncarnationChangedError,
+    NotFoundError,
+    ObjectPrefixViolationError,
+    ValidationError,
+)
 from pyhoglake.types import columns_to_arrow_schema
 
 from millpond.hoglake import HoglakeSink, HoglakeSinkError, is_retryable, table_schema_for_batch
@@ -1913,23 +1919,29 @@ from tests.hoglake_stack.variant_table import (  # noqa: E402
 )
 
 
-def _precreate_variant_table(client, cfg):
+def _precreate_variant_table(client, cfg, *, object_prefix: bool = False):
     """The setup script's work (tests/hoglake_stack/variant_table.py); the
-    catalog is the sink's (constructing a HoglakeSink first ensures it)."""
-    return _precreate_variant_table_in(client, cfg.hoglake_catalog, cfg.hoglake_namespace, cfg.hoglake_table)
+    catalog is the sink's (constructing a HoglakeSink first ensures it).
+    `object_prefix` adds `set_object_prefix_field team_id` on the empty
+    table."""
+    return _precreate_variant_table_in(
+        client, cfg.hoglake_catalog, cfg.hoglake_namespace, cfg.hoglake_table, object_prefix=object_prefix
+    )
 
 
 def _variant_cfg(**overrides) -> HogCfg:
-    return _fresh(
-        hoglake_partition_by=(("team_id", "identity", None), ("timestamp", "month", None)),
-        sort_by=("timestamp",),
+    settings = {
+        "hoglake_partition_by": (("team_id", "identity", None), ("timestamp", "month", None)),
+        "sort_by": ("timestamp",),
         # Shipped stats: the stack runs no hydrator, and a `pending` file
-        # is neither mountable nor a compaction input. (Part 2 of the
-        # brief changes this: with an object prefix, deferred files
-        # register the prefix field's stats and are `provided` anyway.)
-        hoglake_deferred_stats=False,
-        **overrides,
-    )
+        # is neither mountable nor a compaction input. The object-prefix
+        # suite below overrides this to the production default (deferred):
+        # on such a table a deferred file registers the prefix field's
+        # stats (or every stat, at or over 1 MiB) and is `provided` anyway.
+        "hoglake_deferred_stats": False,
+    }
+    settings.update(overrides)
+    return _fresh(**settings)
 
 
 def _whale_rows(n: int, *, team: int = 1, month: str = "2026-09", start: int = 0) -> pa.Table:
@@ -2315,5 +2327,327 @@ class TestVariantRaiseModeLive:
             # The sink is not wedged, the ROW is: rows 0..3 are all valid.
             assert sink.write(_whale_rows(4, team=1), kafka_offsets=(("whales-raise", 0, 12, 15),)) == 4
             assert _record_count(client, cfg) == 4
+        finally:
+            sink.close()
+
+
+# ---------------------------------------------------------------------------
+# Object-prefix tables (Part 2 of the whales brief)
+# ---------------------------------------------------------------------------
+
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    OBJECT_PREFIX_FIELD as _PREFIX_FIELD,
+)
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    set_object_prefix_field_op as _set_prefix_op,
+)
+
+_UNPLACEABLE_TEAM_IDS: tuple[int | None, ...] = (None, -1, -(2**63))
+
+
+def _whale_rows_unplaceable(n: int, *, team: int, month: str, start: int) -> pa.Table:
+    """`_whale_rows` with the D3 shapes an int64 batch can carry mixed in:
+    row i gets `_UNPLACEABLE_TEAM_IDS[i % 4]` for i % 4 < 3 (null, a
+    negative, the most negative long) and `team` otherwise. The three
+    unplaceable values each form their own partition group under
+    `identity(team_id)`, so the skip is exercised per group, as it runs."""
+    rows = _whale_rows(n, team=team, month=month, start=start)
+    team_ids = [_UNPLACEABLE_TEAM_IDS[i % 4] if i % 4 < 3 else team for i in range(n)]
+    index = rows.schema.get_field_index("team_id")
+    return rows.set_column(index, pa.field("team_id", pa.int64()), pa.array(team_ids, pa.int64()))
+
+
+def _unplaceable_uuids(batch: pa.Table) -> set[str]:
+    return {
+        u
+        for u, t in zip(batch.column("uuid").to_pylist(), batch.column("team_id").to_pylist(), strict=True)
+        if t is None or t < 0
+    }
+
+
+def _prefix_root(cfg) -> str:
+    return f"{DATA_PATH}data/{cfg.hoglake_namespace}/{cfg.hoglake_table}/"
+
+
+def _scan_with_stats(client, cfg) -> list[dict]:
+    """The server's scan plan WITH each provided file's stored column
+    stats (`GET /scan?include=column_stats`), raw, so the test can see
+    which field ids a file registered — the D4 claim."""
+    table = _table(client, cfg)
+    return table._namespace._catalog._client._request("GET", table._path("/scan"), params={"include": "column_stats"})
+
+
+def _skipped(reason: str) -> float:
+    from millpond import metrics
+
+    return metrics.records_skipped_total.labels(reason=reason)._value.get()
+
+
+class TestObjectPrefixLive:
+    """The whales table with `set_object_prefix_field team_id` (D2), written
+    by the sink under the production default of DEFERRED stats: every
+    file lands under `team_id=<v>/`, registers `provided` (D4: the prefix
+    field's stats alone below 1 MiB), groups whose `team_id` names no
+    prefix (null, negative) are skipped and counted through the REAL
+    `prepare_append_tables` with nothing unplaceable in the bucket (D3),
+    the variant columns still round-trip, and the server's compaction
+    takes the deferred files as inputs."""
+
+    TEAMS = (1, 2, 3)
+
+    @pytest.fixture(scope="class")
+    def written(self, hog_stack, client):
+        cfg = _variant_cfg(hoglake_deferred_stats=True)
+        sink = HoglakeSink(cfg)
+        table = _precreate_variant_table(client, cfg, object_prefix=True)
+        assert table.info().object_prefix_field == _PREFIX_FIELD
+        column = {c.name: c for c in table.columns}
+        # Six flushes into the (1, 2026-09) group (the compaction input),
+        # one flush fanning out over two more teams and another month, and
+        # one flush carrying unplaceable team_ids (null, negative) among
+        # team 2's rows — three bad groups beside one good one.
+        batches = [_whale_rows(12, team=1, month="2026-09", start=12 * i) for i in range(6)]
+        batches.append(
+            pa.concat_tables(
+                [
+                    _whale_rows(5, team=2, month="2026-09", start=100),
+                    _whale_rows(5, team=3, month="2026-10", start=200),
+                ]
+            )
+        )
+        unplaceable = _whale_rows_unplaceable(12, team=2, month="2026-10", start=300)
+        batches.append(unplaceable)
+        nulls = len(_unplaceable_uuids(unplaceable))
+        assert nulls == 9
+        skipped_before = _skipped("unplaceable_object_prefix_value")
+        before = _variant_metric_snapshot()
+        published = 0
+        for i, batch in enumerate(batches):
+            published += sink.write(batch, kafka_offsets=(("whales-prefix", 0, 100 * i, 100 * i + batch.num_rows - 1),))
+        after = _variant_metric_snapshot()
+        sink.close()
+        yield {
+            "cfg": cfg,
+            "table": table,
+            "column": column,
+            "batches": batches,
+            "nulls": nulls,
+            "published": published,
+            "skipped": _skipped("unplaceable_object_prefix_value") - skipped_before,
+            "metrics": _delta(after, before),
+        }
+
+    def test_every_placeable_row_lands_and_the_unplaceable_are_counted_not_written(self, client, written):
+        cfg = written["cfg"]
+        total = sum(b.num_rows for b in written["batches"])
+        assert total == 94
+        assert written["published"] == total - written["nulls"] == 85
+        assert _record_count(client, cfg) == 85
+        assert written["skipped"] == 9
+        # No ValidationError reached the caller (the writes returned), and
+        # the skipped rows are not in the lake under any uuid; every
+        # landed team_id is a placeable value.
+        back, _ = _read_back_variant(client, cfg, written["column"])
+        landed = set(back.column("uuid").to_pylist())
+        skipped = _unplaceable_uuids(written["batches"][-1])
+        assert skipped and skipped.isdisjoint(landed)
+        assert back.column("team_id").null_count == 0
+        assert min(back.column("team_id").to_pylist()) >= 1
+        assert written["metrics"]["orphans"] == 0
+
+    def test_every_file_sits_under_its_teams_prefix(self, client, written):
+        cfg = written["cfg"]
+        files = _table(client, cfg).files()
+        assert files
+        root = _prefix_root(cfg)
+        for f in files:
+            team = f.partition_values[0]
+            assert f.path.startswith(f"{root}{_PREFIX_FIELD}={team}/"), f.path
+            # The idempotency-key directory is kept UNDER the prefix.
+            rest = f.path.removeprefix(f"{root}{_PREFIX_FIELD}={team}/")
+            key, name = rest.split("/")
+            uuid.UUID(key)
+            assert name.endswith(".parquet")
+        # Nothing in the bucket sits outside a prefix: no orphan under the
+        # table root (a refused first attempt), and nothing for an
+        # unplaceable value (`team_id=-1/`, a null) — those groups were
+        # never encoded, let alone uploaded.
+        objects = [o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")]
+        assert objects
+        assert all(f"/{_PREFIX_FIELD}=" in o for o in objects), objects
+        assert not any(f"/{_PREFIX_FIELD}=-" in o or f"/{_PREFIX_FIELD}=/" in o for o in objects), objects
+        assert sorted(tuple(f.partition_values) for f in files) == sorted(
+            [("1", "680")] * 6 + [("2", "680"), ("3", "681"), ("2", "681")]
+        )
+
+    def test_deferred_files_are_provided_with_the_prefix_fields_stats(self, client, written):
+        # D4. Under deferral pyhoglake registers every file `provided`:
+        # the prefix field's stats alone under 1 MiB (every file here),
+        # never `pending`. The stack runs no hydrator, so a pending file
+        # would have stayed pending for good.
+        cfg = written["cfg"]
+        files = _table(client, cfg).files()
+        assert {f.stats_state for f in files} == {"provided"}
+        assert all(f.file_size_bytes < (1 << 20) for f in files)
+        team_field_id = written["column"]["team_id"].field_id
+        plan = _scan_with_stats(client, cfg)
+        assert len(plan) == len(files)
+        for entry in plan:
+            data_file = entry["data_file"]
+            stats = data_file.get("column_stats")
+            assert stats, f"no column_stats on {data_file['path']}"
+            assert {s["field_id"] for s in stats} == {team_field_id}, data_file["path"]
+            (team,) = stats
+            assert team["null_count"] == 0
+            assert team["value_count"] == data_file["record_count"]
+
+    def test_variant_values_round_trip_through_the_decoder(self, client, written):
+        _back, decoded = _read_back_variant(client, written["cfg"], written["column"])
+        expected = TestVariantColumnsLive._expected(None, written["batches"], "properties")
+        skipped = _unplaceable_uuids(written["batches"][-1])
+        assert decoded["properties"] == {u: v for u, v in expected.items() if u not in skipped}
+
+    def test_the_variant_metrics_count_only_the_rows_that_were_placed(self, written):
+        delta = written["metrics"]
+        # 85 placed rows over seven variant columns; the skipped groups'
+        # JSON was never encoded.
+        assert sum(delta["rows"].values()) == 85 * len(_VARIANT_NAMES)
+        assert delta["encode_count"] == len(written["batches"])
+
+    def test_the_sink_issued_no_ddl_on_the_pre_created_table(self, client, written):
+        cfg = written["cfg"]
+        # Every snapshot the sink authored is a data commit: no alter.
+        assert len(_authored(client, cfg)) == len(_snapshots(client, cfg)), "the sink issued DDL on a pre-created table"
+        # The option's own DDL snapshot is the setup script's.
+        setup = [s for s in client.catalog(cfg.hoglake_catalog).snapshots() if s.author == "setup"]
+        assert any(_PREFIX_FIELD in (s.message or "") and "<value>" in (s.message or "") for s in setup)
+        info = _table(client, cfg).info()
+        assert info.object_prefix_field == _PREFIX_FIELD
+        assert [f.transform for f in info.partition_spec.fields] == ["identity", "month"]
+
+    def test_the_server_compacts_the_deferred_files_under_the_prefix(self, client, written):
+        # The point of D4: a `provided` file is a compaction input with
+        # no hydrator pass. The six-file (1, 2026-09) group becomes one
+        # file, under team 1's prefix, in the declared variant layout.
+        cfg = written["cfg"]
+        group = ("1", "680")
+        inputs = [f for f in _table(client, cfg).files() if tuple(f.partition_values) == group]
+        assert len(inputs) == 6
+        _before, decoded_before = _read_back_variant(client, cfg, written["column"])
+        mismatch_before = _server_metric("hoglake_compaction_variant_layout_mismatch_total")
+        assert _compact(client, cfg) >= 1
+        files = _table(client, cfg).files()
+        outputs = [f for f in files if tuple(f.partition_values) == group]
+        assert len(outputs) == 1, [f.path for f in files]
+        assert outputs[0].path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}=1/")
+        assert outputs[0].stats_state == "provided"
+        assert _server_metric("hoglake_compaction_variant_layout_mismatch_total") == mismatch_before
+        _after, decoded_after = _read_back_variant(client, cfg, written["column"])
+        assert decoded_after == decoded_before
+        assert _record_count(client, cfg) == 85
+
+
+class TestObjectPrefixLayoutRaceLive:
+    """The sink resolves the table BEFORE the setup script sets the option
+    (the first flush racing `set_object_prefix_field`), prepares under
+    the root layout, and the server refuses the commit. One rebuild
+    against a fresh read lands the rows under the prefix; the first
+    attempt's uploads are orphans, counted."""
+
+    def test_one_rebuild_lands_the_flush_under_the_prefix(self, hog_stack, client):
+        from millpond import metrics
+
+        cfg = _variant_cfg(hoglake_deferred_stats=True)
+        sink = HoglakeSink(cfg)
+        table = _precreate_variant_table(client, cfg, object_prefix=False)
+        batch = _whale_rows(6, team=4, month="2026-09")
+        orphans_before = _registry_sum(metrics._hoglake_orphaned_files_total, "_total")
+        try:
+            # Resolve and cache the layout without writing (the option can
+            # only be set on an EMPTY table).
+            sink._ensure_table(table_schema_for_batch(batch.schema))
+            assert sink._table_info(sink._table).object_prefix_field is None
+            table.alter([_set_prefix_op(_PREFIX_FIELD)], author="setup", message="race: set the option late")
+            assert table.info().object_prefix_field == _PREFIX_FIELD
+            # First attempt: built under the cached (root) layout. The
+            # server refuses it — as `ddl_since_read_snapshot` (the alter
+            # is DDL inside the conflict window) or, with a basis past the
+            # alter, as `object_prefix_violation`; either is a re-prepare
+            # the sink answers with ONE retryable stop.
+            with pytest.raises(HoglakeSinkError) as refused:
+                sink.write(batch, kafka_offsets=(("whales-race", 0, 0, 5),))
+            assert refused.value.retryable is True
+            assert is_retryable(refused.value) is True
+            assert sink._prepared is None
+            assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before + 1
+            assert _table(client, cfg).files() == []
+            # main.py's loop: reset, same flush again. Rebuilt against the
+            # fresh read: the drop applies, pyhoglake places, the server
+            # accepts.
+            sink.reset_caches()
+            assert sink.write(batch, kafka_offsets=(("whales-race", 0, 0, 5),)) == 6
+            files = _table(client, cfg).files()
+            assert len(files) == 1
+            assert files[0].path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}=4/")
+            assert files[0].stats_state == "provided"
+            # The first attempt's object is still in the bucket, under the
+            # table root: the orphan the metric counted.
+            objects = [o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")]
+            assert len(objects) == 2
+            assert sum(1 for o in objects if f"/{_PREFIX_FIELD}=" in o) == 1
+        finally:
+            sink.close()
+
+
+class TestObjectPrefixViolationLive:
+    """The server's 422 `object_prefix_violation` against the real commit
+    path, and the sink's classification of it: retryable once, then
+    permanent. Produced by making pyhoglake write under the table root
+    while its own read shows the option — the shape of a client whose
+    placement disagrees with the server's rules."""
+
+    def test_the_second_refusal_is_permanent(self, hog_stack, client, monkeypatch):
+        import pyhoglake.client as pyhoglake_client
+
+        from millpond import metrics
+
+        # A hard failure, not a skip: the class is already gated on a
+        # placing pyhoglake, and this is the only live coverage of the
+        # 422's classification. A refactor that moves `_placement` must
+        # come here, not silently take the test with it.
+        assert hasattr(pyhoglake_client, "_placement"), "pyhoglake.client._placement moved; update this test"
+        cfg = _variant_cfg(hoglake_deferred_stats=True)
+        sink = HoglakeSink(cfg)
+        _precreate_variant_table(client, cfg, object_prefix=True)
+        orphans_before = _registry_sum(metrics._hoglake_orphaned_files_total, "_total")
+        batch = _whale_rows(4, team=5, month="2026-09")
+        offsets = (("whales-violation", 0, 0, 3),)
+        try:
+            monkeypatch.setattr(pyhoglake_client, "_placement", lambda info: None)
+            with pytest.raises(HoglakeSinkError, match="rebuilds once") as first:
+                sink.write(batch, kafka_offsets=offsets)
+            assert first.value.retryable is True
+            assert isinstance(first.value.__cause__, ObjectPrefixViolationError)
+            assert first.value.__cause__.status_code == 422
+            assert sink._prepared is None
+            assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before + 1
+            assert metrics.hoglake_orphaned_files_total.labels(reason="object_prefix_violation")._value.get() >= 1
+            sink.reset_caches()
+            with pytest.raises(HoglakeSinkError, match="twice") as second:
+                sink.write(batch, kafka_offsets=offsets)
+            assert second.value.retryable is False
+            assert is_retryable(second.value) is False
+            assert isinstance(second.value.__cause__, ObjectPrefixViolationError)
+            assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before + 2
+            assert _table(client, cfg).files() == []
+            # With placement back, the same flush lands: the marker is
+            # per flush, and a landed commit clears it.
+            monkeypatch.undo()
+            sink.reset_caches()
+            assert sink.write(batch, kafka_offsets=offsets) == 4
+            assert sink._object_prefix_rebuilt_for is None
+            files = _table(client, cfg).files()
+            assert len(files) == 1
+            assert files[0].path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}=5/")
         finally:
             sink.close()

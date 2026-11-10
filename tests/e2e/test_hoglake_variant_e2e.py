@@ -35,9 +35,10 @@ from pyarrow import fs as pafs
 
 from tests.e2e.test_hoglake_e2e import _metric_samples, _wait_for_kafka
 from tests.hoglake_stack import stack
-from tests.hoglake_stack.variant_table import PROPERTIES_SV, VARIANT_NAMES, precreate
+from tests.hoglake_stack.variant_table import OBJECT_PREFIX_FIELD, PROPERTIES_SV, VARIANT_NAMES, precreate
 
 pytestmark = pytest.mark.e2e
+
 
 # Unique per run: a rerun against a stack a killed run left up must not
 # consume the previous run's topic (or its committed offsets).
@@ -54,6 +55,23 @@ HTTP_PORT = 28001
 # FLUSH_SIZE below is tuned to that.
 N_EVENTS = 1200
 TEAM = 7
+# Every 24th event has no team_id and every 24th-offset-by-12 a negative
+# one (50 each): such a row names no `team_id=<v>/`, so its group is
+# skipped and counted (D3) and never reaches the lake.
+UNPLACEABLE_EVERY = 24
+NEGATIVE_TEAM = -7
+
+
+def _team_id(i: int) -> int | None:
+    if i % UNPLACEABLE_EVERY == 0:
+        return None
+    if i % UNPLACEABLE_EVERY == UNPLACEABLE_EVERY // 2:
+        return NEGATIVE_TEAM
+    return TEAM
+
+
+N_UNPLACEABLE = sum(1 for i in range(N_EVENTS) if _team_id(i) != TEAM)
+N_LANDED = N_EVENTS - N_UNPLACEABLE
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -151,7 +169,7 @@ def _event(i: int) -> dict:
     record = {
         "uuid": str(uuidlib.uuid5(uuidlib.NAMESPACE_URL, f"whale-{i}")),
         "event": "pageview" if i % 2 == 0 else "$autocapture",
-        "team_id": TEAM,
+        "team_id": _team_id(i),
         "distinct_id": f"user-{i % 50}",
         "timestamp": f"2026-09-17 12:{(i // 60) % 60:02d}:{i % 60:02d}.123",
         "person_properties": json.dumps({"email": f"p{i}@ex.am", "age": "thirty"}),
@@ -212,9 +230,11 @@ def _millpond_env() -> dict[str, str]:
             "HOGLAKE_PARTITION_BY": "team_id,month(timestamp)",
             "MILLPOND_SORT_BY": "timestamp",
             "MILLPOND_TYPED_COLUMNS": "timestamp:timestamptz",
-            # Shipped stats: the stack runs no hydrator and a `pending`
-            # file is not a compaction input.
-            "HOGLAKE_DEFERRED_STATS": "false",
+            # The production default. The stack runs no hydrator, and on an
+            # object-prefix table none is needed: pyhoglake registers every
+            # file `provided` (the prefix field's stats under 1 MiB), so
+            # the server's compaction below can take them.
+            "HOGLAKE_DEFERRED_STATS": "true",
             "MILLPOND_HOGLAKE_VARIANT_ON_INVALID": "null",
             "MILLPOND_HTTP_PORT": str(HTTP_PORT),
             "MILLPOND_LOG_FORMAT": "text",
@@ -294,7 +314,8 @@ def pipeline(e2e_stack, tmp_path_factory):
     """Pre-create the table, produce LZ4-framed events, run millpond's real
     entry point as a subprocess until every row has landed, SIGTERM it."""
     client = _client()
-    table = precreate(client, CATALOG, NAMESPACE, TABLE, data_path=f"s3://{BUCKET}/lake/")
+    table = precreate(client, CATALOG, NAMESPACE, TABLE, data_path=f"s3://{BUCKET}/lake/", object_prefix=True)
+    assert table.info().object_prefix_field == OBJECT_PREFIX_FIELD
     column = {c.name: c for c in table.columns}
     _create_topic()
     _wait_for_group_coordinator()
@@ -316,35 +337,43 @@ def pipeline(e2e_stack, tmp_path_factory):
             if proc.poll() is not None:
                 pytest.fail(f"millpond exited early ({proc.returncode}); log:\n{log_path.read_text()[-6000:]}")
             count = _count(client)
-            if count >= N_EVENTS:
+            if count >= N_LANDED:
                 break
             time.sleep(2)
         try:
             metrics_text = httpx.get(f"http://127.0.0.1:{HTTP_PORT}/metrics", timeout=5).text
         except Exception:
             pass
-        # The files the pipeline wrote, read beside the metrics and before
-        # the server compacts them: every event is one (team, month), so
-        # files == flushes == encode observations.
-        files_landed = len(_table(client).files())
+        # The flushes the pipeline landed, read beside the metrics and
+        # before the server compacts the files: one idempotency-key
+        # directory per flush (`<key>/<uuid>-<i>.parquet` under the team's
+        # prefix): every file is team 7's, the unplaceable groups having
+        # been skipped, so this is also the file count.
+        flushes_landed = len({f.path.rsplit("/", 2)[-2] for f in _table(client).files()})
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=10)
-        yield client, table, column, records, log_path, proc, count, metrics_text, files_landed
+        yield client, table, column, records, log_path, proc, count, metrics_text, flushes_landed
     finally:
         if proc.poll() is None:
             proc.kill()
         client.close()
 
 
+def _landed(records: list[dict]) -> list[dict]:
+    """The records the pipeline could place: a null or negative `team_id`
+    names no prefix and its group is skipped."""
+    return [r for r in records if r["team_id"] == TEAM]
+
+
 def _expected(records: list[dict], name: str) -> dict[str, object]:
     from pyhoglake import variant
 
     out: dict[str, object] = {}
-    for record in records:
+    for record in _landed(records):
         text = record.get(name)
         if text is None:
             out[record["uuid"]] = None
@@ -380,12 +409,12 @@ def _decoded(client, column) -> tuple[pa.Table, dict[str, dict[str, object]]]:
 class TestHoglakeVariantE2E:
     def test_every_event_lands_once_and_the_pod_exits_cleanly(self, pipeline):
         client, _table_, _column, _records, log_path, proc, count, _metrics, _files = pipeline
-        assert count == N_EVENTS, f"expected {N_EVENTS} rows, saw {count}; log:\n{log_path.read_text()[-6000:]}"
-        assert _count(client) == N_EVENTS
+        assert count == N_LANDED, f"expected {N_LANDED} rows, saw {count}; log:\n{log_path.read_text()[-6000:]}"
+        assert _count(client) == N_LANDED
         assert proc.returncode == 0
 
     def test_the_table_is_still_the_setup_scripts(self, pipeline):
-        client, *_, files_landed = pipeline
+        client, *_, flushes_landed = pipeline
         info = _table(client).info()
         types = {c.name: c.type for c in info.columns}
         assert all(types[name] == "variant" for name in VARIANT_NAMES)
@@ -400,7 +429,35 @@ class TestHoglakeVariantE2E:
         assert {tuple(f.partition_values) for f in files} == {(str(TEAM), "680")}
         # The count the fixture captured before compaction (which the
         # compaction test below changes), so this holds in any order.
-        assert files_landed >= 5, "fewer files than compaction needs; lower FLUSH_SIZE"
+        assert flushes_landed >= 5, "fewer files than compaction needs; lower FLUSH_SIZE"
+
+    def test_every_object_sits_under_the_teams_prefix_and_the_unplaceable_were_skipped(self, pipeline):
+        client, _table_, _column, records, _log, _proc, _count_, metrics_text, _files = pipeline
+        files = _table(client).files()
+        root = f"s3://{BUCKET}/lake/data/{NAMESPACE}/{TABLE}/"
+        assert all(f.path.startswith(f"{root}{OBJECT_PREFIX_FIELD}={TEAM}/") for f in files), [f.path for f in files]
+        # Nothing under the table root either: no attempt was ever refused
+        # and orphaned there.
+        s3 = pafs.S3FileSystem(
+            access_key=stack.S3_ACCESS_KEY, secret_key=stack.S3_SECRET_KEY, endpoint_override=stack.MINIO_URL
+        )
+        selector = pafs.FileSelector(root.removeprefix("s3://"), recursive=True)
+        objects = [i.path for i in s3.get_file_info(selector) if i.type == pafs.FileType.File]
+        assert objects and all(f"/{OBJECT_PREFIX_FIELD}={TEAM}/" in o for o in objects), objects
+        # Deferred, yet provided (D4): the production default produces
+        # mountable, compactable files with no hydrator in the stack.
+        assert {f.stats_state for f in files} == {"provided"}
+        # D3: the null and negative team_id groups were skipped after the
+        # fanout and counted under one reason, and the orphan counter
+        # never moved.
+        labelled = _labelled_samples(metrics_text)
+        skipped = labelled["millpond_records_skipped_total", (("reason", "unplaceable_object_prefix_value"),)]
+        assert skipped == N_UNPLACEABLE
+        assert _metric_samples(metrics_text).get("millpond_hoglake_orphaned_files_total", 0) == 0
+        assert sum(1 for r in records if r["team_id"] != TEAM) == N_UNPLACEABLE > 0
+        nulls = sum(1 for r in records if r["team_id"] is None)
+        negatives = sum(1 for r in records if r["team_id"] == NEGATIVE_TEAM)
+        assert nulls == negatives == N_UNPLACEABLE // 2
 
     def test_variant_values_round_trip_and_declared_leaves_are_typed(self, pipeline):
         client, _table_, column, records, *_ = pipeline
@@ -410,32 +467,33 @@ class TestHoglakeVariantE2E:
         # The first poll's bare bools in group1_properties landed as the
         # Variant true, not as `True` text nulled as invalid: the sink
         # knew the column was variant before the first conversion.
-        bools = [r["uuid"] for r in records if r.get("group1_properties") is True]
+        bools = [r["uuid"] for r in _landed(records) if r.get("group1_properties") is True]
         assert bools and all(decoded["group1_properties"][u] is True for u in bools)
         props = back.column("properties").combine_chunks()
         typed = props.field("typed_value")
         assert set(typed.type.names) == {f["name"] for f in PROPERTIES_SV["fields"]}
-        with_browser = sum(1 for r in records if r.get("properties", "x").startswith("{"))
-        assert typed.field("$browser").field("typed_value").null_count == N_EVENTS - with_browser
+        landed = _landed(records)
+        with_browser = sum(1 for r in landed if r.get("properties", "x").startswith("{"))
+        assert typed.field("$browser").field("typed_value").null_count == len(landed) - with_browser
         assert with_browser > 0
 
     def test_the_variant_metrics_are_served(self, pipeline):
-        *_, records, _log, _proc, _count, metrics_text, files_landed = pipeline
+        *_, records, _log, _proc, _count, metrics_text, flushes_landed = pipeline
         samples = _metric_samples(metrics_text)
         labelled = _labelled_samples(metrics_text)
-        assert samples["millpond_variant_rows_total"] == N_EVENTS * len(VARIANT_NAMES)
-        invalid = sum(1 for i in range(N_EVENTS) if i % 6 == 5)
+        landed = _landed(records)
+        assert samples["millpond_variant_rows_total"] == N_LANDED * len(VARIANT_NAMES)
+        invalid = sum(1 for r in landed if r.get("properties") == "not json {")
         assert samples["millpond_variant_invalid_total"] == invalid
         assert labelled["millpond_variant_invalid_total", (("reason", "invalid_json"),)] == invalid
         # One observation per prepare and no rebuilds, so exactly the
-        # flushes that landed — which is the file count, every event being
-        # one (team, month) group. Not N_EVENTS / CONSUME_BATCH_SIZE: the
-        # size gate fires at FLUSH_SIZE (~30 records) on whatever a poll
+        # flushes that landed. Not N_EVENTS / CONSUME_BATCH_SIZE: the size
+        # gate fires at FLUSH_SIZE (~30 records) on whatever a poll
         # returned, and a partial poll is a flush of its own.
-        assert files_landed >= 5
-        assert samples["millpond_variant_encode_seconds_count"] == files_landed
+        assert flushes_landed >= 5
+        assert samples["millpond_variant_encode_seconds_count"] == flushes_landed
         # A SAMPLE with a value, per declared path — not the HELP line.
-        with_browser = sum(1 for r in records if r.get("properties", "x").startswith("{"))
+        with_browser = sum(1 for r in landed if r.get("properties", "x").startswith("{"))
         typed = labelled[
             "millpond_variant_values_total",
             (("column", "properties"), ("outcome", "typed"), ("path", "$.$browser")),
@@ -445,7 +503,7 @@ class TestHoglakeVariantE2E:
             "millpond_variant_values_total",
             (("column", "person_properties"), ("outcome", "fallback"), ("path", "$.age")),
         ]
-        assert fallback == N_EVENTS
+        assert fallback == N_LANDED
         # The codec: native for the process, and nothing routed to Python
         # or redone there; every label set exported, at zero.
         assert labelled["millpond_variant_codec_info", (("backend", "native"),)] == 1
@@ -471,6 +529,9 @@ class TestHoglakeVariantE2E:
         files = _table(client).files()
         assert len(files) < len(before_files)
         assert _server_metric("hoglake_compaction_variant_layout_mismatch_total") == mismatch_before
+        # Compaction keeps the layout: the output is under the prefix.
+        root = f"s3://{BUCKET}/lake/data/{NAMESPACE}/{TABLE}/"
+        assert all(f.path.startswith(f"{root}{OBJECT_PREFIX_FIELD}={TEAM}/") for f in files)
         _after, decoded_after = _decoded(client, column)
         assert decoded_after == decoded_before
-        assert _count(client) == N_EVENTS
+        assert _count(client) == N_LANDED
