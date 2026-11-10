@@ -2611,9 +2611,8 @@ class TestObjectPrefixViolationLive:
 
         from millpond import metrics
 
-        # A hard failure, not a skip: the class is already gated on a
-        # placing pyhoglake, and this is the only live coverage of the
-        # 422's classification. A refactor that moves `_placement` must
+        # A hard failure, not a skip: this is the only live coverage of
+        # the 422's classification. A refactor that moves `_placement` must
         # come here, not silently take the test with it.
         assert hasattr(pyhoglake_client, "_placement"), "pyhoglake.client._placement moved; update this test"
         cfg = _variant_cfg(hoglake_deferred_stats=True)
