@@ -1032,6 +1032,36 @@ def _skip_unplaceable_groups(
     return kept, skipped
 
 
+def _grouping_schema(target: pa.Schema, info) -> pa.Schema:
+    """`target` with the object-prefix field made nullable, when the table
+    has one and the column is NOT NULL; otherwise `target` itself.
+
+    The strict schema is what pyhoglake must see — the exact catalog
+    schema, field ids included — but it cannot be what the batch is CAST
+    to before the fanout: pyarrow refuses to cast a column holding nulls
+    to a non-nullable field (`ValueError: Casting field ... with null
+    values to non-nullable`), so on a NOT NULL prefix column one null
+    `team_id` — or a batch that lacks the column, which
+    `_null_fill_missing` fills with nulls — failed the whole flush before
+    `_skip_unplaceable_groups` could skip the one group, and the
+    partition stuck on it with every valid row. So the batch is aligned
+    to this schema (same types, same field ids, the one field nullable),
+    grouped and filtered, and each RETAINED group is cast to `target`:
+    none of them holds a null in that field (a null is unplaceable), so
+    the cast only relabels nullability and shares the buffers. A nullable
+    prefix column, and a table without the option, get `target` back and
+    the single cast they always had.
+    """
+    field = info.object_prefix_field
+    if field is None or field not in target.names:
+        return target
+    index = target.get_field_index(field)
+    column = target.field(index)
+    if column.nullable:
+        return target
+    return target.set(index, column.with_nullable(True))
+
+
 def _partition_tuples(spec) -> tuple[tuple[int, str, int | None], ...]:
     """A live PartitionSpec as comparable (source_field_id, transform,
     param) triples. An absent spec and an empty one are the same thing —
@@ -2201,8 +2231,14 @@ class HoglakeSink:
         # before crashing the pod. Fill first, select second: the select
         # can then only ever narrow.
         batch = self._null_fill_missing(batch)
-        aligned = batch.select(list(target.names)).cast(target)
+        # Cast to the strict schema in two steps when the object-prefix
+        # column is NOT NULL: see `_grouping_schema`. The groups pyhoglake
+        # receives carry `target` exactly, either way.
+        grouping = _grouping_schema(target, info)
+        aligned = batch.select(list(target.names)).cast(grouping)
         groups, skipped = _skip_unplaceable_groups(_partition_groups(aligned, info), info)
+        if grouping is not target:
+            groups = [(values, part.cast(target)) for values, part in groups]
         self._prepared_skipped = skipped or None
         self._prepared_rows = sum(part.num_rows for _, part in groups)
         if not groups:

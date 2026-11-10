@@ -5815,6 +5815,124 @@ class TestObjectPrefixUnplaceableGroups:
         assert s._prepared_skipped is None
 
 
+class TestObjectPrefixNotNullColumn:
+    """A NOT NULL object-prefix column. pyarrow refuses to cast nulls to a
+    non-nullable field, so without `_grouping_schema` one null `team_id`
+    (or a batch lacking the column, null-filled) failed the whole flush
+    before the skip ran and the partition stuck with every valid row.
+    Now the batch is grouped under a schema where only that field is
+    nullable, the unplaceable groups are skipped, and the retained groups
+    are cast to the strict catalog schema pyhoglake must see."""
+
+    OFFSETS = (("events", 0, 10, 14),)
+    REASON = "unplaceable_object_prefix_value"
+    COLUMNS = [_col("team_id", "long", 3, 3, nullable=False) if c.name == "team_id" else c for c in _EVENTS_COLUMNS]
+
+    def _sink(self, cfg=None):
+        return _prefixed_sink(cfg, columns=self.COLUMNS)
+
+    @patch("millpond.hoglake.metrics")
+    def test_mixed_nulls_publish_the_valid_groups_under_the_strict_schema(self, mock_metrics):
+        s, client, catalog, ns, table = self._sink()
+        batch = pa.table({"uuid": ["a", "b", "c", "d"], "team_id": [1, None, 2, None]})
+        assert s.write(batch, kafka_offsets=self.OFFSETS) == 2
+        assert [v[0] for v, _ in _groups()] == ["1", "2"]
+        for _, group in _groups():
+            field = group.schema.field("team_id")
+            # The exact catalog schema reaches pyhoglake: NOT NULL, field id.
+            assert field.nullable is False
+            assert field.metadata[b"PARQUET:field_id"] == b"3"
+            assert group.column("team_id").null_count == 0
+        mock_metrics.records_skipped_total.labels.assert_called_once_with(reason=self.REASON)
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(2)
+        catalog.commit_prepared.assert_called_once()
+        assert s._prepared is None
+
+    def test_the_strict_cast_of_a_retained_group_shares_its_buffers(self):
+        # Only nullability changes between the grouping schema and the
+        # strict one, so the second cast relabels: same data buffer.
+        from pyhoglake.types import columns_to_arrow_schema
+
+        info = _FakeInfo(
+            columns=tuple(self.COLUMNS), partition_spec=_spec(("team_id", "identity")), object_prefix_field="team_id"
+        )
+        strict = columns_to_arrow_schema(tuple(self.COLUMNS), variant="json")
+        loose = hoglake._grouping_schema(strict, info)
+        group = pa.table({c.name: [None] if c.name != "team_id" else [5] for c in self.COLUMNS}).cast(loose)
+        retained = group.cast(strict)
+        assert retained.schema.field("team_id").nullable is False
+        assert retained.schema.field("team_id").metadata[b"PARQUET:field_id"] == b"3"
+        before = group.column("team_id").chunk(0).buffers()[1].address
+        after = retained.column("team_id").chunk(0).buffers()[1].address
+        assert before == after
+
+    @patch("millpond.hoglake.metrics")
+    def test_all_null_publishes_nothing_and_commits_the_offsets(self, mock_metrics):
+        from millpond.main import _flush
+
+        s, client, catalog, ns, table = self._sink()
+        kafka = MagicMock()
+        cfg = MagicMock(destination="hoglake", sort_by=None)
+        batch = pa.table({"uuid": ["a", "b", "c"], "team_id": pa.array([None, None, None], pa.int64())})
+        with patch("millpond.main.metrics"), patch("millpond.main.time"):
+            _flush(s, cfg, kafka, batch, batch.nbytes, 3, {("events", 0): (10, 12)}, 0.0, "size")
+        kafka.commit.assert_called_once()
+        table.prepare_append_tables.assert_not_called()
+        catalog.commit_prepared.assert_not_called()
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(3)
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_batch_without_the_column_is_skipped_whole_not_failed(self, mock_metrics, caplog):
+        # `_null_fill_missing` fills the NOT NULL column with nulls; those
+        # must be skippable, not a cast failure.
+        s, client, catalog, ns, table = self._sink()
+        with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+            assert s.write(pa.table({"uuid": ["a", "b"]}), kafka_offsets=self.OFFSETS) == 0
+        mock_metrics.records_skipped_total.labels.return_value.inc.assert_called_once_with(2)
+        assert any("Skipped 2 record(s) in 1 partition group(s)" in r.getMessage() for r in caplog.records)
+        table.prepare_append_tables.assert_not_called()
+        # Not wedged: the next batch, with the column, publishes.
+        assert s.write(pa.table({"uuid": ["x"], "team_id": [1]}), kafka_offsets=(("events", 0, 15, 15),)) == 1
+
+    def test_the_variant_not_null_refusal_does_not_misfire(self):
+        # A NOT NULL prefix column is not a NOT NULL VARIANT column: the
+        # table resolves, and only a NOT NULL variant is refused.
+        spec = PartitionSpec(spec_id=1, fields=(PartitionField(3, "identity", None),))
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        columns = [
+            _col("team_id", "long", 3, 3, nullable=False) if c.name == "team_id" else c for c in _VARIANT_COLUMNS
+        ]
+        s, client, catalog, ns, table = _prefixed_sink(cfg, columns=columns, spec=spec)
+        assert s.write(_variant_batch(team_id=[1, None, 2]), kafka_offsets=self.OFFSETS) == 2
+        not_null_variant = [*columns[:3], _col("properties", "variant", 4, 4, nullable=False), *columns[4:]]
+        s2, *_ = _prefixed_sink(cfg, columns=not_null_variant, spec=spec)
+        with pytest.raises(hoglake.HoglakeSinkError, match="variant column\(s\) \['properties'\]"):
+            s2.write(_variant_batch(), kafka_offsets=self.OFFSETS)
+
+    def test_a_nullable_prefix_column_takes_the_single_cast(self):
+        # `_grouping_schema` is the identity there, so nothing changed for
+        # the nullable (production) shape.
+        from pyhoglake.types import columns_to_arrow_schema
+
+        info = _FakeInfo(
+            columns=tuple(_EVENTS_COLUMNS), partition_spec=_spec(("team_id", "identity")), object_prefix_field="team_id"
+        )
+        target = columns_to_arrow_schema(tuple(_EVENTS_COLUMNS), variant="json")
+        assert hoglake._grouping_schema(target, info) is target
+        info_not_null = _FakeInfo(
+            columns=tuple(self.COLUMNS), partition_spec=_spec(("team_id", "identity")), object_prefix_field="team_id"
+        )
+        strict = columns_to_arrow_schema(tuple(self.COLUMNS), variant="json")
+        loose = hoglake._grouping_schema(strict, info_not_null)
+        assert loose is not strict
+        assert loose.field("team_id").nullable is True
+        assert loose.field("team_id").metadata == strict.field("team_id").metadata
+        assert [f.with_nullable(True) for f in loose] == [f.with_nullable(True) for f in strict]
+        # Without the option: identity, NOT NULL or not.
+        plain = _FakeInfo(columns=tuple(self.COLUMNS), partition_spec=_spec(("team_id", "identity")))
+        assert hoglake._grouping_schema(strict, plain) is strict
+
+
 class TestObjectPrefixResolve:
     """What the sink refuses at resolve on an object-prefix table, with
     the reason, rather than letting pyhoglake or the server refuse the

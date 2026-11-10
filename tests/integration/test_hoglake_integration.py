@@ -1919,13 +1919,18 @@ from tests.hoglake_stack.variant_table import (  # noqa: E402
 )
 
 
-def _precreate_variant_table(client, cfg, *, object_prefix: bool = False):
+def _precreate_variant_table(client, cfg, *, object_prefix: bool = False, team_id_nullable: bool = True):
     """The setup script's work (tests/hoglake_stack/variant_table.py); the
     catalog is the sink's (constructing a HoglakeSink first ensures it).
     `object_prefix` adds `set_object_prefix_field team_id` on the empty
-    table."""
+    table; `team_id_nullable=False` declares the column NOT NULL."""
     return _precreate_variant_table_in(
-        client, cfg.hoglake_catalog, cfg.hoglake_namespace, cfg.hoglake_table, object_prefix=object_prefix
+        client,
+        cfg.hoglake_catalog,
+        cfg.hoglake_namespace,
+        cfg.hoglake_table,
+        object_prefix=object_prefix,
+        team_id_nullable=team_id_nullable,
     )
 
 
@@ -2650,3 +2655,60 @@ class TestObjectPrefixViolationLive:
             assert files[0].path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}=5/")
         finally:
             sink.close()
+
+
+class TestObjectPrefixNotNullLive:
+    """The prefix column declared NOT NULL on the server. A null (or a
+    batch without the column, null-filled) must be skipped and counted
+    through the real prepare, with the retained groups registered under
+    the strict schema — not fail the flush at the cast and stick the
+    partition."""
+
+    def test_nulls_are_skipped_and_the_valid_groups_land(self, hog_stack, client):
+        from millpond import metrics
+
+        cfg = _variant_cfg(hoglake_deferred_stats=True)
+        sink = HoglakeSink(cfg)
+        table = _precreate_variant_table(client, cfg, object_prefix=True, team_id_nullable=False)
+        info = table.info()
+        assert info.object_prefix_field == _PREFIX_FIELD
+        assert next(c for c in info.columns if c.name == "team_id").nullable is False
+        before = _skipped("unplaceable_object_prefix_value")
+        orphans_before = _registry_sum(metrics._hoglake_orphaned_files_total, "_total")
+        try:
+            # Mixed: null, -1, -2**63 groups beside team 2's rows (12 rows: 9 bad, 3 good).
+            mixed = _whale_rows_unplaceable(12, team=2, month="2026-09", start=0)
+            assert sink.write(mixed, kafka_offsets=(("whales-nn", 0, 0, 11),)) == 3
+            # All null.
+            all_null = mixed.set_column(
+                mixed.schema.get_field_index("team_id"),
+                pa.field("team_id", pa.int64()),
+                pa.nulls(12, pa.int64()),
+            )
+            assert sink.write(all_null, kafka_offsets=(("whales-nn", 0, 12, 23),)) == 0
+            # Column missing: null-filled, every row skipped.
+            missing = _whale_rows(5, team=2, month="2026-09", start=100).drop_columns(["team_id"])
+            assert sink.write(missing, kafka_offsets=(("whales-nn", 0, 24, 28),)) == 0
+            # And the sink still writes afterwards.
+            assert (
+                sink.write(
+                    _whale_rows(4, team=3, month="2026-09", start=200), kafka_offsets=(("whales-nn", 0, 29, 32),)
+                )
+                == 4
+            )
+        finally:
+            sink.close()
+        assert _skipped("unplaceable_object_prefix_value") - before == 9 + 12 + 5
+        assert _record_count(client, cfg) == 7
+        files = _table(client, cfg).files()
+        assert sorted(tuple(f.partition_values) for f in files) == [("2", "680"), ("3", "680")]
+        assert all(f.path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}={f.partition_values[0]}/") for f in files)
+        assert {f.stats_state for f in files} == {"provided"}
+        # The written parquet carries the NOT NULL field: no nulls, the id.
+        for f in files:
+            back = _read_parquet(f.path)
+            assert back.column("team_id").null_count == 0
+            assert back.schema.field("team_id").metadata[b"PARQUET:field_id"] == b"3"
+        objects = [o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")]
+        assert len(objects) == 2
+        assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before

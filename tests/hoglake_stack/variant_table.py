@@ -47,17 +47,19 @@ VARIANT_NAMES = ("properties", "person_properties", *(f"group{i}_properties" for
 TS_TYPE = pa.timestamp("us", tz="UTC")
 
 
-def table_schema() -> pa.Schema:
+def table_schema(*, team_id_nullable: bool = True) -> pa.Schema:
     """The whales table as the setup script creates it: the source names
     kept, every JSON column a declared `variant`, `timestamp` typed, and
-    `_inserted_at` present so millpond never alters it."""
+    `_inserted_at` present so millpond never alters it. `team_id_nullable`
+    False declares the prefix column NOT NULL (a shape the object-prefix
+    suite exercises; the production table is nullable)."""
     from pyhoglake import variant
 
     return pa.schema(
         [
             pa.field("uuid", pa.string()),
             pa.field("event", pa.string()),
-            pa.field("team_id", pa.int64()),
+            pa.field("team_id", pa.int64(), nullable=team_id_nullable),
             pa.field("timestamp", TS_TYPE),
             variant.variant_field("properties", PROPERTIES_SV),
             variant.variant_field("person_properties", PERSON_DECL),
@@ -89,6 +91,7 @@ def precreate(
     *,
     data_path: str | None = None,
     object_prefix: bool = False,
+    team_id_nullable: bool = True,
 ):
     """What the setup script does, with pyhoglake: the table with its
     declarations, `identity(team_id), month(timestamp)` and a `timestamp`
@@ -118,7 +121,7 @@ def precreate(
     try:
         created = ns.create_table(
             table,
-            table_schema(),
+            table_schema(team_id_nullable=team_id_nullable),
             partition_fields=[
                 ops.NamedPartitionField("team_id", "identity"),
                 ops.NamedPartitionField("timestamp", "month"),
