@@ -32,6 +32,7 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -381,222 +382,633 @@ def _pg_execute(conn: duckdb.DuckDBPyConnection, sql: str) -> None:
     conn.execute(f"CALL postgres_execute('{PG_ATTACH_NAME}', {_sql_string_literal(sql)})")
 
 
-def expire_snapshots(
-    conn: duckdb.DuckDBPyConnection, days: int, batch_size: int, num_batches: int | None, dry_run: bool
-) -> None:
-    """Postgres-native snapshot expiry that bypasses ducklake_expire_snapshots.
+_EXPIRE_COLUMNS = {
+    "ducklake_metadata": "key value scope scope_id",
+    "ducklake_snapshot": "snapshot_id snapshot_time schema_version next_catalog_id next_file_id",
+    "ducklake_snapshot_changes": "snapshot_id changes_made author commit_message commit_extra_info",
+    "ducklake_schema": "schema_id schema_uuid begin_snapshot end_snapshot schema_name path path_is_relative",
+    "ducklake_table": "table_id table_uuid begin_snapshot end_snapshot schema_id table_name path path_is_relative",
+    "ducklake_view": "view_id view_uuid begin_snapshot end_snapshot schema_id view_name dialect sql column_aliases",
+    "ducklake_tag": "object_id begin_snapshot end_snapshot key value",
+    "ducklake_column_tag": "table_id column_id begin_snapshot end_snapshot key value",
+    "ducklake_data_file": (
+        "data_file_id table_id begin_snapshot end_snapshot file_order path path_is_relative file_format "
+        "record_count file_size_bytes footer_size row_id_start partition_id encryption_key mapping_id "
+        "partial_max"
+    ),
+    "ducklake_file_column_stats": (
+        "data_file_id table_id column_id column_size_bytes value_count null_count min_value max_value "
+        "contains_nan extra_stats"
+    ),
+    "ducklake_file_variant_stats": (
+        "data_file_id table_id column_id variant_path shredded_type column_size_bytes value_count "
+        "null_count min_value max_value contains_nan extra_stats"
+    ),
+    "ducklake_delete_file": (
+        "delete_file_id table_id begin_snapshot end_snapshot data_file_id path path_is_relative format "
+        "delete_count file_size_bytes footer_size encryption_key partial_max"
+    ),
+    "ducklake_column": (
+        "column_id begin_snapshot end_snapshot table_id column_order column_name column_type "
+        "initial_default default_value nulls_allowed parent_column default_value_type "
+        "default_value_dialect"
+    ),
+    "ducklake_table_stats": "table_id record_count next_row_id file_size_bytes",
+    "ducklake_table_column_stats": "table_id column_id contains_null contains_nan min_value max_value extra_stats",
+    "ducklake_partition_info": "partition_id table_id begin_snapshot end_snapshot",
+    "ducklake_partition_column": "partition_id table_id partition_key_index column_id transform",
+    "ducklake_file_partition_value": "data_file_id table_id partition_key_index partition_value",
+    "ducklake_files_scheduled_for_deletion": "data_file_id path path_is_relative schedule_start",
+    "ducklake_inlined_data_tables": "table_id table_name schema_version",
+    "ducklake_column_mapping": "mapping_id table_id type",
+    "ducklake_name_mapping": "mapping_id column_id source_name target_field_id parent_column is_partition",
+    "ducklake_schema_versions": "begin_snapshot schema_version table_id",
+    "ducklake_macro": "schema_id macro_id macro_name begin_snapshot end_snapshot",
+    "ducklake_macro_impl": "macro_id impl_id dialect sql type",
+    "ducklake_macro_parameters": (
+        "macro_id impl_id column_id parameter_name parameter_type default_value default_value_type"
+    ),
+    "ducklake_sort_info": "sort_id table_id begin_snapshot end_snapshot",
+    "ducklake_sort_expression": "sort_id table_id sort_key_index expression dialect sort_direction null_order",
+}
 
-    DuckLake's built-in OOMs on large catalogs because it loads all matching
-    snapshot rows into a DuckDB in-memory vector at bind time, before deleting
-    anything. This function replicates the same DELETE cascade entirely via
-    postgres_execute, in bounded snapshot_id-ordered batches.
+_EXPIRE_NONINTEGER_TYPES = {
+    "boolean": ("path_is_relative contains_nan nulls_allowed contains_null is_partition"),
+    "character varying": (
+        "key value scope changes_made author "
+        "commit_message commit_extra_info schema_name path table_name "
+        "view_name dialect sql column_aliases file_format "
+        "encryption_key min_value max_value extra_stats variant_path "
+        "shredded_type format column_name column_type initial_default "
+        "default_value default_value_type default_value_dialect transform partition_value "
+        "type source_name macro_name parameter_name parameter_type "
+        "expression sort_direction null_order"
+    ),
+    "timestamp with time zone": ("snapshot_time schedule_start"),
+    "uuid": ("schema_uuid table_uuid view_uuid"),
+}
 
-    Per batch (ONE postgres_execute call = ONE transaction):
-      1. SELECT next `batch_size` expired snapshot_ids (ORDER BY snapshot_id),
-         always excluding MAX(snapshot_id) — the head snapshot is never
-         expired, no matter how old. This mirrors the guard in the fork
-         built-in (ducklake_expire_snapshots.cpp): DuckLake resolves ALL
-         state from the newest snapshot row, so expiring it bricks the
-         catalog (an idle tenant older than --days would otherwise lose
-         every snapshot).
-      2. Find dead DATA files: end_snapshot in batch, and NO snapshot outside
-         this batch bridges [begin, end)
-         → INSERT paths into ducklake_files_scheduled_for_deletion
-         → DELETE cascade: column_stats → partition_value → variant_stats → data_file
-      3. Find dead DELETE VECTORS: same liveness check against ducklake_delete_file
-         → INSERT paths into ducklake_files_scheduled_for_deletion
-         → DELETE from ducklake_delete_file
-      4. DELETE ducklake_snapshot_changes, then ducklake_snapshot rows
+# The progress relation belongs to this tool, not DuckLake.
+_EXPIRE_PROGRESS = "millpond_snapshot_expiry_progress"
+_EXPIRE_FILE_DEPS = (
+    "ducklake_file_column_stats",
+    "ducklake_file_variant_stats",
+    "ducklake_file_partition_value",
+)
+_EXPIRE_TABLE_DEPS = (
+    *_EXPIRE_FILE_DEPS,
+    "ducklake_table_stats",
+    "ducklake_table_column_stats",
+    "ducklake_partition_info",
+    "ducklake_partition_column",
+    "ducklake_column",
+    "ducklake_column_tag",
+    "ducklake_sort_info",
+    "ducklake_sort_expression",
+    "ducklake_schema_versions",
+)
+_EXPIRE_PHASES = (
+    "ducklake_delete_file",
+    "ducklake_data_file",
+    "ducklake_table",
+    "ducklake_view",
+    "ducklake_tag",
+    "ducklake_macro",
+    "ducklake_schema",
+    "ducklake_macro_impl",
+    "ducklake_macro_parameters",
+    "ducklake_name_mapping",
+)
 
-    After all batches: run cleanup-all to physically delete S3 objects.
 
-    Liveness is STRUCTURAL, matching the cascade in the fork: a file
-    survives if ANY snapshot row in [begin_snapshot, end_snapshot) survives
-    this run's deletions — expressed as "a bridging snapshot NOT IN this
-    batch's id list" (ids are processed in ascending order, so every id
-    below the batch was deleted by an earlier batch or is being deleted
-    now; ids above it are retained). The previous predicate mixed a
-    snapshot_time-vs-cutoff test into the bridging check, which could
-    classify a file as dead while a later-batch or --num-batches-spared
-    snapshot still referenced it — queueing live data for S3 deletion.
+class _ExpiryBudget(Exception):
+    """Stop between transactions when the run budget expires."""
 
-    Atomicity: each batch's INSERT + DELETE cascade + snapshot DELETE
-    ships as one multi-statement postgres_execute call — one transaction. A
-    crash between batches leaves whole batches applied or not applied —
-    never a snapshot row whose data-file rows are missing (readers of a
-    surviving snapshot would otherwise see its files vanish). Re-running
-    converges: the batch SELECT simply finds the remaining expired ids.
 
-    Schema note: SQL sent via _pg_execute/_pg_query_one hits Postgres directly
-    and must use PG_CATALOG_SCHEMA ('public'), not METADATA_SCHEMA
-    ('__ducklake_metadata_lake'). The latter is a DuckDB-side alias exposed by
-    the DuckLake extension and does not exist as an actual Postgres schema.
-    """
-    s = PG_CATALOG_SCHEMA  # short alias; all SQL here goes through postgres_execute
-    _acquire_advisory_lock(conn)
+@dataclass
+class _ExpiryRun:
+    pg: psycopg.Connection
+    deadline: float
+    statement_timeout_s: float
+    lock_timeout_s: float
+    file_batch_size: int
+    metadata_batch_size: int
+    path_cache: dict[int, str] = field(default_factory=dict)
 
-    # Capture the expiry cutoff once as a Postgres timestamptz literal so that
-    # every statement in this run uses the identical boundary. Without this,
-    # each postgres_execute call re-evaluates NOW() in its own transaction and
-    # a snapshot right at the boundary could be classified as "expired" by the
-    # batch SELECT but "live" by the NOT EXISTS liveness check (or vice versa).
-    cutoff_text = _pg_query_one(conn, f"SELECT (NOW() - INTERVAL '{days} days')::text")[0]
-    cutoff_sql = f"TIMESTAMPTZ '{cutoff_text}'"
+    def execute(self, query, params=None):
+        """Bound every statement by the remaining run budget."""
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ExpiryBudget
+        timeout = max(1, math.ceil(min(remaining, self.statement_timeout_s) * 1000))
+        self.pg.execute("SELECT set_config('statement_timeout', %s, true)", (f"{timeout}ms",))
+        return self.pg.execute(query, params)
 
-    head_guard = f"snapshot_id != (SELECT MAX(snapshot_id) FROM {s}.ducklake_snapshot)"
+    @contextlib.contextmanager
+    def transaction(self):
+        """Apply transaction-local limits without changing connection defaults."""
+        if time.monotonic() >= self.deadline:
+            raise _ExpiryBudget
+        with self.pg.transaction():
+            self.pg.execute("SELECT set_config('lock_timeout', %s, true)", (f"{self.lock_timeout_s}s",))
+            self.pg.execute("SET LOCAL work_mem = '16MB'")
+            yield
 
-    if dry_run:
-        row = _pg_query_one(
-            conn,
-            f"SELECT COUNT(*) FROM {s}.ducklake_snapshot WHERE snapshot_time < {cutoff_sql} AND {head_guard}",
-        )
-        log.info(
-            "expire-snapshots dry-run: %d snapshots older than %d days (batch_size=%d); "
-            "run without --dry-run to see per-batch dead file counts",
-            row[0],
-            days,
-            batch_size,
-        )
-        return
 
-    total_snapshots = 0
-    total_dead_data_files = 0
-    total_dead_delete_vectors = 0
-    batch_num = 0
-
-    while True:
-        batch_select = (
-            f"SELECT snapshot_id FROM {s}.ducklake_snapshot "
-            f"WHERE snapshot_time < {cutoff_sql} AND {head_guard} "
-            f"ORDER BY snapshot_id LIMIT {batch_size}"
-        )
-        rows = conn.execute(
-            f"SELECT snapshot_id FROM postgres_query('{PG_ATTACH_NAME}', {_sql_string_literal(batch_select)})"
-        ).fetchall()
-        if not rows:
-            log.info("expire-snapshots: no expired snapshots remaining, done")
-            break
-        if num_batches is not None and batch_num >= num_batches:
-            log.info("expire-snapshots: reached --num-batches limit (%d), stopping", num_batches)
-            break
-
-        batch_num += 1
-        snapshot_ids = [row[0] for row in rows]
-        id_list = ", ".join(str(i) for i in snapshot_ids)
-
-        # WHERE clause for both data-file and delete-vector dead checks.
-        # A file/vector is dead when its end_snapshot is in this expired
-        # batch AND no snapshot OUTSIDE this batch bridges [begin_snapshot,
-        # end_snapshot). Structural, matching the cascade in the fork — NOT
-        # a time comparison: ids are deleted in ascending order, so at the
-        # moment a file's end_snapshot is processed, every potential bridge
-        # below it is already gone (earlier batch) or in this batch's
-        # id_list; a later-batch id or --num-batches survivor that bridges
-        # keeps the file alive (it is re-examined if that id expires later).
-        # Excluding the batch by id also makes the predicate evaluate
-        # identically before and after this transaction's own snapshot
-        # DELETEs, so statement order within the batch txn is irrelevant.
-        # Concurrent writers only append ids above MAX, which can never
-        # fall inside an old [begin, end) window.
-        def _dead_where(alias: str) -> str:
-            return (
-                f"{alias}.end_snapshot IN ({id_list}) "
-                f"AND NOT EXISTS ("
-                f"  SELECT 1 FROM {s}.ducklake_snapshot live "
-                f"  WHERE live.snapshot_id >= {alias}.begin_snapshot "
-                f"  AND live.snapshot_id < {alias}.end_snapshot "
-                f"  AND live.snapshot_id NOT IN ({id_list})"
-                f")"
-            )
-
-        # --- Dead data files ---
-        dead_data_where = _dead_where("df")
-        dead_data_full_subq = (
-            f"SELECT df.data_file_id, df.path, df.path_is_relative "
-            f"FROM {s}.ducklake_data_file df WHERE {dead_data_where}"
-        )
-
-        dead_data_count = _pg_query_one(conn, f"SELECT COUNT(*) FROM ({dead_data_full_subq}) _d")[0]
-
-        # --- Dead delete vectors (positional delete files) ---
-        dead_dv_where = _dead_where("dv")
-        dead_dv_full_subq = (
-            f"SELECT dv.delete_file_id AS data_file_id, dv.path, dv.path_is_relative "
-            f"FROM {s}.ducklake_delete_file dv WHERE {dead_dv_where}"
-        )
-
-        dead_dv_count = _pg_query_one(conn, f"SELECT COUNT(*) FROM ({dead_dv_full_subq}) _d")[0]
-
-        log.info(
-            "expire-snapshots: batch %d: snapshot_ids [%d..%d] (%d), dead_data_files=%d dead_delete_vectors=%d",
-            batch_num,
-            snapshot_ids[0],
-            snapshot_ids[-1],
-            len(snapshot_ids),
-            dead_data_count,
-            dead_dv_count,
-        )
-
-        # One postgres_execute call = one transaction for the whole batch:
-        # queue-INSERTs, file-row cascade, and snapshot DELETEs commit
-        # together or not at all (see docstring "Atomicity"). The dead-file
-        # sets are materialized ONCE into ON COMMIT DROP temp tables (same
-        # pattern as repair-partition-values) so the expensive
-        # ducklake_data_file scan runs once per batch instead of once per
-        # referencing statement. Queue INSERTs stay textually before the
-        # file DELETEs to preserve the schedule-before-drop invariant if
-        # this is ever split up again. SET LOCAL bounds a blocked/runaway
-        # batch so the advisory lock cannot be held forever.
-        _pg_execute(
-            conn,
-            f"SET LOCAL statement_timeout = '{_EXPIRE_SNAPSHOTS_STATEMENT_TIMEOUT}'; "
-            f"SET LOCAL lock_timeout = '{_EXPIRE_SNAPSHOTS_LOCK_TIMEOUT}'; "
-            f"CREATE TEMP TABLE _expire_dead_data ON COMMIT DROP AS {dead_data_full_subq}; "
-            f"CREATE TEMP TABLE _expire_dead_dv ON COMMIT DROP AS {dead_dv_full_subq}; "
-            f"INSERT INTO {s}.ducklake_files_scheduled_for_deletion "
-            f"  (data_file_id, path, path_is_relative, schedule_start) "
-            f"SELECT d.data_file_id, d.path, d.path_is_relative, NOW() "
-            f"FROM _expire_dead_data d "
-            f"WHERE NOT EXISTS ("
-            f"  SELECT 1 FROM {s}.ducklake_files_scheduled_for_deletion x "
-            f"  WHERE x.data_file_id = d.data_file_id"
-            f"); "
-            f"INSERT INTO {s}.ducklake_files_scheduled_for_deletion "
-            f"  (data_file_id, path, path_is_relative, schedule_start) "
-            f"SELECT d.data_file_id, d.path, d.path_is_relative, NOW() "
-            f"FROM _expire_dead_dv d "
-            f"WHERE NOT EXISTS ("
-            f"  SELECT 1 FROM {s}.ducklake_files_scheduled_for_deletion x "
-            f"  WHERE x.data_file_id = d.data_file_id"
-            f"); "
-            f"DELETE FROM {s}.ducklake_file_column_stats "
-            f"  WHERE data_file_id IN (SELECT data_file_id FROM _expire_dead_data); "
-            f"DELETE FROM {s}.ducklake_file_partition_value "
-            f"  WHERE data_file_id IN (SELECT data_file_id FROM _expire_dead_data); "
-            f"DELETE FROM {s}.ducklake_file_variant_stats "
-            f"  WHERE data_file_id IN (SELECT data_file_id FROM _expire_dead_data); "
-            f"DELETE FROM {s}.ducklake_data_file "
-            f"  WHERE data_file_id IN (SELECT data_file_id FROM _expire_dead_data); "
-            f"DELETE FROM {s}.ducklake_delete_file "
-            f"  WHERE delete_file_id IN (SELECT data_file_id FROM _expire_dead_dv); "
-            f"DELETE FROM {s}.ducklake_snapshot_changes WHERE snapshot_id IN ({id_list}); "
-            f"DELETE FROM {s}.ducklake_snapshot WHERE snapshot_id IN ({id_list})",
-        )
-
-        total_snapshots += len(snapshot_ids)
-        total_dead_data_files += dead_data_count
-        total_dead_delete_vectors += dead_dv_count
-
-    log.info(
-        "expire-snapshots: done: %d snapshots expired, %d dead data files + %d delete vectors "
-        "scheduled for deletion (%d batches, batch_size=%d, num_batches=%s); run cleanup-all to delete S3 objects",
-        total_snapshots,
-        total_dead_data_files,
-        total_dead_delete_vectors,
-        batch_num,
-        batch_size,
-        str(num_batches) if num_batches is not None else "unlimited",
+def _expiry_unreachable(alias: str) -> str:
+    """Select finite visibility ranges without a retained snapshot."""
+    return (
+        f"{alias}.end_snapshot IS NOT NULL AND NOT EXISTS ("
+        f"SELECT 1 FROM {PG_CATALOG_SCHEMA}.ducklake_snapshot live "
+        f"WHERE live.snapshot_id >= {alias}.begin_snapshot AND live.snapshot_id < {alias}.end_snapshot)"
     )
+
+
+def _expiry_dead_table(alias: str) -> str:
+    """Require every version of a table ID to be unreachable."""
+    s = PG_CATALOG_SCHEMA
+    return (
+        f"EXISTS (SELECT 1 FROM {s}.ducklake_table dt WHERE dt.table_id = {alias}.table_id) "
+        f"AND NOT EXISTS (SELECT 1 FROM {s}.ducklake_table lt "
+        f"WHERE lt.table_id = {alias}.table_id AND NOT ({_expiry_unreachable('lt')}))"
+    )
+
+
+def _expiry_dead_file(alias: str, delete_file: bool = False) -> str:
+    """Include files from unreachable tables and dependent delete vectors."""
+    pred = f"({_expiry_dead_table(alias)}) OR ({_expiry_unreachable(alias)})"
+    if delete_file:
+        pred += (
+            f" OR NOT EXISTS (SELECT 1 FROM {PG_CATALOG_SCHEMA}.ducklake_data_file parent "
+            f"WHERE parent.data_file_id = {alias}.data_file_id) "
+            f"OR EXISTS (SELECT 1 FROM {PG_CATALOG_SCHEMA}.ducklake_data_file parent "
+            f"WHERE parent.data_file_id = {alias}.data_file_id AND ({_expiry_dead_file('parent')}))"
+        )
+    return f"({pred})"
+
+
+def _expiry_delete_rows(run: _ExpiryRun, relation: str, predicate: str, params=()) -> int:
+    """Delete one bounded page without assuming dependent-row uniqueness."""
+    s = PG_CATALOG_SCHEMA
+    result = run.execute(
+        f"WITH doomed AS MATERIALIZED (SELECT d.ctid FROM {s}.{relation} d "
+        f"WHERE {predicate} LIMIT %s) "
+        f"DELETE FROM {s}.{relation} d USING doomed WHERE d.ctid = doomed.ctid",
+        (*params, run.metadata_batch_size),
+    )
+    return result.rowcount
+
+
+def _expiry_path(base: str, path: str, relative: bool) -> str:
+    """Match the engine's slash-separated path concatenation."""
+    if not isinstance(path, str) or not isinstance(relative, bool):
+        raise RuntimeError("Unsupported null path metadata")
+    if "\\" in path or "\x00" in path:
+        raise RuntimeError("Unsupported path separator")
+    return base + path if relative else path
+
+
+def _expiry_resolve_path(run: _ExpiryRun, table_id: int, path: str, relative: bool, base: str) -> str:
+    """Resolve schema, table, and file paths before removing their parents."""
+    if relative is False:
+        return _expiry_path(base, path, relative)
+    if table_id not in run.path_cache:
+        rows = run.execute(
+            "SELECT DISTINCT CASE WHEN s.path IS NULL OR s.path_is_relative IS NULL "
+            "OR t.path IS NULL OR t.path_is_relative IS NULL THEN NULL "
+            "WHEN NOT t.path_is_relative THEN t.path "
+            "ELSE (CASE WHEN s.path_is_relative THEN %s || s.path ELSE s.path END) || t.path END "
+            f"FROM {PG_CATALOG_SCHEMA}.ducklake_table t "
+            f"LEFT JOIN {PG_CATALOG_SCHEMA}.ducklake_schema s USING (schema_id) "
+            "WHERE t.table_id = %s LIMIT 2",
+            (base, table_id),
+        ).fetchall()
+        if len(rows) != 1 or rows[0][0] is None:
+            raise RuntimeError("Missing or ambiguous file path ancestry")
+        parent = rows[0][0]
+        if not parent.endswith("/") or "\\" in parent:
+            raise RuntimeError("Unsupported parent path separator")
+        run.path_cache[table_id] = parent
+    return _expiry_path(run.path_cache[table_id], path, relative)
+
+
+def _expiry_require_primary_keys(run: _ExpiryRun, expected: dict[str, str]) -> None:
+    """Prove ID-array deletes cannot expand beyond their selected rows."""
+    rows = run.execute(
+        "SELECT c.relname, a.attname FROM pg_constraint k "
+        "JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.conkey[1] "
+        "WHERE n.nspname = %s AND c.relname = ANY(%s) "
+        "AND k.contype = 'p' AND cardinality(k.conkey) = 1 AND k.convalidated "
+        "AND NOT k.condeferrable",
+        (PG_CATALOG_SCHEMA, list(expected)),
+    ).fetchall()
+    if dict(rows) != expected:
+        raise RuntimeError("Unsupported catalog primary keys")
+
+
+def _expiry_initialize_progress(run: _ExpiryRun, *, create: bool = True) -> None:
+    """Validate the tool-owned relation before inserting or updating progress."""
+    s = PG_CATALOG_SCHEMA
+    if not create and run.execute("SELECT to_regclass(%s)", (f"{s}.{_EXPIRE_PROGRESS}",)).fetchone()[0] is None:
+        return
+    if create:
+        run.execute(
+            f"CREATE TABLE IF NOT EXISTS {s}.{_EXPIRE_PROGRESS} ("
+            "singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), "
+            "owner text NOT NULL CHECK (owner = 'millpond-expire-snapshots'), "
+            "state_version integer NOT NULL CHECK (state_version = 1), "
+            "phase integer NOT NULL, cursor_id bigint NOT NULL, high_id bigint NOT NULL)"
+        )
+    rows = run.execute(
+        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), c.relkind, a.attnotnull "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+        "WHERE n.nspname = %s AND c.relname = %s",
+        (s, _EXPIRE_PROGRESS),
+    ).fetchall()
+    expected = {
+        "singleton": "boolean",
+        "owner": "text",
+        "state_version": "integer",
+        "phase": "integer",
+        "cursor_id": "bigint",
+        "high_id": "bigint",
+    }
+    if {name: typ for name, typ, _, _ in rows} != expected or any(
+        kind != "r" or not notnull for _, _, kind, notnull in rows
+    ):
+        raise RuntimeError("Unsupported expiry progress relation layout")
+    _expiry_require_primary_keys(run, {_EXPIRE_PROGRESS: "singleton"})
+    if run.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = %s::regclass) "
+        "OR EXISTS (SELECT 1 FROM pg_constraint WHERE contype = 'f' "
+        "AND (conrelid = %s::regclass OR confrelid = %s::regclass))",
+        (f"{s}.{_EXPIRE_PROGRESS}",) * 3,
+    ).fetchone()[0]:
+        raise RuntimeError("Unsupported expiry progress relation dependencies")
+    if run.execute(
+        f"SELECT EXISTS (SELECT 1 FROM {s}.{_EXPIRE_PROGRESS} "
+        "WHERE singleton IS NOT TRUE OR owner != 'millpond-expire-snapshots' OR state_version != 1 "
+        "OR phase < 0 OR phase >= %s OR cursor_id < -1 OR high_id < -1 OR cursor_id > high_id)",
+        (len(_EXPIRE_PHASES),),
+    ).fetchone()[0]:
+        raise RuntimeError("Unsupported expiry progress owner or version")
+    if not create:
+        return
+    run.execute(
+        f"INSERT INTO {s}.{_EXPIRE_PROGRESS} VALUES "
+        "(true, 'millpond-expire-snapshots', 1, 0, -1, -1) ON CONFLICT DO NOTHING"
+    )
+
+
+def _expiry_validate(run: _ExpiryRun) -> str:
+    """Refuse unsupported catalog layouts before creating tool-owned state."""
+    s = PG_CATALOG_SCHEMA
+    if run.execute("SHOW transaction_isolation").fetchone()[0] != "read committed":
+        raise RuntimeError("Expiry requires READ COMMITTED isolation")
+    rows = run.execute(
+        "SELECT c.relname, a.attname, c.relkind, format_type(a.atttypid, a.atttypmod) FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+        "WHERE n.nspname = %s AND c.relname = ANY(%s)",
+        (s, list(_EXPIRE_COLUMNS)),
+    ).fetchall()
+    actual = defaultdict(set)
+    for relation, column, kind, datatype in rows:
+        expected_type = next((t for t, names in _EXPIRE_NONINTEGER_TYPES.items() if column in names.split()), "bigint")
+        if datatype != expected_type:
+            raise RuntimeError("Unsupported DuckLake catalog column types")
+        if kind != "r":
+            raise RuntimeError("Unsupported partitioned or non-table catalog relation")
+        actual[relation].add(column)
+    if dict(actual) != {name: set(columns.split()) for name, columns in _EXPIRE_COLUMNS.items()}:
+        raise RuntimeError("Unsupported DuckLake catalog columns")
+    _expiry_require_primary_keys(
+        run,
+        {
+            "ducklake_snapshot": "snapshot_id",
+            "ducklake_snapshot_changes": "snapshot_id",
+            "ducklake_data_file": "data_file_id",
+            "ducklake_delete_file": "delete_file_id",
+            "ducklake_schema": "schema_id",
+        },
+    )
+    unsafe = run.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = %s AND c.relname = ANY(%s) AND NOT t.tgisinternal) "
+        "OR EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_class c "
+        "ON c.oid = k.conrelid OR c.oid = k.confrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = %s AND c.relname = ANY(%s) AND k.contype = 'f')",
+        (s, list(_EXPIRE_COLUMNS), s, list(_EXPIRE_COLUMNS)),
+    ).fetchone()[0]
+    if unsafe:
+        raise RuntimeError("Unsupported catalog triggers or foreign keys")
+    rows = run.execute(
+        f"SELECT key, value FROM {s}.ducklake_metadata "
+        "WHERE key IN ('version', 'data_path') AND scope IS NULL AND scope_id IS NULL"
+    ).fetchall()
+    metadata = dict(rows)
+    if len(rows) != 2 or metadata.get("version") != "1.0":
+        raise RuntimeError("Unsupported DuckLake catalog version or data path")
+    base = metadata.get("data_path")
+    if not base or not (base.startswith("s3://") or base.startswith("/")) or not base.endswith("/") or "\\" in base:
+        raise RuntimeError("Only absolute slash-separated catalog roots are supported")
+    configured = _require("DUCKLAKE_DATA_PATH")
+    if configured.rstrip("/") + "/" != base:
+        raise RuntimeError("Configured data path differs from the catalog data path")
+    return base
+
+
+def _expiry_progress(run: _ExpiryRun, phase: int, cursor: int, high: int) -> None:
+    """Commit progress with the metadata changes it describes."""
+    run.execute(
+        f"UPDATE {PG_CATALOG_SCHEMA}.{_EXPIRE_PROGRESS} SET phase = %s, cursor_id = %s, high_id = %s WHERE singleton",
+        (phase, cursor, high),
+    )
+
+
+def _expiry_queue_file(run: _ExpiryRun, file_id: int, table_id: int, path: str, relative: bool, base: str) -> None:
+    """Queue one absolute object path. Refuse conflicting global file IDs."""
+    s = PG_CATALOG_SCHEMA
+    absolute = _expiry_resolve_path(run, table_id, path, relative, base)
+    mismatch, exists = run.execute(
+        "SELECT EXISTS (SELECT 1 FROM "
+        f"{s}.ducklake_files_scheduled_for_deletion WHERE data_file_id = %s "
+        "AND (CASE WHEN path_is_relative THEN %s || path "
+        "WHEN path_is_relative IS FALSE THEN path ELSE NULL END) IS DISTINCT FROM %s), "
+        f"EXISTS (SELECT 1 FROM {s}.ducklake_files_scheduled_for_deletion WHERE data_file_id = %s)",
+        (file_id, base, absolute, file_id),
+    ).fetchone()
+    if mismatch:
+        raise RuntimeError("Deletion queue identifier references a different object")
+    if not exists:
+        run.execute(
+            f"INSERT INTO {s}.ducklake_files_scheduled_for_deletion "
+            "(data_file_id, path, path_is_relative, schedule_start) VALUES (%s, %s, false, now())",
+            (file_id, absolute),
+        )
+
+
+def _expiry_file_page(run: _ExpiryRun, relation: str, cursor: int, high: int, base: str) -> tuple[int, int]:
+    """Process a bounded primary-key page while retaining unfinished parents."""
+    s = PG_CATALOG_SCHEMA
+    run.path_cache.clear()
+    is_delete = relation == "ducklake_delete_file"
+    key = "delete_file_id" if is_delete else "data_file_id"
+    rows = run.execute(
+        f"WITH page AS MATERIALIZED (SELECT * FROM {s}.{relation} WHERE {key} > %s AND {key} <= %s "
+        f"ORDER BY {key} LIMIT %s) "
+        f"SELECT p.{key}, p.table_id, p.path, p.path_is_relative, {_expiry_dead_file('p', is_delete)} "
+        f"FROM page p ORDER BY p.{key}",
+        (cursor, high, run.file_batch_size),
+    ).fetchall()
+    if not rows:
+        return high, 0
+    ids = [row[0] for row in rows if row[4]]
+    if not ids:
+        return rows[-1][0], 0
+    if not is_delete:
+        for dependency in _EXPIRE_FILE_DEPS:
+            count = _expiry_delete_rows(run, dependency, "d.data_file_id = ANY(%s)", (ids,))
+            if count:
+                return cursor, 0
+        # Drain dependent vectors even when a resumed cycle starts in the data phase.
+        vectors = run.execute(
+            f"SELECT delete_file_id, table_id, path, path_is_relative FROM {s}.ducklake_delete_file "
+            "WHERE data_file_id = ANY(%s) ORDER BY delete_file_id LIMIT %s",
+            (ids, run.file_batch_size),
+        ).fetchall()
+        if vectors:
+            for vector in vectors:
+                _expiry_queue_file(run, *vector, base)
+            run.execute(
+                f"DELETE FROM {s}.ducklake_delete_file WHERE delete_file_id = ANY(%s)",
+                ([v[0] for v in vectors],),
+            )
+            return cursor, len(vectors)
+    for file_id, table_id, path, relative, dead in rows:
+        if dead:
+            _expiry_queue_file(run, file_id, table_id, path, relative, base)
+    result = run.execute(f"DELETE FROM {s}.{relation} WHERE {key} = ANY(%s)", (ids,))
+    return rows[-1][0], result.rowcount
+
+
+def _expiry_drop_inline_deletes(run: _ExpiryRun, table_id: int) -> bool:
+    """Drop at most one verified engine-owned inline deletion relation."""
+    if not isinstance(table_id, int) or table_id < 0:
+        raise RuntimeError("Unsupported inline deletion table identifier")
+    s = PG_CATALOG_SCHEMA
+    name = f"ducklake_inlined_delete_{table_id}"
+    row = run.execute("SELECT to_regclass(%s)", (f"{s}.{name}",)).fetchone()
+    if row[0] is None:
+        return False
+    target = pgsql.SQL("{}.{}").format(pgsql.Identifier(s), pgsql.Identifier(name))
+    run.execute(pgsql.SQL("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE").format(target))
+    rows = run.execute(
+        "SELECT a.attname, a.atttypid::regtype::text, c.relkind "
+        "FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+        "WHERE c.oid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+        (f"{s}.{name}",),
+    ).fetchall()
+    if rows != [("file_id", "bigint", "r"), ("row_id", "bigint", "r"), ("begin_snapshot", "bigint", "r")]:
+        raise RuntimeError("Unsupported inline deletion table layout")
+    if run.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = %s::regclass AND NOT tgisinternal) "
+        "OR EXISTS (SELECT 1 FROM pg_constraint WHERE contype = 'f' "
+        "AND (conrelid = %s::regclass OR confrelid = %s::regclass))",
+        (f"{s}.{name}",) * 3,
+    ).fetchone()[0]:
+        raise RuntimeError("Unsupported inline deletion table dependencies")
+    run.execute(pgsql.SQL("DROP TABLE {}").format(target))
+    return True
+
+
+def _expiry_table_page(run: _ExpiryRun, cursor: int, high: int) -> tuple[int, int]:
+    """Finish one unreachable table before removing its path metadata."""
+    s = PG_CATALOG_SCHEMA
+    row = run.execute(
+        f"SELECT t.table_id FROM {s}.ducklake_table t "
+        f"WHERE t.table_id > %s AND t.table_id <= %s AND ({_expiry_dead_table('t')}) "
+        "ORDER BY t.table_id LIMIT 1",
+        (cursor, high),
+    ).fetchone()
+    if row is None:
+        return high, 0
+    table_id = row[0]
+    for relation in ("ducklake_data_file", "ducklake_delete_file"):
+        if run.execute(f"SELECT 1 FROM {s}.{relation} WHERE table_id = %s LIMIT 1", (table_id,)).fetchone():
+            return table_id, 0
+    for relation in _EXPIRE_TABLE_DEPS:
+        count = _expiry_delete_rows(run, relation, "d.table_id = %s", (table_id,))
+        if count:
+            return cursor, count
+    mapping = run.execute(
+        f"SELECT mapping_id FROM {s}.ducklake_column_mapping WHERE table_id = %s LIMIT 1", (table_id,)
+    ).fetchone()
+    if mapping:
+        if _expiry_delete_rows(run, "ducklake_name_mapping", "d.mapping_id = %s", mapping):
+            return cursor, 1
+        _expiry_delete_rows(
+            run, "ducklake_column_mapping", "d.table_id = %s AND d.mapping_id = %s", (table_id, mapping[0])
+        )
+        return cursor, 1
+    # The guarded inline operation owns physical drops and registry removal.
+    if run.execute(
+        f"SELECT 1 FROM {s}.ducklake_inlined_data_tables WHERE table_id = %s LIMIT 1", (table_id,)
+    ).fetchone():
+        return table_id, 0
+    if _expiry_drop_inline_deletes(run, table_id):
+        return cursor, 1
+    count = _expiry_delete_rows(run, "ducklake_table", "d.table_id = %s", (table_id,))
+    remaining = run.execute(f"SELECT 1 FROM {s}.ducklake_table WHERE table_id = %s LIMIT 1", (table_id,)).fetchone()
+    return cursor if remaining else table_id, count
+
+
+def _expiry_metadata_page(run: _ExpiryRun, relation: str) -> int:
+    """Delete bounded unreachable roots or children of absent parents."""
+    s = PG_CATALOG_SCHEMA
+    if relation in ("ducklake_macro_impl", "ducklake_macro_parameters"):
+        predicate = f"NOT EXISTS (SELECT 1 FROM {s}.ducklake_macro m WHERE m.macro_id = d.macro_id)"
+    elif relation == "ducklake_name_mapping":
+        predicate = (
+            f"NOT EXISTS (SELECT 1 FROM {s}.ducklake_column_mapping m WHERE m.mapping_id = d.mapping_id) "
+            f"AND NOT EXISTS (SELECT 1 FROM {s}.ducklake_data_file f WHERE f.mapping_id = d.mapping_id)"
+        )
+    else:
+        predicate = _expiry_unreachable("d")
+        if relation == "ducklake_schema":
+            predicate += f" AND NOT EXISTS (SELECT 1 FROM {s}.ducklake_table t WHERE t.schema_id = d.schema_id)"
+    return _expiry_delete_rows(run, relation, predicate)
+
+
+def expire_snapshots(
+    pg: psycopg.Connection | None = None,
+    days: int = 7,
+    batch_size: int = 1000,
+    num_batches: int | None = None,
+    dry_run: bool = False,
+    *,
+    file_batch_size: int = 1000,
+    metadata_batch_size: int = 1000,
+    run_budget_s: float = 300,
+    statement_timeout_s: float = 30,
+    lock_timeout_s: float = 5,
+) -> None:
+    """Expire snapshot visibility before bounded, resumable metadata collection.
+
+    Use a dedicated idle autocommit connection.
+    Snapshot limits only cap visibility expiry. Garbage collection independently
+    uses every retained snapshot. This command never deletes S3 objects.
+
+    The session lock excludes cooperating maintenance, not engine writers.
+    Engine commits append snapshots. They never resurrect unreachable historical
+    ranges or dropped IDs. Physical cleanup retains the engine's shared-object
+    alias assumptions.
+    """
+    if (
+        min(days, batch_size, file_batch_size, metadata_batch_size, run_budget_s, statement_timeout_s, lock_timeout_s)
+        <= 0
+    ):
+        raise ValueError("Expiry bounds must be positive")
+    if max(batch_size, file_batch_size, metadata_batch_size) > _EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE:
+        raise ValueError("Expiry batch sizes must not exceed 10000")
+    if num_batches is not None and num_batches < 1:
+        raise ValueError("Snapshot batch count must be positive")
+    deadline = time.monotonic() + run_budget_s
+    owns_pg = pg is None
+    if owns_pg:
+        pg = _pg_direct_connect("millpond-expire-snapshots")
+    if not pg.autocommit or pg.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        if owns_pg:
+            pg.close()
+        raise ValueError("Expiry requires an idle autocommit connection")
+    run = _ExpiryRun(pg, deadline, statement_timeout_s, lock_timeout_s, file_batch_size, metadata_batch_size)
+    expired = 0
+    try:
+        _lock_refresh(pg)
+        with run.transaction():
+            base = _expiry_validate(run)
+            _expiry_initialize_progress(run, create=False)
+            cutoff = run.execute("SELECT now() - (%s * interval '1 day')", (days,)).fetchone()[0]
+            if dry_run:
+                count = run.execute(
+                    f"SELECT count(*) FROM {PG_CATALOG_SCHEMA}.ducklake_snapshot "
+                    "WHERE snapshot_time < %s AND snapshot_id != "
+                    f"(SELECT max(snapshot_id) FROM {PG_CATALOG_SCHEMA}.ducklake_snapshot)",
+                    (cutoff,),
+                ).fetchone()[0]
+                log.info("expire-snapshots dry-run: eligible_snapshots=%d; no metadata changes", count)
+                return
+        s = PG_CATALOG_SCHEMA
+        for batch in range(num_batches if num_batches is not None else sys.maxsize):
+            with run.transaction():
+                ids = [
+                    r[0]
+                    for r in run.execute(
+                        f"SELECT snapshot_id FROM {s}.ducklake_snapshot WHERE snapshot_time < %s "
+                        f"AND snapshot_id != (SELECT max(snapshot_id) FROM {s}.ducklake_snapshot) "
+                        "ORDER BY snapshot_id LIMIT %s",
+                        (cutoff, batch_size),
+                    ).fetchall()
+                ]
+                if not ids:
+                    break
+                run.execute(f"DELETE FROM {s}.ducklake_snapshot_changes WHERE snapshot_id = ANY(%s)", (ids,))
+                run.execute(f"DELETE FROM {s}.ducklake_snapshot WHERE snapshot_id = ANY(%s)", (ids,))
+            expired += len(ids)
+            log.info("expire-snapshots: snapshot_batch=%d expired=%d", batch + 1, len(ids))
+        with run.transaction():
+            _expiry_initialize_progress(run)
+        # One invocation completes at most one cycle. Future runs revisit low IDs.
+        while True:
+            with run.transaction():
+                owner, state_version, phase, cursor, high = run.execute(
+                    f"SELECT owner, state_version, phase, cursor_id, high_id "
+                    f"FROM {s}.{_EXPIRE_PROGRESS} WHERE singleton FOR UPDATE"
+                ).fetchone()
+                if (
+                    owner != "millpond-expire-snapshots"
+                    or state_version != 1
+                    or phase not in range(len(_EXPIRE_PHASES))
+                    or cursor < -1
+                    or high < -1
+                ):
+                    raise RuntimeError("Invalid expiry progress state")
+                relation = _EXPIRE_PHASES[phase]
+                if relation in ("ducklake_data_file", "ducklake_delete_file", "ducklake_table"):
+                    key = {
+                        "ducklake_data_file": "data_file_id",
+                        "ducklake_delete_file": "delete_file_id",
+                        "ducklake_table": "table_id",
+                    }[relation]
+                    if high == -1:
+                        high = run.execute(f"SELECT coalesce(max({key}), -1) FROM {s}.{relation}").fetchone()[0]
+                    if cursor < high:
+                        if relation == "ducklake_table":
+                            next_cursor, _ = _expiry_table_page(run, cursor, high)
+                        else:
+                            next_cursor, _ = _expiry_file_page(run, relation, cursor, high, base)
+                        _expiry_progress(run, phase, next_cursor, high)
+                        continue
+                elif _expiry_metadata_page(run, relation):
+                    continue
+                next_phase = (phase + 1) % len(_EXPIRE_PHASES)
+                _expiry_progress(run, next_phase, -1, -1)
+                if next_phase == 0:
+                    break
+        log.info("expire-snapshots: expired=%d budget_exhausted=false", expired)
+    except (_ExpiryBudget, psycopg.errors.QueryCanceled) as exc:
+        if not isinstance(exc, _ExpiryBudget) and time.monotonic() < run.deadline:
+            raise
+        log.info("expire-snapshots: expired=%d budget_exhausted=true", expired)
+    finally:
+        if owns_pg:
+            pg.close()
+        else:
+            pg.execute("SELECT pg_advisory_unlock_all()")
 
 
 def _scheduled_for_deletion_count(conn: duckdb.DuckDBPyConnection) -> int:
@@ -737,15 +1149,7 @@ def dedup_deletions(conn: duckdb.DuckDBPyConnection, dry_run: bool) -> None:
 _PURGE_ORPHAN_STATS_STATEMENT_TIMEOUT = "300s"
 _PURGE_ORPHAN_STATS_LOCK_TIMEOUT = "30s"
 
-# Bounds for one expire-snapshots batch transaction (INSERT + full cascade +
-# snapshot DELETE for up to --batch-size snapshots). Generous statement
-# timeout: the dead-file subqueries scan ducklake_data_file, which reaches
-# tens of millions of rows on large catalogs.
-_EXPIRE_SNAPSHOTS_STATEMENT_TIMEOUT = "600s"
-_EXPIRE_SNAPSHOTS_LOCK_TIMEOUT = "30s"
-# Upper bound on --batch-size: the batch id list is interpolated as a literal
-# into every statement of the batch transaction (including a per-row NOT IN
-# inside the bridging check) — unbounded batches produce multi-megabyte SQL.
+# Batch caps bound client allocations and parameter arrays.
 _EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE = 10_000
 
 
@@ -4312,7 +4716,9 @@ def _is_retryable_inline_error(exc: BaseException) -> bool:
     return getattr(exc, "sqlstate", None) in _DROP_INLINE_RETRYABLE_SQLSTATES
 
 
-_DIRECT_PG_COMMANDS = frozenset({"drop-partitions", "list-droppable-partitions", "drop-orphan-inline-tables"})
+_DIRECT_PG_COMMANDS = frozenset(
+    {"drop-partitions", "list-droppable-partitions", "drop-orphan-inline-tables", "expire-snapshots"}
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4344,14 +4750,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=_positive_int,
         default=1000,
-        help="Snapshot IDs to process per iteration (default 1000)",
+        help="Maximum snapshot rows per expiry transaction (default 1000)",
     )
     p.add_argument(
         "--num-batches",
         type=_positive_int,
         default=None,
-        help="Stop after processing this many batches (default: unlimited)",
+        help="Cap snapshot expiry transactions only; garbage collection still runs (default: unlimited)",
     )
+    p.add_argument(
+        "--file-batch-size",
+        type=_positive_int,
+        default=1000,
+        help="Maximum file rows inspected or removed per GC transaction (default 1000)",
+    )
+    p.add_argument(
+        "--metadata-batch-size",
+        type=_positive_int,
+        default=1000,
+        help="Maximum dependent rows removed per GC transaction (default 1000)",
+    )
+    p.add_argument(
+        "--run-budget-s", type=_positive_float, default=300, help="Whole-run wall-clock budget in seconds (default 300)"
+    )
+    p.add_argument(
+        "--statement-timeout-s", type=_positive_float, default=30, help="Per-statement timeout in seconds (default 30)"
+    )
+    p.add_argument("--lock-timeout-s", type=_positive_float, default=5, help="Per-lock timeout in seconds (default 5)")
     p.add_argument("--dry-run", action="store_true", help="Report counts without making changes")
 
     # cleanup
@@ -4749,11 +5174,11 @@ def main(argv: list[str] | None = None) -> None:
     operation = args.command
     if hasattr(args, "days") and args.days < 1:
         parser.error("--days must be >= 1")
-    if args.command == "expire-snapshots" and args.batch_size > _EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE:
-        parser.error(
-            f"--batch-size must be <= {_EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE}: the id list is interpolated "
-            "into every batch statement, and huge batches produce multi-MB SQL and giant NOT-IN lists"
-        )
+    if (
+        args.command == "expire-snapshots"
+        and max(args.batch_size, args.file_batch_size, args.metadata_batch_size) > _EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE
+    ):
+        parser.error(f"Expiry batch sizes must be <= {_EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE}")
     if args.command == "drop-orphan-inline-tables" and args.batch_size > _DROP_INLINE_MAX_BATCH_SIZE:
         parser.error(
             f"--batch-size must be <= {_DROP_INLINE_MAX_BATCH_SIZE}: every DROP in a batch holds "
@@ -4791,7 +5216,17 @@ def main(argv: list[str] | None = None) -> None:
             case "expire":
                 expire(conn, args.days, args.dry_run)
             case "expire-snapshots":
-                expire_snapshots(conn, args.days, args.batch_size, args.num_batches, args.dry_run)
+                expire_snapshots(
+                    days=args.days,
+                    batch_size=args.batch_size,
+                    num_batches=args.num_batches,
+                    dry_run=args.dry_run,
+                    file_batch_size=args.file_batch_size,
+                    metadata_batch_size=args.metadata_batch_size,
+                    run_budget_s=args.run_budget_s,
+                    statement_timeout_s=args.statement_timeout_s,
+                    lock_timeout_s=args.lock_timeout_s,
+                )
             case "cleanup":
                 cleanup(conn, args.days, args.dry_run)
             case "cleanup-all":
