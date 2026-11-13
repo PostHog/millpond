@@ -35,6 +35,7 @@ from pyhoglake import (
     UnsupportedTypeError,
     ValidationError,
 )
+from pyhoglake.auth import BearerToken, ClientCredentials
 from pyhoglake.models import SortField, SortSpec
 
 from millpond import hoglake
@@ -63,6 +64,15 @@ def _cfg(**overrides) -> MagicMock:
     cfg.hoglake_compression = "zstd"
     cfg.hoglake_compression_level = 3
     cfg.hoglake_deferred_stats = True
+    # config.load()'s default: no catalog credential configured, so the
+    # client is built with auth=None. The auth tests override these.
+    cfg.hoglake_auth_token_url = None
+    cfg.hoglake_auth_client_id = None
+    cfg.hoglake_auth_client_secret = None
+    cfg.hoglake_auth_audience = None
+    cfg.hoglake_auth_token = None
+    cfg.hoglake_auth_token_file = None
+    cfg.hoglake_auth_source = "none"
     # config.load()'s default; a MagicMock here would be refused by the
     # constructor guard (and would reach pyhoglake as `variant_on_invalid`).
     cfg.hoglake_variant_on_invalid = "null"
@@ -6194,3 +6204,130 @@ class TestObjectPrefixPrepareInputs:
         s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [7, 7, 532]}), kafka_offsets=(("events", 0, 1, 3),))
         assert [values[0] for values, _ in _groups()] == ["7", "532"]
         assert [g.num_rows for _, g in _groups()] == [2, 1]
+
+
+# ---------------------------------------------------------------------------
+# Catalog authentication (HOGLAKE_AUTH_*): what reaches HoglakeClient(auth=)
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogAuth:
+    """millpond authenticates to the catalog through pyhoglake's `auth=`:
+    one credential object shared by the write-path client and the peek
+    client, chosen from the config the way hoglake's docs/auth.md
+    describes clients — client credentials, a fixed token, or a token
+    file that follows a rotated Secret."""
+
+    def test_no_credential_builds_the_clients_without_auth(self):
+        cfg = _cfg()
+        with patch("millpond.hoglake.HoglakeClient") as mock_client:
+            hoglake.HoglakeSink(cfg)
+        assert mock_client.call_args.kwargs["auth"] is None
+
+    def test_client_credentials_reach_both_clients_as_one_object(self):
+        # One ClientCredentials, not one per client: it caches the token,
+        # so sharing it is one mint per lifetime, not one per client.
+        cfg = _cfg(
+            hoglake_auth_token_url="http://issuer.local/oauth/token",
+            hoglake_auth_client_id="hlc_abc",
+            hoglake_auth_client_secret="s3cret",
+            hoglake_auth_audience="hoglake",
+        )
+        with patch("millpond.hoglake.HoglakeClient") as mock_client:
+            sink = hoglake.HoglakeSink(cfg)
+            sink._peek_client  # noqa: B018 — force the second client if it is lazy
+        auths = {id(call.kwargs["auth"]) for call in mock_client.call_args_list}
+        auth = mock_client.call_args_list[0].kwargs["auth"]
+        assert isinstance(auth, ClientCredentials)
+        assert auth._token_url == "http://issuer.local/oauth/token"
+        assert auth._credentials == ("hlc_abc", "s3cret")
+        assert auth._audience == "hoglake"
+        assert len(auths) == 1
+
+    def test_audience_defaults_to_hoglake(self):
+        cfg = _cfg(
+            hoglake_auth_token_url="http://issuer.local/oauth/token",
+            hoglake_auth_client_id="hlc_abc",
+            hoglake_auth_client_secret="s3cret",
+            hoglake_auth_audience=None,
+        )
+        assert hoglake.make_catalog_auth(cfg)._audience == "hoglake"
+
+    def test_fixed_token_is_a_bearer_token(self):
+        cfg = _cfg(hoglake_auth_token="eyJ.fixed.token")
+        auth = hoglake.make_catalog_auth(cfg)
+        assert isinstance(auth, BearerToken)
+        request = httpx.Request("GET", "http://localhost:28080/v1/catalogs/millpond")
+        flow = auth.auth_flow(request)
+        sent = next(flow)
+        assert sent.headers["Authorization"] == "Bearer eyJ.fixed.token"
+
+    def test_token_file_is_read_and_sent(self, tmp_path):
+        path = tmp_path / "token"
+        path.write_text("first-token\n")
+        auth = hoglake.make_catalog_auth(_cfg(hoglake_auth_token_file=str(path)))
+        assert isinstance(auth, hoglake.TokenFile)
+        request = httpx.Request("GET", "http://localhost:28080/v1/catalogs/millpond")
+        flow = auth.auth_flow(request)
+        sent = next(flow)
+        assert sent.headers["Authorization"] == "Bearer first-token"
+        with pytest.raises(StopIteration):
+            flow.send(httpx.Response(200, request=sent))
+
+    def test_token_file_is_reread_when_it_changes(self, tmp_path):
+        # The kubelet rewrites a mounted Secret on rotation; the next
+        # request must carry the new token without a restart.
+        path = tmp_path / "token"
+        path.write_text("first-token")
+        auth = hoglake.TokenFile(str(path))
+        assert auth._read() == "first-token"
+        path.write_text("second-token")
+        import os
+
+        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
+        assert auth._read() == "second-token"
+
+    def test_token_file_401_rereads_once_and_retries_only_if_it_changed(self, tmp_path):
+        path = tmp_path / "token"
+        path.write_text("stale")
+        auth = hoglake.TokenFile(str(path))
+        request = httpx.Request("GET", "http://localhost:28080/v1/catalogs/millpond")
+        # Unchanged file: the 401 is the answer, no retry.
+        flow = auth.auth_flow(request)
+        sent = next(flow)
+        with pytest.raises(StopIteration):
+            flow.send(httpx.Response(401, request=sent))
+        # Rotated file whose mtime did NOT move (a writer that preserves
+        # timestamps, or a rotation inside the clock's granularity): the
+        # mtime check cannot see it, the 401 can — one re-read, one retry.
+        stat = path.stat()
+        path.write_text("fresh")
+        import os
+
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        flow = auth.auth_flow(request)
+        sent = next(flow)
+        assert sent.headers["Authorization"] == "Bearer stale"
+        retried = flow.send(httpx.Response(401, request=sent))
+        assert retried.headers["Authorization"] == "Bearer fresh"
+        with pytest.raises(StopIteration):
+            flow.send(httpx.Response(200, request=retried))
+
+    def test_token_file_vanishing_mid_rotation_keeps_the_held_token(self, tmp_path):
+        path = tmp_path / "token"
+        path.write_text("held")
+        auth = hoglake.TokenFile(str(path))
+        assert auth._read() == "held"
+        path.unlink()
+        assert auth._read() == "held"
+
+    def test_token_file_missing_at_first_read_is_a_sink_error(self, tmp_path):
+        auth = hoglake.TokenFile(str(tmp_path / "absent"))
+        with pytest.raises(hoglake.HoglakeSinkError, match="cannot be read"):
+            auth._read()
+
+    def test_token_file_empty_at_first_read_is_a_sink_error(self, tmp_path):
+        path = tmp_path / "token"
+        path.write_text("   \n")
+        with pytest.raises(hoglake.HoglakeSinkError, match="is empty"):
+            hoglake.TokenFile(str(path))._read()

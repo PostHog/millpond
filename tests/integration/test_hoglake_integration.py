@@ -88,6 +88,16 @@ class HogCfg:
     hoglake_variant_on_invalid: str | None = "null"
     # Mirrors config.load()'s default: a Python-codec process is refused.
     hoglake_allow_python_variant_codec: bool | None = False
+    # Mirrors config.load()'s default: no catalog credential (the test
+    # server runs HOGLAKE_AUTH_MODE=off), so the sink builds its clients
+    # with auth=None and `hoglake_auth_source` reads "none".
+    hoglake_auth_token_url: str | None = None
+    hoglake_auth_client_id: str | None = None
+    hoglake_auth_client_secret: str | None = None
+    hoglake_auth_audience: str | None = None
+    hoglake_auth_token: str | None = None
+    hoglake_auth_token_file: str | None = None
+    hoglake_auth_source: str = "none"
     sort_by: tuple[str, ...] | None = None
     typed_columns: tuple[tuple[str, str], ...] | None = None
     # Named in every DDL message.

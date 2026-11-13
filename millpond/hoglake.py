@@ -74,9 +74,11 @@ matters at 3am:
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -107,6 +109,7 @@ from pyhoglake import (
     ops,
     transforms,
 )
+from pyhoglake.auth import BearerToken, ClientCredentials
 from pyhoglake.types import arrow_type_to_coltype, column_to_arrow_field, columns_to_arrow_schema
 
 from millpond import arrow_converter, metrics
@@ -534,6 +537,77 @@ _MESSAGE_TRIGGERS: dict[str | None, str] = {
     "final": "final",
 }
 _UNKNOWN_TRIGGER = "unknown"
+
+
+class TokenFile(httpx.Auth):
+    """A fixed token read from a file, re-read when the file changes.
+
+    The shape a mounted Kubernetes Secret takes: the kubelet rewrites the
+    file on rotation (a new mtime), and a 401 — the server no longer
+    accepting what was sent — is the other signal that the file may have
+    moved on, so that re-reads once and retries. pyhoglake's BearerToken
+    is the inline form of the same thing; this is the one that survives a
+    rotation without a restart. The token is never logged.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._token: str | None = None
+        self._mtime_ns: int | None = None
+
+    def _read(self, *, force: bool = False) -> str:
+        with self._lock:
+            try:
+                mtime_ns = os.stat(self._path).st_mtime_ns
+            except OSError as e:
+                if self._token is not None:
+                    # A rotation in progress can briefly leave no file
+                    # (the kubelet swaps a symlink); keep what we have.
+                    return self._token
+                raise HoglakeSinkError(f"hoglake token file {self._path!r} cannot be read: {e}") from e
+            if force or self._token is None or mtime_ns != self._mtime_ns:
+                with open(self._path, encoding="utf-8") as f:
+                    token = f.read().strip()
+                if not token:
+                    if self._token is not None:
+                        return self._token
+                    raise HoglakeSinkError(f"hoglake token file {self._path!r} is empty")
+                if self._token is not None and token != self._token:
+                    log.info("hoglake token file %s changed; using the new token", self._path)
+                self._token, self._mtime_ns = token, mtime_ns
+            return self._token
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        token = self._read()
+        request.headers["Authorization"] = f"Bearer {token}"
+        response = yield request
+        if response.status_code != 401:
+            return
+        fresh = self._read(force=True)
+        if fresh == token:
+            return
+        request.headers["Authorization"] = f"Bearer {fresh}"
+        yield request
+
+
+def make_catalog_auth(cfg: Config) -> httpx.Auth | None:
+    """The credential `HoglakeClient` attaches to every catalog request,
+    from the HOGLAKE_AUTH_* config (validated in config._hoglake_auth):
+    pyhoglake's ClientCredentials, its BearerToken, a TokenFile, or None
+    for a server that does not ask (HOGLAKE_AUTH_MODE=off or warn)."""
+    if cfg.hoglake_auth_token_url is not None:
+        return ClientCredentials(
+            cfg.hoglake_auth_token_url,
+            cfg.hoglake_auth_client_id,
+            cfg.hoglake_auth_client_secret,
+            audience=cfg.hoglake_auth_audience or "hoglake",
+        )
+    if cfg.hoglake_auth_token is not None:
+        return BearerToken(cfg.hoglake_auth_token)
+    if cfg.hoglake_auth_token_file is not None:
+        return TokenFile(cfg.hoglake_auth_token_file)
+    return None
 
 
 class HoglakeSinkError(RuntimeError):
@@ -1339,6 +1413,11 @@ class HoglakeSink:
             )
         self._cfg = cfg
         self._credential_source = _STATIC_KEYS if cfg.hoglake_s3_access_key is not None else _DEFAULT_CHAIN
+        # ONE credential object for both clients: a ClientCredentials
+        # caches its token, so sharing it means one mint per lifetime,
+        # not one per client. Built before either client exists.
+        self._auth = make_catalog_auth(cfg)
+        log.info("hoglake catalog auth source: %s", cfg.hoglake_auth_source)
         # Otherwise pyhoglake's hardcoded 30s applies to every request
         # including the commit, and an operator with a convoyed catalog
         # has no knob at all.
@@ -1558,6 +1637,7 @@ class HoglakeSink:
                 region=self._cfg.hoglake_s3_region,
             ),
             timeout=timeout,
+            auth=self._auth,
         )
 
     # -- Sink protocol -----------------------------------------------------

@@ -256,6 +256,32 @@ class Config:
     # millpond package version. Operators can override via
     # MILLPOND_SERVICE_VERSION (e.g. to expose the image digest).
     service_version: str = "unknown"
+    # How millpond authenticates to the hoglake catalog (hoglake's
+    # docs/auth.md, "Clients"): OAuth client credentials against the
+    # issuer's token URL (the three HOGLAKE_AUTH_TOKEN_URL / _CLIENT_ID /
+    # _CLIENT_SECRET set together, plus the optional audience), or a fixed
+    # token, inline or from a file that is re-read when it changes. One
+    # source or none; none sends no Authorization header, which only a
+    # server in HOGLAKE_AUTH_MODE=off or warn accepts. See _hoglake_auth.
+    hoglake_auth_token_url: str | None = None
+    hoglake_auth_client_id: str | None = None
+    hoglake_auth_client_secret: str | None = None
+    hoglake_auth_audience: str | None = None
+    hoglake_auth_token: str | None = None
+    hoglake_auth_token_file: str | None = None
+
+    @property
+    def hoglake_auth_source(self) -> str:
+        """Which credential reaches the catalog: `client_credentials`,
+        `token`, `token_file` or `none`. Logged at startup; never the
+        secret."""
+        if self.hoglake_auth_token_url is not None:
+            return "client_credentials"
+        if self.hoglake_auth_token is not None:
+            return "token"
+        if self.hoglake_auth_token_file is not None:
+            return "token_file"
+        return "none"
 
     @property
     def flush_interval_s(self) -> float:
@@ -721,6 +747,12 @@ _NONE_HOGLAKE_FIELDS: dict = dict.fromkeys(
         "hoglake_deferred_stats",
         "hoglake_variant_on_invalid",
         "hoglake_allow_python_variant_codec",
+        "hoglake_auth_token_url",
+        "hoglake_auth_client_id",
+        "hoglake_auth_client_secret",
+        "hoglake_auth_audience",
+        "hoglake_auth_token",
+        "hoglake_auth_token_file",
     )
 )
 
@@ -1315,6 +1347,93 @@ def _hoglake_s3_keys() -> tuple[str | None, str | None]:
     return access_key, secret_key
 
 
+_HOGLAKE_AUTH_CLIENT_CREDENTIALS = (
+    "HOGLAKE_AUTH_TOKEN_URL",
+    "HOGLAKE_AUTH_CLIENT_ID",
+    "HOGLAKE_AUTH_CLIENT_SECRET",
+)
+
+
+def _hoglake_auth() -> dict:
+    """The HOGLAKE_AUTH_* group: how millpond authenticates to the catalog.
+
+    Three sources, exactly one or none (hoglake's docs/auth.md, "Clients"):
+
+    * client credentials — HOGLAKE_AUTH_TOKEN_URL, HOGLAKE_AUTH_CLIENT_ID
+      and HOGLAKE_AUTH_CLIENT_SECRET, set together. pyhoglake exchanges
+      them at the token URL (`grant_type=client_credentials`, audience
+      HOGLAKE_AUTH_AUDIENCE, default `hoglake`), caches the token until
+      shortly before it expires and re-mints once on a 401. This is the
+      production shape: a long-lived credential from the issuer, short-
+      lived tokens on the wire.
+    * HOGLAKE_AUTH_TOKEN — a fixed token, as `hoglake-server token mint`
+      prints for a standalone server. Never refreshed.
+    * HOGLAKE_AUTH_TOKEN_FILE — a fixed token read from a file, re-read
+      when the file changes, so a mounted Secret can be rotated without a
+      restart.
+    * none of them — no Authorization header. A server in
+      HOGLAKE_AUTH_MODE=off or warn accepts that; enforce refuses it with
+      401, which the startup resolve surfaces before readiness.
+
+    Mixing sources, or half of the credential trio, is refused here with
+    the variables named: a pod carrying both a token and a credential is
+    a config error, not a preference to resolve. Empty and whitespace-only
+    values count as unset, like the S3 keys — a chart rendering
+    `value: ""` for an absent Secret means "not configured".
+    """
+    values = {name: os.environ.get(name, "").strip() or None for name in _HOGLAKE_AUTH_CLIENT_CREDENTIALS}
+    present = [name for name, value in values.items() if value is not None]
+    if present and len(present) != len(_HOGLAKE_AUTH_CLIENT_CREDENTIALS):
+        missing = ", ".join(name for name in _HOGLAKE_AUTH_CLIENT_CREDENTIALS if values[name] is None)
+        raise RuntimeError(
+            f"{', '.join(_HOGLAKE_AUTH_CLIENT_CREDENTIALS)} must be set together, and {missing} "
+            f"{'is' if ',' not in missing else 'are'} not set. Set all three for client credentials "
+            f"against the issuer's token endpoint, or none and use HOGLAKE_AUTH_TOKEN / "
+            f"HOGLAKE_AUTH_TOKEN_FILE for a fixed token."
+        )
+    token = os.environ.get("HOGLAKE_AUTH_TOKEN", "").strip() or None
+    token_file = os.environ.get("HOGLAKE_AUTH_TOKEN_FILE", "").strip() or None
+    sources = [
+        name
+        for name, configured in (
+            ("HOGLAKE_AUTH_TOKEN_URL (client credentials)", bool(present)),
+            ("HOGLAKE_AUTH_TOKEN", token is not None),
+            ("HOGLAKE_AUTH_TOKEN_FILE", token_file is not None),
+        )
+        if configured
+    ]
+    if len(sources) > 1:
+        raise RuntimeError(
+            f"only one way of authenticating to hoglake may be configured, got {' and '.join(sources)}. "
+            f"Use client credentials (HOGLAKE_AUTH_TOKEN_URL + _CLIENT_ID + _CLIENT_SECRET), or a fixed "
+            f"token (HOGLAKE_AUTH_TOKEN), or a token file (HOGLAKE_AUTH_TOKEN_FILE)."
+        )
+    audience = os.environ.get("HOGLAKE_AUTH_AUDIENCE", "").strip() or None
+    if audience is not None and not present:
+        raise RuntimeError(
+            "HOGLAKE_AUTH_AUDIENCE is the audience requested with client credentials; it needs "
+            "HOGLAKE_AUTH_TOKEN_URL, HOGLAKE_AUTH_CLIENT_ID and HOGLAKE_AUTH_CLIENT_SECRET, which are not set."
+        )
+    if token_file is not None:
+        # Readable now, and non-empty: a mounted Secret with a blank key
+        # would otherwise be discovered as a 401 at the first request.
+        try:
+            with open(token_file, encoding="utf-8") as f:
+                first = f.read().strip()
+        except OSError as e:
+            raise RuntimeError(f"HOGLAKE_AUTH_TOKEN_FILE {token_file!r} cannot be read: {e}") from e
+        if not first:
+            raise RuntimeError(f"HOGLAKE_AUTH_TOKEN_FILE {token_file!r} is empty")
+    return {
+        "hoglake_auth_token_url": values["HOGLAKE_AUTH_TOKEN_URL"],
+        "hoglake_auth_client_id": values["HOGLAKE_AUTH_CLIENT_ID"],
+        "hoglake_auth_client_secret": values["HOGLAKE_AUTH_CLIENT_SECRET"],
+        "hoglake_auth_audience": audience if present else None,
+        "hoglake_auth_token": token,
+        "hoglake_auth_token_file": token_file,
+    }
+
+
 def _load_hoglake_fields() -> dict:
     """Read the HOGLAKE_* env group; validate names against the server's
     identifier rules so misconfig fails at startup, not as a 422."""
@@ -1394,6 +1513,7 @@ def _load_hoglake_fields() -> dict:
             "DUCKLAKE_PARTITION_BY to confirm the table is meant to be unpartitioned."
         )
     s3_access_key, s3_secret_key = _hoglake_s3_keys()
+    auth = _hoglake_auth()
     compression, compression_level = _hoglake_compression()
     deferred_stats = _hoglake_deferred_stats()
     return {
@@ -1416,6 +1536,7 @@ def _load_hoglake_fields() -> dict:
         # region whether the keys are static or come from the chain.
         "hoglake_s3_region": os.environ.get("HOGLAKE_S3_REGION", "").strip() or None,
         "hoglake_partition_by": _parse_hoglake_partition_by(partition_raw) if partition_raw else None,
+        **auth,
     }
 
 
