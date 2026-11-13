@@ -1635,3 +1635,141 @@ class TestHoglakePartitionBy:
         monkeypatch.setenv("HOGLAKE_PARTITION_BY", expr)
         with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
             load()
+
+
+class TestHoglakeAuthConfig:
+    """HOGLAKE_AUTH_*: how millpond authenticates to the catalog. One
+    source or none; the credential trio is all-or-nothing; a file must be
+    readable and non-empty at startup."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("KAFKA_TOPIC", "test-topic")
+        monkeypatch.setenv("REPLICA_COUNT", "4")
+        monkeypatch.setenv("POD_NAME", "millpond-events-2")
+        monkeypatch.setenv("MILLPOND_DESTINATION", "hoglake")
+        monkeypatch.setenv("HOGLAKE_URL", "http://localhost:28080")
+        monkeypatch.setenv("HOGLAKE_CATALOG", "millpond")
+        monkeypatch.setenv("HOGLAKE_NAMESPACE", "analytics")
+        monkeypatch.setenv("HOGLAKE_TABLE", "events")
+        for var in (
+            "HOGLAKE_AUTH_TOKEN_URL",
+            "HOGLAKE_AUTH_CLIENT_ID",
+            "HOGLAKE_AUTH_CLIENT_SECRET",
+            "HOGLAKE_AUTH_AUDIENCE",
+            "HOGLAKE_AUTH_TOKEN",
+            "HOGLAKE_AUTH_TOKEN_FILE",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_nothing_configured_is_no_credential(self):
+        cfg = load()
+        assert cfg.hoglake_auth_source == "none"
+        assert cfg.hoglake_auth_token_url is None
+        assert cfg.hoglake_auth_token is None
+        assert cfg.hoglake_auth_token_file is None
+
+    def test_client_credentials_trio(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN_URL", "http://issuer.local/oauth/token")
+        monkeypatch.setenv("HOGLAKE_AUTH_CLIENT_ID", "hlc_abc")
+        monkeypatch.setenv("HOGLAKE_AUTH_CLIENT_SECRET", "s3cret")
+        cfg = load()
+        assert cfg.hoglake_auth_source == "client_credentials"
+        assert cfg.hoglake_auth_token_url == "http://issuer.local/oauth/token"
+        assert cfg.hoglake_auth_client_id == "hlc_abc"
+        assert cfg.hoglake_auth_client_secret == "s3cret"
+        # Unset audience is left to the client's default (`hoglake`).
+        assert cfg.hoglake_auth_audience is None
+
+    def test_audience_rides_with_the_credentials(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN_URL", "http://issuer.local/oauth/token")
+        monkeypatch.setenv("HOGLAKE_AUTH_CLIENT_ID", "hlc_abc")
+        monkeypatch.setenv("HOGLAKE_AUTH_CLIENT_SECRET", "s3cret")
+        monkeypatch.setenv("HOGLAKE_AUTH_AUDIENCE", "hoglake-eu")
+        assert load().hoglake_auth_audience == "hoglake-eu"
+
+    def test_audience_without_credentials_is_refused(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_AUTH_AUDIENCE", "hoglake")
+        with pytest.raises(RuntimeError, match="HOGLAKE_AUTH_AUDIENCE"):
+            load()
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["HOGLAKE_AUTH_TOKEN_URL", "HOGLAKE_AUTH_CLIENT_ID", "HOGLAKE_AUTH_CLIENT_SECRET"],
+    )
+    def test_a_partial_credential_trio_is_refused_naming_the_missing_one(self, missing, monkeypatch):
+        for var in ("HOGLAKE_AUTH_TOKEN_URL", "HOGLAKE_AUTH_CLIENT_ID", "HOGLAKE_AUTH_CLIENT_SECRET"):
+            if var != missing:
+                monkeypatch.setenv(var, "x")
+        with pytest.raises(RuntimeError) as excinfo:
+            load()
+        message = str(excinfo.value)
+        assert missing in message
+        assert "must be set together" in message
+
+    def test_fixed_token(self, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN", "eyJ.fixed.token")
+        cfg = load()
+        assert cfg.hoglake_auth_source == "token"
+        assert cfg.hoglake_auth_token == "eyJ.fixed.token"
+
+    def test_token_file_must_be_readable_and_non_empty(self, monkeypatch, tmp_path):
+        path = tmp_path / "token"
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN_FILE", str(path))
+        with pytest.raises(RuntimeError, match="cannot be read"):
+            load()
+        path.write_text("  \n")
+        with pytest.raises(RuntimeError, match="is empty"):
+            load()
+        path.write_text("eyJ.file.token\n")
+        cfg = load()
+        assert cfg.hoglake_auth_source == "token_file"
+        assert cfg.hoglake_auth_token_file == str(path)
+        # The file's CONTENT is not copied into the config: the sink reads
+        # the file so a rotation is picked up without a restart.
+        assert cfg.hoglake_auth_token is None
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"HOGLAKE_AUTH_TOKEN": "t"},
+            {"HOGLAKE_AUTH_TOKEN_FILE": "/dev/null"},
+        ],
+    )
+    def test_two_sources_are_refused(self, extra, monkeypatch):
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN_URL", "http://issuer.local/oauth/token")
+        monkeypatch.setenv("HOGLAKE_AUTH_CLIENT_ID", "hlc_abc")
+        monkeypatch.setenv("HOGLAKE_AUTH_CLIENT_SECRET", "s3cret")
+        for key, value in extra.items():
+            monkeypatch.setenv(key, value)
+        with pytest.raises(RuntimeError, match="only one way of authenticating"):
+            load()
+
+    def test_token_and_token_file_together_are_refused(self, monkeypatch, tmp_path):
+        path = tmp_path / "token"
+        path.write_text("x")
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN", "t")
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN_FILE", str(path))
+        with pytest.raises(RuntimeError, match="only one way of authenticating"):
+            load()
+
+    def test_blank_values_count_as_unset(self, monkeypatch):
+        # A chart rendering `value: ""` for an absent Secret.
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN", "   ")
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN_URL", "")
+        assert load().hoglake_auth_source == "none"
+
+    def test_ducklake_destination_ignores_the_auth_vars(self, monkeypatch):
+        monkeypatch.setenv("MILLPOND_DESTINATION", "ducklake")
+        monkeypatch.setenv("DUCKLAKE_TABLE", "events")
+        monkeypatch.setenv("DUCKLAKE_DATA_PATH", "s3://bucket/data")
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "host")
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", "pass")
+        monkeypatch.setenv("DUCKLAKE_CONNECTION", ":memory:")
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN", "t")
+        monkeypatch.setenv("HOGLAKE_AUTH_TOKEN_URL", "http://x")  # half a trio, which hoglake would refuse
+        cfg = load()
+        assert cfg.destination == "ducklake"
+        assert cfg.hoglake_auth_token is None
+        assert cfg.hoglake_auth_source == "none"
