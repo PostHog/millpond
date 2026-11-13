@@ -1514,10 +1514,11 @@ class HoglakeSink:
         # The variant column names of the LAST SHAPE THIS PROCESS READ, or
         # None when it never read one. Set by `_adopt_columns`, never
         # cleared — `reset_caches()` drops the shape, not this — so a peek
-        # that fails during a catalog outage has a safe answer: a variant
-        # declaration is immutable, and the only thing a stale answer can
-        # miss is a variant column added since, which the TTL window
-        # already accepts. See `json_text_columns`.
+        # that fails during a catalog outage has a safe answer: this is a
+        # set of NAMES, which a changed shredding declaration
+        # (`set_variant_shredding`) leaves alone, so the only thing a
+        # stale answer can miss is a variant column added since, which
+        # the TTL window already accepts. See `json_text_columns`.
         self._known_json_text_columns: frozenset[str] | None = None
         # When the peek last found the table missing (negative cache, on
         # the TTL clock), and when it last warned about a failed peek.
@@ -1573,6 +1574,15 @@ class HoglakeSink:
         # sleeping out a catalog retention period. `_live_info_ttl_s` is
         # the whole argument for why there is a TTL at all.
         self._live_info_read_at: float | None = None
+        # The cached shape was last adopted by the PEEK (`_peek_live_shape`)
+        # while the write handle `self._table` was already resolved. The
+        # peek reads through its own handle, so pyhoglake's writer cache
+        # on `self._table` — the columns `write_part` encodes each
+        # variant column with, and the `read_snapshot` the commit carries
+        # — is then BEHIND this cache. `_table_info` answers it with one
+        # read through the write handle instead of trusting the fresh
+        # stamp; see there, and `_adopt_info`.
+        self._write_handle_behind = False
         self._monotonic = time.monotonic
         # The (partition, sort) spec tuples `_reconcile_specs` last
         # validated against config. See `_table_info`: a shape adopted by
@@ -1819,6 +1829,9 @@ class HoglakeSink:
         """
         self._live_info = None
         self._live_info_read_at = None
+        # No shape, so nothing for the write handle to be behind: the
+        # next flush reads through it regardless.
+        self._write_handle_behind = False
         # The reconciliation verdict belongs to the shape it was reached
         # on; a new read has to be re-checked against config.
         self._reconciled_specs = None
@@ -1874,13 +1887,18 @@ class HoglakeSink:
         is read here, READ-ONLY ("the peek", `_peek_live_shape`):
         namespace and table GET plus one `info(totals=False)`, under the
         peek's own short-timeout client, adopted into the same TTL'd
-        cache the write path reads (`_adopt_info`), so the next
-        `_table_info` costs no second request. No create, no DDL, no spec
-        declaration: those stay with `_ensure_table`, which still runs in
-        full on the write (the handle `self._table` is not set here). A
-        NOT NULL variant column, or a variant column under the Python
-        codec, is refused here with the same `HoglakeSinkError` the
-        resolve would raise, which is permanent either way.
+        cache the write path reads (`_adopt_info`). Before the first write
+        the resolve then costs no second read; once the write handle is
+        held, the next `_table_info` re-reads through IT, once, because
+        pyhoglake's writer cache on that handle (the variant declarations
+        `write_part` encodes with, the commit's `read_snapshot`) is not
+        something this peek can refresh — see `_write_handle_behind`. No
+        create, no DDL, no spec declaration: those stay with
+        `_ensure_table`, which still runs in full on the write (the handle
+        `self._table` is not set here). A NOT NULL variant column, or a
+        variant column under the Python codec, is refused here with the
+        same `HoglakeSinkError` the resolve would raise, which is
+        permanent either way.
 
         A table that does not exist is an empty set — the write would
         create it from the batch, with no variant column — and is
@@ -1891,11 +1909,14 @@ class HoglakeSink:
         write path re-resolves on its own NotFound.
 
         A FAILED PEEK IS NOT A FATAL ERROR ONCE ANYTHING HAS BEEN READ.
-        A variant declaration is immutable, so the last shape this
-        process read (`_known_json_text_columns`, which survives
-        `reset_caches()`) is a safe answer during a catalog blip; the one
-        thing it can miss is a variant column added since, which the TTL
-        window already accepts. So: with a last-known answer the peek is
+        The answer is a set of NAMES — a changed shredding declaration
+        (`set_variant_shredding`) keeps the name and changes only what
+        pyhoglake encodes, which is the write path's concern — so the last
+        shape this process read (`_known_json_text_columns`, which
+        survives `reset_caches()`) is a safe answer during a catalog
+        blip; the one thing it can miss is a variant column added since,
+        which the TTL window already accepts. So: with a last-known
+        answer the peek is
         ONE short attempt, best effort — on failure it logs (at most once
         a minute), counts `millpond_errors_total{type="hoglake_shape_peek"}`,
         answers from what it knows and does not read again for
@@ -1980,7 +2001,7 @@ class HoglakeSink:
                     self._peek_table = None
                     self._note_table_missing()
                     return
-                self._adopt_info(info)
+                self._adopt_info(info, peeked=True)
                 return
             except HoglakeSinkError:
                 raise
@@ -3712,7 +3733,7 @@ class HoglakeSink:
                 f"nullable."
             )
 
-    def _adopt_info(self, info):
+    def _adopt_info(self, info, *, peeked: bool = False):
         """Take a `TableInfo` as the destination's live shape, and stamp
         when it was read.
 
@@ -3728,9 +3749,25 @@ class HoglakeSink:
         receipt (at the post-alter snapshot) and `Table.info` does the
         same through `Table._adopt`, so every stamp taken here coincides
         with a stamp taken there. `_live_info_ttl_s` depends on that.
+
+        EXCEPT the peek (`peeked=True`): it reads through its own handle
+        (`_peek_table`, its own client, its own timeout), so the stamp it
+        takes here coincides with a stamp on THAT handle's cache, not on
+        the write handle's. While `self._table` is unresolved that is
+        harmless — the resolve seeds the write handle from its own read.
+        Once it is resolved, the write handle's cache is now older than
+        this shape: `prepare_append_tables` encodes every variant column
+        with the DECLARATION in pyhoglake's cached columns and sends
+        that cache's `read_snapshot` as the conflict basis, so a shredding
+        declaration changed since (`set_variant_shredding`) would be
+        encoded under the old layout and refused at the commit, after the
+        upload — once per pod, since the refusal drops both caches (see
+        `_table_info`). `_write_handle_behind` records it, and
+        `_table_info` answers it with one read through the write handle.
         """
         self._live_info = info
         self._live_info_read_at = self._monotonic()
+        self._write_handle_behind = peeked and self._table is not None
         self._adopt_columns(info.columns)
         # After the columns: the check resolves the field through them.
         self._check_object_prefix(info)
@@ -3919,8 +3956,43 @@ class HoglakeSink:
         every live file row of the table, which on prod-us is ~15M rows
         and the whole cost of the call, and nothing in this sink has ever
         read one.
+
+        A FRESH SHAPE THE PEEK ADOPTED IS RE-READ THROUGH THE WRITE
+        HANDLE, once (`_write_handle_behind`). main.py asks
+        `json_text_columns` before every conversion, so past the TTL it
+        is the peek, not this method, that refreshes the cache — through
+        a handle of its own. pyhoglake's writer cache on `self._table`
+        is untouched by that: it still holds the columns of its last read
+        (the variant declarations `write_part` encodes with) and the
+        `read_snapshot` of that read (the commit's conflict basis), until
+        its own half-retention refresh or a refusal drops it. So in the
+        window where the peek has seen a DDL that no flush has yet met,
+        millpond's view is AHEAD of pyhoglake's write handle, and what
+        that costs depends on the DDL:
+
+        * a changed shredding declaration (`set_variant_shredding`): the
+          next flush encodes under the old layout with a pre-alter basis
+          and is refused `ddl_since_read_snapshot` at the commit — after
+          the upload, so a fanout of orphans and a re-encode. ONCE per
+          pod, not until the TTL: the commit goes through
+          `commit_prepared(payload, table=self._table)`, so pyhoglake
+          invalidates that handle on the refusal, `_commit_prepared`
+          drops this cache, and main.py's `reset_caches()` drops
+          `self._table`; the rebuild reads fresh on both sides.
+        * a partition-spec change that moves the ARITY: millpond computes
+          the new spec's values, pyhoglake's cached spec disagrees, and
+          its client-side "partition arity differs" `ValidationError` is
+          permanent — the pod crashes once and the restart reads fresh.
+
+        One `table.info(totals=False)` through the write handle moves
+        both caches to the same read, so the next flush encodes under the
+        live declaration (or computes under the live spec) with a basis
+        the server accepts: the single refusal, and the single crash,
+        become zero in that window. It is the TTL's own read, moved from
+        the peek to here: one read per TTL window either way, plus the
+        peek's.
         """
-        if self._live_info_is_fresh():
+        if self._live_info_is_fresh() and not self._write_handle_behind:
             if _spec_identity(self._live_info) != self._reconciled_specs:
                 # A FRESH SHAPE IS NOT NECESSARILY A RECONCILED ONE, and
                 # the early return above used to assume it was.

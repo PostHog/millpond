@@ -5115,6 +5115,382 @@ class TestVariantBookkeeping:
         mock_metrics.variant_encode_seconds.labels.assert_not_called()
 
 
+# A second declaration for `properties`: one more field, and `n` retyped
+# from int64 to string, so the two footers differ in BOTH leaf count and a
+# leaf's physical type. The leaf set alone would also tell `_PROPS_DECL`
+# from `None` (unshredded), which is what the clear-then-set test needs.
+_PROPS_DECL_2 = {
+    "type": "object",
+    "fields": [
+        {"name": "$browser", "type": "string"},
+        {"name": "n", "type": "string"},
+        {"name": "$os", "type": "string"},
+    ],
+}
+
+
+def _shredded_leaves(decl: dict | None) -> set[str]:
+    """The parquet leaf paths pyhoglake writes under a top-level variant
+    column declared `decl` (an object of scalars, or unshredded)."""
+    leaves = {"metadata", "value"}
+    for field in (decl or {}).get("fields", ()):
+        leaves |= {f"typed_value.{field['name']}.value", f"typed_value.{field['name']}.typed_value"}
+    return leaves
+
+
+def _leaves(parquet: pq.ParquetFile, column: str) -> dict[str, str]:
+    """{leaf path below `column`: physical type} off a file's footer."""
+    out = {}
+    for i in range(len(parquet.schema)):
+        leaf = parquet.schema.column(i)
+        if leaf.path.startswith(column + "."):
+            out[leaf.path[len(column) + 1 :]] = leaf.physical_type
+    return out
+
+
+class _LiveTable:
+    """The server and pyhoglake's WRITE handle, in miniature, for the
+    declaration-change tests.
+
+    What the stock fakes cannot express: pyhoglake encodes each variant
+    column with the declaration in ITS OWN cached columns (`Table._info`,
+    seeded by the resolve, refreshed by `Table.info()`, dropped on a
+    `re_prepare` refusal) and sends that cache's `read_snapshot` as the
+    commit's conflict basis; the server refuses a basis older than the
+    last DDL as `ddl_since_read_snapshot`. `_wire_real_encode` encodes
+    with the LIVE columns, which is right while nothing changes and hides
+    exactly the staleness these tests are about. So:
+
+    * `alter_declaration` is the DDL: it changes the live column and
+      mints a snapshot;
+    * `ns.table()` and `table.info()` refresh the handle's view from the
+      live state (`Namespace.table` builds the Table from a GET;
+      `Table.info` adopts);
+    * `prepare_append_tables` runs the real `write_part` with the
+      HANDLE's columns (re-read first only when the handle's cache was
+      dropped, as `_prepared_read` does), keeps every footer, and stamps
+      the handle's `read_snapshot` on the payload;
+    * `commit_prepared` refuses a basis below the last DDL and drops the
+      handle's cache on that refusal, as `Catalog._commit` does;
+    * `peek_handle()` is a SEPARATE handle onto the same live state, the
+      way the peek's own client gives it one: reading through it moves
+      nothing on the write handle.
+
+    Not modelled: pyhoglake's own half-retention expiry of the handle
+    cache (`_cache_is_usable`). Every test here runs inside one such
+    window, so the handle's view moves only on a resolve, an `info()`
+    read, or a refusal.
+    """
+
+    def __init__(self, table, catalog, ns) -> None:
+        self.table, self.catalog = table, catalog
+        self.head = 41
+        self.ddl_snapshot = 40
+        self.handle_columns: tuple | None = None
+        self.handle_snapshot: int | None = None
+        self.handle_reads = 0
+        self.footers: list[list[pq.ParquetFile]] = []
+        self.before_commit = None
+        self._fake_prepare = table.prepare_append_tables.side_effect
+
+        def resolve(_name):
+            self._refresh_handle()
+            return table
+
+        ns.table.side_effect = resolve
+        table.info.side_effect = _guarded_info(self._read)
+        table.prepare_append_tables.side_effect = self._prepare
+        catalog.commit_prepared.side_effect = self._commit
+
+    # -- the server ---------------------------------------------------------
+
+    def alter_declaration(self, decl: dict | None) -> None:
+        params = None if decl is None else {"shredding": decl}
+        columns = tuple(
+            _col(c.name, c.type, c.field_id, c.ordinal, type_params=params) if c.name == "properties" else c
+            for c in self.table.state.columns
+        )
+        self.table.state.columns = columns
+        self.table.columns = columns
+        self.head += 1
+        self.ddl_snapshot = self.head
+
+    def peek_handle(self) -> MagicMock:
+        peek = MagicMock()
+        peek.info.side_effect = _guarded_info(lambda: self.table.state)
+        return peek
+
+    # -- pyhoglake's write handle -------------------------------------------
+
+    def _refresh_handle(self) -> None:
+        self.handle_columns = self.table.state.columns
+        self.handle_snapshot = self.head
+        self.handle_reads += 1
+
+    def _read(self):
+        self._refresh_handle()
+        return self.table.state
+
+    def _prepare(self, groups, *, idempotency_key, expected_table_uuid=None, **kwargs):
+        if self.handle_columns is None:
+            self._refresh_handle()
+        options = parquet_write_options(kwargs.get("compression"), kwargs.get("compression_level"))
+        footers = []
+        for part, _values in groups:
+            written = write_part(
+                part,
+                self.handle_columns,
+                write_options=options,
+                variant_on_invalid=kwargs["variant_on_invalid"],
+                variant_report=kwargs["variant_report"],
+            )
+            footers.append(pq.ParquetFile(pa.BufferReader(written.body)))
+        self.footers.append(footers)
+        payload = self._fake_prepare(
+            groups, idempotency_key=idempotency_key, expected_table_uuid=expected_table_uuid, **kwargs
+        )
+        payload["read_snapshot"] = self.handle_snapshot
+        return payload
+
+    def _commit(self, payload, table=None):
+        if self.before_commit is not None:
+            hook, self.before_commit = self.before_commit, None
+            hook()
+        if self.ddl_snapshot > payload["read_snapshot"]:
+            self.handle_columns = None
+            self.handle_snapshot = None
+            raise DdlSinceReadSnapshotError(
+                "ddl_since_read_snapshot",
+                status_code=409,
+                detail=f"concurrent DDL since snapshot {payload['read_snapshot']} on table(s): analytics.events",
+                tables=("analytics.events",),
+                read_snapshot=payload["read_snapshot"],
+            )
+        self.head += 1
+        return MagicMock(snapshot_id=self.head, schema_version=1)
+
+
+class TestVariantDeclarationChange:
+    """hoglake's `set_variant_shredding` changes a VARIANT column's
+    `type_params.shredding` under a running pod. millpond declares no
+    shredding of its own: the layout each file is written in is whatever
+    declaration pyhoglake's `write_part` finds in the columns it encodes
+    with, which are the WRITE HANDLE's cached columns. These prove the
+    change reaches the files mid-stream — through the TTL re-read, through
+    the server's `ddl_since_read_snapshot` refusal and the rebuild, and
+    through the peek's separate handle — and that nothing keeps encoding
+    under the old declaration past the TTL."""
+
+    OFFSETS = [(("events", 0, 10 * i, 10 * i + 2),) for i in range(4)]
+    VARIANT = frozenset({"properties", "person_properties"})
+
+    def _live(self, cfg=None, **kw):
+        s, client, catalog, ns, table = _sink(cfg, columns=_VARIANT_COLUMNS, **kw)
+        return s, _LiveTable(table, catalog, ns), catalog, table
+
+    @staticmethod
+    def _expire(s) -> None:
+        s._live_info_read_at -= s._live_info_ttl_s() + 1
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_declaration_changed_between_flushes_is_encoded_after_the_ttl_re_read(self, mock_metrics):
+        # D1 on the first flush; the alter lands; the TTL passes; the next
+        # flush re-reads through the write handle and its files carry D2.
+        # Asserted on the footer pyhoglake wrote, not on the sink's cache.
+        s, live, catalog, table = self._live()
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[0]) == 3
+        [first] = live.footers[0]
+        assert set(_leaves(first, "properties")) == _shredded_leaves(_PROPS_DECL)
+        assert _leaves(first, "properties")["typed_value.n.typed_value"] == "INT64"
+
+        live.alter_declaration(_PROPS_DECL_2)
+        self._expire(s)
+        table.info.reset_mock()
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[1]) == 3
+        assert table.info.call_count == 1, "the TTL re-read, through the write handle"
+        [second] = live.footers[1]
+        assert set(_leaves(second, "properties")) == _shredded_leaves(_PROPS_DECL_2)
+        assert _leaves(second, "properties")["typed_value.n.typed_value"] == "BYTE_ARRAY"
+        # Both committed first time: the re-read moved the basis past the
+        # alter, so the server had nothing to refuse and nothing was
+        # orphaned.
+        assert catalog.commit_prepared.call_count == 2
+        assert _orphans(mock_metrics) == []
+        # The sink's own copy agrees with what was written.
+        assert s._live_columns["properties"].type_params == {"shredding": _PROPS_DECL_2}
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_change_inside_the_ttl_is_refused_once_and_the_rebuild_encodes_the_new_declaration(self, mock_metrics):
+        # No re-read yet: the write handle still holds D1 and the basis
+        # from before the alter. The file is encoded under D1, the server
+        # refuses the commit, the payload is abandoned (orphans counted),
+        # and the retry rebuilds — against a fresh read on both sides —
+        # under D2.
+        s, live, catalog, table = self._live()
+        s.write(_variant_batch(), kafka_offsets=self.OFFSETS[0])
+        live.alter_declaration(_PROPS_DECL_2)
+        with pytest.raises(hoglake.HoglakeSinkError, match="changed while this flush was in flight") as refused:
+            s.write(_variant_batch(), kafka_offsets=self.OFFSETS[1])
+        assert hoglake.is_retryable(refused.value)
+        [stale] = live.footers[1]
+        assert set(_leaves(stale, "properties")) == _shredded_leaves(_PROPS_DECL), "the refused file was D1"
+        assert _orphans(mock_metrics) == [("ddl_since_read_snapshot", 1)]
+        assert s._prepared is None and s._live_info is None
+        s.reset_caches()  # what main.py's retry loop does between attempts
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[1]) == 3
+        [rebuilt] = live.footers[2]
+        assert set(_leaves(rebuilt, "properties")) == _shredded_leaves(_PROPS_DECL_2)
+        assert catalog.commit_prepared.call_count == 3
+        assert _orphans(mock_metrics) == [("ddl_since_read_snapshot", 1)]
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_change_between_prepare_and_commit_rebuilds_under_the_new_declaration_and_books_once(self, mock_metrics):
+        # Partitioned, so the refused payload is a two-file fanout and the
+        # orphan count has something to be wrong about.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, live, catalog, table = self._live(cfg, partition_spec=_spec(("team_id", "identity")))
+        # Row 0 carries `$os`, a path only D2 declares, and `n` as an
+        # int, which D1 types and D2 (n: string) sends to `value`.
+        batch = _variant_batch(
+            properties=['{"$browser": "Chrome", "n": 1, "$os": "mac"}', '{"$browser": "Safari", "n": "x"}', None]
+        )
+        live.before_commit = lambda: live.alter_declaration(_PROPS_DECL_2)
+        with pytest.raises(hoglake.HoglakeSinkError, match="changed while this flush was in flight"):
+            s.write(batch, kafka_offsets=self.OFFSETS[0])
+        refused = catalog.commit_prepared.call_args.args[0]
+        uploaded = [f["path"] for f in refused["appends"][0]["files"]]
+        assert len(uploaded) == 2
+        assert all(set(_leaves(f, "properties")) == _shredded_leaves(_PROPS_DECL) for f in live.footers[0])
+        # Every uploaded file of the refused payload is an orphan, by
+        # path, under the refusal's reason — none unaccounted.
+        assert _orphans(mock_metrics) == [("ddl_since_read_snapshot", 2)]
+        assert sorted(mock_metrics.hoglake_orphaned_files_total.labels.call_args.kwargs.items()) == [
+            ("reason", "ddl_since_read_snapshot")
+        ]
+        # Nothing published, nothing booked for it (Part 1 bookkeeping).
+        mock_metrics.variant_rows_total.labels.assert_not_called()
+        mock_metrics.hoglake_files_written_total.inc.assert_not_called()
+
+        s.reset_caches()
+        assert s.write(batch, kafka_offsets=self.OFFSETS[0]) == 3
+        assert all(set(_leaves(f, "properties")) == _shredded_leaves(_PROPS_DECL_2) for f in live.footers[1])
+        assert table.prepare_append_tables.call_count == 2
+        # Rows booked ONCE, for the payload that published: 3 rows x 2
+        # variant columns. The encode's cost was spent twice and is booked
+        # twice, by design.
+        rows = _booked(mock_metrics, "variant_rows_total", "outcome")
+        assert sum(rows.values()) == 3 * 2
+        assert rows == {"encoded": 2, "sql_null": 4, "invalid": 0}
+        assert mock_metrics.variant_encode_seconds.labels.return_value.observe.call_count == 2
+        mock_metrics.hoglake_files_written_total.inc.assert_called_once_with(2)
+        # The per-path fit is booked once too, and it is D2's view of the
+        # rows: `$.$os` exists, and the int `n` is a fallback under
+        # `n: string` where D1 would have typed it.
+        values = {
+            (c.kwargs["path"], c.kwargs["outcome"]): n
+            for c, n in zip(
+                mock_metrics.variant_values_total.labels.call_args_list,
+                [c.args[0] for c in mock_metrics.variant_values_total.labels.return_value.inc.call_args_list],
+                strict=True,
+            )
+        }
+        assert values == {
+            ("$", "typed"): 2,
+            ("$.$browser", "typed"): 2,
+            ("$.n", "typed"): 1,
+            ("$.n", "fallback"): 1,
+            ("$.$os", "typed"): 1,
+        }
+        assert _orphans(mock_metrics) == [("ddl_since_read_snapshot", 2)]
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_peek_adopting_a_changed_declaration_re_reads_through_the_write_handle_once(self, mock_metrics):
+        # main.py asks `json_text_columns()` before every conversion, so
+        # past the TTL it is the PEEK that refreshes the sink's cache —
+        # through its own handle. The write handle's pyhoglake cache is
+        # not moved by that, and the next flush would encode D1 with a
+        # pre-alter basis: refused at the commit, after the upload. The
+        # sink notices (`_write_handle_behind`) and spends one read
+        # through the write handle instead.
+        s, live, catalog, table = self._live()
+        s.write(_variant_batch(), kafka_offsets=self.OFFSETS[0])
+        live.alter_declaration(_PROPS_DECL_2)
+        # The peek's own handle, as its own client would resolve it.
+        s._peek_catalog = MagicMock()
+        s._peek_table = live.peek_handle()
+        self._expire(s)
+        table.info.reset_mock()
+        handle_columns_before = live.handle_columns
+
+        # The peek: same NAMES, the cached shape carries D2, the write
+        # handle untouched.
+        assert s.json_text_columns() == self.VARIANT
+        assert s._live_columns["properties"].type_params == {"shredding": _PROPS_DECL_2}
+        assert s._live_info_is_fresh()
+        assert table.info.call_count == 0
+        assert live.handle_columns is handle_columns_before
+        assert s._write_handle_behind is True
+
+        # The write: one read through the write handle, encoded under
+        # D2, committed first time.
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[1]) == 3
+        assert table.info.call_count == 1
+        assert s._write_handle_behind is False
+        [second] = live.footers[1]
+        assert set(_leaves(second, "properties")) == _shredded_leaves(_PROPS_DECL_2)
+        assert catalog.commit_prepared.call_count == 2
+        assert _orphans(mock_metrics) == []
+
+        # Steady state again: within the TTL neither the hook nor the
+        # flush reads.
+        assert s.json_text_columns() == self.VARIANT
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[2]) == 3
+        assert table.info.call_count == 1
+        assert s._peek_table.info.call_count == 1
+
+    def test_a_peek_before_the_first_write_leaves_the_resolve_one_read(self):
+        # The guard only fires once a write handle exists: before the
+        # first write the resolve seeds pyhoglake's cache from its own
+        # GET, and the shape the peek adopted is reused as before.
+        s, live, catalog, table = self._live()
+        assert s.json_text_columns() == self.VARIANT
+        assert s._write_handle_behind is False
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[0]) == 3
+        assert table.info.call_count == 1
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_declaration_cleared_to_unshredded_and_set_again(self, mock_metrics):
+        # D1 -> null (metadata + value only, no typed_value subtree) ->
+        # D2, one TTL re-read each. The column stays a variant column
+        # throughout, so the hook's answer never moves; only the files do.
+        s, live, catalog, table = self._live()
+        assert s.json_text_columns() == self.VARIANT
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[0]) == 3
+
+        live.alter_declaration(None)
+        self._expire(s)
+        assert s.json_text_columns() == self.VARIANT
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[1]) == 3
+        [unshredded] = live.footers[1]
+        assert set(_leaves(unshredded, "properties")) == {"metadata", "value"}
+        assert s._live_columns["properties"].type_params is None
+
+        live.alter_declaration(_PROPS_DECL_2)
+        self._expire(s)
+        assert s.json_text_columns() == self.VARIANT
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[2]) == 3
+        [reshredded] = live.footers[2]
+        assert set(_leaves(reshredded, "properties")) == _shredded_leaves(_PROPS_DECL_2)
+
+        assert [set(_leaves(f[0], "properties")) for f in live.footers] == [
+            _shredded_leaves(_PROPS_DECL),
+            {"metadata", "value"},
+            _shredded_leaves(_PROPS_DECL_2),
+        ]
+        assert catalog.commit_prepared.call_count == 3
+        assert _orphans(mock_metrics) == []
+
+
 class TestVariantCodecGuards:
     """A Python codec refuses a VARIANT table at resolve (not a string-only
     one, and not at startup); a `native` refusal from the encoder is
@@ -5916,7 +6292,7 @@ class TestObjectPrefixNotNullColumn:
         assert s.write(_variant_batch(team_id=[1, None, 2]), kafka_offsets=self.OFFSETS) == 2
         not_null_variant = [*columns[:3], _col("properties", "variant", 4, 4, nullable=False), *columns[4:]]
         s2, *_ = _prefixed_sink(cfg, columns=not_null_variant, spec=spec)
-        with pytest.raises(hoglake.HoglakeSinkError, match="variant column\(s\) \['properties'\]"):
+        with pytest.raises(hoglake.HoglakeSinkError, match=r"variant column\(s\) \['properties'\]"):
             s2.write(_variant_batch(), kafka_offsets=self.OFFSETS)
 
     def test_a_nullable_prefix_column_takes_the_single_cast(self):
