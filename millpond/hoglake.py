@@ -574,7 +574,7 @@ class TokenFile(httpx.Auth):
                         return self._token
                     raise HoglakeSinkError(f"hoglake token file {self._path!r} is empty")
                 if self._token is not None and token != self._token:
-                    log.info("hoglake credential file %s changed; reloaded", self._path)
+                    log.info("hoglake %s changed on disk; reloaded", self._path)
                 self._token, self._mtime_ns = token, mtime_ns
             return self._token
 
@@ -1417,7 +1417,7 @@ class HoglakeSink:
         # caches its token, so sharing it means one mint per lifetime,
         # not one per client. Built before either client exists.
         self._auth = make_catalog_auth(cfg)
-        log.info("hoglake catalog auth source: %s", cfg.hoglake_auth_source)
+        log.info("hoglake catalog identity source: %s", cfg.hoglake_auth_source)
         # Otherwise pyhoglake's hardcoded 30s applies to every request
         # including the commit, and an operator with a convoyed catalog
         # has no knob at all.
