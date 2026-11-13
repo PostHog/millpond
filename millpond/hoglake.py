@@ -574,7 +574,7 @@ class TokenFile(httpx.Auth):
                         return self._token
                     raise HoglakeSinkError(f"hoglake token file {self._path!r} is empty")
                 if self._token is not None and token != self._token:
-                    log.info("hoglake token file %s changed; using the new token", self._path)
+                    log.info("hoglake credential file %s changed; reloaded", self._path)
                 self._token, self._mtime_ns = token, mtime_ns
             return self._token
 
