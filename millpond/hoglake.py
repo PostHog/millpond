@@ -1887,12 +1887,14 @@ class HoglakeSink:
         is read here, READ-ONLY ("the peek", `_peek_live_shape`):
         namespace and table GET plus one `info(totals=False)`, under the
         peek's own short-timeout client, adopted into the same TTL'd
-        cache the write path reads (`_adopt_info`). Before the first write
-        the resolve then costs no second read; once the write handle is
-        held, the next `_table_info` re-reads through IT, once, because
-        pyhoglake's writer cache on that handle (the variant declarations
-        `write_part` encodes with, the commit's `read_snapshot`) is not
-        something this peek can refresh — see `_write_handle_behind`. No
+        cache the write path reads (`_adopt_info`). The peek's shape never
+        decides a layout a flush is written under, though: before the
+        first write the resolve re-reads through the handle it resolves
+        (`_ensure_table`), and once the write handle is held the next
+        `_table_info` re-reads through IT, once, because pyhoglake's
+        writer cache on that handle (the variant declarations `write_part`
+        encodes with, the commit's `read_snapshot`) is not something this
+        peek can refresh — see `_write_handle_behind`. No
         create, no DDL, no spec declaration: those stay with
         `_ensure_table`, which still runs in full on the write (the handle
         `self._table` is not set here). A NOT NULL variant column, or a
@@ -3339,11 +3341,20 @@ class HoglakeSink:
             table = ns.table(cfg.hoglake_table)
             log.info("Hoglake table %s.%s already exists", cfg.hoglake_namespace, cfg.hoglake_table)
             self._adopt_columns(table.columns)
-            # Against the shape `json_text_columns` read moments ago when
-            # it is still fresh (the same TTL the steady state trusts),
-            # so the first write does not read what the conversion
-            # before it already did; a cold cache reads here, as before.
-            self._reconcile_specs(table, self._live_info if self._live_info_is_fresh() else None)
+            # Read through the handle just resolved, HOWEVER FRESH the
+            # cached shape is. The only way a shape is cached here with no
+            # handle is the peek (`_peek_live_shape`), which read through
+            # its own client; pyhoglake's writer cache on `table` is the
+            # GET above, and a spec change between the two leaves the
+            # fanout computing under the peek's spec while pyhoglake
+            # encodes, and sends a `read_snapshot`, under the resolve's —
+            # a same-arity re-spec would then commit mis-partitioned files
+            # with a basis the server accepts, and the config check below
+            # would judge a spec the table no longer has. `_reconcile_specs`
+            # with no `info` reads and adopts, so the spec it checks, the
+            # one the fanout uses and the one pyhoglake holds are one read.
+            # One `info(totals=False)` per resolve, not per flush.
+            self._reconcile_specs(table)
         except NotFoundError:
             table = self._create_table(ns, batch_schema)
 
@@ -3754,8 +3765,10 @@ class HoglakeSink:
         (`_peek_table`, its own client, its own timeout), so the stamp it
         takes here coincides with a stamp on THAT handle's cache, not on
         the write handle's. While `self._table` is unresolved that is
-        harmless — the resolve seeds the write handle from its own read.
-        Once it is resolved, the write handle's cache is now older than
+        harmless — the resolve (`_ensure_table`) re-reads through the
+        handle it resolves and re-adopts from that, so this shape is
+        replaced before any flush computes under it. Once it is
+        resolved, the write handle's cache is now older than
         this shape: `prepare_append_tables` encodes every variant column
         with the DECLARATION in pyhoglake's cached columns and sends
         that cache's `read_snapshot` as the conflict basis, so a shredding
@@ -3988,9 +4001,17 @@ class HoglakeSink:
         both caches to the same read, so the next flush encodes under the
         live declaration (or computes under the live spec) with a basis
         the server accepts: the single refusal, and the single crash,
-        become zero in that window. It is the TTL's own read, moved from
-        the peek to here: one read per TTL window either way, plus the
-        peek's.
+        become zero in that window. It IS an additional read: since the
+        peek refreshes the cache before every conversion, the TTL read
+        this method used to make never fires in steady state, so a pod
+        now spends two `info(totals=False)` per TTL window (the peek's
+        and this one) where it spent one. `_write_handle_behind` is set
+        on every peek adopt, not only on a changed shape, because the
+        write handle's `read_snapshot` is what has to move, and a
+        shape compare could not see a DDL that changes neither columns
+        nor specs. At retention/4 that is one cheap read per pod every
+        few minutes, bought for never writing a flush under a layout the
+        peek saw before the writer did.
         """
         if self._live_info_is_fresh() and not self._write_handle_behind:
             if _spec_identity(self._live_info) != self._reconciled_specs:

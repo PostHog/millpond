@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
@@ -5161,8 +5161,8 @@ class _LiveTable:
     with the LIVE columns, which is right while nothing changes and hides
     exactly the staleness these tests are about. So:
 
-    * `alter_declaration` is the DDL: it changes the live column and
-      mints a snapshot;
+    * `alter_declaration` and `alter_partition_spec` are the DDL: each
+      changes the live state and mints a snapshot;
     * `ns.table()` and `table.info()` refresh the handle's view from the
       live state (`Namespace.table` builds the Table from a GET;
       `Table.info` adopts);
@@ -5215,9 +5215,17 @@ class _LiveTable:
         self.head += 1
         self.ddl_snapshot = self.head
 
+    def alter_partition_spec(self, spec) -> None:
+        """An operator's `set_partition_spec` (millpond never re-specs a
+        specced table), or another pod's recovery declaration on an
+        unspecced one."""
+        self.table.state.partition_spec = spec
+        self.head += 1
+        self.ddl_snapshot = self.head
+
     def peek_handle(self) -> MagicMock:
         peek = MagicMock()
-        peek.info.side_effect = _guarded_info(lambda: self.table.state)
+        peek.info.side_effect = _guarded_info(self._snapshot)
         return peek
 
     # -- pyhoglake's write handle -------------------------------------------
@@ -5229,7 +5237,14 @@ class _LiveTable:
 
     def _read(self):
         self._refresh_handle()
-        return self.table.state
+        return self._snapshot()
+
+    def _snapshot(self):
+        """A read answers a COPY of the live state, as a real `TableInfo`
+        (frozen) does: a shape the sink cached off one read must not move
+        with the DDL that lands after it, or these tests could not tell a
+        stale cache from a fresh one."""
+        return replace(self.table.state)
 
     def _prepare(self, groups, *, idempotency_key, expected_table_uuid=None, **kwargs):
         if self.handle_columns is None:
@@ -5448,15 +5463,69 @@ class TestVariantDeclarationChange:
         assert table.info.call_count == 1
         assert s._peek_table.info.call_count == 1
 
-    def test_a_peek_before_the_first_write_leaves_the_resolve_one_read(self):
-        # The guard only fires once a write handle exists: before the
-        # first write the resolve seeds pyhoglake's cache from its own
-        # GET, and the shape the peek adopted is reused as before.
+    def test_a_peek_before_the_first_write_is_re_read_at_the_resolve_through_the_write_handle(self):
+        # `_write_handle_behind` only fires once a write handle exists.
+        # Before the first write the resolve does not trust the peek's
+        # shape either: it re-adopts from its own `info()` through the
+        # handle it just resolved, so the layout the flush is computed
+        # under and the layout pyhoglake encodes under come from the same
+        # read, however fresh the peek's copy is.
         s, live, catalog, table = self._live()
+        s._peek_catalog = MagicMock()
+        s._peek_table = live.peek_handle()
         assert s.json_text_columns() == self.VARIANT
         assert s._write_handle_behind is False
+        assert s._live_columns["properties"].type_params == {"shredding": _PROPS_DECL}
+        # The DDL lands between the peek and the first flush.
+        live.alter_declaration(_PROPS_DECL_2)
         assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[0]) == 3
-        assert table.info.call_count == 1
+        assert table.info.call_count == 1, "the resolve's own read, through the write handle"
+        assert s._live_info.columns == live.handle_columns
+        assert s._live_columns["properties"].type_params == {"shredding": _PROPS_DECL_2}
+        [first] = live.footers[0]
+        assert set(_leaves(first, "properties")) == _shredded_leaves(_PROPS_DECL_2)
+        assert catalog.commit_prepared.call_count == 1
+
+    def test_a_peek_before_the_first_resolve_does_not_decide_the_layout_the_flush_is_written_under(self):
+        # The peek adopts identity(team_id), which config matches. An
+        # operator re-specs the table to bucket(team_id, 16) before the
+        # first flush. The resolve's own GET sees the bucket spec and
+        # pyhoglake will encode under it; if the fanout kept computing
+        # under the peek's identity spec, this pod would commit one flush
+        # of identity values under a bucket spec with a post-alter basis
+        # the server accepts — mis-pruned forever — and the "a pod that
+        # disagrees with the table it writes to stops" rule would fire one
+        # flush late, on the next peek. It has to fire here, before any
+        # group is encoded.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, live, catalog, table = self._live(cfg, partition_spec=_spec(("team_id", "identity")))
+        assert s.json_text_columns() == self.VARIANT
+        assert s._live_info_is_fresh()
+        live.alter_partition_spec(_spec(("team_id", "bucket", 16)))
+        with pytest.raises(hoglake.HoglakeSinkError, match="does not match HOGLAKE_PARTITION_BY"):
+            s.write(_variant_batch(), kafka_offsets=self.OFFSETS[0])
+        table.prepare_append_tables.assert_not_called()
+        catalog.commit_prepared.assert_not_called()
+        # The resolve failed, so nothing is cached for the retry to trust.
+        assert s._table is None
+
+    def test_a_spec_declared_between_the_peek_and_the_resolve_is_not_declared_again(self):
+        # The create-then-alter window under a fleet: the table exists
+        # unspecced, this pod's peek sees it so, and another pod's
+        # recovery declares the configured spec before this pod's first
+        # flush. The resolve reads the declared spec and has nothing to
+        # recover; trusting the peek's unspecced shape would issue a
+        # second, redundant DDL for a layout the table already carries.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, live, catalog, table = self._live(cfg)
+        assert s.json_text_columns() == self.VARIANT
+        live.alter_partition_spec(_spec(("team_id", "identity")))
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS[0]) == 3
+        table.alter.assert_not_called()
+        groups = table.prepare_append_tables.call_args.args[0]
+        assert sorted(values for _part, values in groups) == [("1",), ("2",)]
+        assert s._live_info.partition_spec == live.table.state.partition_spec
+        assert catalog.commit_prepared.call_count == 1
 
     @patch("millpond.hoglake.metrics")
     def test_a_declaration_cleared_to_unshredded_and_set_again(self, mock_metrics):
@@ -5688,12 +5757,15 @@ class TestJsonTextColumnsHook:
         ns.create_table.assert_not_called()
         table.alter.assert_not_called()
         assert s._table is None
-        # Cached: a second ask reads nothing, and the first write reuses
-        # the shape it adopted (no second info read).
+        # Cached: a second ask reads nothing. The first write does NOT
+        # reuse the peek's shape: the resolve reads once more, through the
+        # write handle it just resolved, so the layout the flush is
+        # computed under is the one pyhoglake encodes under (see
+        # `TestVariantDeclarationChange` for the DDL that lands between).
         assert s.json_text_columns() == self.VARIANT
         assert table.info.call_count == 1
         assert s.write(_variant_batch()) == 3
-        assert table.info.call_count == 1
+        assert table.info.call_count == 2
         table.alter.assert_not_called()
 
     def test_the_peek_resolves_once_under_the_write_timeout_and_refreshes_cheaply(self):
