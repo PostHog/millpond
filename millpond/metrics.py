@@ -298,16 +298,17 @@ _variant_invalid_total = Counter(
     "Variant column-rows that could not be encoded and landed as SQL NULL, by the encoder's reason",
     ["pipeline", "broker_source", "reason"],
 )
-# Per DECLARED path of each variant column: how well the immutable
+# Per DECLARED path of each variant column: how well the column's
 # shredding declaration fits the data. `typed` went to the path's
 # `typed_value` leaf; `fallback` stayed in `value` because its type did
 # not match (a string under an int64, an int under a double); and
 # `variant_null` is a present JSON null, counted apart so an often-null key
 # does not read as a mismatch. A missing key is in none of them. Labels
 # come from the catalog's declaration (at most 1000 paths per column,
-# fixed for the column's life), never from a payload key, so the series
-# set is bounded by the table. A rising `fallback` share on a path means
-# the declaration is wrong for the data and the column needs replacing.
+# changed only by DDL — `set_variant_shredding`), never from a payload
+# key, so the series set is bounded by the table. A rising `fallback`
+# share on a path means the declaration is wrong for the data and the
+# column's declaration needs changing.
 _variant_values_total = Counter(
     "millpond_variant_values_total",
     "Variant values per declared shredding path, by where they landed (typed|fallback|variant_null)",
