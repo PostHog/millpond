@@ -355,6 +355,12 @@ compact-all-tiers-default: (compact-all-tiers)
 # snapshot expiry at the 7-day fleet default, chain-safe
 expire-7d: (expire "7")
 
+# This parameterless wrapper preserves later recipes in a maintenance chain.
+# The run budget leaves time for subsequent maintenance steps.
+[group('lifecycle')]
+expire-snapshots-7d: _confirm-target
+    env {{ _target_env }} python {{ ducklake_maintenance }} expire-snapshots --days 7 --batch-size {{ env_var_or_default("MILLPOND_EXPIRY_SNAPSHOT_BATCH_SIZE", "1000") }} --file-batch-size {{ env_var_or_default("MILLPOND_EXPIRY_FILE_BATCH_SIZE", "1000") }} --metadata-batch-size {{ env_var_or_default("MILLPOND_EXPIRY_METADATA_BATCH_SIZE", "1000") }} --run-budget-s {{ env_var_or_default("MILLPOND_EXPIRY_RUN_BUDGET_S", "300") }}
+
 # The run budget comes from MILLPOND_INLINE_RUN_BUDGET_S (default 300s), not
 # from the recipe default, because this is the form the maintenance cron runs
 # and the cron's cadence is the real bound: three prod-us tenants run the whole
@@ -520,6 +526,64 @@ bootstrap-index-name-mapping: _confirm-target
 # Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
 [group('bootstrap')]
 bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-column-stats-table-column bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover bootstrap-index-name-mapping
+
+# Keep expiry index creation separate from the existing maintenance chain.
+# Reuse valid B-tree indexes that start with the required column.
+[group('bootstrap')]
+@bootstrap-expiry-indexes: _confirm-target
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _psql }} <<'SQL'
+    SELECT format(
+        'CREATE INDEX CONCURRENTLY %I ON public.%I (%I)',
+        'millpond_expiry_' || wanted.relation || '_' || wanted.column_name || '_idx',
+        wanted.relation, wanted.column_name
+    )
+    FROM (VALUES
+        ('ducklake_schema', 'schema_id'),
+        ('ducklake_table', 'table_id'),
+        ('ducklake_table', 'schema_id'),
+        ('ducklake_data_file', 'table_id'),
+        ('ducklake_data_file', 'mapping_id'),
+        ('ducklake_delete_file', 'data_file_id'),
+        ('ducklake_delete_file', 'table_id'),
+        ('ducklake_files_scheduled_for_deletion', 'data_file_id'),
+        ('ducklake_file_column_stats', 'data_file_id'),
+        ('ducklake_file_column_stats', 'table_id'),
+        ('ducklake_file_variant_stats', 'data_file_id'),
+        ('ducklake_file_variant_stats', 'table_id'),
+        ('ducklake_file_partition_value', 'data_file_id'),
+        ('ducklake_file_partition_value', 'table_id'),
+        ('ducklake_table_stats', 'table_id'),
+        ('ducklake_table_column_stats', 'table_id'),
+        ('ducklake_partition_info', 'table_id'),
+        ('ducklake_partition_column', 'table_id'),
+        ('ducklake_column', 'table_id'),
+        ('ducklake_column_tag', 'table_id'),
+        ('ducklake_sort_info', 'table_id'),
+        ('ducklake_sort_expression', 'table_id'),
+        ('ducklake_schema_versions', 'table_id'),
+        ('ducklake_inlined_data_tables', 'table_id'),
+        ('ducklake_column_mapping', 'table_id'),
+        ('ducklake_column_mapping', 'mapping_id'),
+        ('ducklake_name_mapping', 'mapping_id'),
+        ('ducklake_macro', 'macro_id')
+    ) AS wanted(relation, column_name)
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM pg_index i
+        JOIN pg_class idx ON idx.oid = i.indexrelid
+        JOIN pg_am am ON am.oid = idx.relam
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+        WHERE i.indrelid = format('public.%I', wanted.relation)::regclass
+          AND a.attname = wanted.column_name
+          AND am.amname = 'btree'
+          AND i.indisvalid AND i.indisready
+          AND i.indpred IS NULL AND i.indexprs IS NULL
+    )
+    ORDER BY wanted.relation, wanted.column_name
+    \gexec
+    SQL
 
 # ----------------------------------------------------------------------------
 # state-metrics daemon

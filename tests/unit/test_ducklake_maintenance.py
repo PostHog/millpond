@@ -277,168 +277,252 @@ class TestArgparse:
 
 
 class TestExpireSnapshots:
-    """Verify expire_snapshots batch loop and num_batches limit."""
+    """Exercise direct-Postgres expiry orchestration."""
 
-    def _make_conn(self, batch_rows):
-        """Return a mock conn whose execute().fetchall() cycles through batch_rows.
+    def _make_pg(self, batches):
+        pg = MagicMock()
+        pg.autocommit = True
+        pg.info.transaction_status = psycopg.pq.TransactionStatus.IDLE
+        pages = iter([*batches, []])
 
-        Each element of batch_rows is either a list of (snapshot_id,) tuples
-        (one batch) or an empty list (signals end-of-data). After the sequence
-        is exhausted, subsequent calls return [].
-
-        The mock also accepts _pg_query_one / _pg_execute call patterns:
-        postgres_query returns a single-row result for the cutoff SELECT and
-        per-batch COUNT queries; postgres_execute is a no-op.
-        """
-        conn = MagicMock()
-        iter_batches = iter(batch_rows + [[]])  # sentinel empty list at end
-
-        def fake_execute(sql, *args, **kwargs):
+        def execute(query, params=None):
             result = MagicMock()
-            if "postgres_query" in sql and "ducklake_snapshot" in sql and "SELECT snapshot_id" in sql:
-                # batch SELECT — return next batch
-                result.fetchall.return_value = next(iter_batches, [])
-            elif "postgres_query" in sql and "NOW()" in sql:
-                # cutoff timestamp query
-                result.fetchone.return_value = ("2026-06-07 00:00:00+00",)
-            elif "postgres_query" in sql and "COUNT(*)" in sql:
-                # dead-file count — return 0 to skip DML
-                result.fetchone.return_value = (0,)
-            elif "postgres_query" in sql and "pg_try_advisory_lock" in sql:
-                result.fetchone.return_value = (True,)
-            else:
-                result.fetchall.return_value = []
-                result.fetchone.return_value = (0,)
+            if query.startswith("SELECT now()"):
+                result.fetchone.return_value = ("2024-01-01 00:00:00+00",)
+            elif query.startswith("SELECT snapshot_id"):
+                result.fetchall.return_value = next(pages, [])
+            elif query.startswith("SELECT owner"):
+                result.fetchone.return_value = ("millpond-expire-snapshots", 1, 0, -1, -1)
+            elif query.startswith("SELECT count(*)"):
+                result.fetchone.return_value = (3,)
+            elif query.startswith("SELECT to_regclass"):
+                result.fetchone.return_value = (None,)
             return result
 
-        conn.execute.side_effect = fake_execute
-        return conn
+        pg.execute.side_effect = execute
+        return pg
 
-    def test_processes_all_batches_when_no_limit(self, caplog):
-        batches = [[(1,), (2,)], [(3,), (4,)], [(5,)]]
-        conn = self._make_conn(batches)
-        with caplog.at_level(logging.INFO, logger="maintenance"):
-            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=False)
-        assert any("no expired snapshots remaining" in r.message for r in caplog.records)
-        batch_logs = [r for r in caplog.records if "batch" in r.message and "snapshot_ids" in r.message]
-        assert len(batch_logs) == 3
+    def _run(self, batches, **kwargs):
+        pg = self._make_pg(batches)
+        with (
+            patch.object(ducklake_maintenance, "_lock_refresh") as lock,
+            patch.object(ducklake_maintenance, "_expiry_validate", return_value="/tmp/lake/"),
+            patch.object(ducklake_maintenance, "_EXPIRE_PHASES", ("ducklake_view",)),
+            patch.object(ducklake_maintenance, "_expiry_metadata_page", return_value=0) as gc,
+            patch.object(ducklake_maintenance, "_expiry_initialize_progress"),
+        ):
+            ducklake_maintenance.expire_snapshots(pg, **kwargs)
+        return pg, lock, gc
 
-    def test_stops_after_num_batches(self, caplog):
-        batches = [[(1,), (2,)], [(3,), (4,)], [(5,)]]
-        conn = self._make_conn(batches)
-        with caplog.at_level(logging.INFO, logger="maintenance"):
-            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=2, dry_run=False)
-        batch_logs = [r for r in caplog.records if "snapshot_ids" in r.message]
-        assert len(batch_logs) == 2
-        assert any("reached --num-batches limit" in r.message for r in caplog.records)
+    def test_processes_snapshot_batches_before_gc(self):
+        pg, lock, gc = self._run([[(1,), (2,)], [(3,)]])
+        lock.assert_called_once_with(pg)
+        gc.assert_called_once()
+        deletes = [c for c in pg.execute.call_args_list if str(c.args[0]).startswith("DELETE FROM")]
+        assert [c.args[1] for c in deletes] == [([1, 2],), ([1, 2],), ([3],), ([3],)]
+        assert pg.close.call_count == 0
 
-    def test_num_batches_one_processes_exactly_one(self, caplog):
-        batches = [[(1,)], [(2,)], [(3,)]]
-        conn = self._make_conn(batches)
-        with caplog.at_level(logging.INFO, logger="maintenance"):
-            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=1, dry_run=False)
-        batch_logs = [r for r in caplog.records if "snapshot_ids" in r.message]
-        assert len(batch_logs) == 1
+    def test_snapshot_batch_cap_does_not_skip_gc(self):
+        pg, _, gc = self._run([[(1,)], [(2,)]], num_batches=1)
+        selects = [c for c in pg.execute.call_args_list if str(c.args[0]).startswith("SELECT snapshot_id")]
+        assert len(selects) == 1
+        gc.assert_called_once()
 
-    def test_dry_run_returns_without_processing(self, caplog):
-        conn = self._make_conn([])
-        with caplog.at_level(logging.INFO, logger="maintenance"):
-            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=True)
-        assert any("dry-run" in r.message for r in caplog.records)
-        # No batch processing log lines
-        assert not any("snapshot_ids" in r.message for r in caplog.records)
+    def test_dry_run_never_creates_progress(self):
+        pg, _, gc = self._run([], dry_run=True)
+        assert not any("CREATE TABLE" in str(c.args[0]) for c in pg.execute.call_args_list)
+        gc.assert_not_called()
 
-    def test_empty_catalog_logs_done(self, caplog):
-        conn = self._make_conn([])
-        with caplog.at_level(logging.INFO, logger="maintenance"):
-            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=False)
-        assert any("no expired snapshots remaining" in r.message for r in caplog.records)
+    def test_cutoff_and_head_guard_are_fixed(self):
+        pg, _, _ = self._run([[(1,)], [(2,)]])
+        selects = [c for c in pg.execute.call_args_list if str(c.args[0]).startswith("SELECT snapshot_id")]
+        assert len({c.args[1][0] for c in selects}) == 1
+        assert all("max(snapshot_id)" in c.args[0] for c in selects)
 
+    def test_direct_connection_is_closed_when_owned(self):
+        pg = self._make_pg([])
+        with (
+            patch.object(ducklake_maintenance, "_pg_direct_connect", return_value=pg),
+            patch.object(ducklake_maintenance, "_lock_refresh"),
+            patch.object(ducklake_maintenance, "_expiry_validate", return_value="/tmp/lake/"),
+        ):
+            ducklake_maintenance.expire_snapshots(dry_run=True)
+        pg.close.assert_called_once()
 
-# ---------------------------------------------------------------------------
-# Tier B — orchestrators with mocked sub-calls
-# ---------------------------------------------------------------------------
+    def test_invalid_direct_bounds_raise(self):
+        for kwargs in ({"batch_size": 0}, {"file_batch_size": 10001}, {"num_batches": 0}):
+            with pytest.raises(ValueError):
+                ducklake_maintenance.expire_snapshots(MagicMock(), **kwargs)
 
 
 class TestExpireSnapshotsSafety:
-    """Pin the three safety properties of expire_snapshots: head guard,
-    structural bridging predicate, and per-batch atomicity."""
+    """Pin retained visibility, bounded cleanup, and queue invariants."""
 
-    def _run(self, batch_rows, dry_run=False):
-        conn = TestExpireSnapshots()._make_conn(batch_rows)
-        ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=dry_run)
-        return [str(c.args[0]) for c in conn.execute.call_args_list]
+    def test_liveness_uses_retained_snapshot_ranges(self):
+        predicate = ducklake_maintenance._expiry_unreachable("f")
+        assert "f.end_snapshot IS NOT NULL" in predicate
+        assert "live.snapshot_id >= f.begin_snapshot" in predicate
+        assert "live.snapshot_id < f.end_snapshot" in predicate
+        assert "snapshot_time" not in predicate
 
-    def test_head_guard_in_batch_select(self):
-        """The newest snapshot must NEVER be expired — DuckLake resolves all
-        state from MAX(snapshot_id); expiring it bricks the catalog (fork
-        built-in has the same guard)."""
-        calls = self._run([[(1,), (2,)]])
-        batch_selects = [c for c in calls if "ORDER BY snapshot_id LIMIT" in c]
-        assert batch_selects, "no batch SELECT issued"
-        for c in batch_selects:
-            assert "MAX(snapshot_id)" in c and "snapshot_id !=" in c
+    def test_dead_table_checks_every_version(self):
+        predicate = ducklake_maintenance._expiry_dead_table("f")
+        assert "EXISTS" in predicate and "NOT EXISTS" in predicate
+        assert "lt.table_id = f.table_id" in predicate
 
-    def test_head_guard_in_dry_run_count(self):
-        calls = self._run([], dry_run=True)
-        counts = [c for c in calls if "COUNT(*)" in c and "ducklake_snapshot" in c]
-        assert counts and all("MAX(snapshot_id)" in c for c in counts)
+    def test_delete_vector_includes_dead_parent(self):
+        predicate = ducklake_maintenance._expiry_dead_file("dv", True)
+        assert "parent.data_file_id = dv.data_file_id" in predicate
+        assert "parent.end_snapshot IS NOT NULL" in predicate
 
-    def test_dead_predicate_is_structural_not_time_based(self):
-        """Bridging must be 'no surviving snapshot in [begin, end)' — a
-        snapshot_time comparison can classify a file dead while a later-batch
-        or head-retained snapshot still references it."""
-        calls = self._run([[(1,), (2,)]])
-        dml = [c for c in calls if "postgres_execute" in c and "ducklake_data_file" in c]
-        assert dml, "no batch DML issued"
-        for c in dml:
-            assert "live.snapshot_id NOT IN" in c
-            assert "live.snapshot_time" not in c
+    def test_dependent_delete_is_ctid_bounded(self):
+        run = MagicMock(metadata_batch_size=17)
+        ducklake_maintenance._expiry_delete_rows(run, "ducklake_file_column_stats", "d.data_file_id = %s", (4,))
+        query, params = run.execute.call_args.args
+        assert "LIMIT %s" in query and "d.ctid = doomed.ctid" in query
+        assert params == (4, 17)
 
-    def test_batch_is_single_transaction(self):
-        """Queue INSERTs, file cascade, and snapshot DELETEs must ship in ONE
-        postgres_execute call (one txn): a crash between separate calls
-        leaves surviving snapshot rows whose data-file rows are gone."""
-        calls = self._run([[(1,), (2,)]])
-        dml = [c for c in calls if "postgres_execute" in c]
-        # exactly one DML call for the single batch
-        assert len(dml) == 1, f"expected 1 batch txn, got {len(dml)}"
-        sql = dml[0]
-        assert "SET LOCAL statement_timeout" in sql and "SET LOCAL lock_timeout" in sql
-        # schedule-before-drop and snapshots-last invariants
-        q_ins = sql.index("ducklake_files_scheduled_for_deletion")
-        d_file = sql.index("DELETE FROM public.ducklake_data_file ")
-        d_snap = sql.rindex("DELETE FROM public.ducklake_snapshot WHERE")
-        assert q_ins < d_file < d_snap
+    def test_data_phase_drains_vectors_after_resumed_expiry(self):
+        run = MagicMock(file_batch_size=2)
+        page = MagicMock()
+        page.fetchall.return_value = [(7, 1, "data.parquet", True, True)]
+        vectors = MagicMock()
+        vectors.fetchall.return_value = [(8, 1, "delete.parquet", True)]
+        run.execute.side_effect = [page, vectors, MagicMock()]
+        with (
+            patch.object(ducklake_maintenance, "_expiry_delete_rows", return_value=0),
+            patch.object(ducklake_maintenance, "_expiry_queue_file") as queue,
+        ):
+            cursor, count = ducklake_maintenance._expiry_file_page(run, "ducklake_data_file", 3, 9, "/lake/")
+        assert (cursor, count) == (3, 1)
+        queue.assert_called_once_with(run, 8, 1, "delete.parquet", True, "/lake/")
+        assert "DELETE FROM public.ducklake_delete_file" in run.execute.call_args.args[0]
 
-    def test_empty_catalog_issues_no_dml(self):
-        calls = self._run([])
-        assert not any("postgres_execute" in c for c in calls)
+    def test_stats_cleanup_keeps_parent_and_cursor(self):
+        run = MagicMock(file_batch_size=2)
+        run.execute.return_value.fetchall.return_value = [(7, 1, "data.parquet", True, True)]
+        with patch.object(ducklake_maintenance, "_expiry_delete_rows", return_value=2):
+            assert ducklake_maintenance._expiry_file_page(run, "ducklake_data_file", 3, 9, "/lake/") == (3, 0)
+        assert run.execute.call_count == 1
 
-    def test_dml_failure_propagates_and_stops(self):
-        """A failed batch txn (lock_timeout, network, anything) must raise and
-        stop the loop — never swallow and re-select the same ids (spin) or
-        continue to later batches on top of an unapplied one."""
-        conn = TestExpireSnapshots()._make_conn([[(1,), (2,)], [(3,), (4,)]])
-        inner = conn.execute.side_effect
+    def test_queue_collision_fails_closed(self):
+        run = MagicMock()
+        run.execute.return_value.fetchone.return_value = (True, True)
+        with patch.object(ducklake_maintenance, "_expiry_resolve_path", return_value="/lake/file.parquet"):
+            with pytest.raises(RuntimeError, match="different object"):
+                ducklake_maintenance._expiry_queue_file(run, 1, 2, "file.parquet", True, "/lake/")
+        assert run.execute.call_count == 1
 
-        def failing_execute(sql, *args, **kwargs):
-            if "postgres_execute" in sql:
-                raise RuntimeError("lock_timeout")
-            return inner(sql, *args, **kwargs)
+    def test_existing_same_object_queue_entry_is_idempotent(self):
+        run = MagicMock()
+        run.execute.return_value.fetchone.return_value = (False, True)
+        with patch.object(ducklake_maintenance, "_expiry_resolve_path", return_value="/lake/file.parquet"):
+            ducklake_maintenance._expiry_queue_file(run, 1, 2, "file.parquet", True, "/lake/")
+        assert run.execute.call_count == 1
 
-        conn.execute.side_effect = failing_execute
-        with pytest.raises(RuntimeError, match="lock_timeout"):
-            ducklake_maintenance.expire_snapshots(conn, days=7, batch_size=1000, num_batches=None, dry_run=False)
-        selects = [c for c in conn.execute.call_args_list if "ORDER BY snapshot_id LIMIT" in str(c.args[0])]
-        assert len(selects) == 1, "loop must stop at the failed batch, not continue"
+    def test_new_queue_entries_use_absolute_paths(self):
+        run = MagicMock()
+        run.execute.return_value.fetchone.return_value = (False, False)
+        with patch.object(ducklake_maintenance, "_expiry_resolve_path", return_value="/lake/file.parquet"):
+            ducklake_maintenance._expiry_queue_file(run, 1, 2, "file.parquet", True, "/lake/")
+        query, params = run.execute.call_args.args
+        assert "false" in query
+        assert params == (1, "/lake/file.parquet")
 
-    def test_batch_size_cap_rejected_at_parse(self):
-        parser = ducklake_maintenance.build_parser()
-        args = parser.parse_args(["expire-snapshots", "--batch-size", "20000"])
-        assert args.batch_size == 20000  # argparse allows; main() rejects
-        with pytest.raises(SystemExit):
-            ducklake_maintenance.main(["expire-snapshots", "--batch-size", "20000", "--dry-run"])
+    def test_batch_size_cap_rejected_before_connect(self):
+        with patch.object(ducklake_maintenance, "connect") as connect:
+            with pytest.raises(SystemExit):
+                ducklake_maintenance.main(["expire-snapshots", "--file-batch-size", "20000"])
+        connect.assert_not_called()
+
+    def test_borrowed_connection_requires_idle_autocommit(self):
+        for autocommit, status in (
+            (False, psycopg.pq.TransactionStatus.IDLE),
+            (True, psycopg.pq.TransactionStatus.INTRANS),
+        ):
+            pg = MagicMock(autocommit=autocommit)
+            pg.info.transaction_status = status
+            with patch.object(ducklake_maintenance, "_lock_refresh") as lock:
+                with pytest.raises(ValueError, match="idle autocommit"):
+                    ducklake_maintenance.expire_snapshots(pg)
+            lock.assert_not_called()
+
+    def test_absolute_file_path_skips_parent_lookup(self):
+        run = MagicMock()
+        assert ducklake_maintenance._expiry_resolve_path(run, 1, "/outside/file", False, "/lake/") == "/outside/file"
+        run.execute.assert_not_called()
+
+    def test_parent_resolution_bounds_distinct_resolved_results(self):
+        run = MagicMock(path_cache={})
+        run.execute.return_value.fetchall.return_value = [("/lake/schema/table/",)]
+        assert ducklake_maintenance._expiry_resolve_path(run, 1, "file", True, "/lake/") == "/lake/schema/table/file"
+        query, params = run.execute.call_args.args
+        assert "SELECT DISTINCT CASE" in query and "LIMIT 2" in query
+        assert params == ("/lake/", 1)
+        ducklake_maintenance._expiry_resolve_path(run, 1, "other", True, "/lake/")
+        assert run.execute.call_count == 1
+
+    def test_ambiguous_resolved_parent_paths_fail_closed(self):
+        run = MagicMock(path_cache={})
+        run.execute.return_value.fetchall.return_value = [("/one/",), ("/two/",)]
+        with pytest.raises(RuntimeError, match="ambiguous"):
+            ducklake_maintenance._expiry_resolve_path(run, 1, "file", True, "/lake/")
+
+    def test_engine_primary_keys_are_required(self):
+        run = MagicMock()
+        run.execute.return_value.fetchall.return_value = []
+        with pytest.raises(RuntimeError, match="primary keys"):
+            ducklake_maintenance._expiry_require_primary_keys(run, {"ducklake_data_file": "data_file_id"})
+
+    def test_non_read_committed_isolation_fails_closed(self):
+        run = MagicMock()
+        run.execute.return_value.fetchone.return_value = ("serializable",)
+        with pytest.raises(RuntimeError, match="READ COMMITTED"):
+            ducklake_maintenance._expiry_validate(run)
+        assert run.execute.call_count == 1
+
+    def test_existing_progress_is_validated_before_snapshot_expiry(self):
+        pg = TestExpireSnapshots()._make_pg([[(1,)]])
+        with (
+            patch.object(ducklake_maintenance, "_lock_refresh"),
+            patch.object(ducklake_maintenance, "_expiry_validate", return_value="/lake/"),
+            patch.object(
+                ducklake_maintenance, "_expiry_initialize_progress", side_effect=RuntimeError("invalid state")
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="invalid state"):
+                ducklake_maintenance.expire_snapshots(pg)
+        assert not any(str(c.args[0]).startswith("DELETE") for c in pg.execute.call_args_list)
+
+    def test_budget_limits_individual_statement_timeout(self):
+        pg = MagicMock()
+        run = ducklake_maintenance._ExpiryRun(pg, 0.05, 30, 5, 2, 2)
+        with patch.object(ducklake_maintenance.time, "monotonic", return_value=0):
+            run.execute("SELECT 1")
+        assert pg.execute.call_args_list[0].args[1] == ("50ms",)
+
+    def test_expired_budget_starts_no_statement(self):
+        pg = MagicMock()
+        run = ducklake_maintenance._ExpiryRun(pg, 1, 30, 5, 2, 2)
+        with patch.object(ducklake_maintenance.time, "monotonic", return_value=2):
+            with pytest.raises(ducklake_maintenance._ExpiryBudget):
+                run.execute("SELECT 1")
+        pg.execute.assert_not_called()
+
+    def test_malformed_progress_layout_fails_before_insert(self):
+        run = MagicMock()
+        run.execute.return_value.fetchall.return_value = [("singleton", "text", "r", True)]
+        with pytest.raises(RuntimeError, match="progress relation layout"):
+            ducklake_maintenance._expiry_initialize_progress(run)
+        assert not any("INSERT INTO" in str(c.args[0]) for c in run.execute.call_args_list)
+
+    def test_inline_deletion_cleanup_rejects_unknown_layout(self):
+        run = MagicMock()
+        run.execute.return_value.fetchone.return_value = ("ducklake_inlined_delete_1",)
+        run.execute.return_value.fetchall.return_value = [("payload", "text", "r")]
+        with pytest.raises(RuntimeError, match="inline deletion table layout"):
+            ducklake_maintenance._expiry_drop_inline_deletes(run, 1)
+        assert not any("DROP TABLE" in str(c.args[0]) for c in run.execute.call_args_list)
 
     def test_expire_builtin_takes_advisory_lock(self):
         conn = MagicMock()

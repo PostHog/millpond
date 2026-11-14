@@ -327,6 +327,70 @@ The `tools/` directory ships two DuckLake-only operational binaries inside the s
 
 Subcommand and YAML schema reference and the full env-var contract live in [`tools/README.md`](tools/README.md). Both binaries reuse the writer's `DUCKLAKE_RDS_*` / `DUCKDB_S3_*` / `DUCKLAKE_DATA_PATH` env vars.
 
+#### Bounded snapshot expiry
+
+`expire-snapshots` uses a direct PostgreSQL connection.
+It does not initialize DuckDB.
+It does not require S3 credentials.
+The command preserves the newest snapshot.
+It collects metadata only when no retained snapshot can reach it.
+It queues object paths without deleting the objects.
+
+Preview snapshot expiry:
+
+```sh
+just -f tools/justfile expire-snapshots-dry-run 7 1000
+```
+
+The preview counts eligible snapshots.
+It does not preview file collection or physical deletion.
+
+Run bounded expiry with a seven-day retention period:
+
+```sh
+just -f tools/justfile expire-snapshots-7d
+```
+
+| Environment variable | Default | Purpose |
+|---|---:|---|
+| `MILLPOND_EXPIRY_SNAPSHOT_BATCH_SIZE` | `1000` | Snapshot IDs per expiry transaction |
+| `MILLPOND_EXPIRY_FILE_BATCH_SIZE` | `1000` | File records per scan page |
+| `MILLPOND_EXPIRY_METADATA_BATCH_SIZE` | `1000` | Dependent rows per deletion statement |
+| `MILLPOND_EXPIRY_RUN_BUDGET_S` | `300` | Run budget in seconds |
+
+The CLI also exposes `--statement-timeout-s` and `--lock-timeout-s`.
+Their defaults are 30 seconds and 5 seconds, respectively.
+`--num-batches` limits snapshot expiry only.
+Metadata collection continues independently within the run budget.
+
+The command records scan progress in `public.millpond_snapshot_expiry_progress`.
+Each transaction commits its progress with its metadata changes.
+A later invocation resumes an interrupted scan.
+Completed scans wrap to revisit records that become unreachable later.
+A run that exhausts its budget exits successfully.
+
+Large catalogs need indexes for the dependency lookups.
+Review the storage requirements before running this optional command:
+
+```sh
+just -f tools/justfile bootstrap-expiry-indexes
+```
+
+This command creates missing indexes concurrently.
+It reuses valid B-tree indexes with a compatible leading column.
+The existing `bootstrap-indexes` recipe does not invoke it.
+
+The existing `expire` and `expire-7d` commands keep their DuckLake implementation.
+Deployment configuration must explicitly select `expire-snapshots-7d`.
+The new wrapper accepts no positional arguments.
+This prevents it from consuming subsequent recipe names in a maintenance chain.
+
+The maintenance advisory lock excludes cooperating maintenance commands only.
+Normal engine writers remain concurrent.
+Expiry does not protect arbitrarily stale readers.
+Review reader lifetimes before running physical cleanup.
+The engine's existing assumptions about shared object paths still apply.
+
 ## Configuration
 
 All configuration via environment variables.
