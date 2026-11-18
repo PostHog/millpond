@@ -122,9 +122,7 @@ class TestE2E:
 
     def test_data_integrity(self, conn, initial_count):
         """Core fields should not be null."""
-        sample = conn.execute(
-            "SELECT uuid, event, team_id FROM lake.main.events LIMIT 10"
-        ).fetchall()
+        sample = conn.execute("SELECT uuid, event, team_id FROM lake.main.events LIMIT 10").fetchall()
         assert len(sample) > 0
         for uuid, event, team_id in sample:
             assert uuid is not None

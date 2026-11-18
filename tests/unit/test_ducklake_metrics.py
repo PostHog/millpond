@@ -10,6 +10,7 @@ Coverage:
 
 from __future__ import annotations
 
+import re
 import threading
 
 import duckdb
@@ -268,6 +269,58 @@ class TestRunQuery:
         _run(conn, q, gauges[q.name], sm)
 
         assert _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "t_mismatch"}) == 1
+
+    def test_success_leaves_no_open_transaction(self, conn, registry):
+        # Regression (2026-09-10): under autocommit, duckdb-postgres ended
+        # the remote transaction lazily, so the daemon's attached-Postgres
+        # connection sat "idle in transaction" on the shared catalog for
+        # the whole inter-query interval. _run_query now brackets every
+        # query in an explicit BEGIN/COMMIT. A leftover open transaction
+        # makes the BEGIN below raise ("cannot start a transaction within
+        # a transaction").
+        q = dm.Query(name="t_txn", help="t", sql="SELECT 1 AS n", interval_seconds=60, labels=[], values=["n"])
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is True
+        conn.execute("BEGIN")
+        conn.execute("COMMIT")
+
+    def test_failure_leaves_no_open_transaction(self, conn, registry):
+        # The failure path must roll the bracket back, not leak it.
+        q = dm.Query(
+            name="t_txn_fail", help="t", sql="SELECT * FROM no_such_table", interval_seconds=60, labels=[], values=["n"]
+        )
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is False
+        conn.execute("BEGIN")
+        conn.execute("COMMIT")
+
+    def test_server_sql_fallback_still_works_inside_bracket(self, conn, registry):
+        # The server-side form fails on a lake without the pg attach
+        # (BinderException / CatalogException). The bracket must survive
+        # that failed statement and run the local fallback in a fresh
+        # transaction.
+        conn.execute("CREATE TABLE fb (n INTEGER)")
+        conn.execute("INSERT INTO fb VALUES (7)")
+        q = dm.Query(
+            name="t_fallback",
+            help="t",
+            sql="SELECT n FROM fb",
+            server_sql="SELECT n FROM fb",
+            interval_seconds=60,
+            labels=[],
+            values=["n"],
+        )
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is True
+        assert _gauge_value(registry, "t_fallback_n") == 7.0
+        conn.execute("BEGIN")
+        conn.execute("COMMIT")
 
 
 # ---------------------------------------------------------------------------
@@ -1007,3 +1060,375 @@ class TestRunOnce:
         # the filesystem — the semgrep dynamic-urllib hardening.
         monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
         assert dm._run_once([_once_query()], TENANT, "file:///etc/passwd", None) == 1
+
+
+# ---------------------------------------------------------------------------
+# server_sql: loader plumbing, fallback execution, and the mergeable-band
+# builtin's semantics (the only builtin that carries a server_sql form)
+# ---------------------------------------------------------------------------
+
+
+class TestServerSql:
+    def test_loader_accepts_server_sql(self):
+        q = dm._query_from_dict(
+            {
+                "name": "t_srv",
+                "help": "t",
+                "interval_mins": 1,
+                "sql": "SELECT 1 AS n",
+                "server_sql": "SELECT 1 AS n",
+                "values": ["n"],
+            },
+            "test",
+        )
+        assert q.server_sql == "SELECT 1 AS n"
+
+    def test_loader_defaults_server_sql_none(self):
+        q = dm._query_from_dict(
+            {"name": "t_srv", "help": "t", "interval_mins": 1, "sql": "SELECT 1 AS n", "values": ["n"]},
+            "test",
+        )
+        assert q.server_sql is None
+
+    def test_loader_rejects_non_string_server_sql(self):
+        with pytest.raises(ValueError, match="server_sql must be a string"):
+            dm._query_from_dict(
+                {
+                    "name": "t_srv",
+                    "help": "t",
+                    "interval_mins": 1,
+                    "sql": "SELECT 1 AS n",
+                    "server_sql": ["not", "a", "string"],
+                    "values": ["n"],
+                },
+                "test",
+            )
+
+    def test_falls_back_to_local_sql_without_pg_attach(self, conn, registry):
+        # Plain in-memory duckdb has no postgres_query table function, which
+        # is exactly the dev/file-lake + test-stub shape: the server form
+        # must degrade to the local form, still succeed, and only log once.
+        conn.execute("CREATE TABLE t (n BIGINT)")
+        conn.execute("INSERT INTO t VALUES (7)")
+        q = dm.Query(
+            name="t_fallback",
+            help="t",
+            sql="SELECT n FROM t",
+            interval_seconds=60,
+            labels=[],
+            values=["n"],
+            server_sql="SELECT n FROM public.t",
+        )
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is True
+        assert _gauge_value(registry, "t_fallback_n") == 7
+        # Error counter untouched: the fallback is an expected shape, not a failure.
+        errors = _gauge_value(registry, "ducklake_metrics_query_errors_total", {"query": "t_fallback"})
+        assert errors is None or errors == 0
+
+    def test_mergeable_builtin_semantics(self, conn, registry):
+        # Executable-SQL test of the ducklake_mergeable_files_per_band
+        # builtin against a mimicked metadata schema: a tier1 pair in one
+        # partition group counts; a tier1 singleton partition does not; a
+        # file carrying a live delete file is excluded; `large` never
+        # appears.
+        conn.execute("CREATE SCHEMA __ducklake_metadata_lake")
+        conn.execute(
+            "CREATE TABLE __ducklake_metadata_lake.ducklake_data_file ("
+            "data_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "
+            "path VARCHAR, file_size_bytes BIGINT, partition_id BIGINT, record_count BIGINT)"
+        )
+        conn.execute(
+            "CREATE TABLE __ducklake_metadata_lake.ducklake_delete_file ("
+            "delete_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "
+            "data_file_id BIGINT, path VARCHAR, file_size_bytes BIGINT)"
+        )
+        conn.execute(
+            "CREATE TABLE __ducklake_metadata_lake.ducklake_file_partition_value ("
+            "data_file_id BIGINT, table_id BIGINT, partition_key_index BIGINT, partition_value VARCHAR)"
+        )
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_data_file VALUES "
+            # tier1 pair, same partition -> mergeable (2 files, 1 group)
+            "(1, 1, 0, NULL, 'a', 100, 10, 1), (2, 1, 0, NULL, 'b', 200, 10, 1),"
+            # tier1 singleton partition -> excluded
+            "(3, 1, 0, NULL, 'c', 300, 10, 1),"
+            # tier1 pair BUT one carries a live delete file -> both drop
+            # (survivor becomes a singleton)
+            "(4, 1, 0, NULL, 'd', 400, 10, 1), (5, 1, 0, NULL, 'e', 500, 10, 1),"
+            # large pair, same partition -> band excluded entirely
+            "(6, 1, 0, NULL, 'f', 100000000, 10, 1), (7, 1, 0, NULL, 'g', 100000000, 10, 1),"
+            # dropped file (end_snapshot set) -> excluded
+            "(8, 1, 0, 5, 'h', 150, 10, 1)"
+        )
+        conn.execute("INSERT INTO __ducklake_metadata_lake.ducklake_delete_file VALUES (1, 1, 0, NULL, 4, 'dv', 10)")
+        conn.execute(
+            "INSERT INTO __ducklake_metadata_lake.ducklake_file_partition_value VALUES "
+            "(1, 1, 0, 'p1'), (2, 1, 0, 'p1'),"
+            "(3, 1, 0, 'p2'),"
+            "(4, 1, 0, 'p3'), (5, 1, 0, 'p3'),"
+            "(6, 1, 0, 'p4'), (7, 1, 0, 'p4'),"
+            "(8, 1, 0, 'p1')"
+        )
+        queries = {q.name: q for q in dm.load_queries(None, set())}
+        q = queries["ducklake_mergeable_files_per_band"]
+        assert q.server_sql is not None  # ships the join to the catalog in prod
+        gauges = dm._build_query_gauges([q], registry=registry)
+        sm = dm._build_self_metrics(registry=registry)
+
+        assert _run(conn, q, gauges[q.name], sm) is True
+        assert _gauge_value(registry, "ducklake_mergeable_files_per_band_count", {"band": "tier1"}) == 2
+        assert _gauge_value(registry, "ducklake_mergeable_files_per_band_bytes", {"band": "tier1"}) == 300
+        assert _gauge_value(registry, "ducklake_mergeable_files_per_band_groups", {"band": "tier1"}) == 1
+        for band in ("tier2", "tier3", "large"):
+            assert _gauge_value(registry, "ducklake_mergeable_files_per_band_count", {"band": band}) is None
+
+
+# ---------------------------------------------------------------------------
+# Catalog mode: Postgres forms of the built-ins, mode selection, and the
+# postgres-mode run path (the real-Postgres behavior is in
+# tests/integration/test_ducklake_metrics_postgres.py)
+# ---------------------------------------------------------------------------
+
+
+# DuckDB-only spellings that a Postgres form must not contain.
+_DUCKDB_ONLY = re.compile(r"__ducklake_metadata_lake|regexp_extract|regexp_matches|\bDOUBLE\b|\bVARCHAR\b", re.I)
+
+
+class TestBuiltinPostgresForms:
+    def test_every_builtin_has_a_postgres_form(self):
+        missing = [q.name for q in dm.load_queries(None, set()) if q.server_sql is None]
+        assert missing == []
+
+    def test_postgres_forms_use_postgres_names_only(self):
+        for q in dm.load_queries(None, set()):
+            # `double precision` is the Postgres spelling; strip it before the DOUBLE check.
+            text = q.server_sql.replace("double precision", "")
+            assert not _DUCKDB_ONLY.search(text), q.name
+            if q.name != "ducklake_pg_catalog_size":
+                assert "public.ducklake_" in q.server_sql, q.name
+
+    def test_catalog_size_is_postgres_only(self):
+        q = _builtin("ducklake_pg_catalog_size")
+        assert q.sql is None
+        assert q.values == ["pg_class_rows", "pg_attribute_rows", "pg_attribute_bytes"]
+        assert "reltuples" in q.server_sql and "count(" not in q.server_sql.lower()
+
+    def test_loader_accepts_postgres_only_query(self):
+        q = dm._query_from_dict(
+            {"name": "t_pg", "help": "t", "interval_mins": 1, "server_sql": "SELECT 1 AS n", "values": ["n"]},
+            "test",
+        )
+        assert q.sql is None and q.server_sql == "SELECT 1 AS n"
+
+    def test_loader_needs_one_form(self):
+        with pytest.raises(ValueError, match="missing required key 'sql'"):
+            dm._query_from_dict({"name": "x", "help": "h", "interval_mins": 1, "values": ["n"]}, "test")
+
+    def test_loader_rejects_non_string_sql(self):
+        with pytest.raises(ValueError, match="sql must be a string"):
+            dm._query_from_dict({"name": "x", "help": "h", "interval_mins": 1, "sql": 5, "values": ["n"]}, "test")
+
+
+def _q(name, sql="SELECT 1 AS n", server_sql=None):
+    return dm.Query(name=name, help="t", sql=sql, server_sql=server_sql, interval_seconds=60, values=["n"])
+
+
+class TestResolveCatalogMode:
+    HOST = {"DUCKLAKE_RDS_HOST": "db"}
+
+    def test_auto_with_host_and_postgres_forms_is_postgres(self):
+        queries = dm.load_queries(None, set())
+        assert dm._resolve_catalog_mode("auto", queries, self.HOST) == "postgres"
+
+    def test_auto_without_host_is_duckdb(self):
+        queries = dm.load_queries(None, set())
+        assert dm._resolve_catalog_mode("auto", queries, {}) == "duckdb"
+
+    def test_auto_with_a_duckdb_only_user_query_is_duckdb(self, caplog):
+        queries = [*dm.load_queries(None, set()), _q("user_q")]
+        caplog.set_level("INFO")
+        assert dm._resolve_catalog_mode("auto", queries, self.HOST) == "duckdb"
+        assert "user_q" in caplog.text
+
+    def test_duckdb_is_always_duckdb(self):
+        assert dm._resolve_catalog_mode("duckdb", dm.load_queries(None, set()), self.HOST) == "duckdb"
+
+    def test_postgres_without_host_refuses(self):
+        with pytest.raises(ValueError, match="DUCKLAKE_RDS_HOST"):
+            dm._resolve_catalog_mode("postgres", [_q("a", server_sql="SELECT 1 AS n")], {})
+
+    def test_postgres_with_a_duckdb_only_query_refuses(self):
+        with pytest.raises(ValueError, match="user_q"):
+            dm._resolve_catalog_mode("postgres", [_q("user_q")], self.HOST)
+
+    def test_unknown_mode_refuses(self):
+        with pytest.raises(ValueError, match="one of auto, postgres, duckdb"):
+            dm._resolve_catalog_mode("sqlite", [], self.HOST)
+
+    def test_duckdb_mode_skips_postgres_only_queries(self, caplog):
+        caplog.set_level("INFO")
+        kept = dm._queries_for_mode([_q("a"), _q("pg_only", sql=None, server_sql="SELECT 1 AS n")], "duckdb")
+        assert [q.name for q in kept] == ["a"]
+        assert "skipping Postgres-only queries ['pg_only']" in caplog.text
+
+    def test_postgres_mode_keeps_every_query(self):
+        queries = dm.load_queries(None, set())
+        assert dm._queries_for_mode(queries, "postgres") == queries
+
+
+class TestPgOptions:
+    def test_defaults(self):
+        assert dm.PgOptions() == dm.PgOptions(30.0, 5.0)
+
+    @pytest.mark.parametrize("bad", [0, -1, True, "30"])
+    def test_rejects_non_positive(self, bad):
+        with pytest.raises(ValueError, match="positive number of seconds"):
+            dm.PgOptions(statement_timeout_seconds=bad)
+
+
+class _FakePgConn:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeCatalog(dm._PostgresCatalog):
+    """A _PostgresCatalog whose fetch() answers from a dict, no server."""
+
+    def __init__(self, answers):
+        super().__init__(_FakePgConn(), dm.PgOptions())
+        self.answers = answers
+        self.ran: list[str] = []
+
+    def fetch(self, q):
+        self.ran.append(q.name)
+        answer = self.answers[q.name]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+class TestRunOncePostgresMode:
+    def _forbid_duckdb(self, monkeypatch):
+        def no_duckdb(*_a, **_kw):
+            raise AssertionError("postgres catalog mode must not open DuckDB")
+
+        monkeypatch.setattr(dm, "_connect_once", no_duckdb)
+        monkeypatch.setattr(dm.ducklake_maintenance, "connect", no_duckdb)
+
+    def test_runs_server_sql_and_ignores_memory_limit(self, monkeypatch, caplog):
+        self._forbid_duckdb(monkeypatch)
+        fake = _FakeCatalog({"t_pg": (["n"], [(3,)])})
+        monkeypatch.setattr(dm, "_connect_postgres", lambda _opts: fake)
+        caplog.set_level("INFO")
+        sink = _CaptureSink()
+        try:
+            # An invalid DuckDB memory limit is not even validated: it is not used.
+            rc = dm._run_once(
+                [_q("t_pg", sql=None, server_sql="SELECT 3 AS n")], TENANT, sink.url, "1GB'; --", "postgres"
+            )
+        finally:
+            sink.close()
+        assert rc == 0
+        assert 't_pg_n{tenant="test"} 3.0' in sink.bodies[0].decode()
+        assert "is ignored in postgres catalog mode" in caplog.text
+        assert fake.conn.closed
+
+    def test_per_query_failure_counts_and_continues(self, monkeypatch):
+        self._forbid_duckdb(monkeypatch)
+        fake = _FakeCatalog({"t_bad": RuntimeError("statement timeout"), "t_ok": (["n"], [(1,)])})
+        monkeypatch.setattr(dm, "_connect_postgres", lambda _opts: fake)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once(
+                [_q("t_bad", server_sql="x"), _q("t_ok", server_sql="y")], TENANT, sink.url, None, "postgres"
+            )
+        finally:
+            sink.close()
+        assert rc == 0
+        body = sink.bodies[0].decode()
+        assert 'ducklake_metrics_query_errors_total{query="t_bad",tenant="test"} 1.0' in body
+        assert 't_ok_n{tenant="test"} 1.0' in body
+
+    def test_connect_failure_exits_nonzero(self, monkeypatch):
+        def boom(_opts):
+            raise RuntimeError("no catalog")
+
+        monkeypatch.setattr(dm, "_connect_postgres", boom)
+        assert dm._run_once([_q("t", server_sql="x")], TENANT, "http://127.0.0.1:1/nope", None, "postgres") == 1
+
+    def test_all_failing_exits_nonzero_without_push(self, monkeypatch):
+        fake = _FakeCatalog({"t_bad": RuntimeError("boom")})
+        monkeypatch.setattr(dm, "_connect_postgres", lambda _opts: fake)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once([_q("t_bad", server_sql="x")], TENANT, sink.url, None, "postgres")
+        finally:
+            sink.close()
+        assert rc == 1 and sink.bodies == []
+
+    def test_duckdb_mode_skips_postgres_only_query(self, conn, monkeypatch):
+        monkeypatch.setattr(dm, "_connect_once", lambda _ml: conn)
+        sink = _CaptureSink()
+        try:
+            rc = dm._run_once(
+                [_once_query(), _q("t_pg_only", sql=None, server_sql="SELECT 1 AS n")], TENANT, sink.url, None
+            )
+        finally:
+            sink.close()
+        assert rc == 0
+        body = sink.bodies[0].decode()
+        assert "t_pg_only" not in body
+        assert 't_once_n{tenant="test"} 7.0' in body
+
+
+class TestConnectWithBackoffPostgresMode:
+    def test_uses_direct_connection_and_skips_memory_limit(self, registry, monkeypatch):
+        sm = dm._build_self_metrics(registry=registry)
+        fake = _FakeCatalog({})
+        seen = []
+
+        def fake_connect_postgres(opts):
+            seen.append(opts)
+            return fake
+
+        monkeypatch.setattr(dm, "_connect_postgres", fake_connect_postgres)
+        monkeypatch.setattr(
+            dm.ducklake_maintenance, "connect", lambda: pytest.fail("connect() must not be called in postgres mode")
+        )
+        opts = dm.PgOptions(10, 1)
+        result = dm._connect_with_backoff(
+            threading.Event(), sm, TENANT, memory_limit="bad'value", catalog_mode="postgres", pg_options=opts
+        )
+        assert result is fake and seen == [opts]
+
+
+class TestMainCatalogModeFlags:
+    def test_forced_postgres_without_host_exits(self, monkeypatch):
+        monkeypatch.delenv("DUCKLAKE_RDS_HOST", raising=False)
+        with pytest.raises(SystemExit) as exc:
+            dm.main(["--once", "--tenant", "t", "--push-url", "http://x", "--catalog-mode", "postgres"])
+        assert "DUCKLAKE_RDS_HOST" in str(exc.value.code)
+
+    def test_bad_mode_from_env_exits(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_METRICS_CATALOG_MODE", "sqlite")
+        with pytest.raises(SystemExit) as exc:
+            dm.main(["--once", "--tenant", "t", "--push-url", "http://x"])
+        assert "one of auto, postgres, duckdb" in str(exc.value.code)
+
+    def test_auto_dispatches_postgres_to_run_once(self, monkeypatch):
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", "db")
+        monkeypatch.delenv("DUCKLAKE_METRICS_CATALOG_MODE", raising=False)
+        monkeypatch.delenv("DUCKLAKE_METRICS_CONFIG", raising=False)
+        calls = []
+        monkeypatch.setattr(dm, "_run_once", lambda *a: calls.append(a) or 0)
+        with pytest.raises(SystemExit) as exc:
+            dm.main(["--once", "--tenant", "t", "--push-url", "http://x", "--pg-statement-timeout-seconds", "12"])
+        assert exc.value.code == 0
+        (_queries, _tenant, _url, _ml, mode, opts) = calls[0]
+        assert mode == "postgres" and opts == dm.PgOptions(12.0, 5.0)

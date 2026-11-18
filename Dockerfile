@@ -1,4 +1,4 @@
-FROM ghcr.io/astral-sh/uv:0.7 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.4 AS uv
 FROM python:3.12-slim AS builder
 
 COPY --from=uv /uv /usr/local/bin/uv
@@ -88,6 +88,19 @@ RUN python -c "import duckdb, os; c = duckdb.connect(); c.execute('INSTALL httpf
 # execute it (the failure mode we just patched). Cheap (~ms) and runs in the
 # same layer the regression would land in.
 RUN duckdb -c "SELECT 1;" >/dev/null
+
+# The Rust VARIANT codec must be in the final image. `pyhoglake[variant-codec]`
+# installs it only where its wheel markers match (CPython on linux
+# x86_64/aarch64, among others) and installs NOTHING otherwise, so a
+# platform the markers miss would build a green image whose every variant
+# row encodes in Python at 6-10x the CPU (whale-shaped rows: ~27 us/row
+# native vs ~172 us/row Python on an M4, more on Graviton), and whose
+# pods the sink then refuses to point at a variant table (MILLPOND_ALLOW_PYTHON_VARIANT_CODEC).
+# Both image platforms (linux/amd64, linux/arm64) are covered; assert it
+# rather than trust it, through pyhoglake's own selector so what is
+# checked is what the flush path will use. As the runtime user, in the
+# venv the ENTRYPOINT runs.
+RUN python -c "from pyhoglake import _variant_backend as b; m, why = b.native(); assert m is not None, f'pyhoglake-variant-codec is not importable in the final image: {why}'"
 
 # Health check for non-K8s environments (K8s uses liveness/readiness probes in statefulset.yaml).
 EXPOSE 8000

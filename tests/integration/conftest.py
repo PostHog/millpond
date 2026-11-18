@@ -50,3 +50,44 @@ def ducklake_conn_inlining(tmp_path):
     conn = _attach_ducklake(tmp_path, inline_rows=None)
     yield conn
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Real Postgres (helpers and source order in postgres_server.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def pg_server():
+    """One throwaway Postgres server for the whole session. Requested only by
+    the suites that need a real catalog database, so other suites never start it."""
+    from tests.integration.postgres_server import pg_server_context
+
+    with pg_server_context() as server:
+        yield server
+
+
+@pytest.fixture()
+def catalog_db(pg_server, monkeypatch):
+    """A fresh database per test, with the DUCKLAKE_RDS_* env pointing at it
+    so code under test connects through the real _pg_direct_connect()."""
+    from tests.integration.postgres_server import throwaway_database
+
+    with throwaway_database(pg_server) as server:
+        monkeypatch.setenv("DUCKLAKE_RDS_HOST", server["host"])
+        monkeypatch.setenv("DUCKLAKE_RDS_PORT", str(server["port"]))
+        monkeypatch.setenv("DUCKLAKE_RDS_DATABASE", server["dbname"])
+        monkeypatch.setenv("DUCKLAKE_RDS_USERNAME", server["user"])
+        monkeypatch.setenv("DUCKLAKE_RDS_PASSWORD", server["password"] or "unused")
+        yield server
+
+
+@pytest.fixture()
+def pg(catalog_db):
+    """An autocommit psycopg connection to the per-test catalog database."""
+    import psycopg
+
+    from tests.integration.postgres_server import _conninfo
+
+    with psycopg.connect(_conninfo(catalog_db), autocommit=True) as conn:
+        yield conn

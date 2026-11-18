@@ -1,0 +1,2724 @@
+"""Integration tests for HoglakeSink against a REAL hoglake server.
+
+Boots the throwaway stack in tests/hoglake_stack/docker-compose.yaml
+(compose project `millpond-hog-it`: hoglake-server + postgres + minio,
+high 127.0.0.1 ports only — never the hoglake dev stack's defaults) and
+drives the actual sink against it. Skips cleanly when Docker or the
+server image is unavailable. Tears the stack down (volumes included) at
+session end.
+
+Run explicitly:
+    uv run pytest tests/integration/test_hoglake_integration.py -v
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import re
+import tempfile
+import threading
+import uuid
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from unittest.mock import MagicMock
+
+import httpx
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from pyarrow import fs as pafs
+from pyhoglake import (
+    CommitConflictError,
+    IncarnationChangedError,
+    NotFoundError,
+    ObjectPrefixViolationError,
+    ValidationError,
+)
+from pyhoglake.types import columns_to_arrow_schema
+
+from millpond.hoglake import HoglakeSink, HoglakeSinkError, is_retryable, table_schema_for_batch
+from millpond.main import _flush
+from tests.hoglake_stack import stack
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _bind_metrics():
+    """The real sink and main._flush hit the real metrics module; bind the
+    common labels once so the raw labeled metrics don't refuse bare
+    .inc()/.observe() calls (main() does this at startup in production)."""
+    from millpond import metrics
+
+    metrics.init("hog-it", broker_source="test")
+
+
+CATALOG = "millpond-it"
+BUCKET = "millpond-it"
+DATA_PATH = f"s3://{BUCKET}/lake/"
+
+
+@dataclass
+class HogCfg:
+    """The Config surface HoglakeSink (and main._flush) actually reads."""
+
+    destination: str = "hoglake"
+    hoglake_url: str = stack.SERVER_URL
+    hoglake_catalog: str = CATALOG
+    hoglake_namespace: str = "it"
+    hoglake_table: str = "events"
+    hoglake_data_path: str | None = DATA_PATH
+    hoglake_s3_endpoint: str = stack.MINIO_URL
+    hoglake_s3_access_key: str = stack.S3_ACCESS_KEY
+    hoglake_s3_secret_key: str = stack.S3_SECRET_KEY
+    hoglake_s3_region: str | None = None
+    hoglake_partition_by: tuple[tuple[str, str, int | None], ...] | None = None
+    hoglake_max_retry_count: int = 8
+    hoglake_request_timeout_s: float = 45.0
+    # config.load()'s defaults: millpond always passes a codec.
+    hoglake_compression: str | None = "zstd"
+    hoglake_compression_level: int | None = 3
+    # Mirrors config.load()'s default (test_deferred_stats_defaults_on pins it).
+    hoglake_deferred_stats: bool | None = True
+    # Mirrors config.load()'s default (test_variant_on_invalid_defaults_to_null).
+    hoglake_variant_on_invalid: str | None = "null"
+    # Mirrors config.load()'s default: a Python-codec process is refused.
+    hoglake_allow_python_variant_codec: bool | None = False
+    # Mirrors config.load()'s default: no catalog credential (the test
+    # server runs HOGLAKE_AUTH_MODE=off), so the sink builds its clients
+    # with auth=None and `hoglake_auth_source` reads "none".
+    hoglake_auth_token_url: str | None = None
+    hoglake_auth_client_id: str | None = None
+    hoglake_auth_client_secret: str | None = None
+    hoglake_auth_audience: str | None = None
+    hoglake_auth_token: str | None = None
+    hoglake_auth_token_file: str | None = None
+    hoglake_auth_source: str = "none"
+    sort_by: tuple[str, ...] | None = None
+    typed_columns: tuple[tuple[str, str], ...] | None = None
+    # Named in every DDL message.
+    topic: str = "events_json"
+    ordinal: int = 0
+    table_label: str = field(default="events")
+    # Named in every commit message; a real string, because the sink
+    # reads it once at construction.
+    service_version: str = "0.0.0+it"
+
+
+@pytest.fixture(scope="session")
+def hog_stack():
+    stack.ensure_available()
+    stack.up()
+    try:
+        # The pin, ASSERTED rather than asserted-in-a-comment. These are
+        # contract tests against a specific server build, and for two
+        # weeks the container ran whatever `:latest` resolved to locally
+        # while every comment in stack.py said it was pinned by digest —
+        # because the digest only ever reached `docker pull`. Reading the
+        # image back off the daemon is the one check that cannot be
+        # falsified by a substitution going wrong.
+        running = stack.running_server_image()
+        assert running == stack.server_image(), (
+            f"the hoglake-server container is running {running!r}, not the pinned "
+            f"{stack.server_image()!r} — the compose image substitution is not taking effect, so "
+            f"these contract tests would assert against a server nobody chose"
+        )
+        logging.getLogger(__name__).warning("hoglake server image under test: %s", running)
+        stack.make_bucket(BUCKET)
+        yield stack
+    finally:
+        stack.down()
+
+
+@pytest.fixture(scope="session")
+def client(hog_stack):
+    from pyhoglake import HoglakeClient, S3Config
+
+    c = HoglakeClient(
+        stack.SERVER_URL,
+        s3=S3Config(
+            access_key=stack.S3_ACCESS_KEY,
+            secret_key=stack.S3_SECRET_KEY,
+            endpoint_override=stack.MINIO_URL,
+        ),
+    )
+    yield c
+    c.close()
+
+
+# A drop is destructive DDL, and hoglake refuses one without both
+# fields (422). These drops stand in for an operator acting behind the
+# sink's back, so they are attributed to one rather than to the sink.
+_EXTERNAL_DROP = {"author": "millpond-it/operator", "message": "integration test: drop the table under a live writer"}
+
+
+def _fresh(**overrides) -> HogCfg:
+    cfg = HogCfg(**overrides)
+    if "hoglake_table" not in overrides:
+        cfg.hoglake_table = f"events_{uuid.uuid4().hex[:8]}"
+    cfg.table_label = cfg.hoglake_table
+    return cfg
+
+
+def _batch(n=3, teams=(1,), extra_cols=None) -> pa.Table:
+    rows = {
+        "uuid": [f"u{i}" for i in range(n)],
+        "event": ["pageview"] * n,
+        "team_id": [teams[i % len(teams)] for i in range(n)],
+        "properties": ['{"k": 1}'] * n,
+    }
+    if extra_cols:
+        rows.update(extra_cols)
+    return pa.table(rows)
+
+
+def _table(client, cfg):
+    return client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace).table(cfg.hoglake_table)
+
+
+def _record_count(client, cfg) -> int:
+    return sum(f.record_count for f in _table(client, cfg).files())
+
+
+def _list_objects(data_path: str, cfg) -> list[str]:
+    """Every object under this table's data prefix, bucket-relative."""
+    s3 = pafs.S3FileSystem(
+        access_key=stack.S3_ACCESS_KEY,
+        secret_key=stack.S3_SECRET_KEY,
+        endpoint_override=stack.MINIO_URL,
+    )
+    prefix = f"{data_path}data/{cfg.hoglake_namespace}/{cfg.hoglake_table}".removeprefix("s3://")
+    selector = pafs.FileSelector(prefix, recursive=True, allow_not_found=True)
+    return [f.path for f in s3.get_file_info(selector) if f.type == pafs.FileType.File]
+
+
+def _minio() -> pafs.S3FileSystem:
+    return pafs.S3FileSystem(
+        access_key=stack.S3_ACCESS_KEY,
+        secret_key=stack.S3_SECRET_KEY,
+        endpoint_override=stack.MINIO_URL,
+    )
+
+
+def _object_exists(uri: str) -> bool:
+    """Whether one object is present in the stack MinIO, by full s3:// URI."""
+    return _minio().get_file_info(uri.removeprefix("s3://")).type == pafs.FileType.File
+
+
+def _delete_object(uri: str) -> None:
+    """Remove one object if it is there; a no-op if it is not."""
+    with contextlib.suppress(FileNotFoundError, OSError):
+        _minio().delete_file(uri.removeprefix("s3://"))
+
+
+def _authored(client, cfg) -> list:
+    """Every snapshot this sink authored, DDL included, oldest first.
+
+    The feed is `GET /v1/catalogs/{catalog}/snapshots`, which pyhoglake
+    wraps — and it is CATALOG-wide: every table in this session shares
+    it. The author carries the table name, so filtering on it is what
+    makes "the snapshots this sink wrote" a well-defined thing here.
+    """
+    author = f"millpond/{cfg.hoglake_table}/{cfg.ordinal}"
+    return [s for s in client.catalog(cfg.hoglake_catalog).snapshots() if s.author == author]
+
+
+def _snapshots(client, cfg) -> list:
+    """This table's DATA snapshots, oldest first — the commits.
+
+    The DDL the sink issues carries the same author, so the author alone
+    no longer tells a flush from the create that preceded it; a commit
+    is the snapshot whose changes insert into the table.
+    """
+    return [s for s in _authored(client, cfg) if any(c.kind == "table_inserted_into" for c in s.changes)]
+
+
+def _read_all(client, cfg) -> pa.Table:
+    """Every live row of the table, concatenated across its files.
+
+    Schemas differ between files when a flush predates a column, so the
+    concat promotes rather than demanding identity — which is also what
+    makes "this column is null in files written before it existed" a
+    usable assertion.
+    """
+    tables = [_read_parquet(f.path) for f in _table(client, cfg).files()]
+    assert tables, "the table has no live files"
+    return pa.concat_tables(tables, promote_options="permissive")
+
+
+def _read_parquet(path: str) -> pa.Table:
+    s3 = pafs.S3FileSystem(
+        access_key=stack.S3_ACCESS_KEY,
+        secret_key=stack.S3_SECRET_KEY,
+        endpoint_override=stack.MINIO_URL,
+    )
+    with s3.open_input_file(path.removeprefix("s3://")) as f:
+        return pq.read_table(f)
+
+
+class TestBootstrap:
+    def test_first_write_creates_catalog_namespace_table(self, hog_stack, client):
+        cfg = _fresh(
+            hoglake_catalog="millpond-it-boot",
+            hoglake_data_path=f"s3://{BUCKET}/boot/",
+            hoglake_namespace="boot",
+        )
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(_batch(5)) == 5
+        finally:
+            sink.close()
+        catalog = client.catalog("millpond-it-boot")
+        assert catalog.data_path == f"s3://{BUCKET}/boot/"
+        table = catalog.namespace("boot").table(cfg.hoglake_table)
+        types = {c.name: c.type for c in table.columns}
+        assert types == {
+            "uuid": "string",
+            "event": "string",
+            "team_id": "long",
+            "properties": "string",
+            "_inserted_at": "timestamptz",
+        }
+
+    def test_missing_catalog_without_data_path_is_a_startup_error(self, hog_stack):
+        # Literally at startup now: the sink resolves its catalog in
+        # __init__, so this never reaches a flush (and never builds lag
+        # behind a pod that passes its probes).
+        cfg = _fresh(hoglake_catalog="millpond-it-absent", hoglake_data_path=None)
+        with pytest.raises(RuntimeError, match="HOGLAKE_DATA_PATH"):
+            HoglakeSink(cfg)
+
+    def test_unreachable_control_plane_is_a_startup_error(self, hog_stack):
+        cfg = _fresh(hoglake_url="http://127.0.0.1:1")
+        with pytest.raises(RuntimeError, match="cannot reach the hoglake control plane"):
+            HoglakeSink(cfg)
+
+    def test_object_store_credentials_are_probed_at_startup(self, hog_stack, monkeypatch):
+        # MinIO authenticates every request, so a sink with no static
+        # keys has nothing the AWS default chain can turn into a grant on
+        # this bucket — the same shape as an IRSA role whose policy
+        # misses the bucket. The point of the test is WHERE it fails:
+        # in the constructor, before a single row is offered, rather than
+        # as an S3 403 on the first flush behind a pod that is already
+        # consuming. (This is as close as the stack gets to the IRSA
+        # case; it cannot mint a web-identity token, so what is covered
+        # is the probe firing and refusing, not the chain succeeding.)
+        #
+        # IMDS off: with no credentials anywhere else, the SDK otherwise
+        # spends seconds knocking on 169.254.169.254 before giving up on
+        # a laptop.
+        monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+        cfg = _fresh(hoglake_s3_access_key=None, hoglake_s3_secret_key=None)
+        with pytest.raises(HoglakeSinkError) as excinfo:
+            HoglakeSink(cfg)
+        message = str(excinfo.value)
+        assert f"{DATA_PATH}_millpond/probe" in message
+        assert "the AWS default credential chain (IRSA in Kubernetes)" in message
+        # Permanent: no retry loop exists at startup, and a missing grant
+        # is not something waiting fixes.
+        assert excinfo.value.retryable is False
+
+    def test_static_keys_pass_the_probe_and_leave_the_marker(self, hog_stack, caplog):
+        # The other half of the pair: the probe must not refuse a sink
+        # that can in fact write, and the proof that it RAN is the marker
+        # object plus its one startup log line (a probe that silently
+        # no-ops would pass this test's first half on its own).
+        #
+        # Delete the marker first: every other sink in this session has
+        # already written it, so finding one afterwards would otherwise
+        # prove nothing about THIS construction.
+        marker = f"{DATA_PATH}_millpond/probe"
+        _delete_object(marker)
+        assert not _object_exists(marker)
+        with caplog.at_level(logging.INFO, logger="millpond.hoglake"):
+            sink = HoglakeSink(_fresh())
+            sink.close()
+        lines = [r.getMessage() for r in caplog.records if "object store auth source" in r.getMessage()]
+        assert len(lines) == 1
+        assert "static HOGLAKE_S3_* keys" in lines[0]
+        assert f"{DATA_PATH}_millpond/probe" in lines[0]
+        assert _object_exists(marker)
+
+    def test_a_bucket_typo_is_refused_at_construction(self, hog_stack):
+        # The failure the old LIST probe could not see: pyarrow's
+        # get_file_info maps a NoSuchBucket 404 onto an empty listing, so
+        # a typo'd bucket passed and then failed on the first flush —
+        # with the bad data path already frozen into the catalog row.
+        #
+        # This leaves a poisoned catalog row behind in the stack's
+        # Postgres (hoglake has no delete-catalog route, which is the
+        # very hazard under test). Harmless here: the stack is torn down
+        # with its volumes at session end.
+        cfg = _fresh(
+            hoglake_catalog="millpond-it-typo",
+            hoglake_data_path="s3://millpond-it-typpo/lake/",
+        )
+        with pytest.raises(HoglakeSinkError) as excinfo:
+            HoglakeSink(cfg)
+        message = str(excinfo.value)
+        assert "millpond-it-typpo" in message
+        assert excinfo.value.retryable is False
+
+    def test_partition_spec_and_sort_order_declared(self, hog_stack, client):
+        cfg = _fresh(
+            hoglake_partition_by=(("team_id", "identity", None), ("_inserted_at", "month", None)),
+            sort_by=("team_id", "uuid"),
+        )
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(6, teams=(101, 202)))
+        finally:
+            sink.close()
+        info = _table(client, cfg).info()
+        fid = {c.name: c.field_id for c in info.columns}
+        assert info.partition_spec is not None
+        assert [(f.source_field_id, f.transform) for f in info.partition_spec.fields] == [
+            (fid["team_id"], "identity"),
+            (fid["_inserted_at"], "month"),
+        ]
+        assert info.sort_spec is not None
+        assert [(f.source_field_id, f.direction, f.null_order) for f in info.sort_spec.fields] == [
+            (fid["team_id"], "asc", "nulls_last"),
+            (fid["uuid"], "asc", "nulls_last"),
+        ]
+
+    def test_partitioned_append_fans_out_one_file_per_tuple(self, hog_stack, client):
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(9, teams=(1, 2, 3)))
+        finally:
+            sink.close()
+        files = _table(client, cfg).files()
+        assert len(files) == 3
+        assert sum(f.record_count for f in files) == 9
+        assert sorted(f.partition_values[0] for f in files) == ["1", "2", "3"]
+
+    def test_changing_the_partition_spec_fails_loudly(self, hog_stack, client):
+        # A deployed pipeline whose HOGLAKE_PARTITION_BY changes used to
+        # keep writing under the old layout with nothing in the logs.
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3))
+        finally:
+            sink.close()
+        changed = _fresh(
+            hoglake_table=cfg.hoglake_table,
+            hoglake_partition_by=(("team_id", "bucket", 8),),
+        )
+        sink2 = HoglakeSink(changed)
+        try:
+            with pytest.raises(RuntimeError, match="HOGLAKE_PARTITION_BY"):
+                sink2.write(_batch(3))
+        finally:
+            sink2.close()
+        assert _record_count(client, cfg) == 3  # nothing written under the wrong layout
+
+    def test_spec_declaration_recovers_on_an_existing_unpartitioned_table(self, hog_stack, client):
+        # The create-then-alter window: the table exists, its spec does
+        # not. The next bootstrap must declare it, not shrug.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+        finally:
+            sink.close()
+        partitioned = _fresh(
+            hoglake_table=cfg.hoglake_table,
+            hoglake_partition_by=(("team_id", "identity", None),),
+        )
+        sink2 = HoglakeSink(partitioned)
+        try:
+            sink2.write(_batch(4, teams=(7, 8)))
+        finally:
+            sink2.close()
+        info = _table(client, cfg).info()
+        assert info.partition_spec is not None
+        assert [f.transform for f in info.partition_spec.fields] == ["identity"]
+
+    def test_a_typo_in_the_spec_keeps_failing(self, hog_stack, client):
+        # month() on a bigint is a 422 from the server. The failure must
+        # repeat on every attempt rather than leaving a permanently
+        # unpartitioned table behind after the first one.
+        cfg = _fresh(hoglake_partition_by=(("team_id", "month", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            for _ in range(2):
+                # A 422 the server returns for the alter, surfaced as the
+                # sink's own refusal — and a PERMANENT one, so main.py's
+                # retry loop crashes the pod with the message instead of
+                # spending eight attempts on a config typo.
+                with pytest.raises(ValidationError) as caught:
+                    sink.write(_batch(2))
+                assert is_retryable(caught.value) is False
+                sink.reset_caches()
+        finally:
+            sink.close()
+        # The table exists (create succeeded, the alter did not) and has
+        # no rows: the flush never got past the declaration.
+        assert _record_count(client, cfg) == 0
+
+    def test_concurrent_create_tolerated(self, hog_stack, client):
+        cfg = _fresh()
+        sinks = [HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table)) for _ in range(2)]
+        errors: list[BaseException] = []
+
+        def go(s):
+            try:
+                s.write(_batch(4))
+            except BaseException as e:  # noqa: BLE001 - collected for assertion
+                errors.append(e)
+
+        threads = [threading.Thread(target=go, args=(s,)) for s in sinks]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for s in sinks:
+            s.close()
+        assert not errors, f"concurrent first-writes failed: {errors!r}"
+        assert _record_count(client, cfg) == 8
+
+
+class TestAppendVisibility:
+    def test_rows_queryable_with_stats(self, hog_stack, client):
+        # Shipped stats: the deferred mode is TestDeferredStats.
+        cfg = _fresh(hoglake_deferred_stats=False)
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(5))
+            sink.write(_batch(7))
+        finally:
+            sink.close()
+        table = _table(client, cfg)
+        files = table.files()
+        assert sorted(f.record_count for f in files) == [5, 7]
+        # Stats shipped with the commit (HOGLAKE_DEFERRED_STATS=false): the server
+        # marks them provided/loaded, not pending.
+        assert all(f.stats_state != "pending" for f in files)
+        # Scan planning sees the same files.
+        scan = table.scan_plan()
+        assert sorted(s.data_file.record_count for s in scan) == [5, 7]
+
+    def test_parquet_contents_round_trip(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3, teams=(42,)))
+        finally:
+            sink.close()
+        files = _table(client, cfg).files()
+        assert len(files) == 1
+        data = _read_parquet(files[0].path)
+        assert data.num_rows == 3
+        assert data.column("team_id").to_pylist() == [42, 42, 42]
+        assert data.column("properties").to_pylist() == ['{"k": 1}'] * 3
+        assert data.column("_inserted_at").null_count == 0
+
+
+class TestCompression:
+    """The codec is shown in the written bytes, not in mock kwargs: the
+    object's footer names it, and so does the snapshot message."""
+
+    @pytest.mark.parametrize(
+        ("codec", "level", "footer", "token"),
+        [("zstd", 3, "ZSTD", "zstd-3"), ("snappy", None, "SNAPPY", "snappy")],
+    )
+    def test_the_written_object_carries_the_codec(self, hog_stack, client, codec, level, footer, token):
+        cfg = _fresh(hoglake_compression=codec, hoglake_compression_level=level)
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3, teams=(42,)))
+        finally:
+            sink.close()
+        (live,) = _table(client, cfg).files()
+        with _minio().open_input_file(live.path.removeprefix("s3://")) as f:
+            metadata = pq.read_metadata(f)
+        assert {
+            metadata.row_group(r).column(c).compression
+            for r in range(metadata.num_row_groups)
+            for c in range(metadata.num_columns)
+        } == {footer}
+        assert f" codec={token} " in _snapshots(client, cfg)[-1].message.split("\n")[0]
+
+
+class TestDeferredStats:
+    """`deferred_stats` read back from the catalog: each file's
+    `stats_state`, the snapshot message, and an add_column over files
+    still `pending` (hoglake 1.4.6+ refuses only PROVEN id-less files).
+    The stack disables the hydrator (HOGLAKE_HYDRATOR_INTERVAL_MS=0 in
+    tests/hoglake_stack/docker-compose.yaml), so `pending` stays `pending`."""
+
+    @pytest.mark.parametrize(("deferred", "token"), [(True, "deferred"), (False, "shipped")])
+    def test_the_files_register_in_the_configured_stats_state(self, hog_stack, client, deferred, token):
+        cfg = _fresh(hoglake_deferred_stats=deferred, hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(6, teams=(1, 2, 3)))
+        finally:
+            sink.close()
+        files = _table(client, cfg).files()
+        assert len(files) == 3
+        states = {f.stats_state for f in files}
+        if deferred:
+            assert states == {"pending"}
+        else:
+            assert "pending" not in states
+        assert f" stats={token} " in _snapshots(client, cfg)[-1].message.split("\n")[0]
+
+    def test_an_add_column_over_pending_files_lands(self, hog_stack, client):
+        cfg = _fresh()  # HogCfg's default: deferred, as config.load()'s
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2), kafka_offsets=(("events", 0, 0, 1),))
+            assert {f.stats_state for f in _table(client, cfg).files()} == {"pending"}
+            sink.write(_batch(2, extra_cols={"extra": ["a", "b"]}), kafka_offsets=(("events", 0, 2, 3),))
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 4
+        assert "extra" in {c.name for c in _table(client, cfg).columns}
+        # The values landed, not just the column: null for the first
+        # flush's rows, the batch's own for the second's.
+        assert Counter(_read_all(client, cfg).column("extra").to_pylist()) == Counter(["a", "b", None, None])
+
+
+class TestSchemaEvolution:
+    def test_new_column_added_and_old_column_null_filled(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+            # New upstream column appears; `event` disappears upstream.
+            batch2 = pa.table(
+                {
+                    "uuid": ["x", "y"],
+                    "team_id": [7, 7],
+                    "properties": ["{}", "{}"],
+                    "new_col": ["a", "b"],
+                }
+            )
+            sink.write(batch2)
+        finally:
+            sink.close()
+        table = _table(client, cfg)
+        types = {c.name: c.type for c in table.columns}
+        assert types["new_col"] == "string"
+        files = sorted(table.files(), key=lambda f: f.data_file_id)
+        assert [f.record_count for f in files] == [2, 2]
+        second = _read_parquet(files[1].path)
+        assert second.column("new_col").to_pylist() == ["a", "b"]
+        assert second.column("event").null_count == 2  # null-filled
+
+    def test_concurrent_writers_evolving_and_appending(self, hog_stack, client):
+        """Two pods adding columns and appending at once still converge —
+        now THROUGH the retry loop, which is the shape production runs.
+
+        It used to converge with no retry at all, because the sink
+        stripped `read_snapshot` off the payload and a commit with no
+        conflict basis cannot be refused for a DDL race. With the basis
+        on, the other writer's `add_column` landing between this flush's
+        read and its commit is refused as `ddl_since_read_snapshot` —
+        atomically, zero rows written — and the recovery is the rebuild
+        `_write_with_retry` drives: `reset_caches`, re-resolve, re-align
+        against the new column, upload again, commit. That refusal is the
+        POINT of the basis (a payload built against the old layout is
+        exactly what must not be registered under the new one), so the
+        test asserts convergence under the real retry rather than
+        pretending the refusal does not happen. The cost is the refused
+        flush's parquet, which the orphan counter books.
+        """
+        from millpond.main import _write_with_retry
+
+        cfg = _fresh()
+        settle = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table))
+        settle.write(_batch(1))  # settle creation before the race
+        settle.close()
+
+        errors: list[BaseException] = []
+
+        def writer(idx: int):
+            s = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table, ordinal=idx))
+            try:
+                for round_ in range(3):
+                    extra = {f"col_w{idx}_{round_}": [f"v{idx}"] * 2}
+                    _write_with_retry(
+                        s,
+                        _batch(2, teams=(idx,), extra_cols=extra),
+                        destination="hoglake",
+                        write_kwargs={"kafka_offsets": (("events", idx, round_, round_),)},
+                    )
+            except BaseException as e:  # noqa: BLE001 - collected for assertion
+                errors.append(e)
+            finally:
+                s.close()
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in (1, 2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, f"concurrent evolve/append failed: {errors!r}"
+        assert _record_count(client, cfg) == 1 + 2 * 3 * 2
+        names = {c.name for c in _table(client, cfg).columns}
+        for idx in (1, 2):
+            for round_ in range(3):
+                assert f"col_w{idx}_{round_}" in names
+        # PER FLUSH, not just in total. The retry loop rebuilds a refused
+        # flush and re-uploads it, and the total would be right either
+        # way if one flush landed twice while another landed not at all
+        # (the refusals are concurrent, so the two errors cancel). Each
+        # round's marker column is written by exactly one flush of
+        # exactly 2 rows, so its non-null count is that flush's
+        # publication count.
+        rows = _read_all(client, cfg)
+        for idx in (1, 2):
+            for round_ in range(3):
+                column = f"col_w{idx}_{round_}"
+                landed = [v for v in rows.column(column).to_pylist() if v is not None]
+                assert landed == [f"v{idx}", f"v{idx}"], (
+                    f"{column} landed {len(landed)} time(s), not 2 — a refused flush was published twice or lost"
+                )
+
+
+class TestRestartAndReset:
+    def test_reset_caches_reresolves(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+            sink.reset_caches()
+            sink.write(_batch(3))
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 5
+
+    def test_new_sink_instance_resumes_existing_table(self, hog_stack, client):
+        cfg = _fresh()
+        s1 = HoglakeSink(cfg)
+        try:
+            s1.write(_batch(2))
+        finally:
+            s1.close()
+        s2 = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table))
+        try:
+            s2.write(_batch(4))
+        finally:
+            s2.close()
+        assert _record_count(client, cfg) == 6
+
+    def test_external_drop_recovers_after_reset(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+            _table(client, cfg).drop(**_EXTERNAL_DROP)
+            # The cached handle names a table that no longer resolves.
+            # WHICH refusal depends on how far the flush gets, and all of
+            # them are retryable, so the test accepts the family rather
+            # than one of them: the client's pre-flight re-resolve
+            # (`NotFoundError`, only on a cold writer cache — see
+            # `test_a_pre_upload_refusal_really_does_carry_zero`), or the
+            # commit, which the server answers 409 `table_dropped` ->
+            # `CommitConflictError`. `reset_caches` adopts the live table
+            # on the next attempt either way.
+            with pytest.raises((CommitConflictError, IncarnationChangedError, NotFoundError)) as caught:
+                sink.write(_batch(2))
+            assert is_retryable(caught.value) is True
+            sink.reset_caches()
+            assert sink.write(_batch(3)) == 3
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+
+    def test_external_drop_recreate_is_refused_not_published(self, hog_stack, client):
+        """The RECREATE case, which the drop-only test above cannot reach.
+
+        Once the name resolves again, every check that was supposed to
+        catch this used to pass: `_prepare`'s own `table.info()` adopted
+        the new incarnation into the pyhoglake handle, and a defaulted
+        `expected_table_uuid` was then read off that same refreshed value
+        — so the client pre-flight, the server's guard and the
+        (now-retired) pre-commit destination read all compared fresh
+        against fresh. The commit landed on a table this sink had never
+        reconciled, and the only thing still naming the dead one was the
+        idempotency key.
+
+        What closes it is `_prepare` pinning `expected_table_uuid` to the
+        resolved-and-reconciled incarnation, which is unchanged. WHERE it
+        is caught moved: the sink no longer re-reads the destination
+        before the commit, and pyhoglake skips its own pre-flight
+        re-resolve while its writer cache is warm — so the refusal is the
+        server's 409 `table_recreated`, after the upload. millpond
+        converts it to a retryable `HoglakeSinkError`, discards the
+        payload and books its parquet as an orphan, which is the cost of
+        catching it one round trip later.
+        """
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(_batch(2), kafka_offsets=(("events", 0, 0, 1),)) == 2
+            dead = _table(client, cfg).table_uuid
+            _table(client, cfg).drop(**_EXTERNAL_DROP)
+            ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
+            reborn = ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
+            assert reborn.table_uuid != dead
+
+            with pytest.raises(HoglakeSinkError, match="recreated") as caught:
+                sink.write(_batch(2), kafka_offsets=(("events", 0, 2, 3),))
+            assert is_retryable(caught.value) is True
+            assert isinstance(caught.value.__cause__, IncarnationChangedError)
+            assert _record_count(client, cfg) == 0, "the flush published across incarnations"
+
+            # Retryable, so main.py resets and re-resolves — which is
+            # also what puts the recreated table through _reconcile_specs.
+            sink.reset_caches()
+            assert sink.write(_batch(3), kafka_offsets=(("events", 0, 2, 4),)) == 3
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+
+
+class TestLostCommitResponse:
+    """THE duplicate-publication hazard, against the real server.
+
+    A commit the server APPLIED whose response never reaches the client
+    is indistinguishable, at the client, from a commit that never
+    happened: both surface as a timeout. millpond retries; the retry
+    mints fresh parquet paths (uuid4) and commits again; hoglake permits
+    a path to be registered twice (there is no unique index on it, by
+    design); the rows publish a second time and the offsets advance over
+    both. No log, no metric, no way to know afterwards.
+
+    The fix is the commit's idempotency key, derived from the Kafka
+    offset range being flushed, plus a prepared payload the sink holds
+    across retries — so the retry is byte-identically the SAME request
+    and the server answers it from its receipt without writing.
+    """
+
+    def _drop_next_commit_response(self, sink):
+        """Let the commit reach the server and apply, then destroy the
+        response on its way back — exactly what a connection reset or a
+        gateway timeout does."""
+        http = sink._client._http
+        real = http.request
+        state = {"dropped": False}
+
+        def request(method, url, **kwargs):
+            response = real(method, url, **kwargs)
+            if not state["dropped"] and method == "POST" and "/commit" in str(url):
+                state["dropped"] = True
+                raise httpx.ReadTimeout("response lost in transit", request=response.request)
+            return response
+
+        http.request = request
+        return state
+
+    def _flush_once(self, sink, cfg, batch, offsets):
+        kafka = MagicMock()
+        _flush(sink, cfg, kafka, batch, batch.nbytes, batch.num_rows, offsets, 1.0)
+        return kafka
+
+    def test_lost_response_publishes_the_rows_exactly_once(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        offsets = {("events", 0): (36, 41)}
+        batch = _batch(6, teams=(1, 2))
+        try:
+            sink.write(_batch(1))  # bootstrap while healthy
+            state = self._drop_next_commit_response(sink)
+            kafka = self._flush_once(sink, cfg, batch, offsets)
+        finally:
+            sink.close()
+        assert state["dropped"], "the harness never dropped a commit response"
+        # The flush as a whole SUCCEEDED (the retry resolved it), so the
+        # offsets committed — which is the dangerous half: had the retry
+        # published a second copy, the offsets would have advanced over
+        # duplicated rows with nothing to show for it.
+        kafka.commit.assert_called_once()
+        assert _record_count(client, cfg) == 1 + 6
+
+    def test_lost_response_on_a_partitioned_table_too(self, hog_stack, client):
+        # The fanout path registers one file per partition tuple in one
+        # commit, so a replay has to reproduce the whole file SET.
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2, teams=(1,)))
+            state = self._drop_next_commit_response(sink)
+            self._flush_once(sink, cfg, _batch(9, teams=(1, 2, 3)), {("events", 0): (69, 77)})
+        finally:
+            sink.close()
+        assert state["dropped"]
+        assert _record_count(client, cfg) == 2 + 9
+        # And exactly one file per tuple from the retried flush — not two.
+        files = _table(client, cfg).files()
+        assert len(files) == 1 + 3
+
+    def test_replay_does_not_re_upload(self, hog_stack, client):
+        # A retry must replay the identical registration, not build a new
+        # one: re-uploading orphans the first set, and a payload that
+        # differs by so much as a file name is a 422 against the receipt.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(1))
+            self._drop_next_commit_response(sink)
+            self._flush_once(sink, cfg, _batch(4), {("events", 0): (9, 12)})
+            registered = {f.path for f in _table(client, cfg).files()}
+        finally:
+            sink.close()
+        objects = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+        # Guard the subset assertion: an empty listing (a wrong prefix, a
+        # renamed layout) satisfies `<=` against anything and proves
+        # nothing.
+        assert len(objects) == len(registered) == 2  # the bootstrap write plus the retried flush
+        # Every object under the table's data path is a registered file:
+        # no orphan from a second upload.
+        assert objects <= {p.removeprefix("s3://") for p in registered}
+
+
+class TestNewProcessReplay:
+    """What the key does and does not buy ACROSS a process boundary.
+
+    In-process the guarantee is exact: the payload is held, the retry is
+    byte-identical, the receipt resolves it. Across a restart neither of
+    those holds — the rebuilt flush stamps a fresh `_inserted_at` and
+    uploads under fresh uuid4 names — so all the key can do is recognize
+    a repeated BOUNDARY and refuse to publish twice over it.
+
+    And the boundary is not reproducible. It is whatever the size and
+    time triggers happened to cut at: a size trigger accumulates per poll
+    batch, the time trigger is wall-clock, the filter's allowlist is
+    mutable, and every partition in the flush has to coincide. So the
+    pipeline is at-least-once across process boundaries, with the key
+    suppressing the duplicate in the case where the boundary does repeat.
+
+    Both halves are pinned here, because a claim that only holds in the
+    lucky case is worse than no claim: it is the one an operator reasons
+    with at 3am.
+    """
+
+    def _flush_as_new_process(self, cfg, batch, offsets):
+        """A fresh sink over the same table — the restart, minus the
+        process boundary. Nothing survives but the catalog."""
+        sink = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table))
+        try:
+            kafka = MagicMock()
+            _flush(sink, cfg, kafka, batch, batch.nbytes, batch.num_rows, offsets, 1.0)
+            return kafka
+        finally:
+            sink.close()
+
+    def test_the_same_boundary_from_a_new_process_publishes_once(self, hog_stack, client):
+        # The pod died after the commit applied and before the offsets
+        # committed; Kafka replayed the identical range and the flush was
+        # rebuilt from scratch.
+        cfg = _fresh()
+        batch = _batch(5)
+        offsets = {("events", 0): (12, 16)}
+        self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5
+        kafka = self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5, "the replayed boundary published a second copy"
+        # The offsets still commit: the rows ARE in the lake, just not
+        # because of this process.
+        kafka.commit.assert_called_once()
+
+    def test_the_reused_key_branch_reports_zero_rows_written(self, hog_stack, client):
+        """The reused-key branch, taken against the real server rather
+        than a fabricated exception.
+
+        This is the branch a unit fixture got backwards: hoglake answers
+        `{error: "validation", detail: "idempotency_key reused with a
+        different request"}`, so the sentence is in `detail` and the
+        message is the bare code. It is exercised here end to end, and
+        the thing asserted is the number that used to be wrong — a
+        writer reporting its whole batch for a range it did not publish
+        is how 8 reported rows became 3 in the lake.
+        """
+        cfg = _fresh()
+        batch = _batch(5)
+        offsets = {("events", 0): (12, 16)}
+        self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5
+
+        sink = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table))
+        try:
+            written = sink.write(batch, kafka_offsets=(("events", 0, 12, 16),))
+        finally:
+            sink.close()
+        assert written == 0, "reported rows this process did not publish"
+        assert _record_count(client, cfg) == 5
+
+    def test_a_shifted_boundary_from_a_new_process_duplicates(self, hog_stack, client):
+        # The honest half. The restart re-consumed the same records but
+        # its flush cut at a different offset, so this is a different
+        # publication by every name anyone has — and the rows land twice.
+        # AT-LEAST-ONCE, which is what the docs now say.
+        cfg = _fresh()
+        batch = _batch(5)
+        self._flush_as_new_process(cfg, batch, {("events", 0): (12, 16)})
+        assert _record_count(client, cfg) == 5
+        self._flush_as_new_process(cfg, batch, {("events", 0): (12, 19)})
+        assert _record_count(client, cfg) == 10
+
+    def test_a_recreated_table_does_not_answer_from_the_old_receipt(self, hog_stack, client):
+        # Receipts are per catalog and survive a table drop with no
+        # cascade. Without the incarnation in the key, this sequence
+        # reported the second flush as already published and advanced
+        # over rows that were in a dropped table: 5 rows written, 0 in
+        # the lake, offsets committed.
+        cfg = _fresh()
+        batch = _batch(5)
+        offsets = {("events", 0): (12, 16)}
+        self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5
+        _table(client, cfg).drop(**_EXTERNAL_DROP)
+        self._flush_as_new_process(cfg, batch, offsets)
+        assert _record_count(client, cfg) == 5, "the recreated table answered from its predecessor's receipt"
+
+
+class TestSpecChangeUnderAPreparedPayload:
+    """A registered file carries the partition VALUES the client computed
+    and is stamped with whatever spec_id the table has when the commit
+    lands. The server never opens the file, so if the spec changes to
+    another of the SAME ARITY between prepare and commit, the file is
+    registered as (say) bucketed while carrying identity values — and
+    every scan prunes it wrongly, forever, with nothing anywhere saying
+    so."""
+
+    def test_a_same_arity_respec_mid_flight_refuses_the_commit(self, hog_stack, client, monkeypatch):
+        from pyhoglake import ops
+
+        from millpond.hoglake import HoglakeSink as Sink
+
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = Sink(cfg)
+        original = Sink._prepare
+
+        def prepare_then_respec(self, table, batch, key, facts):
+            payload = original(self, table, batch, key, facts)
+            # Another operator re-specs the table while the upload is in
+            # flight. Same arity, so the server's commit-side validation
+            # (which checks arity and nothing else) would accept it.
+            live = _table(client, cfg)
+            fid = {c.name: c.field_id for c in live.info().columns}["team_id"]
+            live.alter([ops.set_partition_spec([ops.partition_field(fid, "bucket", 8)])])
+            return payload
+
+        try:
+            sink.write(_batch(3, teams=(1,)))
+            assert _record_count(client, cfg) == 3
+            monkeypatch.setattr(Sink, "_prepare", prepare_then_respec)
+            with pytest.raises(RuntimeError, match="partition spec") as caught:
+                sink.write(_batch(3, teams=(2,)))
+            # Retryable: a REBUILT flush computes its values under the new
+            # spec and publishes cleanly, unlike the sink's other stops.
+            assert is_retryable(caught.value) is True
+        finally:
+            monkeypatch.undo()
+            sink.close()
+        # Nothing was registered under the wrong spec.
+        assert _record_count(client, cfg) == 3
+        # And the rebuild, under the live spec, lands.
+        sink2 = HoglakeSink(_fresh(hoglake_table=cfg.hoglake_table, hoglake_partition_by=(("team_id", "bucket", 8),)))
+        try:
+            assert sink2.write(_batch(3, teams=(2,))) == 3
+        finally:
+            sink2.close()
+        assert _record_count(client, cfg) == 6
+
+
+class _FailNthRequest:
+    """Refuse the Nth upload REQUEST of a fan-out, counted across both
+    transports and thread-safely.
+
+    Two things it has to cope with that the old filesystem-only wrapper
+    did not. pyhoglake 1.3.7 sends any object at or under 8 MiB as a
+    single boto3 `put_object` (the `fast-upload` extra, which millpond
+    pins) and only a larger one through pyarrow's
+    `open_output_stream` — so a wrapper that only intercepts the stream
+    never fires for a real millpond flush, which is hundreds of ~12 KiB
+    files. And the fan-out is CONCURRENT, so "the Nth call" is whichever
+    thread claims the counter third; the lock is what keeps that exactly
+    one refusal rather than nondeterministically zero or two.
+
+    Which group fails is deliberately not pinned. Every group is
+    submitted at once (the fan-out is wider than this test's group
+    count), the failure cancels nothing that has already started, and
+    `run_uploads` waits for the rest — so exactly one object is missing
+    and the others really are in MinIO, which is the claim: the count
+    pyhoglake stamps is checkable against the bucket instead of against
+    another fake. What is NOT checkable any more is that the landed set
+    is a PREFIX of the groups, and that is the point of reading the uris
+    rather than the count."""
+
+    def __init__(self, fail_on: int):
+        self._fail_on = fail_on
+        self._lock = threading.Lock()
+        self.calls = 0
+
+    def claim(self) -> bool:
+        with self._lock:
+            self.calls += 1
+            return self.calls == self._fail_on
+
+
+class _FailNthStream:
+    """The real S3 filesystem with `_FailNthRequest` in front of its
+    output stream — the transport a too-large object still takes."""
+
+    def __init__(self, real, gate: _FailNthRequest):
+        self._real = real
+        self._gate = gate
+
+    def open_output_stream(self, path, *a, **kw):
+        if self._gate.claim():
+            raise OSError(f"injected object-store failure on upload {self._gate.calls}")
+        return self._real.open_output_stream(path, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _FailNthPut:
+    """The real boto3 client with the same gate in front of `put_object`
+    — the transport every object in a millpond flush actually takes.
+
+    The OSError is raised rather than a botocore fault on purpose:
+    `perform_upload` translates botocore's taxonomy into `OSError`
+    anyway, so this is the exception shape the caller sees either way and
+    the one millpond's `is_retryable` classifies."""
+
+    def __init__(self, real, gate: _FailNthRequest):
+        self._real = real
+        self._gate = gate
+
+    def put_object(self, **kw):
+        if self._gate.claim():
+            raise OSError(f"injected object-store failure on upload {self._gate.calls}")
+        return self._real.put_object(**kw)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestPrepareOrphanAccounting:
+    """What a failed `prepare_append_files` leaves behind, measured
+    against the bucket rather than deduced.
+
+    millpond used to reason about where in pyhoglake's upload loop a
+    given failure could fire, and book a number from that reasoning. It
+    was wrong twice. pyhoglake >=1.1.1 reports the truth on the
+    exception itself; these tests pin that contract against the real
+    library, the real server and real objects, because a unit test that
+    stamps the attributes itself can only prove millpond reads what a
+    fake wrote."""
+
+    def test_a_mid_fanout_failure_counts_and_names_the_objects_that_landed(self, hog_stack, client, caplog):
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3, teams=(1,)))  # bootstrap, so the table exists
+            before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+            # Both transports, one gate: the bootstrap flush above has
+            # already built and cached both clients, and the 3-way
+            # fan-out below asks for a pool no wider than the one they
+            # got, so neither is rebuilt out from under the wrapper.
+            real_fs = sink._client._filesystem()
+            real_put = sink._client._put_client(1)
+            gate = _FailNthRequest(fail_on=3)
+            sink._client._fs = _FailNthStream(real_fs, gate)
+            if real_put is not None:
+                sink._client._put = _FailNthPut(real_put, gate)
+            with caplog.at_level(logging.WARNING, logger="millpond.hoglake"), pytest.raises(OSError) as caught:
+                sink.write(_batch(9, teams=(1, 2, 3)))
+        finally:
+            sink._client._fs = real_fs
+            sink._client._put = real_put
+            sink.close()
+
+        # pyhoglake's own accounting: two uploads closed cleanly, the
+        # third raised and is in neither number.
+        assert gate.calls == 3, "the injected failure never fired — which transport did the upload take?"
+        assert caught.value.uploaded_files == 2
+        assert len(caught.value.uploaded_uris) == 2
+
+        # ...and those two really are in the bucket. This is the whole
+        # claim: the count is provable, not inferred.
+        after = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+        landed = after - before
+        assert {u.removeprefix("s3://") for u in caught.value.uploaded_uris} <= landed
+
+        # Nothing was registered, so every one of them is an orphan.
+        assert _record_count(client, cfg) == 3
+        assert "Orphaned 2 uploaded parquet file(s)" in caplog.text
+        for uri in caught.value.uploaded_uris:
+            assert uri in caplog.text
+        # The retracted advice: the shared prefix is not the sweep unit.
+        assert "never the prefix" in caplog.text
+        assert "truncated" in caplog.text
+
+    def test_a_pre_upload_refusal_really_does_carry_zero(self, hog_stack, client):
+        """The other half of the contract, and the one millpond used to
+        assert from first principles: a refusal raised before the first
+        upload reports 0 / (). Driven through a real drop+recreate under
+        the sink's cached handle, so the real client pre-flight raises
+        it.
+
+        `invalidate()` is what makes the pre-flight run at all, and it is
+        the condition rather than a convenience: pyhoglake 1.3.7 SKIPS
+        its incarnation re-resolve while its writer cache is warm (that
+        is the whole of "zero table reads per flush"), so on a warm cache
+        this same sequence is caught by the server at the commit instead
+        — see the test below. A cold cache is the ordinary state after a
+        restart, after any `re_prepare` refusal, and once per
+        half-retention."""
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+            before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+            ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
+            ns.table(cfg.hoglake_table).drop(**_EXTERNAL_DROP)
+            ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
+            sink._table.invalidate()
+            with pytest.raises(IncarnationChangedError) as caught:
+                sink.write(_batch(2))
+        finally:
+            sink.close()
+        assert getattr(caught.value, "uploaded_files", None) == 0
+        assert getattr(caught.value, "uploaded_uris", None) == ()
+        # And the bucket agrees — no object was written for the refusal.
+        after = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+        assert after == before
+
+    def test_a_warm_cache_pays_one_flush_of_uploads_for_a_recreation(self, hog_stack, client, caplog):
+        """The cost of the skipped pre-flight, measured rather than
+        argued: with a warm writer cache the recreation is caught by the
+        server's `expected_table_uuid` guard AFTER the upload, so that
+        flush's parquet is in the bucket with nothing referencing it.
+
+        This is the trade the zero-read flush makes — one flush's objects
+        for one table GET per flush, forever — and the orphan counter and
+        its log are the whole accounting for it, so they are what gets
+        asserted."""
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2))
+            before = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+            ns = client.catalog(cfg.hoglake_catalog).namespace(cfg.hoglake_namespace)
+            ns.table(cfg.hoglake_table).drop(**_EXTERNAL_DROP)
+            ns.create_table(cfg.hoglake_table, table_schema_for_batch(_batch(1).schema))
+            with caplog.at_level(logging.WARNING, logger="millpond.hoglake"):
+                with pytest.raises(HoglakeSinkError, match="recreated") as caught:
+                    sink.write(_batch(2))
+            assert isinstance(caught.value.__cause__, IncarnationChangedError)
+            assert is_retryable(caught.value) is True
+        finally:
+            sink.close()
+        after = {o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")}
+        orphans = after - before
+        assert len(orphans) == 1, "the refused flush's upload should be in the bucket, unreferenced"
+        assert "Orphaned 1 uploaded parquet file(s)" in caplog.text
+        for path in orphans:
+            assert path in caplog.text
+        assert _record_count(client, cfg) == 0  # nothing published to the new incarnation
+
+
+class TestOneRequestPerFlush:
+    """The wire-level form of the zero-reads claim, which the unit tests
+    cannot make.
+
+    They assert on the mock handles millpond itself calls, so they are
+    blind to anything pyhoglake issues inside `prepare_append_tables` —
+    its catalog head refresh, its incarnation re-resolve. What an
+    operator cares about is the request count against the control plane,
+    so count THAT: an httpx event hook on the sink's own client, which
+    already has one for `Retry-After`.
+    """
+
+    def _counted(self, sink) -> list[str]:
+        """Every catalog request this sink makes, newest last."""
+        seen: list[str] = []
+
+        def record(response):
+            seen.append(f"{response.request.method} {response.request.url.path}")
+
+        sink._client._http.event_hooks["response"].append(record)
+        return seen
+
+    def test_the_steady_state_flush_is_one_commit_and_nothing_else(self, hog_stack, client):
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(3, teams=(1,)))  # bootstrap: creates, declares, reconciles
+            seen = self._counted(sink)
+            for i in range(5):
+                sink.write(_batch(3, teams=(1, 2)), kafka_offsets=(("events", 0, i, i),))
+        finally:
+            sink.close()
+        # FLAT, and flat at one: five flushes, five requests, every one
+        # of them the commit. Not "few" — exactly the commits, because a
+        # per-flush table GET carried a live-totals scan and the point of
+        # the whole change is that it is gone.
+        assert seen == ["POST /v1/catalogs/" + cfg.hoglake_catalog + "/commit/prepared"] * 5, seen
+
+    def test_the_bootstrap_flush_is_the_only_one_that_reads(self, hog_stack, client):
+        # The reads that remain, named: resolve the catalog, resolve (or
+        # create) namespace and table, reconcile the specs. All of them
+        # are once per sink, and the assertion is that the SECOND flush
+        # adds none of them back.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        seen = self._counted(sink)
+        try:
+            sink.write(_batch(2), kafka_offsets=(("events", 0, 0, 1),))
+            bootstrap = len(seen)
+            sink.write(_batch(2), kafka_offsets=(("events", 0, 2, 3),))
+        finally:
+            sink.close()
+        assert len(seen) - bootstrap == 1, seen[bootstrap:]
+        assert seen[-1].endswith("/commit/prepared")
+
+    def test_no_read_asks_for_the_live_totals(self, hog_stack, client):
+        """The totals scan is a count and two sums over every live file
+        row of the table; the writer has never read one. Asserted on the
+        wire, so it covers pyhoglake's reads and not only millpond's.
+
+        The selector is the ENDPOINT, not the query string. Selecting on
+        `totals=` was a tautology: a read that omitted the parameter —
+        the exact regression this test exists to catch — was filtered
+        out of the set before the assertion ran, so the only way to fail
+        was to send `totals=true` explicitly, which no code path does.
+
+        Fixing that immediately found one such read, which is why the
+        assertion below is in two parts. `Namespace.table(name)` —
+        pyhoglake's table RESOLVE, which `_ensure_table` calls — issues a
+        bare `GET /tables/<name>` and takes no parameter at all, so it
+        pays the live-totals scan and millpond cannot ask it not to.
+        That is one scan per resolve (per sink, plus one per
+        `reset_caches()`), never per flush, so it does not touch the
+        steady-state claim above; the bound here is what keeps it that
+        way. Removing it needs a `totals` argument on `Namespace.table`
+        upstream.
+        """
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        requests: list[tuple[str, str, str]] = []
+        sink._client._http.event_hooks["response"].append(
+            lambda r: requests.append((r.request.method, r.request.url.path, str(r.request.url)))
+        )
+        try:
+            sink.write(_batch(2))
+            sink.write(_batch(2))
+        finally:
+            sink.close()
+        # Every GET of a single table, whatever it asked for: the path
+        # ends at `/tables/<name>` with no further segment (so `/files`,
+        # `/scan`, `/alter` and the table LIST are all out).
+        table_endpoint = re.compile(r"/tables/[^/]+$")
+        table_gets = [url for method, path, url in requests if method == "GET" and table_endpoint.search(path)]
+        assert table_gets, "no table read happened at all; this test would pass vacuously"
+        asked = [url for url in table_gets if "totals=" in url]
+        unasked = [url for url in table_gets if "totals=" not in url]
+        # Every read that CAN say so, does.
+        assert asked, "no read carried the parameter at all; this half would pass vacuously"
+        assert all("totals=false" in url for url in asked), asked
+        # And the only reads that cannot are the resolves: one sink, two
+        # flushes, no reset between them, so exactly one. A millpond read
+        # that stopped passing `totals=False` would land in this bucket
+        # and break the count — which is the property the old
+        # query-string selector did not have.
+        assert len(unasked) == 1, unasked
+
+
+class TestAtLeastOnce:
+    def test_server_outage_no_offset_advance_then_clean_retry(self, hog_stack, client):
+        """The at-least-once sequencing against a real outage: stop the
+        server, drive main._flush (real sink, mock kafka) — the write
+        raises through the retry budget and offsets are never committed;
+        restart the server, flush again — rows land exactly once and the
+        offset commit fires."""
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        kafka = MagicMock()
+        offsets = {("topic", 0): (7, 10)}
+        batch = _batch(4)
+        try:
+            sink.write(_batch(1))  # bootstrap while healthy
+
+            stack.compose("stop", "hoglake-server")
+            try:
+                # Connection refused, through the full retry budget: a
+                # transport failure, never a verdict on the request.
+                with pytest.raises(httpx.HTTPError):
+                    _flush(sink, cfg, kafka, batch, batch.nbytes, 4, offsets, 1.0)
+                kafka.commit.assert_not_called()
+            finally:
+                stack.compose("start", "hoglake-server")
+                stack.wait_http_ok(f"{stack.SERVER_URL}/healthz")
+
+            # Clean retry after recovery: same batch, offsets commit once.
+            sink.reset_caches()
+            _flush(sink, cfg, kafka, batch, batch.nbytes, 4, offsets, 1.0)
+            kafka.commit.assert_called_once()
+            committed = kafka.commit.call_args.kwargs["offsets"]
+            assert committed[0].offset == 11  # +1 next-to-fetch
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 5  # 1 bootstrap + 4, no duplicates
+
+    def test_write_survives_transient_500s_via_retry_path(self, hog_stack, client):
+        # Sanity: a healthy server + the retry helper writes exactly once.
+        from millpond.main import _write_with_retry
+
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            written = _write_with_retry(sink, _batch(2))
+        finally:
+            sink.close()
+        assert written == 2
+        assert _record_count(client, cfg) == 2
+
+
+class TestColumnHygieneLive:
+    def test_hog_prefixed_and_unsafe_columns_dropped_not_fatal(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            n = sink.write(
+                pa.table(
+                    {
+                        "uuid": ["a"],
+                        "_hog_row_id": [9],
+                        "bad-name": ["x"],
+                        "team_id": [1],
+                    }
+                )
+            )
+        finally:
+            sink.close()
+        assert n == 1
+        names = {c.name for c in _table(client, cfg).columns}
+        assert "_hog_row_id" not in names
+        assert "bad-name" not in names
+        assert _record_count(client, cfg) == 1
+
+
+class TestUuidColumnLive:
+    """`MILLPOND_TYPED_COLUMNS=uuid:uuid` end to end against the real server.
+
+    The coercer turns the ClickHouse-events UUID strings into `pa.uuid()`;
+    this pins that the server types the column `uuid` (not `string`, not
+    `binary`) and that the parquet the sink uploads carries the UUID logical
+    annotation an Iceberg reader binds the column through.
+    """
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    OTHER = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    def _pinned_batch(self) -> pa.Table:
+        from millpond.arrow_converter import coerce_typed_columns
+
+        raw = pa.table(
+            {
+                "uuid": pa.array([self.CANONICAL, self.OTHER, None], pa.string()),
+                "person_id": pa.array([None, None, None], pa.string()),
+                "event": ["pageview"] * 3,
+                "team_id": [1, 1, 1],
+            }
+        )
+        batch = coerce_typed_columns(raw, (("uuid", "uuid"), ("person_id", "uuid")))
+        assert batch.schema.field("uuid").type == pa.uuid()
+        # An all-null pinned column must still arrive typed, or the table is
+        # created with a string `person_id` that no later flush can narrow.
+        assert batch.schema.field("person_id").type == pa.uuid()
+        return batch
+
+    def test_server_types_the_column_uuid(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._pinned_batch()) == 3
+        finally:
+            sink.close()
+        types = {c.name: c.type for c in _table(client, cfg).columns}
+        assert types["uuid"] == "uuid"
+        assert types["person_id"] == "uuid"
+        assert types["event"] == "string"
+        assert _record_count(client, cfg) == 3
+
+    def test_uploaded_parquet_carries_the_uuid_annotation(self, hog_stack, client):
+        """The commit lands AND the object's footer says UUID.
+
+        Both halves matter and they used to be mutually exclusive. `_prepare`
+        casts each batch to `columns_to_arrow_schema(info.columns)`; before
+        pyhoglake 1.3.0 that named plain `pa.binary(16)`, for which pyarrow
+        stamps no logical type, and writing the annotated form anyway had
+        `prepare_append_files` refuse the file outright —
+        `parquet.schema_arrow.equals(columns_to_arrow_schema(...))` is an exact
+        compare, so the extension-typed column came back as "prepared Parquet
+        schema/field IDs differ from destination" (observed against this very
+        server). 1.3.0 moved both sides: the schema names `pa.uuid()` and
+        append accepts either spelling.
+        """
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._pinned_batch()) == 3
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+        paths = _list_objects(DATA_PATH, cfg)
+        assert len(paths) == 1
+        s3 = _minio()
+        with s3.open_input_file(paths[0]) as f:
+            pf = pq.ParquetFile(f)
+            by_name = {pf.schema.column(i).name: pf.schema.column(i) for i in range(pf.metadata.num_columns)}
+            for name in ("uuid", "person_id"):
+                assert by_name[name].physical_type == "FIXED_LEN_BYTE_ARRAY"
+                assert by_name[name].length == 16
+                assert str(by_name[name].logical_type) == "UUID"
+            assert pf.schema_arrow.field("uuid").type == pa.uuid()
+            table = pf.read()
+        assert table.column("uuid").to_pylist() == [
+            uuid.UUID(self.CANONICAL),
+            uuid.UUID(self.OTHER),
+            None,
+        ]
+
+    def test_a_bare_fixed_size_binary_file_still_prepares(self, hog_stack, client):
+        """The mixed-fleet half of the 1.3.0 contract: append accepts BOTH
+        spellings, so a pod that predates this pin — one whose `_prepare` cast
+        named `pa.binary(16)` — keeps writing to the same table.
+
+        Driven at the pyhoglake boundary rather than through the sink, because
+        the sink can no longer produce the old spelling: the schema it casts to
+        comes from the installed pyhoglake.
+        """
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(self._pinned_batch())
+            table = _table(client, cfg)
+            bare = pa.schema(
+                [
+                    field.with_type(pa.binary(16)) if field.type == pa.uuid() else field
+                    for field in columns_to_arrow_schema(table.info().columns)
+                ]
+            )
+            assert bare.field("uuid").type == pa.binary(16)
+            rows = (
+                pa.table(
+                    {
+                        "uuid": pa.array([uuid.UUID(self.OTHER).bytes], pa.binary(16)),
+                        "person_id": pa.nulls(1, pa.binary(16)),
+                        "event": ["pageview"],
+                        "team_id": pa.array([1], pa.int64()),
+                        "_inserted_at": pa.array([datetime.now(UTC)], pa.timestamp("us", tz="UTC")),
+                    }
+                )
+                .select(list(bare.names))
+                .cast(bare)
+            )
+            with tempfile.TemporaryDirectory(prefix="millpond-bare-") as tmp:
+                path = os.path.join(tmp, "part-0.parquet")
+                pq.write_table(rows, path)
+                assert pq.ParquetFile(path).schema.column(0).logical_type.type == "NONE"
+                # `prepare_append_files`, not `_tables`: the FILE path is
+                # what a variant-aware or old-spelling writer uses, and
+                # the bare `fixed_size_binary(16)` form cannot be
+                # produced from Arrow through the table path at all.
+                payload = table.prepare_append_files([(path, None)], idempotency_key=str(uuid.uuid4()))
+            # `read_snapshot` stays on, as it does on every millpond
+            # commit now: appends do not conflict with appends, so the
+            # basis costs this commit nothing and sending it is the shape
+            # the fleet is moving to.
+            client.catalog(cfg.hoglake_catalog).commit_prepared(payload, table=table)
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 4
+
+    def test_second_flush_appends_without_schema_drift(self, hog_stack, client):
+        # The coerced type must reconcile against the live `uuid` column, not
+        # try to add or widen it every flush.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(self._pinned_batch())
+            sink.write(self._pinned_batch())
+        finally:
+            sink.close()
+        types = {c.name: c.type for c in _table(client, cfg).columns}
+        assert types["uuid"] == "uuid"
+        assert _record_count(client, cfg) == 6
+
+
+class TestUuidPinOnAStringColumnLive:
+    """B1 against the real server: the pin arriving at a table whose column is
+    already `string` — the state every existing table is in, `events_raw` in
+    dev included, because the column was created from unpinned batches.
+
+    Before the degradation arm this was a permanent wedge, not a degraded
+    flush: `cast(pa.uuid() -> string)` reinterprets the 16 bytes as UTF-8 and
+    raises `ArrowInvalid: Invalid UTF8 payload` on every attempt, so the
+    offsets never commit and the restart re-consumes the same batch forever.
+    """
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    OTHER = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    def _pinned(self, values):
+        from millpond.arrow_converter import coerce_typed_columns
+
+        batch = coerce_typed_columns(
+            pa.table(
+                {
+                    "uuid": pa.array(values, pa.string()),
+                    "event": ["pageview"] * len(values),
+                    "team_id": [1] * len(values),
+                }
+            ),
+            (("uuid", "uuid"),),
+        )
+        assert batch.schema.field("uuid").type == pa.uuid()
+        return batch
+
+    def test_pin_on_an_existing_string_column_degrades_to_text(self, hog_stack, client):
+        cfg = _fresh()
+
+        # 1. Unpinned flush creates the table with `uuid` as a string column —
+        #    exactly how every table that predates the pin was created.
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(_batch(2)) == 2
+        finally:
+            sink.close()
+        assert {c.name: c.type for c in _table(client, cfg).columns}["uuid"] == "string"
+
+        # 2. Now the operator adds `uuid:uuid`. The flush must land, not wedge.
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._pinned([self.CANONICAL, None, self.OTHER])) == 3
+        finally:
+            sink.close()
+
+        # The column is still `string` — hoglake has no string->uuid promotion,
+        # so no DDL was attempted — and the rows are canonical UUID text.
+        assert {c.name: c.type for c in _table(client, cfg).columns}["uuid"] == "string"
+        assert _record_count(client, cfg) == 5
+        written = sorted(
+            v for path in _list_objects(DATA_PATH, cfg) for v in _read_parquet(path).column("uuid").to_pylist() if v
+        )
+        assert self.CANONICAL in written
+        assert self.OTHER in written
+
+    def test_repeated_flushes_keep_landing(self, hog_stack, client):
+        # The wedge was permanent, so "it worked once" is not the property
+        # under test — every subsequent flush has to land too.
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(1))
+            sink.write(self._pinned([self.CANONICAL]))
+            sink.write(self._pinned([self.OTHER]))
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+
+
+class TestUuidPinRollbackLive:
+    """B1's mirror against the real server: a live `uuid` column and an
+    UNPINNED string batch.
+
+    The rollback direction, and the mixed-fleet one — a pod that has not taken
+    the new config writes to a table another pod created with the pin. Before
+    the rewrite arm this raised `ArrowInvalid: Failed casting from string to
+    fixed_size_binary[16]: widths must match`, which the retry path correctly
+    calls permanent, so the flush died on attempt 1 with offsets uncommitted.
+    """
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    OTHER = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    def _pinned(self, values):
+        from millpond.arrow_converter import coerce_typed_columns
+
+        return coerce_typed_columns(
+            pa.table(
+                {
+                    "uuid": pa.array(values, pa.string()),
+                    "event": ["pageview"] * len(values),
+                    "team_id": [1] * len(values),
+                }
+            ),
+            (("uuid", "uuid"),),
+        )
+
+    def _unpinned(self, values):
+        return pa.table(
+            {
+                "uuid": pa.array(values, pa.string()),
+                "event": ["pageview"] * len(values),
+                "team_id": [1] * len(values),
+            }
+        )
+
+    def test_unpinned_batch_lands_on_a_uuid_column(self, hog_stack, client):
+        cfg = _fresh()
+
+        # 1. A pinned flush creates the table with a real `uuid` column.
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._pinned([self.CANONICAL])) == 1
+        finally:
+            sink.close()
+        assert {c.name: c.type for c in _table(client, cfg).columns}["uuid"] == "uuid"
+
+        # 2. The pin comes back off (or a stale pod flushes). Must land, and
+        #    keep landing — the wedge was permanent, not a one-off.
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(self._unpinned([self.OTHER, None])) == 2
+            assert sink.write(self._unpinned([self.CANONICAL])) == 1
+        finally:
+            sink.close()
+
+        assert {c.name: c.type for c in _table(client, cfg).columns}["uuid"] == "uuid"
+        assert _record_count(client, cfg) == 4
+        written = sorted(
+            v for path in _list_objects(DATA_PATH, cfg) for v in _read_parquet(path).column("uuid").to_pylist() if v
+        )
+        assert written == sorted(
+            [
+                uuid.UUID(self.CANONICAL),
+                uuid.UUID(self.CANONICAL),
+                uuid.UUID(self.OTHER),
+            ]
+        )
+
+    def test_non_uuid_text_is_nulled_not_fatal(self, hog_stack, client):
+        cfg = _fresh()
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(self._pinned([self.CANONICAL]))
+            assert sink.write(self._unpinned([self.OTHER, "not-a-uuid"])) == 2
+        finally:
+            sink.close()
+        assert _record_count(client, cfg) == 3
+        values = [v for path in _list_objects(DATA_PATH, cfg) for v in _read_parquet(path).column("uuid").to_pylist()]
+        assert None in values
+        assert uuid.UUID(self.OTHER) in values
+
+
+class TestCommitMessage:
+    """The snapshot's `message`, read back from the real catalog.
+
+    The offset ranges in it are the ONLY record of which Kafka positions
+    a snapshot holds — the author names the pipeline and the files name
+    object keys, and nothing else connects a published snapshot to a
+    position in the topic. The unit tests pin the format; these pin that
+    it survives the wire, the server and the read back.
+    """
+
+    TOPIC = "clickhouse_events_json"
+    OFFSETS = ((TOPIC, 3, 4128819, 4155470), (TOPIC, 19, 4130021, 4156802))
+
+    def test_the_snapshot_carries_the_offsets_it_published(self, hog_stack, client):
+        cfg = _fresh()
+        batch = _batch(4)
+        sink = HoglakeSink(cfg)
+        try:
+            assert sink.write(batch, kafka_offsets=self.OFFSETS, trigger="size") == 4
+        finally:
+            sink.close()
+
+        snapshots = _snapshots(client, cfg)
+        assert len(snapshots) == 1
+        summary, offsets = snapshots[0].message.split("\n")
+        live_uuid = _table(client, cfg).info().table_uuid
+        assert summary == (
+            f"records=4 files=1 partitions=0 arrow_bytes={batch.nbytes} codec=zstd-3 stats=deferred trigger=size "
+            f"millpond={cfg.service_version} table={live_uuid}"
+        )
+        assert offsets == f"offsets {self.TOPIC} p3:4128819-4155470 p19:4130021-4156802 (2)"
+        # The author is unchanged by any of this.
+        assert snapshots[0].author == f"millpond/{cfg.hoglake_table}/0"
+
+    def test_a_partitioned_flush_counts_its_files_and_partition_tuples(self, hog_stack, client):
+        cfg = _fresh(hoglake_partition_by=(("team_id", "identity", None),))
+        batch = _batch(9, teams=(1, 2, 3))
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(batch, kafka_offsets=self.OFFSETS, trigger="time")
+        finally:
+            sink.close()
+
+        summary = _snapshots(client, cfg)[-1].message.split("\n")[0]
+        # Three tuples, one file each; `time` is the metric's name for
+        # the interval trigger and the message says `interval`.
+        assert summary.startswith(
+            f"records=9 files=3 partitions=3 arrow_bytes={batch.nbytes} codec=zstd-3 stats=deferred trigger=interval "
+        )
+        assert len(_table(client, cfg).files()) == 3
+
+    def test_main_flush_labels_the_trigger_all_the_way_through(self, hog_stack, client):
+        # The seam end to end: main._flush -> _sink_write_kwargs ->
+        # HoglakeSink.write -> the commit -> the catalog.
+        cfg = _fresh()
+        batch = _batch(2)
+        sink = HoglakeSink(cfg)
+        try:
+            _flush(sink, cfg, MagicMock(), batch, batch.nbytes, 2, {(self.TOPIC, 3): (30, 41)}, 1.0, "final")
+        finally:
+            sink.close()
+
+        summary, offsets = _snapshots(client, cfg)[-1].message.split("\n")
+        assert " trigger=final " in summary
+        assert offsets == f"offsets {self.TOPIC} p3:30-41 (1)"
+
+    def test_a_replayed_commit_leaves_one_snapshot_with_the_same_message(self, hog_stack, client):
+        # The lost-response case. The retry re-sends the payload
+        # verbatim, the server answers from its receipt, and the catalog
+        # holds ONE snapshot whose message still describes that flush.
+        cfg = _fresh()
+        batch = _batch(5)
+        sink = HoglakeSink(cfg)
+        # The same harness TestIdempotentPublication uses: let the commit
+        # reach the server and apply, then destroy the response.
+        http = sink._client._http
+        real = http.request
+        state = {"dropped": False}
+
+        def request(method, url, **kwargs):
+            response = real(method, url, **kwargs)
+            if not state["dropped"] and method == "POST" and "/commit" in str(url):
+                state["dropped"] = True
+                raise httpx.ReadTimeout("response lost in transit", request=response.request)
+            return response
+
+        http.request = request
+        try:
+            with pytest.raises(httpx.ReadTimeout):
+                sink.write(batch, kafka_offsets=self.OFFSETS, trigger="size")
+            assert sink.write(batch, kafka_offsets=self.OFFSETS, trigger="size") == 5
+        finally:
+            sink.close()
+        assert state["dropped"]
+
+        snapshots = _snapshots(client, cfg)
+        assert len(snapshots) == 1, "the replay published a second snapshot"
+        assert snapshots[0].message.split("\n")[1] == (
+            f"offsets {self.TOPIC} p3:4128819-4155470 p19:4130021-4156802 (2)"
+        )
+
+
+class TestDdlAttribution:
+    """Every DDL the sink issues reaches the server with an author and a
+    message, and the server keeps them on the snapshot. The unit tests
+    pin the text; these pin that it is on the wire (the request body as
+    sent, not the keywords handed to pyhoglake) and in the catalog's
+    snapshot feed afterwards."""
+
+    def _record_requests(self, monkeypatch) -> list[tuple[str, str, dict]]:
+        """Every catalog request with a JSON body, as (method, path,
+        body) decoded from the bytes httpx actually sent. Patched on the
+        class because the catalog is created inside the sink's
+        constructor, before any instance hook could be installed."""
+        sent: list[tuple[str, str, dict]] = []
+        real = httpx.Client.request
+
+        def request(self, method, url, **kwargs):
+            response = real(self, method, url, **kwargs)
+            if response.request.content:
+                sent.append((method, response.request.url.path, json.loads(response.request.content)))
+            return response
+
+        monkeypatch.setattr(httpx.Client, "request", request)
+        return sent
+
+    def test_bootstrap_and_evolution_are_attributed_on_the_wire_and_in_the_catalog(
+        self, hog_stack, client, monkeypatch
+    ):
+        tag = uuid.uuid4().hex[:8]
+        cfg = _fresh(
+            hoglake_catalog=f"millpond-it-ddl-{tag}",
+            hoglake_data_path=f"s3://{BUCKET}/ddl-{tag}/",
+            hoglake_namespace="ddl",
+            hoglake_partition_by=(("team_id", "identity", None),),
+            sort_by=("uuid",),
+            typed_columns=(("team_id", "bigint"),),
+        )
+        author = f"millpond/{cfg.hoglake_table}/0"
+        sent = self._record_requests(monkeypatch)
+        sink = HoglakeSink(cfg)
+        try:
+            sink.write(_batch(2, extra_cols={"count": pa.array([1, 2], pa.int32())}))
+            # One flush carrying both evolution ops: a new column and a
+            # widening of `count` int -> long.
+            sink.write(_batch(2, extra_cols={"count": pa.array([2**40, 3], pa.int64()), "extra": ["x", "y"]}))
+        finally:
+            sink.close()
+
+        create_table = (
+            f"first flush of events_json: create table ddl.{cfg.hoglake_table} with 6 columns from the batch; "
+            "HOGLAKE_PARTITION_BY=identity(team_id); MILLPOND_SORT_BY=uuid; MILLPOND_TYPED_COLUMNS=team_id:bigint"
+        )
+        declare = (
+            "first flush of events_json: declare partition spec and sort order; "
+            "HOGLAKE_PARTITION_BY=identity(team_id); MILLPOND_SORT_BY=uuid"
+        )
+        add = "schema evolution from events_json: add column extra (string)"
+        promote = "schema evolution from events_json: promote column count from int to long"
+        expected = {
+            "/v1/catalogs": (
+                f"startup for events_json: create catalog {cfg.hoglake_catalog}; "
+                f"HOGLAKE_DATA_PATH={cfg.hoglake_data_path}"
+            ),
+            f"/v1/catalogs/{cfg.hoglake_catalog}/namespaces": "first flush of events_json: create namespace ddl",
+            f"/v1/catalogs/{cfg.hoglake_catalog}/namespaces/ddl/tables": create_table,
+        }
+        ddl = [(path, body) for method, path, body in sent if method == "POST" and not path.endswith("/commit")]
+        for path, message in expected.items():
+            bodies = [body for p, body in ddl if p == path]
+            assert len(bodies) == 1, f"expected one POST {path}, saw {[p for p, _ in ddl]}"
+            assert (bodies[0].get("author"), bodies[0].get("message")) == (author, message)
+        alters = [body for p, body in ddl if p.endswith(f"/tables/{cfg.hoglake_table}/alter")]
+        assert [(body.get("author"), body.get("message")) for body in alters] == [
+            (author, declare),
+            (author, add),
+            (author, promote),
+        ]
+
+        # And persisted: the server records both fields on the snapshot
+        # each DDL produced, read back from GET /v1/catalogs/{c}/snapshots.
+        # Catalog creation is the exception — it precedes the catalog's
+        # snapshot history, so its attribution lands in the server's
+        # audit log only, which the API does not serve; the wire check
+        # above is all that can be asserted for it from here.
+        recorded = [s.message for s in _authored(client, cfg) if s not in _snapshots(client, cfg)]
+        for message in (
+            expected[f"/v1/catalogs/{cfg.hoglake_catalog}/namespaces"],
+            create_table,
+            declare,
+            add,
+            promote,
+        ):
+            assert message in recorded, f"{message!r} not on any snapshot; snapshots carry {recorded}"
+
+
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    PROPERTIES_SV as _PROPERTIES_SV,
+)
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    TS_TYPE as _TS_TYPE,
+)
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    VARIANT_NAMES as _VARIANT_NAMES,
+)
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    precreate as _precreate_variant_table_in,
+)
+
+
+def _precreate_variant_table(client, cfg, *, object_prefix: bool = False, team_id_nullable: bool = True):
+    """The setup script's work (tests/hoglake_stack/variant_table.py); the
+    catalog is the sink's (constructing a HoglakeSink first ensures it).
+    `object_prefix` adds `set_object_prefix_field team_id` on the empty
+    table; `team_id_nullable=False` declares the column NOT NULL."""
+    return _precreate_variant_table_in(
+        client,
+        cfg.hoglake_catalog,
+        cfg.hoglake_namespace,
+        cfg.hoglake_table,
+        object_prefix=object_prefix,
+        team_id_nullable=team_id_nullable,
+    )
+
+
+def _variant_cfg(**overrides) -> HogCfg:
+    settings = {
+        "hoglake_partition_by": (("team_id", "identity", None), ("timestamp", "month", None)),
+        "sort_by": ("timestamp",),
+        # Shipped stats: the stack runs no hydrator, and a `pending` file
+        # is neither mountable nor a compaction input. The object-prefix
+        # suite below overrides this to the production default (deferred):
+        # on such a table a deferred file registers the prefix field's
+        # stats (or every stat, at or over 1 MiB) and is `provided` anyway.
+        "hoglake_deferred_stats": False,
+    }
+    settings.update(overrides)
+    return _fresh(**settings)
+
+
+def _whale_rows(n: int, *, team: int = 1, month: str = "2026-09", start: int = 0) -> pa.Table:
+    """n events_json-shaped rows for one (team, month): every variant
+    source present as the JSON string the arrow_converter produces, with
+    the mix the encoder must handle — declared keys typed, undeclared
+    keys in the residual, a wrong-typed declared key (`age`), a JSON
+    `null`, SQL NULL (the key was absent), and invalid text. The group
+    columns are sparse: group0 on even rows, the rest absent."""
+    ts = pa.array([f"{month}-01T12:00:{(start + i) % 60:02d}Z" for i in range(n)]).cast(_TS_TYPE)
+
+    def props(i: int) -> str | None:
+        k = (start + i) % 6
+        if k == 4:
+            return None  # absent upstream -> SQL NULL
+        if k == 5:
+            return "not json {"  # invalid -> SQL NULL under `null`, counted
+        return json.dumps(
+            {
+                "$browser": ["Chrome", "Safari", "Firefox", "Edge"][k],
+                "$current_url": f"https://ex.am/ple/{start + i}",
+                "$lib": "web" if k else None,  # a JSON null under a declared key
+                "custom": {"depth": [1, 2, {"x": k}]},  # undeclared, nested
+                "n": start + i,
+            }
+        )
+
+    return pa.table(
+        {
+            "uuid": [f"u{start + i}" for i in range(n)],
+            "event": ["pageview"] * n,
+            "team_id": [team] * n,
+            "timestamp": ts,
+            "properties": [props(i) for i in range(n)],
+            "person_properties": [json.dumps({"email": f"p{start + i}@ex.am", "age": "thirty"}) for i in range(n)],
+            "group0_properties": [json.dumps({"name": "acme"}) if i % 2 == 0 else None for i in range(n)],
+        }
+    )
+
+
+def _server_metric(name: str) -> float:
+    """Sum of a server counter over its label sets, off the stack's
+    unauthenticated infra listener (HOGLAKE_METRICS_PORT in the compose
+    file). Absent from the exposition (never incremented) reads as 0."""
+    from prometheus_client.parser import text_string_to_metric_families
+
+    text = httpx.get("http://127.0.0.1:29090/metrics", timeout=10).text
+    total = 0.0
+    for family in text_string_to_metric_families(text):
+        for sample in family.samples:
+            if sample.name in (name, f"{name}_total"):
+                total += sample.value
+    return total
+
+
+def _compact(client, cfg) -> int:
+    """Run the server's compaction by hand (the stack's loop is off), as
+    pyhoglake's own compaction test does, until a sweep finds nothing."""
+    catalog = client.catalog(cfg.hoglake_catalog)
+    compacted = 0
+    for _ in range(5):
+        result = catalog._client._request("POST", catalog._path("/maintenance/compact"), params={"batch": 10})
+        compacted += result["groups_compacted"]
+        if result["groups_compacted"] == 0:
+            break
+    return compacted
+
+
+def _expected_rows(batches: list[pa.Table]) -> dict[str, int]:
+    """What `millpond_variant_rows_total{outcome}` must book for these
+    batches, exactly: column-rows over the seven variant columns. A
+    column the batch lacks is null-filled (SQL NULL every row); a None is
+    SQL NULL; the one invalid text is invalid; everything else encodes."""
+    counts = {"encoded": 0, "sql_null": 0, "invalid": 0}
+    for batch in batches:
+        for name in _VARIANT_NAMES:
+            if name not in batch.schema.names:
+                counts["sql_null"] += batch.num_rows
+                continue
+            for text in batch.column(name).to_pylist():
+                if text is None:
+                    counts["sql_null"] += 1
+                elif text == "not json {":
+                    counts["invalid"] += 1
+                else:
+                    counts["encoded"] += 1
+    return counts
+
+
+def _expected_values(batches: list[pa.Table]) -> dict[tuple[str, str, str], int]:
+    """What `millpond_variant_values_total{column,path,outcome}` must book
+    for the declared paths these tests assert on."""
+    props = [
+        json.loads(t) if t and t.startswith("{") else None for b in batches for t in b.column("properties").to_pylist()
+    ]
+    objects = [p for p in props if p is not None]
+    return {
+        ("properties", "$", "typed"): len(objects),
+        ("properties", "$.$browser", "typed"): sum(1 for p in objects if isinstance(p.get("$browser"), str)),
+        ("properties", "$.$lib", "variant_null"): sum(1 for p in objects if "$lib" in p and p["$lib"] is None),
+        ("properties", "$.$lib", "typed"): sum(1 for p in objects if isinstance(p.get("$lib"), str)),
+        # `age` is declared int64 and sent as text on every person row.
+        ("person_properties", "$.age", "fallback"): sum(b.num_rows for b in batches),
+        ("person_properties", "$.email", "typed"): sum(b.num_rows for b in batches),
+    }
+
+
+def _variant_metric_snapshot() -> dict[str, dict]:
+    """The variant series this suite asserts exact deltas on, read off the
+    live registry. Read inside the fixture, immediately before and after
+    the writes, so another class's writes cannot land in between."""
+    from millpond import metrics
+    from millpond.hoglake import _CODEC_ENCODE_REASONS, _CODEC_ROUTED
+
+    outcomes = ("encoded", "sql_null", "invalid")
+    return {
+        "rows": {o: metrics.variant_rows_total.labels(outcome=o)._value.get() for o in outcomes},
+        "invalid": {"invalid_json": metrics.variant_invalid_total.labels(reason="invalid_json")._value.get()},
+        "values": {
+            (c, p, o): metrics.variant_values_total.labels(column=c, path=p, outcome=o)._value.get()
+            for c, p, o in _expected_values([_whale_rows(1)]).keys()
+        },
+        "routed": {
+            (op, r): metrics.variant_codec_routed_to_python_total.labels(op=op, reason=r)._value.get()
+            for op, r in _CODEC_ROUTED
+        },
+        "fallback": {
+            r: metrics.variant_codec_fallback_total.labels(reason=r)._value.get() for r in _CODEC_ENCODE_REASONS
+        },
+        "encode_count": _registry_sum(metrics._variant_encode_seconds, "_count"),
+        "orphans": _registry_sum(metrics._hoglake_orphaned_files_total, "_total"),
+    }
+
+
+def _registry_sum(metric, suffix: str) -> float:
+    """Sum of one raw metric's samples with `suffix`, over every label set."""
+    return sum(s.value for m in metric.collect() for s in m.samples if s.name.endswith(suffix))
+
+
+def _delta(after: dict, before: dict) -> dict:
+    out = {}
+    for k, value in after.items():
+        out[k] = {kk: value[kk] - before[k][kk] for kk in value} if isinstance(value, dict) else value - before[k]
+    return out
+
+
+class TestVariantColumnsLive:
+    """The whales shape against a real server: a PRE-CREATED table whose
+    seven JSON columns are declared `variant` (D1, D2), written by the
+    sink from the same string columns the arrow_converter produces, read
+    back through pyhoglake's decoder. Every test here reads the fixture's
+    table and changes nothing about it; the compaction and raise-mode
+    tests below use tables of their own, so this class passes in any
+    order and under `-k`."""
+
+    @pytest.fixture(scope="class")
+    def written(self, hog_stack, client):
+        cfg = _variant_cfg()
+        sink = HoglakeSink(cfg)  # ensures the catalog
+        table = _precreate_variant_table(client, cfg)
+        column = {c.name: c for c in table.columns}
+        # Six flushes into ONE (team, month) group, plus one flush fanning
+        # out over two more teams and another month.
+        batches = [_whale_rows(12, team=1, month="2026-09", start=12 * i) for i in range(6)]
+        batches.append(
+            pa.concat_tables(
+                [
+                    _whale_rows(5, team=2, month="2026-09", start=100),
+                    _whale_rows(5, team=3, month="2026-10", start=200),
+                ]
+            )
+        )
+        before = _variant_metric_snapshot()
+        published = 0
+        for i, batch in enumerate(batches):
+            published += sink.write(batch, kafka_offsets=(("whales", 0, 100 * i, 100 * i + batch.num_rows - 1),))
+        after = _variant_metric_snapshot()
+        sink.close()
+        yield {
+            "cfg": cfg,
+            "table": table,
+            "column": column,
+            "batches": batches,
+            "published": published,
+            "metrics": _delta(after, before),
+            "codec": sink._variant_backend,
+        }
+
+    def _expected(self, batches: list[pa.Table], name: str) -> dict[str, object]:
+        """uuid -> the Python value `to_python` should give for `name`:
+        the parsed text, VARIANT_NULL for the text `null`, None for SQL
+        NULL and for text the encoder refused."""
+        from pyhoglake import variant
+
+        out: dict[str, object] = {}
+        for batch in batches:
+            texts = batch.column(name).to_pylist() if name in batch.schema.names else [None] * batch.num_rows
+            for uuid_, text in zip(batch.column("uuid").to_pylist(), texts, strict=True):
+                if text is None:
+                    out[uuid_] = None
+                    continue
+                try:
+                    value = json.loads(text)
+                except ValueError:
+                    out[uuid_] = None
+                    continue
+                out[uuid_] = variant.VARIANT_NULL if value is None else value
+        return out
+
+    def test_every_row_lands_and_the_table_keeps_its_declared_shape(self, client, written):
+        cfg, table = written["cfg"], written["table"]
+        assert written["published"] == sum(b.num_rows for b in written["batches"]) == 82
+        assert _record_count(client, cfg) == 82
+        # millpond altered nothing: the shape is the setup script's.
+        info = table.info()
+        assert {c.name: c.type for c in info.columns if c.type == "variant"} == dict.fromkeys(_VARIANT_NAMES, "variant")
+        assert info.columns[4].type_params == {"shredding": _PROPERTIES_SV}
+        assert [f.transform for f in info.partition_spec.fields] == ["identity", "month"]
+        assert len(_authored(client, cfg)) == len(_snapshots(client, cfg)), "the sink issued DDL on a pre-created table"
+
+    def test_files_are_provided_and_fanned_out_by_team_and_month(self, client, written):
+        # Wire form of `month(timestamp)` is the month ordinal since
+        # 1970-01 (Iceberg): 2026-09 is 680, 2026-10 is 681.
+        files = _table(client, written["cfg"]).files()
+        assert {f.stats_state for f in files} == {"provided"}
+        assert sorted(tuple(f.partition_values) for f in files) == sorted(
+            [("1", "680")] * 6 + [("2", "680"), ("3", "681")]
+        )
+
+    def test_variant_values_round_trip_through_the_decoder(self, client, written):
+        _back, decoded = _read_back_variant(client, written["cfg"], written["column"])
+        for name in _VARIANT_NAMES:
+            assert decoded[name] == self._expected(written["batches"], name), name
+
+    def test_declared_leaves_are_shredded_into_typed_value(self, client, written):
+        back, _decoded = _read_back_variant(client, written["cfg"], written["column"])
+        props = back.column("properties").combine_chunks()
+        assert set(props.type.names) == {"metadata", "value", "typed_value"}
+        typed = props.field("typed_value")
+        assert set(typed.type.names) == {f["name"] for f in _PROPERTIES_SV["fields"]}
+        texts = pa.concat_tables(written["batches"], promote_options="permissive").column("properties").to_pylist()
+        parsed = [json.loads(t) if t and t.startswith("{") else None for t in texts]
+        with_browser = sum(1 for p in parsed if p and isinstance(p.get("$browser"), str))
+        assert typed.field("$browser").field("typed_value").null_count == len(parsed) - with_browser
+        # `$lib` is a JSON null on every 6th row: a Variant null, kept in
+        # `value` (00), never in the typed leaf.
+        lib_null = sum(1 for p in parsed if p and "$lib" in p and p["$lib"] is None)
+        assert lib_null > 0
+        assert typed.field("$lib").field("value").null_count == len(parsed) - lib_null
+        # Undeclared keys stay in the object's residual `value`.
+        assert props.field("value").null_count == sum(1 for p in parsed if p is None)
+        # person_properties.age was declared int64 and sent as text: the
+        # value stays in the leaf's `value`, the typed side empty.
+        person = back.column("person_properties").combine_chunks().field("typed_value")
+        assert person.field("age").field("typed_value").null_count == len(parsed)
+        assert person.field("age").field("value").null_count == 0
+
+    def test_the_variant_metrics_describe_the_flushes_exactly(self, written):
+        # Deltas over the fixture's seven writes, read before and after
+        # them in the fixture itself: exact, not `>=`, and never an
+        # absolute off a counter other classes also move.
+        delta = written["metrics"]
+        batches = written["batches"]
+        assert delta["rows"] == _expected_rows(batches)
+        assert sum(delta["rows"].values()) == 82 * len(_VARIANT_NAMES)
+        assert delta["rows"]["invalid"] > 0
+        assert delta["invalid"] == {"invalid_json": delta["rows"]["invalid"]}
+        assert delta["values"] == _expected_values(batches)
+        # One encode observation per prepare: seven flushes, no rebuild.
+        assert delta["encode_count"] == len(batches)
+        assert delta["orphans"] == 0
+
+    def test_the_codec_was_native_for_every_call(self, written):
+        # The process resolved to the Rust codec AND no call was routed
+        # to Python under `auto` (a plan it does not take, text that is
+        # not UTF-8) or redone there (a fallback): the whales declaration
+        # is one the Rust codec takes whole.
+        from millpond import metrics
+
+        assert written["codec"] == "native"
+        assert metrics.variant_codec_info.labels(backend="native")._value.get() == 1
+        assert all(n == 0 for n in written["metrics"]["routed"].values()), written["metrics"]["routed"]
+        assert all(n == 0 for n in written["metrics"]["fallback"].values()), written["metrics"]["fallback"]
+
+
+def _read_back_variant(client, cfg, column) -> tuple[pa.Table, dict[str, dict[str, object]]]:
+    """Every live file as pyarrow reads it (variant storage as plain
+    structs), and per variant column uuid -> decoded value."""
+    from pyhoglake import variant
+
+    decoded: dict[str, dict[str, object]] = {name: {} for name in _VARIANT_NAMES}
+    tables = []
+    for f in _table(client, cfg).files():
+        back = _read_parquet(f.path)
+        tables.append(back)
+        uuids = back.column("uuid").to_pylist()
+        for name in _VARIANT_NAMES:
+            values = variant.to_python(back.column(name), column[name])
+            decoded[name].update(zip(uuids, values, strict=True))
+    return pa.concat_tables(tables, promote_options="permissive"), decoded
+
+
+class TestVariantCompactionLive:
+    """The server compacts millpond's variant files in their declared
+    layout (HOGLAKE_COMPACTION_VARIANT=true in the compose file). Its own
+    table, because compaction changes the file set every other test
+    reads; and the assertion is about THIS table's group, not about how
+    many groups the catalog-wide sweep happened to find."""
+
+    @pytest.fixture(scope="class")
+    def compacted(self, hog_stack, client):
+        cfg = _variant_cfg()
+        sink = HoglakeSink(cfg)
+        table = _precreate_variant_table(client, cfg)
+        column = {c.name: c for c in table.columns}
+        # Six provided files into the one (1, 2026-09) group: over the
+        # server's default HOGLAKE_COMPACTION_MIN_INPUT_FILES=5.
+        batches = [_whale_rows(12, team=1, month="2026-09", start=12 * i) for i in range(6)]
+        for i, batch in enumerate(batches):
+            sink.write(batch, kafka_offsets=(("whales-compact", 0, 100 * i, 100 * i + 11),))
+        sink.close()
+        inputs = _table(client, cfg).files()
+        _before, decoded_before = _read_back_variant(client, cfg, column)
+        mismatch_before = _server_metric("hoglake_compaction_variant_layout_mismatch_total")
+        swept = _compact(client, cfg)
+        return {
+            "cfg": cfg,
+            "column": column,
+            "batches": batches,
+            "inputs": inputs,
+            "decoded_before": decoded_before,
+            "mismatch_before": mismatch_before,
+            "swept": swept,
+        }
+
+    def test_this_tables_six_file_group_is_one_file(self, client, compacted):
+        cfg = compacted["cfg"]
+        group = ("1", "680")
+        assert sum(1 for f in compacted["inputs"] if tuple(f.partition_values) == group) == 6
+        files = _table(client, cfg).files()
+        assert sum(1 for f in files if tuple(f.partition_values) == group) == 1, [f.path for f in files]
+        assert {f.path for f in files}.isdisjoint({f.path for f in compacted["inputs"]})
+        assert compacted["swept"] >= 1
+
+    def test_the_layout_was_accepted_and_every_value_survives(self, client, compacted):
+        cfg = compacted["cfg"]
+        assert _server_metric("hoglake_compaction_variant_layout_mismatch_total") == compacted["mismatch_before"]
+        _after, decoded_after = _read_back_variant(client, cfg, compacted["column"])
+        assert decoded_after == compacted["decoded_before"]
+        assert _record_count(client, cfg) == 72
+
+
+class TestVariantRaiseModeLive:
+    """`raise` against the real prepare: the encoder refuses the row
+    before the first upload, so the flush fails with nothing in the
+    table, nothing in the bucket and nothing to orphan — and the next
+    batch without the row writes cleanly on the same sink."""
+
+    def test_an_invalid_row_fails_the_flush_leaving_nothing_behind(self, hog_stack, client):
+        from pyhoglake import VariantEncodingError
+
+        from millpond import metrics
+
+        cfg = _variant_cfg(hoglake_variant_on_invalid="raise")
+        sink = HoglakeSink(cfg)
+        _precreate_variant_table(client, cfg)
+        orphans_before = _registry_sum(metrics._hoglake_orphaned_files_total, "_total")
+        rows_before = {o: metrics.variant_rows_total.labels(outcome=o)._value.get() for o in ("encoded", "invalid")}
+        try:
+            # Rows 0..11 include the invalid text at global index 5.
+            with pytest.raises(VariantEncodingError) as info:
+                sink.write(_whale_rows(12, team=1), kafka_offsets=(("whales-raise", 0, 0, 11),))
+            assert info.value.reason == "invalid_json"
+            assert info.value.column == "properties"
+            assert is_retryable(info.value) is False
+            assert _table(client, cfg).files() == []
+            assert [o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")] == []
+            assert sink._prepared is None
+            assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before
+            # Nothing booked as encoded: the flush did not publish.
+            assert metrics.variant_rows_total.labels(outcome="encoded")._value.get() == rows_before["encoded"]
+            assert metrics.variant_rows_total.labels(outcome="invalid")._value.get() == rows_before["invalid"]
+            # The sink is not wedged, the ROW is: rows 0..3 are all valid.
+            assert sink.write(_whale_rows(4, team=1), kafka_offsets=(("whales-raise", 0, 12, 15),)) == 4
+            assert _record_count(client, cfg) == 4
+        finally:
+            sink.close()
+
+
+# ---------------------------------------------------------------------------
+# Object-prefix tables (Part 2 of the whales brief)
+# ---------------------------------------------------------------------------
+
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    OBJECT_PREFIX_FIELD as _PREFIX_FIELD,
+)
+from tests.hoglake_stack.variant_table import (  # noqa: E402
+    set_object_prefix_field_op as _set_prefix_op,
+)
+
+_UNPLACEABLE_TEAM_IDS: tuple[int | None, ...] = (None, -1, -(2**63))
+
+
+def _whale_rows_unplaceable(n: int, *, team: int, month: str, start: int) -> pa.Table:
+    """`_whale_rows` with the D3 shapes an int64 batch can carry mixed in:
+    row i gets `_UNPLACEABLE_TEAM_IDS[i % 4]` for i % 4 < 3 (null, a
+    negative, the most negative long) and `team` otherwise. The three
+    unplaceable values each form their own partition group under
+    `identity(team_id)`, so the skip is exercised per group, as it runs."""
+    rows = _whale_rows(n, team=team, month=month, start=start)
+    team_ids = [_UNPLACEABLE_TEAM_IDS[i % 4] if i % 4 < 3 else team for i in range(n)]
+    index = rows.schema.get_field_index("team_id")
+    return rows.set_column(index, pa.field("team_id", pa.int64()), pa.array(team_ids, pa.int64()))
+
+
+def _unplaceable_uuids(batch: pa.Table) -> set[str]:
+    return {
+        u
+        for u, t in zip(batch.column("uuid").to_pylist(), batch.column("team_id").to_pylist(), strict=True)
+        if t is None or t < 0
+    }
+
+
+def _prefix_root(cfg) -> str:
+    return f"{DATA_PATH}data/{cfg.hoglake_namespace}/{cfg.hoglake_table}/"
+
+
+def _scan_with_stats(client, cfg) -> list[dict]:
+    """The server's scan plan WITH each provided file's stored column
+    stats (`GET /scan?include=column_stats`), raw, so the test can see
+    which field ids a file registered — the D4 claim."""
+    table = _table(client, cfg)
+    return table._namespace._catalog._client._request("GET", table._path("/scan"), params={"include": "column_stats"})
+
+
+def _skipped(reason: str) -> float:
+    from millpond import metrics
+
+    return metrics.records_skipped_total.labels(reason=reason)._value.get()
+
+
+class TestObjectPrefixLive:
+    """The whales table with `set_object_prefix_field team_id` (D2), written
+    by the sink under the production default of DEFERRED stats: every
+    file lands under `team_id=<v>/`, registers `provided` (D4: the prefix
+    field's stats alone below 1 MiB), groups whose `team_id` names no
+    prefix (null, negative) are skipped and counted through the REAL
+    `prepare_append_tables` with nothing unplaceable in the bucket (D3),
+    the variant columns still round-trip, and the server's compaction
+    takes the deferred files as inputs."""
+
+    TEAMS = (1, 2, 3)
+
+    @pytest.fixture(scope="class")
+    def written(self, hog_stack, client):
+        cfg = _variant_cfg(hoglake_deferred_stats=True)
+        sink = HoglakeSink(cfg)
+        table = _precreate_variant_table(client, cfg, object_prefix=True)
+        assert table.info().object_prefix_field == _PREFIX_FIELD
+        column = {c.name: c for c in table.columns}
+        # Six flushes into the (1, 2026-09) group (the compaction input),
+        # one flush fanning out over two more teams and another month, and
+        # one flush carrying unplaceable team_ids (null, negative) among
+        # team 2's rows — three bad groups beside one good one.
+        batches = [_whale_rows(12, team=1, month="2026-09", start=12 * i) for i in range(6)]
+        batches.append(
+            pa.concat_tables(
+                [
+                    _whale_rows(5, team=2, month="2026-09", start=100),
+                    _whale_rows(5, team=3, month="2026-10", start=200),
+                ]
+            )
+        )
+        unplaceable = _whale_rows_unplaceable(12, team=2, month="2026-10", start=300)
+        batches.append(unplaceable)
+        nulls = len(_unplaceable_uuids(unplaceable))
+        assert nulls == 9
+        skipped_before = _skipped("unplaceable_object_prefix_value")
+        before = _variant_metric_snapshot()
+        published = 0
+        for i, batch in enumerate(batches):
+            published += sink.write(batch, kafka_offsets=(("whales-prefix", 0, 100 * i, 100 * i + batch.num_rows - 1),))
+        after = _variant_metric_snapshot()
+        sink.close()
+        yield {
+            "cfg": cfg,
+            "table": table,
+            "column": column,
+            "batches": batches,
+            "nulls": nulls,
+            "published": published,
+            "skipped": _skipped("unplaceable_object_prefix_value") - skipped_before,
+            "metrics": _delta(after, before),
+        }
+
+    def test_every_placeable_row_lands_and_the_unplaceable_are_counted_not_written(self, client, written):
+        cfg = written["cfg"]
+        total = sum(b.num_rows for b in written["batches"])
+        assert total == 94
+        assert written["published"] == total - written["nulls"] == 85
+        assert _record_count(client, cfg) == 85
+        assert written["skipped"] == 9
+        # No ValidationError reached the caller (the writes returned), and
+        # the skipped rows are not in the lake under any uuid; every
+        # landed team_id is a placeable value.
+        back, _ = _read_back_variant(client, cfg, written["column"])
+        landed = set(back.column("uuid").to_pylist())
+        skipped = _unplaceable_uuids(written["batches"][-1])
+        assert skipped and skipped.isdisjoint(landed)
+        assert back.column("team_id").null_count == 0
+        assert min(back.column("team_id").to_pylist()) >= 1
+        assert written["metrics"]["orphans"] == 0
+
+    def test_every_file_sits_under_its_teams_prefix(self, client, written):
+        cfg = written["cfg"]
+        files = _table(client, cfg).files()
+        assert files
+        root = _prefix_root(cfg)
+        for f in files:
+            team = f.partition_values[0]
+            assert f.path.startswith(f"{root}{_PREFIX_FIELD}={team}/"), f.path
+            # The idempotency-key directory is kept UNDER the prefix.
+            rest = f.path.removeprefix(f"{root}{_PREFIX_FIELD}={team}/")
+            key, name = rest.split("/")
+            uuid.UUID(key)
+            assert name.endswith(".parquet")
+        # Nothing in the bucket sits outside a prefix: no orphan under the
+        # table root (a refused first attempt), and nothing for an
+        # unplaceable value (`team_id=-1/`, a null) — those groups were
+        # never encoded, let alone uploaded.
+        objects = [o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")]
+        assert objects
+        assert all(f"/{_PREFIX_FIELD}=" in o for o in objects), objects
+        assert not any(f"/{_PREFIX_FIELD}=-" in o or f"/{_PREFIX_FIELD}=/" in o for o in objects), objects
+        assert sorted(tuple(f.partition_values) for f in files) == sorted(
+            [("1", "680")] * 6 + [("2", "680"), ("3", "681"), ("2", "681")]
+        )
+
+    def test_deferred_files_are_provided_with_the_prefix_fields_stats(self, client, written):
+        # D4. Under deferral pyhoglake registers every file `provided`:
+        # the prefix field's stats alone under 1 MiB (every file here),
+        # never `pending`. The stack runs no hydrator, so a pending file
+        # would have stayed pending for good.
+        cfg = written["cfg"]
+        files = _table(client, cfg).files()
+        assert {f.stats_state for f in files} == {"provided"}
+        assert all(f.file_size_bytes < (1 << 20) for f in files)
+        team_field_id = written["column"]["team_id"].field_id
+        plan = _scan_with_stats(client, cfg)
+        assert len(plan) == len(files)
+        for entry in plan:
+            data_file = entry["data_file"]
+            stats = data_file.get("column_stats")
+            assert stats, f"no column_stats on {data_file['path']}"
+            assert {s["field_id"] for s in stats} == {team_field_id}, data_file["path"]
+            (team,) = stats
+            assert team["null_count"] == 0
+            assert team["value_count"] == data_file["record_count"]
+
+    def test_variant_values_round_trip_through_the_decoder(self, client, written):
+        _back, decoded = _read_back_variant(client, written["cfg"], written["column"])
+        expected = TestVariantColumnsLive._expected(None, written["batches"], "properties")
+        skipped = _unplaceable_uuids(written["batches"][-1])
+        assert decoded["properties"] == {u: v for u, v in expected.items() if u not in skipped}
+
+    def test_the_variant_metrics_count_only_the_rows_that_were_placed(self, written):
+        delta = written["metrics"]
+        # 85 placed rows over seven variant columns; the skipped groups'
+        # JSON was never encoded.
+        assert sum(delta["rows"].values()) == 85 * len(_VARIANT_NAMES)
+        assert delta["encode_count"] == len(written["batches"])
+
+    def test_the_sink_issued_no_ddl_on_the_pre_created_table(self, client, written):
+        cfg = written["cfg"]
+        # Every snapshot the sink authored is a data commit: no alter.
+        assert len(_authored(client, cfg)) == len(_snapshots(client, cfg)), "the sink issued DDL on a pre-created table"
+        # The option's own DDL snapshot is the setup script's.
+        setup = [s for s in client.catalog(cfg.hoglake_catalog).snapshots() if s.author == "setup"]
+        assert any(_PREFIX_FIELD in (s.message or "") and "<value>" in (s.message or "") for s in setup)
+        info = _table(client, cfg).info()
+        assert info.object_prefix_field == _PREFIX_FIELD
+        assert [f.transform for f in info.partition_spec.fields] == ["identity", "month"]
+
+    def test_the_server_compacts_the_deferred_files_under_the_prefix(self, client, written):
+        # The point of D4: a `provided` file is a compaction input with
+        # no hydrator pass. The six-file (1, 2026-09) group becomes one
+        # file, under team 1's prefix, in the declared variant layout.
+        cfg = written["cfg"]
+        group = ("1", "680")
+        inputs = [f for f in _table(client, cfg).files() if tuple(f.partition_values) == group]
+        assert len(inputs) == 6
+        _before, decoded_before = _read_back_variant(client, cfg, written["column"])
+        mismatch_before = _server_metric("hoglake_compaction_variant_layout_mismatch_total")
+        assert _compact(client, cfg) >= 1
+        files = _table(client, cfg).files()
+        outputs = [f for f in files if tuple(f.partition_values) == group]
+        assert len(outputs) == 1, [f.path for f in files]
+        assert outputs[0].path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}=1/")
+        assert outputs[0].stats_state == "provided"
+        assert _server_metric("hoglake_compaction_variant_layout_mismatch_total") == mismatch_before
+        _after, decoded_after = _read_back_variant(client, cfg, written["column"])
+        assert decoded_after == decoded_before
+        assert _record_count(client, cfg) == 85
+
+
+class TestObjectPrefixLayoutRaceLive:
+    """The sink resolves the table BEFORE the setup script sets the option
+    (the first flush racing `set_object_prefix_field`), prepares under
+    the root layout, and the server refuses the commit. One rebuild
+    against a fresh read lands the rows under the prefix; the first
+    attempt's uploads are orphans, counted."""
+
+    def test_one_rebuild_lands_the_flush_under_the_prefix(self, hog_stack, client):
+        from millpond import metrics
+
+        cfg = _variant_cfg(hoglake_deferred_stats=True)
+        sink = HoglakeSink(cfg)
+        table = _precreate_variant_table(client, cfg, object_prefix=False)
+        batch = _whale_rows(6, team=4, month="2026-09")
+        orphans_before = _registry_sum(metrics._hoglake_orphaned_files_total, "_total")
+        try:
+            # Resolve and cache the layout without writing (the option can
+            # only be set on an EMPTY table).
+            sink._ensure_table(table_schema_for_batch(batch.schema))
+            assert sink._table_info(sink._table).object_prefix_field is None
+            table.alter([_set_prefix_op(_PREFIX_FIELD)], author="setup", message="race: set the option late")
+            assert table.info().object_prefix_field == _PREFIX_FIELD
+            # First attempt: built under the cached (root) layout. The
+            # server refuses it — as `ddl_since_read_snapshot` (the alter
+            # is DDL inside the conflict window) or, with a basis past the
+            # alter, as `object_prefix_violation`; either is a re-prepare
+            # the sink answers with ONE retryable stop.
+            with pytest.raises(HoglakeSinkError) as refused:
+                sink.write(batch, kafka_offsets=(("whales-race", 0, 0, 5),))
+            assert refused.value.retryable is True
+            assert is_retryable(refused.value) is True
+            assert sink._prepared is None
+            assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before + 1
+            assert _table(client, cfg).files() == []
+            # main.py's loop: reset, same flush again. Rebuilt against the
+            # fresh read: the drop applies, pyhoglake places, the server
+            # accepts.
+            sink.reset_caches()
+            assert sink.write(batch, kafka_offsets=(("whales-race", 0, 0, 5),)) == 6
+            files = _table(client, cfg).files()
+            assert len(files) == 1
+            assert files[0].path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}=4/")
+            assert files[0].stats_state == "provided"
+            # The first attempt's object is still in the bucket, under the
+            # table root: the orphan the metric counted.
+            objects = [o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")]
+            assert len(objects) == 2
+            assert sum(1 for o in objects if f"/{_PREFIX_FIELD}=" in o) == 1
+        finally:
+            sink.close()
+
+
+class TestObjectPrefixViolationLive:
+    """The server's 422 `object_prefix_violation` against the real commit
+    path, and the sink's classification of it: retryable once, then
+    permanent. Produced by making pyhoglake write under the table root
+    while its own read shows the option — the shape of a client whose
+    placement disagrees with the server's rules."""
+
+    def test_the_second_refusal_is_permanent(self, hog_stack, client, monkeypatch):
+        import pyhoglake.client as pyhoglake_client
+
+        from millpond import metrics
+
+        # A hard failure, not a skip: this is the only live coverage of
+        # the 422's classification. A refactor that moves `_placement` must
+        # come here, not silently take the test with it.
+        assert hasattr(pyhoglake_client, "_placement"), "pyhoglake.client._placement moved; update this test"
+        cfg = _variant_cfg(hoglake_deferred_stats=True)
+        sink = HoglakeSink(cfg)
+        _precreate_variant_table(client, cfg, object_prefix=True)
+        orphans_before = _registry_sum(metrics._hoglake_orphaned_files_total, "_total")
+        batch = _whale_rows(4, team=5, month="2026-09")
+        offsets = (("whales-violation", 0, 0, 3),)
+        try:
+            monkeypatch.setattr(pyhoglake_client, "_placement", lambda info: None)
+            with pytest.raises(HoglakeSinkError, match="rebuilds once") as first:
+                sink.write(batch, kafka_offsets=offsets)
+            assert first.value.retryable is True
+            assert isinstance(first.value.__cause__, ObjectPrefixViolationError)
+            assert first.value.__cause__.status_code == 422
+            assert sink._prepared is None
+            assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before + 1
+            assert metrics.hoglake_orphaned_files_total.labels(reason="object_prefix_violation")._value.get() >= 1
+            sink.reset_caches()
+            with pytest.raises(HoglakeSinkError, match="twice") as second:
+                sink.write(batch, kafka_offsets=offsets)
+            assert second.value.retryable is False
+            assert is_retryable(second.value) is False
+            assert isinstance(second.value.__cause__, ObjectPrefixViolationError)
+            assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before + 2
+            assert _table(client, cfg).files() == []
+            # With placement back, the same flush lands: the marker is
+            # per flush, and a landed commit clears it.
+            monkeypatch.undo()
+            sink.reset_caches()
+            assert sink.write(batch, kafka_offsets=offsets) == 4
+            assert sink._object_prefix_rebuilt_for is None
+            files = _table(client, cfg).files()
+            assert len(files) == 1
+            assert files[0].path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}=5/")
+        finally:
+            sink.close()
+
+
+class TestObjectPrefixNotNullLive:
+    """The prefix column declared NOT NULL on the server. A null (or a
+    batch without the column, null-filled) must be skipped and counted
+    through the real prepare, with the retained groups registered under
+    the strict schema — not fail the flush at the cast and stick the
+    partition."""
+
+    def test_nulls_are_skipped_and_the_valid_groups_land(self, hog_stack, client):
+        from millpond import metrics
+
+        cfg = _variant_cfg(hoglake_deferred_stats=True)
+        sink = HoglakeSink(cfg)
+        table = _precreate_variant_table(client, cfg, object_prefix=True, team_id_nullable=False)
+        info = table.info()
+        assert info.object_prefix_field == _PREFIX_FIELD
+        assert next(c for c in info.columns if c.name == "team_id").nullable is False
+        before = _skipped("unplaceable_object_prefix_value")
+        orphans_before = _registry_sum(metrics._hoglake_orphaned_files_total, "_total")
+        try:
+            # Mixed: null, -1, -2**63 groups beside team 2's rows (12 rows: 9 bad, 3 good).
+            mixed = _whale_rows_unplaceable(12, team=2, month="2026-09", start=0)
+            assert sink.write(mixed, kafka_offsets=(("whales-nn", 0, 0, 11),)) == 3
+            # All null.
+            all_null = mixed.set_column(
+                mixed.schema.get_field_index("team_id"),
+                pa.field("team_id", pa.int64()),
+                pa.nulls(12, pa.int64()),
+            )
+            assert sink.write(all_null, kafka_offsets=(("whales-nn", 0, 12, 23),)) == 0
+            # Column missing: null-filled, every row skipped.
+            missing = _whale_rows(5, team=2, month="2026-09", start=100).drop_columns(["team_id"])
+            assert sink.write(missing, kafka_offsets=(("whales-nn", 0, 24, 28),)) == 0
+            # And the sink still writes afterwards.
+            assert (
+                sink.write(
+                    _whale_rows(4, team=3, month="2026-09", start=200), kafka_offsets=(("whales-nn", 0, 29, 32),)
+                )
+                == 4
+            )
+        finally:
+            sink.close()
+        assert _skipped("unplaceable_object_prefix_value") - before == 9 + 12 + 5
+        assert _record_count(client, cfg) == 7
+        files = _table(client, cfg).files()
+        assert sorted(tuple(f.partition_values) for f in files) == [("2", "680"), ("3", "680")]
+        assert all(f.path.startswith(f"{_prefix_root(cfg)}{_PREFIX_FIELD}={f.partition_values[0]}/") for f in files)
+        assert {f.stats_state for f in files} == {"provided"}
+        # The written parquet carries the NOT NULL field: no nulls, the id.
+        for f in files:
+            back = _read_parquet(f.path)
+            assert back.column("team_id").null_count == 0
+            assert back.schema.field("team_id").metadata[b"PARQUET:field_id"] == b"3"
+        objects = [o for o in _list_objects(DATA_PATH, cfg) if o.endswith(".parquet")]
+        assert len(objects) == 2
+        assert _registry_sum(metrics._hoglake_orphaned_files_total, "_total") == orphans_before

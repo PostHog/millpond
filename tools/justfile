@@ -185,6 +185,42 @@ purge-orphan-stats-dry-run:
 purge-orphan-stats: _confirm-target
     env {{ _target_env }} python {{ ducklake_maintenance }} purge-orphan-stats
 
+# Report inlined-data tables of dropped DuckLake tables (counts + non-empty check, no DDL/DML)
+[group('lifecycle')]
+drop-orphan-inline-tables-dry-run batch_size="500":
+    env {{ _target_env }} python {{ ducklake_maintenance }} drop-orphan-inline-tables --batch-size {{ quote(batch_size) }} --dry-run
+
+# batch_size is an UPPER BOUND only. The op derives the real cap from the
+# server: max_locks_per_transaction * (max_connections +
+# max_prepared_transactions), a quarter of it, divided by the 5 shared
+# lock-table entries each DROP of an inlined table holds until commit
+# (measured on PG 16/17/18: heap + TOAST heap + TOAST index + 2 pg_type
+# object locks). A stock server gives 6400 x 0.25 / 5 -> a cap of 320, below
+# this default; an RDS-sized max_connections puts the raw cap in the
+# thousands, so there the op's own 2000 ceiling governs instead. It logs the
+# GUCs and the effective size, and on SQLSTATE 53200 ("out of shared memory")
+# it retries with the size halved for the rest of the run, re-growing after
+# 10 clean batches. A lock table still full after 5 attempts is fatal, on
+# purpose.
+#
+# run_budget_s bounds the wall clock because the whole run holds the
+# maintenance advisory lock, which expire / cleanup / compaction wait on. The
+# bound that matters is the cron CADENCE, not the activeDeadlineSeconds
+# (18000 by default): three prod-us tenants run the whole chain every 15
+# minutes under concurrencyPolicy Forbid, so a step that holds the chain for
+# longer than a tick skips the next tick for every other step. 300s keeps
+# the chain inside one tick; the chain wrapper below reads it from
+# MILLPOND_INLINE_RUN_BUDGET_S so a tenant can be raised without touching
+# the chain args. Stopping on the budget is a clean exit 0, not a failure:
+# keyset paging restarts from the orphan predicate rather than a saved
+# cursor, so the next cron tick resumes the backlog of droppable rows. Pass
+# an empty run_budget_s to drain a backlog unbudgeted by hand.
+
+# Drop inlined-data tables of dropped DuckLake tables (direct Postgres; works when ATTACH cannot)
+[group('lifecycle')]
+drop-orphan-inline-tables batch_size="500" max_batches="" run_budget_s="300": _confirm-target
+    env {{ _target_env }} python {{ ducklake_maintenance }} drop-orphan-inline-tables --batch-size {{ quote(batch_size) }} {{ if run_budget_s != "" { "--run-budget-s " + quote(run_budget_s) } else { "" } }} {{ if max_batches != "" { "--max-batches " + quote(max_batches) } else { "" } }}
+
 # REMOVE-WHEN: upstream-ducklake-fix-deployed
 # Preview repair-partition-values (counts only, no DML; one-shot per customer)
 [group('lifecycle')]
@@ -319,6 +355,19 @@ compact-all-tiers-default: (compact-all-tiers)
 # snapshot expiry at the 7-day fleet default, chain-safe
 expire-7d: (expire "7")
 
+# The run budget comes from MILLPOND_INLINE_RUN_BUDGET_S (default 300s), not
+# from the recipe default, because this is the form the maintenance cron runs
+# and the cron's cadence is the real bound: three prod-us tenants run the whole
+# chain every 15 minutes under concurrencyPolicy Forbid, so a step that holds
+# the chain for 30 minutes skips their ticks (compaction included). 300s keeps
+# the chain inside one tick with the other steps. A budgeted stop is not a
+# failure - the next tick resumes from the orphan predicate (keyset paging, no
+# saved cursor). Raise it per tenant with the env var, never by editing the
+# chain args: a parameterized recipe in a just chain eats the next word.
+
+# drop-orphan-inline-tables at the default batch size, no batch limit, env budget (default 300s), chain-safe
+drop-orphan-inline-tables-default: (drop-orphan-inline-tables "500" "" env_var_or_default("MILLPOND_INLINE_RUN_BUDGET_S", "300"))
+
 # Run all tiered compactions sequentially (tier 1 -> 2 -> 3) then delete scheduled S3 files
 [group('compaction')]
 compact-all-tiers-and-clean table="": (compact-to-tier-1 table) (compact-to-tier-2 table) (compact-to-tier-3 table) cleanup-all
@@ -405,6 +454,18 @@ bootstrap-index-file-column-stats: _confirm-target
     @echo ">>> ducklake_file_column_stats_file_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_file_idx ON public.ducklake_file_column_stats USING btree (data_file_id);"
 
+# Per-column stats scope: (table_id, column_id) drives global column-stat
+# recomputation and per-column reads (top observed index on
+# duckling-posthog: 337K scans, ahead of every script-defined btree — it
+# existed there only as a hand-created stray, codified here so every
+# tenant gets it and rebuilds don't silently lose it).
+#
+# Per-column stats scope for global column-stat recomputation
+[group('bootstrap')]
+bootstrap-index-file-column-stats-table-column: _confirm-target
+    @echo ">>> ducklake_file_column_stats_table_column_idx"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_column_stats_table_column_idx ON public.ducklake_file_column_stats USING btree (table_id, column_id);"
+
 # Partition-value join key for per-file lookups
 [group('bootstrap')]
 bootstrap-index-file-partition-value-file: _confirm-target
@@ -442,9 +503,23 @@ bootstrap-index-file-partition-value-table-file: _confirm-target
     @echo ">>> ducklake_file_partition_value_table_file_idx"
     @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_file_partition_value_table_file_idx ON public.ducklake_file_partition_value USING btree (table_id, data_file_id);"
 
+# Name-mapping lookup key for externally registered parquet (field-id
+# mapping, written by ducklake_add_data_files): readers fetch all rows for
+# a file's data_file.mapping_id. Upstream ships the table with NO indexes
+# and NO snapshot lineage (no begin/end_snapshot columns), so it is
+# invisible to expire and lookups on a registration-churned catalog are
+# full seq scans (observed: 2.27M rows / 169MB on duckling-posthog, >90%
+# orphaned mappings).
+#
+# Name-mapping lookup key for registered-parquet field-id mapping reads
+[group('bootstrap')]
+bootstrap-index-name-mapping: _confirm-target
+    @echo ">>> ducklake_name_mapping_mapping_idx"
+    @{{ _psql }} -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS ducklake_name_mapping_mapping_idx ON public.ducklake_name_mapping USING btree (mapping_id);"
+
 # Create every DuckLake catalog btree, sequentially (same-relation builds serialize anyway)
 [group('bootstrap')]
-bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover
+bootstrap-indexes: bootstrap-index-data-file-compaction bootstrap-index-data-file-compaction-order bootstrap-index-data-file-snapshot-read bootstrap-index-delete-file-snapshot-read bootstrap-index-delete-file-table bootstrap-index-delete-file-metrics bootstrap-index-file-column-stats bootstrap-index-file-column-stats-table-file bootstrap-index-file-column-stats-table-column bootstrap-index-file-partition-value-file bootstrap-index-file-partition-value-table bootstrap-index-file-partition-value-table-file bootstrap-index-file-partition-value-cover bootstrap-index-name-mapping
 
 # Apply the canonical DuckLake sort keys (tenant column first on every
 # tenant table): new writes and compaction outputs come out sorted, giving
@@ -478,7 +553,10 @@ ducklake-metrics-list config="":
 # $DUCKLAKE_METRICS_PUSH_URL (VictoriaMetrics import endpoint).
 # Chain-safe (no positional params) — the per-tenant metrics CronJob's
 # recipe; tenant identity via $DUCKLAKE_TENANT, catalog target via the
-# same _target_env contract the maintenance recipes use.
+# same _target_env contract the maintenance recipes use. With
+# DUCKLAKE_RDS_HOST set, catalog mode auto uses a direct Postgres
+# connection and never opens DuckDB (DUCKLAKE_METRICS_CATALOG_MODE
+# overrides it).
 [group('metrics')]
 metrics-once:
     env {{ _target_env }} python {{ ducklake_metrics }} --once

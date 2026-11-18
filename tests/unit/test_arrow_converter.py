@@ -1,10 +1,27 @@
+import base64
+import io
+import logging
+import uuid as uuid_mod
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import orjson
 import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
 
-from millpond.arrow_converter import _drop_null_typed_columns, coerce_typed_columns, convert
+from millpond import arrow_converter
+from millpond.arrow_converter import (
+    OversizedValueError,
+    _decode_value,
+    _drop_null_typed_columns,
+    _to_uuid,
+    coerce_typed_columns,
+    convert,
+    uuid_bytes,
+    uuid_text,
+)
 
 
 class TestConvert:
@@ -131,7 +148,98 @@ class TestConvert:
         assert table is not None
         assert len(table) == 2
         assert table.schema.field("flag_response").type == pa.string()
+        # `str()`, as always, for a DuckLake or hoglake STRING column:
+        # Python's `True`. Only a column the hoglake sink names as a live
+        # variant column (`json_text_columns`) gets JSON text instead.
         assert table.column("flag_response").to_pylist() == ["True", "variant-a"]
+
+    def test_mixed_type_values_are_json_text_for_variant_bound_columns_only(self):
+        """A column named in `json_text_columns` (the hoglake sink's live
+        variant columns) has its mixed-type values JSON-serialized, so it
+        decodes to the value the producer sent: `[true, '{"a":1}']` ->
+        `[True, {"a": 1}]`. Every other mixed column keeps `str()`."""
+        from pyhoglake import variant
+
+        messages = [
+            orjson.dumps({"v": True, "w": True}),
+            orjson.dumps({"v": {"a": 1}, "w": "x"}),
+            orjson.dumps({"v": 1.5}),
+            orjson.dumps({"v": 7}),
+            orjson.dumps({"v": None}),
+            orjson.dumps({"v": "plain text"}),
+        ]
+        table = convert(messages, json_text_columns={"v"})
+        assert table.schema.field("v").type == pa.string()
+        texts = table.column("v").to_pylist()
+        assert texts == ["true", '{"a":1}', "1.5", "7", None, "plain text"]
+        # `w` is mixed too, and not variant-bound: Python's repr, as before.
+        assert table.column("w").to_pylist() == ["True", "x", None, None, None, None]
+        # Through pyhoglake's encoder, as the sink would feed them (the
+        # plain string is the one invalid row: not JSON).
+        encoded = variant.encode_json(texts[:5], shredding=None)
+        assert variant.to_python(encoded.array, shredding=None) == [True, {"a": 1}, 1.5, 7, None]
+
+    def test_variant_bound_columns_are_string_typed_on_every_poll(self):
+        """Not only mixed polls: a poll in which every record carries a
+        bool for a variant-bound column is JSON text too, so two polls of
+        different shapes concatenate in main.py and decode to what the
+        producer sent."""
+        from pyhoglake import variant
+
+        all_bool = [orjson.dumps({"v": True, "k": 1}), orjson.dumps({"v": False, "k": 2})]
+        all_text = [orjson.dumps({"v": {"a": 1}, "k": 3}), orjson.dumps({"v": 2.0, "k": 4})]
+        # Without the hint: the first poll infers a bool column and the
+        # concat the consume loop does refuses the pair. This is the
+        # failure the hint exists to prevent.
+        with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+            pa.concat_tables([convert(all_bool), convert(all_text)], promote_options="default")
+        first = convert(all_bool, json_text_columns={"v"})
+        second = convert(all_text, json_text_columns={"v"})
+        assert first.schema.field("v").type == second.schema.field("v").type == pa.string()
+        joined = pa.concat_tables([first, second], promote_options="default")
+        texts = joined.column("v").to_pylist()
+        assert texts == ["true", "false", '{"a":1}', "2.0"]
+        encoded = variant.encode_json(texts, shredding=None)
+        assert variant.to_python(encoded.array, shredding=None) == [True, False, {"a": 1}, 2.0]
+        # Other columns are untouched by the hint.
+        assert joined.column("k").to_pylist() == [1, 2, 3, 4]
+
+
+class TestJsonText:
+    """`json_text`: the one rendering of a non-string value for a variant
+    column, shared by the converter and the sink."""
+
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            (True, "true"),
+            (False, "false"),
+            (7, "7"),
+            (2.0, "2.0"),
+            (1.5, "1.5"),
+            (1e300, "1e+300"),
+            ({"a": [1, 2.0]}, '{"a":[1,2.0]}'),
+            (float("nan"), "NaN"),
+            (float("inf"), "Infinity"),
+            (float("-inf"), "-Infinity"),
+        ],
+    )
+    def test_renders(self, value, text):
+        assert arrow_converter.json_text(value) == text
+
+    def test_a_decimal_is_its_text(self):
+        from decimal import Decimal
+
+        assert arrow_converter.json_text(Decimal("1.50")) == "1.50"
+
+    def test_non_finite_floats_are_refused_by_the_encoder_not_nulled(self):
+        # orjson alone renders NaN as `null`, a Variant null nobody would
+        # count; the literal is what pyhoglake refuses as
+        # `non_finite_number`, so the bad number is a counted invalid row.
+        from pyhoglake import variant
+
+        encoded = variant.encode_json([arrow_converter.json_text(float("nan"))], shredding=None, on_invalid="null")
+        assert encoded.report.invalid_by_reason == {"non_finite_number": 1}
 
     def test_mixed_type_int_and_string(self):
         """Same field is int in one record and string in another."""
@@ -143,6 +251,37 @@ class TestConvert:
         assert table is not None
         assert len(table) == 2
         assert table.schema.field("employee_count").type == pa.string()
+
+    def test_large_int_in_float_field_converts_lossily(self):
+        """An int above 2^53 in a float-inferred field must not crash the batch.
+
+        The session features topic emits float aggregates as integers when
+        whole; one record carried an integer above 2^53, and PyArrow refuses
+        the inexact int-to-double conversion in from_pylist. The converter
+        pre-casts ints to float when the inferred field type is floating —
+        nearest-double is the wanted semantics for a floating measure.
+        """
+        huge = 130184854372975800  # > 2^53, not exactly representable
+        messages = [
+            orjson.dumps({"mouse_sum_x": 1.5}),
+            orjson.dumps({"mouse_sum_x": huge}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert len(table) == 2
+        assert pa.types.is_floating(table.schema.field("mouse_sum_x").type)
+        assert table.column("mouse_sum_x").to_pylist() == [1.5, float(huge)]
+
+    def test_whole_int_in_float_field_stays_float(self):
+        """Whole-number ints in a float-inferred field become floats, not strings."""
+        messages = [
+            orjson.dumps({"velocity": 0.25}),
+            orjson.dumps({"velocity": 3}),
+        ]
+        table = convert(messages)
+        assert table is not None
+        assert pa.types.is_floating(table.schema.field("velocity").type)
+        assert table.column("velocity").to_pylist() == [0.25, 3.0]
 
     def test_large_integer_precision_preserved(self):
         """Integers > 2^53 must not lose precision via float64 cast."""
@@ -188,6 +327,95 @@ class TestConvert:
         assert merged.column("b").to_pylist() == [None, "new"]
 
 
+# An LZ4 frame written by Bento's lz4 codec (WarpStream pipelines): no
+# content-size field. Decompresses to {"team_id":2,"event":"signup"}.
+_BENTO_LZ4_FRAME = base64.b64decode("BCJNGGRwuR4AAIB7InRlYW1faWQiOjIsImV2ZW50Ijoic2lnbnVwIn0AAAAA1wZZsQ==")
+
+# The same codec on {"team_id":2,"pad":"0123456789"*500000} (5,000,022
+# bytes): two blocks under Bento's 4 MiB block size, 19,712 bytes.
+_BENTO_TWO_BLOCKS = (Path(__file__).parent / "data" / "bento_lz4_two_blocks.lz4").read_bytes()
+
+
+def _lz4_frame(value: bytes) -> bytes:
+    sink = pa.BufferOutputStream()
+    with pa.CompressedOutputStream(sink, "lz4") as out:
+        out.write(value)
+    return sink.getvalue().to_pybytes()
+
+
+class TestLz4FramedValues:
+    def test_a_bento_frame_is_decompressed(self):
+        table = convert([_BENTO_LZ4_FRAME])
+        assert table is not None
+        assert table.to_pylist() == [{"team_id": 2, "event": "signup"}]
+
+    def test_framed_and_plain_values_mix_in_one_batch(self):
+        plain = orjson.dumps({"team_id": 1, "event": "a"})
+        framed = _lz4_frame(orjson.dumps({"team_id": 2, "event": "b", "extra": "x"}))
+        table = convert([plain, framed])
+        assert table is not None
+        assert table.column("team_id").to_pylist() == [1, 2]
+        assert table.column("extra").to_pylist() == [None, "x"]
+
+    def test_a_framed_value_converts_like_its_plain_json(self):
+        value = orjson.dumps({"team_id": 7, "properties": {"a": 1, "b": [1, 2]}, "n": 1.5})
+        assert convert([_lz4_frame(value)]).equals(convert([value]))
+
+    def test_a_corrupt_frame_is_skipped_and_the_rest_converts(self, caplog):
+        corrupt = b"\x04\x22\x4d\x18" + b"not an lz4 frame"
+        truncated = _BENTO_LZ4_FRAME[:12]
+        good = orjson.dumps({"team_id": 3})
+        with caplog.at_level(logging.WARNING, logger="millpond.arrow_converter"):
+            table = convert([corrupt, truncated, good])
+        assert table is not None
+        assert table.column("team_id").to_pylist() == [3]
+        assert sum("undecodable LZ4-framed value" in r.getMessage() for r in caplog.records) == 2
+
+    def test_a_framed_value_holding_bad_json_is_skipped(self):
+        assert convert([_lz4_frame(b"not json")]) is None
+
+    def test_plain_values_are_not_touched(self):
+        value = orjson.dumps({"team_id": 1})
+        assert _decode_value(value) is value
+
+    def test_a_multi_block_bento_frame_is_decompressed_whole(self):
+        table = convert([_BENTO_TWO_BLOCKS])
+        assert table.to_pylist() == [{"team_id": 2, "pad": "0123456789" * 500_000}]
+
+    def test_a_bad_content_checksum_is_skipped(self, caplog):
+        bad = _BENTO_LZ4_FRAME[:-1] + bytes([_BENTO_LZ4_FRAME[-1] ^ 1])
+        with caplog.at_level(logging.WARNING, logger="millpond.arrow_converter"):
+            assert convert([bad]) is None
+        assert any("undecodable LZ4-framed value" in r.getMessage() for r in caplog.records)
+
+    def test_the_magic_alone_is_undecodable(self):
+        with pytest.raises(OSError):
+            _decode_value(b"\x04\x22\x4d\x18")
+
+    def test_a_magic_prefix_is_not_the_magic(self):
+        value = b"\x04\x22\x4d{}"
+        assert _decode_value(value) is value
+
+    def test_decoding_stops_past_the_limit(self):
+        decoded = b'{"team_id":2,"pad":"' + b"0123456789" * 500_000 + b'"}'
+        assert _decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded)) == decoded
+        with pytest.raises(OversizedValueError):
+            _decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded) - 1)
+
+    def test_a_frame_decompressing_past_the_limit_is_skipped(self, monkeypatch, caplog):
+        monkeypatch.setattr(arrow_converter, "MAX_DECODED_VALUE_BYTES", 1024 * 1024)
+        with caplog.at_level(logging.WARNING, logger="millpond.arrow_converter"):
+            table = convert([_BENTO_TWO_BLOCKS, _BENTO_LZ4_FRAME])
+        assert table.to_pylist() == [{"team_id": 2, "event": "signup"}]
+        assert any("decompresses past 1048576 bytes" in r.getMessage() for r in caplog.records)
+
+    def test_empty_and_whitespace_values(self):
+        assert convert([b""]) is None
+        ws = b' \n\t{"team_id": 1}'
+        assert _decode_value(ws) is ws
+        assert convert([ws]).to_pylist() == [{"team_id": 1}]
+
+
 class TestDropNullTypedColumns:
     """Defensive filter against pa.null() columns slipping through to a Sink.
 
@@ -197,9 +425,7 @@ class TestDropNullTypedColumns:
     """
 
     def test_drops_pa_null_column(self):
-        table = pa.table(
-            {"a": pa.array([None, None], pa.null()), "b": ["x", "y"]}
-        )
+        table = pa.table({"a": pa.array([None, None], pa.null()), "b": ["x", "y"]})
         out = _drop_null_typed_columns(table)
         assert out.column_names == ["b"]
 
@@ -350,3 +576,305 @@ class TestCoerceTypedColumns:
         assert table.schema.field("timestamp").type == pa.string()
         out = coerce_typed_columns(table, (("timestamp", "timestamptz"),))
         assert out.schema.field("timestamp").type == pa.timestamp("us", tz="UTC")
+
+
+class TestCoerceUuidColumns:
+    """`uuid:uuid` pins — the events topic carries `uuid`/`person_id` as UUID
+    strings against hoglake `uuid` / DuckLake `UUID` columns."""
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    # `pa.uuid()` scalars come back as `uuid.UUID`; the 16 big-endian bytes
+    # are what the extension actually stores.
+    VALUE = uuid_mod.UUID(CANONICAL)
+    BYTES = VALUE.bytes
+
+    def test_canonical_string_coerces_to_uuid(self):
+        table = pa.table({"uuid": [self.CANONICAL], "event": ["$pageview"]})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [self.VALUE]
+        assert out.column("uuid").combine_chunks().storage.to_pylist() == [self.BYTES]
+        # Untargeted columns are untouched.
+        assert out.schema.field("event").type == pa.string()
+
+    def test_unhyphenated_and_alternate_forms_parse(self):
+        # The full accepted grammar, which is ENUMERATED rather than
+        # delegated: canonical 8-4-4-4-12, 32 bare hex, either wrapped in
+        # braces or prefixed `urn:uuid:`, hex in either case. Deliberately
+        # NARROWER than `uuid.UUID`'s — see TestUuidBytesGrammar for the
+        # stdlib-accepted shapes this refuses and why.
+        forms = [
+            self.CANONICAL.replace("-", ""),
+            "{" + self.CANONICAL + "}",
+            "urn:uuid:" + self.CANONICAL,
+            self.CANONICAL.upper(),
+        ]
+        table = pa.table({"uuid": forms})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [self.VALUE] * len(forms)
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_invalid_value_is_nulled_and_metricked(self, mock_metrics):
+        table = pa.table({"uuid": ["not-a-uuid"]})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [None]
+        # assert_called_once_WITH: a bare MagicMock memoizes labels() to one
+        # child whatever kwargs it gets, so `labels(type=...).inc` asserts
+        # nothing about the label.
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")
+        # A column with ANY failed value is not also counted as cleanly coerced.
+        mock_metrics.columns_coerced_total.labels.assert_not_called()
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_mixed_good_and_bad_keeps_good_values(self, mock_metrics):
+        # Only the unconvertible values are nulled; the good ones survive.
+        table = pa.table({"uuid": [self.CANONICAL, "zzzz", None]})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.column("uuid").to_pylist() == [self.VALUE, None, None]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")
+        mock_metrics.columns_coerced_total.labels.assert_not_called()
+
+    def test_nulls_pass_through(self):
+        table = pa.table({"person_id": pa.array([self.CANONICAL, None], pa.string())})
+        out = coerce_typed_columns(table, (("person_id", "uuid"),))
+        assert out.column("person_id").to_pylist() == [self.VALUE, None]
+
+    def test_all_null_string_column_coerces_to_uuid(self):
+        # Mirrors project_id:bigint — an all-null batch infers VARCHAR and must
+        # still land as the target type so the destination column is right from
+        # the first flush.
+        table = pa.table({"person_id": pa.array([None, None], pa.string())})
+        out = coerce_typed_columns(table, (("person_id", "uuid"),))
+        assert out.schema.field("person_id").type == pa.uuid()
+        assert out.column("person_id").to_pylist() == [None, None]
+
+    def test_already_uuid_typed_left_alone(self):
+        storage = pa.array([self.BYTES], pa.binary(16))
+        table = pa.table({"uuid": pa.ExtensionArray.from_storage(pa.uuid(), storage)})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out is table
+
+    def test_fixed_size_binary_16_is_adopted_not_left_as_blob(self):
+        # A plain binary(16) column already holds the right bytes but is BLOB
+        # to DuckDB and carries no parquet UUID annotation, so it is wrapped
+        # (zero-copy) rather than passed through.
+        table = pa.table({"uuid": pa.array([self.BYTES], pa.binary(16))})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [self.VALUE]
+
+    def test_failed_and_clean_batches_concat(self):
+        # Type-consistency: a batch that fell back to the per-value path must
+        # still concat with a fully-coerced one at flush.
+        good = coerce_typed_columns(pa.table({"uuid": [self.CANONICAL]}), (("uuid", "uuid"),))
+        bad = coerce_typed_columns(pa.table({"uuid": ["garbage"]}), (("uuid", "uuid"),))
+        merged = pa.concat_tables([good, bad])
+        assert merged.column("uuid").to_pylist() == [self.VALUE, None]
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_roundtrips_through_convert(self, mock_metrics):
+        other = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+        messages = [orjson.dumps({"uuid": self.CANONICAL, "person_id": other, "event": "$pageview"})]
+        table = convert(messages)
+        assert table is not None
+        assert table.schema.field("uuid").type == pa.string()
+        out = coerce_typed_columns(table, (("uuid", "uuid"), ("person_id", "uuid")))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.schema.field("person_id").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [self.VALUE]
+        assert out.column("person_id").to_pylist() == [uuid_mod.UUID(other)]
+        assert out.column("event").to_pylist() == ["$pageview"]
+        assert mock_metrics.errors_total.labels.call_count == 0
+
+    def test_parquet_write_carries_the_uuid_logical_annotation(self):
+        # The coerced column writes as FIXED_LEN_BYTE_ARRAY(16) WITH
+        # LogicalTypeAnnotation.uuidType() — that annotation is what the Trino
+        # hoglake connector reads a uuid column back through. A plain binary(16)
+        # column writes the same physical bytes with no annotation. This is the
+        # column's own property; that it survives into the object the hoglake
+        # sink uploads is pinned separately, in
+        # tests/unit/test_hoglake.py::TestUuidColumnWireForm.
+        out = coerce_typed_columns(pa.table({"uuid": [self.CANONICAL]}), (("uuid", "uuid"),))
+        buf = io.BytesIO()
+        pq.write_table(out, buf)
+        buf.seek(0)
+        pf = pq.ParquetFile(buf)
+        column = pf.schema.column(0)
+        assert column.physical_type == "FIXED_LEN_BYTE_ARRAY"
+        assert column.length == 16
+        assert str(column.logical_type) == "UUID"
+
+
+class TestUuidBytesGrammar:
+    """`uuid_bytes` on its own — the accepted shapes are enumerated, not
+    delegated to `uuid.UUID`, whose grammar remaps things that are not UUIDs."""
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    BYTES = uuid_mod.UUID(CANONICAL).bytes
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            CANONICAL,
+            CANONICAL.upper(),
+            CANONICAL.replace("-", ""),
+            CANONICAL.replace("-", "").upper(),
+            "{" + CANONICAL + "}",
+            "urn:uuid:" + CANONICAL,
+        ],
+    )
+    def test_accepted_shapes(self, text):
+        assert uuid_bytes(text) == self.BYTES
+
+    @pytest.mark.parametrize(
+        ("text", "why"),
+        [
+            # `uuid.UUID` strips `urn:`/`uuid:` from ANYWHERE and removes EVERY
+            # hyphen, so all three of these parse there and silently become a
+            # UUID the producer never sent.
+            ("0123-4567-89ab-cdef-0123-4567-89ab-cdef", "hyphens outside the canonical offsets"),
+            ("urn:0123456789abcdef0123456789abcdef", "bare urn: prefix"),
+            ("0123456789abcdefuuid:0123456789abcdef", "uuid: buried mid-value"),
+            # Everything `int(text, 16)` accepts and a UUID does not. All
+            # three are 32 characters, so the stdlib's length check passes and
+            # it produces a different, plausible-looking UUID (verified on
+            # CPython 3.13: "0x0123456789abcdef0123456789abcd" ->
+            # 00012345-6789-abcd-ef01-23456789abcd).
+            ("0x0123456789abcdef0123456789abcd", "radix prefix"),
+            ("1_3456789abcdef0123456789abcdef0", "PEP 515 underscore"),
+            ("+0123456789abcdef0123456789abcde", "leading sign"),
+            # QE c2: the length guard is the ONLY thing standing between a
+            # whitespace-bearing 32-character string and a silent 15-byte
+            # decode, because `bytes.fromhex` skips ASCII whitespace.
+            ("0123456789abcdef  0123456789abcd", "32 chars with two internal spaces"),
+            ("0123456789abcdef0123456789abcd", "30 hex digits"),
+            ("0123456789abcdef0123456789abcdeff", "33 hex digits"),
+            ("URN:UUID:" + CANONICAL, "urn prefix is case-sensitive"),
+            ("", "empty"),
+            ("not-a-uuid", "not hex at all"),
+            ("018f3c7e6b2a-7c3d-9e4f-5a6b7c8d9e0f", "canonical length, wrong hyphen offsets"),
+            # One case per canonical hyphen offset, each 36 characters long and
+            # each tripping ONLY that offset's check — so deleting any single
+            # clause of the four fails exactly one of these.
+            ("012345678-9ab-cdef-0123-456789abcdef", "offset 8 only"),
+            ("0-123456-789abcdef-0123-456789abcdef", "offset 13 only"),
+            ("0-123456-789a-bcdef0123-456789abcdef", "offset 18 only"),
+            ("01234567-89ab-cdef-0123456789-abcdef", "offset 23 only"),
+        ],
+    )
+    def test_refused_shapes(self, text, why):
+        with pytest.raises(ValueError):
+            uuid_bytes(text)
+
+    @pytest.mark.parametrize("value", [None, 5, b"0123456789abcdef", 1.5, ["x"]])
+    def test_non_strings_refused(self, value):
+        with pytest.raises(ValueError):
+            uuid_bytes(value)
+
+    def test_rfc_variant_and_version_bits_are_not_validated(self):
+        # ClickHouse UUID is an opaque 128-bit value and PostHog writes v4 and
+        # v7 both; rejecting an "invalid" variant would drop real data.
+        assert uuid_bytes("00000000-0000-0000-0000-000000000000") == b"\x00" * 16
+        assert uuid_bytes("ffffffff-ffff-ffff-ffff-ffffffffffff") == b"\xff" * 16
+
+    def test_uuid_text_is_the_inverse(self):
+        assert uuid_text(self.BYTES) == self.CANONICAL
+        assert uuid_bytes(uuid_text(self.BYTES)) == self.BYTES
+
+    @pytest.mark.parametrize("raw", [b"short", b"", "text", None, b"0" * 17])
+    def test_uuid_text_refuses_non_16_byte_input(self, raw):
+        with pytest.raises(ValueError):
+            uuid_text(raw)
+
+
+class TestToUuidDirectly:
+    """`_to_uuid` itself. The tests above go through `coerce_typed_columns`,
+    which rebuilds the table from the declared field type — so a coercer that
+    returned bare `binary(16)` would still produce a `pa.uuid()` column there
+    and the bug would only surface at the sink."""
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    BYTES = uuid_mod.UUID(CANONICAL).bytes
+
+    def test_returns_the_extension_type_not_the_storage(self):
+        out = _to_uuid(pa.array([self.CANONICAL], pa.string()))
+        assert out.type == pa.uuid()
+        assert out.storage.type == pa.binary(16)
+        assert out.storage.to_pylist() == [self.BYTES]
+
+    def test_already_extension_typed_is_returned_as_is(self):
+        arr = pa.ExtensionArray.from_storage(pa.uuid(), pa.array([self.BYTES], pa.binary(16)))
+        assert _to_uuid(arr) is arr
+
+    def test_chunked_input_is_accepted(self):
+        chunked = pa.chunked_array([pa.array([self.CANONICAL], pa.string()), pa.array([None], pa.string())])
+        out = _to_uuid(chunked)
+        assert out.type == pa.uuid()
+        assert out.storage.to_pylist() == [self.BYTES, None]
+
+    def test_large_string_source_parses(self):
+        out = _to_uuid(pa.array([self.CANONICAL], pa.large_string()))
+        assert out.type == pa.uuid()
+        assert out.storage.to_pylist() == [self.BYTES]
+
+    def test_variable_width_binary_of_16_bytes_is_adopted(self):
+        out = _to_uuid(pa.array([self.BYTES], pa.binary()))
+        assert out.type == pa.uuid()
+        assert out.storage.to_pylist() == [self.BYTES]
+
+    @pytest.mark.parametrize(
+        "array",
+        [
+            pa.array([1, 2], pa.int64()),
+            pa.array([1.5], pa.float64()),
+            pa.array([True], pa.bool_()),
+            pa.array([b"01234567"], pa.binary(8)),
+            pa.array([b"short"], pa.binary()),
+        ],
+    )
+    def test_unusable_source_types_raise_arrow_invalid(self, array):
+        # ArrowInvalid specifically: that is what `_coerce_or_null` catches to
+        # run its per-value null-out pass.
+        with pytest.raises(pa.ArrowInvalid):
+            _to_uuid(array)
+
+
+class TestCoerceUuidFromNonStringColumns:
+    """Whole-table behaviour for source columns that are not UUID text."""
+
+    CANONICAL = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    BYTES = uuid_mod.UUID(CANONICAL).bytes
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_int64_column_nulls_every_row(self, mock_metrics):
+        table = pa.table({"uuid": pa.array([1, 2], pa.int64())})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [None, None]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_binary_8_column_nulls_every_row(self, mock_metrics):
+        table = pa.table({"uuid": pa.array([b"01234567"], pa.binary(8))})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [None]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_large_string_column_parses(self, mock_metrics):
+        table = pa.table({"uuid": pa.array([self.CANONICAL], pa.large_string())})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        assert out.column("uuid").to_pylist() == [uuid_mod.UUID(self.CANONICAL)]
+        mock_metrics.columns_coerced_total.labels.assert_called_once_with(target_type="uuid")
+        mock_metrics.errors_total.labels.assert_not_called()
+
+    @patch("millpond.arrow_converter.metrics")
+    def test_variable_binary_mixed_widths_nulls_only_the_wrong_ones(self, mock_metrics):
+        table = pa.table({"uuid": pa.array([self.BYTES, b"short"], pa.binary())})
+        out = coerce_typed_columns(table, (("uuid", "uuid"),))
+        assert out.column("uuid").to_pylist() == [uuid_mod.UUID(self.CANONICAL), None]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="column_coercion")

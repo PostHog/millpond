@@ -1,3 +1,9 @@
+import logging
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import duckdb
@@ -6,8 +12,11 @@ import pytest
 from confluent_kafka import KafkaException
 
 from millpond.main import (
+    _RETRY_AFTER_MAX_S,
     _convert_batch,
     _flush,
+    _sink_write_kwargs,
+    _update_lag_metrics,
     _write_with_retry,
 )
 
@@ -49,7 +58,9 @@ class TestWriteWithRetry:
         with patch("millpond.main.time") as mock_time:
             _write_with_retry(sink, table)
         assert sink.write.call_count == 2
-        mock_time.sleep.assert_called_once_with(1.0)
+        # One sleep, on the base step plus its upward jitter.
+        (slept,) = [c.args[0] for c in mock_time.sleep.call_args_list]
+        assert 1.0 <= slept <= 1.25
 
     @pytest.mark.parametrize(
         "exc_cls",
@@ -75,7 +86,22 @@ class TestWriteWithRetry:
         with patch("millpond.main.time") as mock_time:
             _write_with_retry(sink, table)
         calls = [c.args[0] for c in mock_time.sleep.call_args_list]
-        assert calls == [1.0, 2.0]
+        assert len(calls) == 2
+        assert 1.0 <= calls[0] <= 1.25
+        assert 2.0 <= calls[1] <= 2.5
+
+    def test_backoff_steps_are_jittered(self):
+        # A fleet refused by the same 503 must not wake in lockstep and
+        # re-form the convoy it was backing off from.
+        sink = _make_sink()
+        seen = set()
+        for _ in range(30):
+            sink.write.side_effect = [OSError(), None]
+            with patch("millpond.main.time") as mock_time:
+                _write_with_retry(sink, pa.table({"a": [1]}))
+            seen.add(mock_time.sleep.call_args.args[0])
+        assert len(seen) > 1, "every pod would sleep the same 1.0s"
+        assert all(1.0 <= d <= 1.25 for d in seen)
 
     @pytest.mark.parametrize("exc", _RETRYABLE_EXCEPTIONS)
     def test_resets_caches_on_retry(self, exc):
@@ -100,7 +126,165 @@ _DUCKLAKE_CONTENTION_MESSAGES = [
     # Postgres serialization failure under SERIALIZABLE isolation —
     # unlikely on duckling RDS today but cheap to classify
     "ERROR: could not serialize access due to concurrent update",
+    # DuckLake conflict-checker hard abort (can_retry=false) after a
+    # concurrent snapshot's change token — e.g. a drop-partitions catalog
+    # write ending files under an in-flight insert; absorbed by retry on a
+    # fresh baseline. Verbatim fork wording (ducklake_transaction_state.cpp
+    # ConflictCheck) so a wording change that drops the prefix is caught.
+    (
+        'Transaction conflict - attempting to insert into table with index "5"'
+        " - but another transaction has deleted from it"
+    ),
 ]
+
+
+class TestFlushDeadline:
+    """The wall-clock bound on one flush, which the attempt count is not.
+
+    The consume loop is single threaded, so every second a flush spends
+    retrying is a second `server.HealthState` sees no poll. Three costs
+    are invisible to the startup model: the server's `Retry-After`
+    floors each backoff gap (clamped per gap, never in sum), a rebuild
+    re-resolves the destination and re-reads its shape under their own
+    timeouts, and a stalled object store can hold one prepare far past
+    its allowance. So the loop stops on the clock — raising the last
+    error, which is the outcome exhausting the attempts already gives,
+    except that it happens while the process can still log why rather
+    than being SIGKILLed mid-flush with nothing in its own logs.
+    """
+
+    def _sink(self, budget_s=450.0, attempt_cost_s=65.0, attempts=6):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "write_retry_budget", "write_flush_deadline"])
+        sink.write.side_effect = OSError("S3 timeout")
+        sink.write_retry_budget.return_value = (attempts, 1.0)
+        sink.write_flush_deadline.return_value = (budget_s, attempt_cost_s)
+        return sink
+
+    def _clock(self, step_s: float):
+        """A clock that advances `step_s` on every reading, so each
+        attempt's elapsed time grows without anything sleeping."""
+        t = {"now": 0.0}
+
+        def now():
+            t["now"] += step_s
+            return t["now"]
+
+        return now
+
+    def test_a_flush_that_cannot_finish_another_attempt_stops_early(self):
+        # 100s per reading against a 450s budget and a 65s reservation:
+        # the deadline bites well before the 6 attempts run out.
+        sink = self._sink()
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(100.0))
+        assert sink.write.call_count < 6, "the attempt budget was spent despite the deadline"
+
+    def test_the_early_stop_is_logged_as_its_own_fact(self, caplog):
+        # "gave up on purpose" and "ran out of attempts" look identical
+        # in the exception and lead to different investigations, so the
+        # flag is greppable and the numbers behind the decision are on
+        # the line.
+        sink = self._sink()
+        with (
+            caplog.at_level(logging.ERROR, logger="millpond.main"),
+            patch("millpond.main.time"),
+            pytest.raises(OSError),
+        ):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(100.0))
+        assert "flush_deadline_exceeded=true" in caplog.text
+        assert "elapsed=" in caplog.text
+        assert "budget=450.0s" in caplog.text
+        assert "attempts=" in caplog.text
+
+    @patch("millpond.main.metrics")
+    def test_the_early_stop_is_counted(self, mock_metrics):
+        sink = self._sink()
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(100.0))
+        mock_metrics.errors_total.labels.assert_any_call(type="flush_deadline_exceeded")
+
+    def test_a_fast_flush_spends_its_whole_attempt_budget(self):
+        # The negative, and the one that matters most: the deadline must
+        # not shorten the ladder a healthy-but-convoyed catalog needs.
+        # A clock that barely moves leaves every attempt affordable.
+        sink = self._sink()
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(0.01))
+        assert sink.write.call_count == 6
+
+    @patch("millpond.main.metrics")
+    def test_a_fast_flush_is_not_counted_as_a_deadline_stop(self, mock_metrics):
+        sink = self._sink()
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(0.01))
+        for call in mock_metrics.errors_total.labels.call_args_list:
+            assert call.kwargs.get("type") != "flush_deadline_exceeded"
+
+    def test_a_sink_without_the_hook_is_unbounded_by_the_clock(self):
+        # DuckLake: three outer attempts over an inner loop with its own
+        # bound. Adding a deadline it never asked for would change a
+        # deployed path for no reason.
+        sink = MagicMock(spec=["write", "reset_caches", "close"])
+        sink.write.side_effect = OSError("S3 timeout")
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), now=self._clock(10_000.0))
+        assert sink.write.call_count == 3
+
+    def test_the_deadline_never_blocks_the_first_attempt(self):
+        # However far behind the pod already is, the flush gets one try:
+        # refusing to attempt at all would advance nothing and crash on
+        # a batch that might have landed.
+        sink = self._sink(budget_s=1.0, attempt_cost_s=1000.0)
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(500.0))
+        assert sink.write.call_count == 1
+
+    def test_the_hoglake_sinks_own_numbers_fit_the_budget(self):
+        # The hook's values, not a fixture's: the per-attempt reservation
+        # has to be the request timeout plus the prepare allowance, and
+        # the budget has to be the liveness deadline less the margin.
+        from millpond.config import _LIVENESS_BUDGET_S, _PREPARE_ALLOWANCE_S, hoglake_flush_deadline
+
+        budget_s, attempt_cost_s = hoglake_flush_deadline(45.0)
+        assert attempt_cost_s == 45.0 + _PREPARE_ALLOWANCE_S
+        assert budget_s < _LIVENESS_BUDGET_S
+        # And the default ladder still fits inside it, or the deadline
+        # would be cutting healthy flushes short rather than doomed ones.
+        assert budget_s >= 6 * attempt_cost_s
+
+    def test_the_deadline_is_re_read_after_every_failed_attempt(self):
+        # The hoglake sink's reservation is derived from the prepare it
+        # just ran, so the loop must ask again after each failure: a
+        # 2 GiB variant flush whose first attempt took 270 s is priced at
+        # the floor only if the hook was read once, up front. Here the
+        # hook answers 445 s (270 s x 1.5 plus the timeout) from the
+        # first reading: 5 s elapsed + ~1 s backoff + 445 s > 450 s, so
+        # there is no room for a second attempt.
+        sink = self._sink(budget_s=450.0, attempt_cost_s=445.0)
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(sink, pa.table({"a": [1]}), destination="hoglake", now=self._clock(5.0))
+        assert sink.write.call_count == 1
+        # Read AFTER the failure, once per failed attempt — never before
+        # the first attempt, which has nothing measured to price it with.
+        assert sink.write_flush_deadline.call_count == 1
+
+    def test_a_reservation_that_grows_stops_the_ladder_where_the_floor_would_not(self):
+        # The same 60 s/reading clock, two reservations: at the floor the
+        # whole ladder runs (the fifth failure sees 300 + 16 + 65 < 450);
+        # at a measured 150 s per attempt it stops after the fifth
+        # attempt (300 + 16 + 150 > 450).
+        floor = self._sink(budget_s=450.0, attempt_cost_s=65.0)
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(floor, pa.table({"a": [1]}), destination="hoglake", now=self._clock(60.0))
+        assert floor.write.call_count == 6
+        measured = self._sink(budget_s=450.0, attempt_cost_s=150.0)
+        with patch("millpond.main.time"), pytest.raises(OSError):
+            _write_with_retry(measured, pa.table({"a": [1]}), destination="hoglake", now=self._clock(60.0))
+        assert measured.write.call_count == 5
+        # Every failed attempt re-read the hook (the sixth attempt of the
+        # floor run raises on exhaustion before reading it).
+        assert measured.write_flush_deadline.call_count == 5
+        assert floor.write_flush_deadline.call_count == 5
 
 
 class TestWriteWithRetryErrorLabels:
@@ -176,7 +360,7 @@ class TestFlushErrorDistinction:
         # Sinks return the count actually written; _flush feeds it to
         # records_written_total.
         sink.write.return_value = table.num_rows
-        offsets = {("topic", 0): 42}
+        offsets = {("topic", 0): (30, 42)}  # (first, last) in the pending buffer
         return sink, cfg, kafka, table, offsets
 
     @patch("millpond.main.time")
@@ -264,6 +448,21 @@ class TestArrowConversionTiming:
         observed = mock_metrics.arrow_conversion_seconds.observe.call_args[0][0]
         assert isinstance(observed, float)
         assert observed >= 0
+
+    @patch("millpond.main.metrics")
+    @patch("millpond.main.arrow_converter")
+    def test_the_sinks_json_text_columns_reach_the_converter(self, mock_converter, _metrics):
+        # The hoglake sink names its live variant columns; a sink without
+        # the hook (DuckLake) gives the converter an empty set.
+        mock_converter.convert.return_value = pa.table({"a": [1]})
+        hoglake_like = MagicMock(spec=["json_text_columns"])
+        hoglake_like.json_text_columns.return_value = frozenset({"properties"})
+        _convert_batch([b"{}"], hoglake_like)
+        assert mock_converter.convert.call_args.kwargs["json_text_columns"] == frozenset({"properties"})
+        _convert_batch([b"{}"], MagicMock(spec=["write"]))
+        assert mock_converter.convert.call_args.kwargs["json_text_columns"] == frozenset()
+        _convert_batch([b"{}"])
+        assert mock_converter.convert.call_args.kwargs["json_text_columns"] == frozenset()
 
     @patch("millpond.main.metrics")
     @patch("millpond.main.arrow_converter")
@@ -649,6 +848,266 @@ def _capture_sort_skip_calls(mock_metrics):
     return sort_calls
 
 
+class TestUuidPinnedColumnDownstream:
+    """A `uuid`-pinned column is `pa.uuid()`, an EXTENSION type, and pyarrow's
+    compute kernels refuse one. Every stage between the coercer and the sink
+    therefore has to work on its storage array — these pin that they do, and
+    that the failure mode each one used to have is gone."""
+
+    A = "018f3c7e-6b2a-7c3d-9e4f-5a6b7c8d9e0f"
+    B = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+    C = "ffffffff-ffff-4fff-bfff-ffffffffffff"
+
+    def _table(self, values, **extra):
+        from millpond.arrow_converter import coerce_typed_columns
+
+        cols = {"uuid": pa.array(values, pa.string())}
+        cols.update(extra)
+        out = coerce_typed_columns(pa.table(cols), (("uuid", "uuid"),))
+        assert out.schema.field("uuid").type == pa.uuid()
+        return out
+
+    # -- B2: sort ---------------------------------------------------------
+
+    def _sort_cfg(self, sort_by):
+        cfg = MagicMock()
+        cfg.sort_by = sort_by
+        return cfg
+
+    @patch("millpond.main.metrics")
+    def test_sort_by_uuid_column_sorts_instead_of_crashing(self, mock_metrics):
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = self._table([self.C, self.A, self.B], event=["c", "a", "b"])
+        result = _apply_sort(table, self._sort_cfg(("uuid",)))
+
+        # Storage is the 16 big-endian bytes, so bytewise order IS canonical
+        # text order.
+        assert [str(v) for v in result.column("uuid").to_pylist()] == [self.A, self.B, self.C]
+        # Full-row reordering, and the declared type is untouched.
+        assert result.column("event").to_pylist() == ["a", "b", "c"]
+        assert result.schema.field("uuid").type == pa.uuid()
+        assert sort_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_sort_by_uuid_with_a_second_key_and_nulls(self, mock_metrics):
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        table = self._table([self.B, None, self.A], team_id=[1, 1, 1])
+        result = _apply_sort(table, self._sort_cfg(("team_id", "uuid")))
+        assert [None if v is None else str(v) for v in result.column("uuid").to_pylist()] == [
+            self.A,
+            self.B,
+            None,
+        ]
+        assert sort_calls == []
+
+    @patch("millpond.main.metrics")
+    def test_unsortable_type_skips_the_sort_and_keeps_the_rows(self, mock_metrics):
+        from millpond.main import _apply_sort
+
+        sort_calls = _capture_sort_skip_calls(mock_metrics)
+        # A list column has no sort kernel and is not an extension type, so it
+        # reaches the backstop arm. The rows must still flow through, unsorted.
+        table = pa.table({"s": pa.array([[2], [1]], pa.list_(pa.int64()))})
+        result = _apply_sort(table, self._sort_cfg(("s",)))
+        assert result.num_rows == 2
+        assert result.column("s").to_pylist() == [[2], [1]]
+        assert sort_calls == [("unsortable_type", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_unsortable_warning_is_deduped(self, mock_metrics, caplog):
+        import logging as _logging
+
+        from millpond.main import _apply_sort
+
+        _capture_sort_skip_calls(mock_metrics)
+        table = pa.table({"s": pa.array([[1]], pa.list_(pa.int64()))})
+        with caplog.at_level(_logging.WARNING, logger="millpond.main"):
+            _apply_sort(table, self._sort_cfg(("s",)))
+            _apply_sort(table, self._sort_cfg(("s",)))
+        assert len([r for r in caplog.records if "sort kernel" in r.message]) == 1
+
+    # -- S1: keep filter ---------------------------------------------------
+
+    def _keep_cfg(self):
+        cfg = MagicMock()
+        cfg.filter_keep_field = "uuid"
+        return cfg
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_on_uuid_column_matches_on_bytes(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B, self.C], event=["a", "b", "c"])
+        result = _apply_filter(table, self._keep_cfg(), (self.A, self.C))
+        assert result.num_rows == 2
+        assert result.column("event").to_pylist() == ["a", "c"]
+        assert skip_calls == [("filter_excluded", 1)]
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_accepts_unhyphenated_filter_values(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B])
+        result = _apply_filter(table, self._keep_cfg(), (self.A.replace("-", ""),))
+        assert result.num_rows == 1
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_counts_nulls_as_field_missing(self, mock_metrics):
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, None])
+        result = _apply_filter(table, self._keep_cfg(), (self.A,))
+        assert result.num_rows == 1
+        assert skip_calls == [("filter_field_missing", 1)]
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_ignores_one_bad_polled_value_and_keeps_the_rest(self, mock_metrics):
+        # Config load refuses a static non-UUID; a DYNAMIC include-values poll
+        # can still serve one. It cannot match a uuid column under any
+        # encoding, so it is dropped from the allowlist — condemning the whole
+        # batch would starve every team on the list for one bad entry.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B, self.C])
+        result = _apply_filter(table, self._keep_cfg(), (self.A, "not-a-uuid", self.C))
+        assert result.num_rows == 2
+        assert [str(v) for v in result.column("uuid").to_pylist()] == [self.A, self.C]
+        assert skip_calls == [("filter_excluded", 1)]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="filter_value_invalid")
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_fails_closed_when_no_value_is_a_uuid(self, mock_metrics):
+        # Nothing on the allowlist can match, so nothing is admitted — the
+        # allowlist's own failure direction, under its OWN reason label so a
+        # bad include set is not read as a renamed column.
+        from millpond.main import _apply_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B])
+        result = _apply_filter(table, self._keep_cfg(), ("not-a-uuid", "also-bad"))
+        assert result.num_rows == 0
+        assert skip_calls == [("filter_value_invalid", 2)]
+
+    @patch("millpond.main.metrics")
+    def test_drop_filter_ignores_one_bad_value_and_denies_the_rest(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B, self.C])
+        result = _apply_drop_filter(table, self._drop_cfg(("not-a-uuid", self.B)))
+        assert [str(v) for v in result.column("uuid").to_pylist()] == [self.A, self.C]
+        assert skip_calls == [("filter_dropped", 1)]
+        mock_metrics.errors_total.labels.assert_called_once_with(type="filter_value_invalid")
+
+    @patch("millpond.main.metrics")
+    def test_keep_filter_matched_label_is_canonical_uuid_text(self, mock_metrics):
+        # The label has to be something an operator can match against a UUID.
+        # The default `str` renderer over the STORAGE array emits a Python
+        # bytes repr (b"\x01\x8f<~..."), which is neither greppable nor
+        # joinable to anything.
+        from millpond.main import _apply_filter
+
+        match_calls: list[tuple[str, int]] = []
+
+        def _counter_for(value):
+            counter = MagicMock()
+            counter.inc.side_effect = lambda n, v=value: match_calls.append((v, n))
+            return counter
+
+        mock_metrics.filter_matched_total.labels.side_effect = lambda value: _counter_for(value)
+        table = self._table([self.A, self.A, self.B, self.C])
+        result = _apply_filter(table, self._keep_cfg(), (self.A, self.B))
+
+        assert result.num_rows == 3
+        assert sorted(match_calls) == [(self.A, 2), (self.B, 1)]
+
+    @patch("millpond.main.metrics")
+    def test_non_uuid_polled_value_warns_once(self, mock_metrics, caplog):
+        # A dynamic poll keeps serving the same bad value, so the condition is
+        # permanent; the warning carries the whole values tuple and must not
+        # land once per flush.
+        import logging as _logging
+
+        from millpond.main import _apply_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = self._table([self.A])
+        with caplog.at_level(_logging.WARNING, logger="millpond.main"):
+            _apply_filter(table, self._keep_cfg(), (self.A, "nope"))
+            _apply_filter(table, self._keep_cfg(), (self.A, "nope"))
+            # A genuinely different bad value still gets its own line.
+            _apply_filter(table, self._keep_cfg(), (self.A, "other"))
+        assert len([r for r in caplog.records if "are not UUIDs" in r.message]) == 2
+
+    def test_warn_key_holds_no_reference_to_the_values(self):
+        # An authoritative include-values source rebuilds its list on every
+        # membership change; a dedup set keyed on the tuple would retain every
+        # historical one with nothing to evict it.
+        import millpond.main as _main
+
+        values = tuple(str(i) for i in range(50)) + ("bad",)
+        _main._warn_bad_uuid_filter_values("uuid", values, ("bad",), "ignored")
+        (key,) = _main._uuid_filter_values_warned
+        assert key == ("uuid", 51, "bad")
+
+    def test_parsed_filter_values_are_memoized(self):
+        import millpond.main as _main
+
+        values = (self.A, self.B)
+        first, _ = _main._parse_uuid_filter_values(values)
+        second, _ = _main._parse_uuid_filter_values(values)
+        # Same object back, not an equal rebuild: the memo is what keeps the
+        # parse off the per-batch path.
+        assert first is second
+        third, _ = _main._parse_uuid_filter_values((self.C,))
+        assert third is not first
+
+    # -- S1: drop filter ---------------------------------------------------
+
+    def _drop_cfg(self, drop_values):
+        cfg = MagicMock()
+        cfg.filter_drop_field = "uuid"
+        cfg.filter_drop_values = drop_values
+        return cfg
+
+    @patch("millpond.main.metrics")
+    def test_drop_filter_on_uuid_column_denies_on_bytes(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        skip_calls = _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B, self.C], event=["a", "b", "c"])
+        result = _apply_drop_filter(table, self._drop_cfg((self.B,)))
+        assert result.column("event").to_pylist() == ["a", "c"]
+        assert skip_calls == [("filter_dropped", 1)]
+
+    @patch("millpond.main.metrics")
+    def test_drop_filter_keeps_nulls(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, None])
+        result = _apply_drop_filter(table, self._drop_cfg((self.A,)))
+        assert result.num_rows == 1
+        assert result.column("uuid").to_pylist() == [None]
+
+    @patch("millpond.main.metrics")
+    def test_drop_filter_fails_open_on_a_non_uuid_value(self, mock_metrics):
+        from millpond.main import _apply_drop_filter
+
+        _capture_skip_calls(mock_metrics)
+        table = self._table([self.A, self.B])
+        result = _apply_drop_filter(table, self._drop_cfg(("not-a-uuid",)))
+        assert result.num_rows == 2
+
+
 class TestApplyDropFilter:
     """Drop-direction (denylist) filter. Composes AFTER the keep-filter;
     fail-open on anything unevaluable (the opposite of keep — see the
@@ -976,9 +1435,573 @@ class TestFlushCommit:
         cfg.sort_by = None
         kafka = MagicMock()
         table = pa.table({"a": [1, 2]})
-        offsets = {("events", 0): 100}
+        offsets = {("events", 0): (88, 100)}
         _flush(sink, cfg, kafka, table, 100, 2, offsets, 1.0)
         kafka.commit.assert_called_once()
         # Committed offset is next-to-fetch (max consumed + 1).
         committed = kafka.commit.call_args.kwargs["offsets"]
         assert [(tp.partition, tp.offset) for tp in committed] == [(0, 101)]
+
+
+class TestConsumeTimeout:
+    """_consume_timeout must never exceed the liveness poll-age budget.
+
+    server.health marks the process dead when no poll lands for 300s
+    (max_poll_age_s), and record_poll only runs after consume() returns.
+    Before the cap, FLUSH_INTERVAL_MS=600000 on a quiet topic meant a
+    600s consume block -> liveness SIGKILL loop across the fleet.
+    """
+
+    def test_large_interval_capped_at_max_block(self):
+        from millpond.main import _CONSUME_MAX_BLOCK_S, _consume_timeout
+
+        assert _consume_timeout(600.0) == _CONSUME_MAX_BLOCK_S
+
+    def test_cap_stays_under_liveness_budget(self):
+        from millpond.main import _CONSUME_MAX_BLOCK_S
+        from millpond.server import _HealthState
+
+        assert _CONSUME_MAX_BLOCK_S < _HealthState().max_poll_age_s
+
+    def test_short_remaining_passes_through(self):
+        from millpond.main import _consume_timeout
+
+        assert _consume_timeout(30.0) == 30.0
+
+    def test_elapsed_interval_floors_at_poll_minimum(self):
+        from millpond.main import _consume_timeout
+
+        assert _consume_timeout(-5.0) == 0.1
+        assert _consume_timeout(0.0) == 0.1
+
+
+class TestUpdateLagMetrics:
+    """_update_lag_metrics refreshes the lag gauge for every assigned
+    partition, not only the ones in the flushed batch — the runtime half of
+    PostHog/millpond#133. Watermarks come from one batched query via
+    consumer.query_watermarks."""
+
+    def _tp(self, partition, offset=-1001):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(topic="t", partition=partition, offset=offset, error=None)
+
+    def _run(self, kafka, tp_offsets, watermarks, auto_offset_reset="earliest"):
+        gauges = {}
+        with (
+            patch("millpond.main.metrics") as mock_metrics,
+            patch("millpond.consumer.query_watermarks", return_value=watermarks),
+        ):
+            mock_metrics.consumer_lag.labels.side_effect = lambda partition: gauges.setdefault(partition, MagicMock())
+            _update_lag_metrics(kafka, MagicMock(), tp_offsets, auto_offset_reset)
+        return gauges
+
+    def test_batch_partitions_use_flushed_positions(self):
+        kafka = MagicMock()
+        kafka.assignment.return_value = [self._tp(0)]
+        gauges = self._run(kafka, [self._tp(0, offset=150)], {0: (100, 200)})
+        gauges["0"].set.assert_called_once_with(50)
+        kafka.position.assert_not_called()
+
+    def test_idle_partition_uses_fetch_position(self):
+        kafka = MagicMock()
+        kafka.assignment.return_value = [self._tp(0), self._tp(1)]
+        kafka.position.return_value = [self._tp(1, offset=150)]
+        gauges = self._run(kafka, [self._tp(0, offset=190)], {0: (100, 200), 1: (100, 200)})
+        gauges["0"].set.assert_called_once_with(10)
+        gauges["1"].set.assert_called_once_with(50)
+        kafka.committed.assert_not_called()
+
+    def test_idle_partition_falls_back_to_committed(self):
+        kafka = MagicMock()
+        kafka.assignment.return_value = [self._tp(1)]
+        kafka.position.return_value = [self._tp(1)]  # OFFSET_INVALID
+        kafka.committed.return_value = [self._tp(1, offset=120)]
+        gauges = self._run(kafka, [], {1: (100, 200)})
+        gauges["1"].set.assert_called_once_with(80)
+
+    def test_fresh_idle_partition_uses_reset_target(self):
+        """No fetch position, no committed offset: report lag from the
+        auto.offset.reset target so deep-backlog partitions stay visible
+        while they wait their turn in the drain."""
+        kafka = MagicMock()
+        kafka.assignment.return_value = [self._tp(2)]
+        kafka.position.return_value = [self._tp(2)]
+        kafka.committed.return_value = [self._tp(2)]
+        gauges = self._run(kafka, [], {2: (100, 200)}, auto_offset_reset="earliest")
+        gauges["2"].set.assert_called_once_with(100)
+        gauges = self._run(kafka, [], {2: (100, 200)}, auto_offset_reset="latest")
+        gauges["2"].set.assert_called_once_with(0)
+
+    def test_kafka_errors_degrade_to_batch_only(self):
+        """assignment()/position() failures must not break the batch-partition
+        refresh — the sample stays best-effort."""
+        kafka = MagicMock()
+        kafka.assignment.side_effect = RuntimeError("broker down")
+        gauges = self._run(kafka, [self._tp(0, offset=150)], {0: (100, 200)})
+        gauges["0"].set.assert_called_once_with(50)
+
+    def test_no_partitions_no_query(self):
+        kafka = MagicMock()
+        kafka.assignment.return_value = []
+        with patch("millpond.consumer.query_watermarks") as qw:
+            with patch("millpond.main.metrics"):
+                _update_lag_metrics(kafka, MagicMock(), [], "earliest")
+            qw.assert_not_called()
+
+
+class TestHoglakeErrorLabels:
+    """pyhoglake commit conflicts (OCC 409, retryable=True on the class)
+    get their own errors_total label so hoglake-destination alerts don't
+    key on DuckLake-worded string matching."""
+
+    def test_hoglake_commit_conflict_labels_as_hoglake_commit_contention(self):
+        from pyhoglake import CommitConflictError
+
+        sink = _make_sink()
+        sink.write.side_effect = [CommitConflictError("commit conflict", status_code=409), None]
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
+            _write_with_retry(sink, table)
+        calls = mock_metrics.errors_total.labels.call_args_list
+        assert len(calls) == 1
+        assert calls[0].kwargs == {"type": "hoglake_commit_contention"}
+
+    def test_hoglake_validation_error_labels_as_write_retry(self):
+        from pyhoglake import ValidationError
+
+        sink = _make_sink()
+        sink.write.side_effect = [ValidationError("bad request", status_code=422), None]
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
+            _write_with_retry(sink, table)
+        calls = mock_metrics.errors_total.labels.call_args_list
+        assert calls[0].kwargs == {"type": "write_retry"}
+
+    def test_ducklake_strings_still_label_ducklake(self):
+        sink = _make_sink()
+        sink.write.side_effect = [duckdb.Error("Exceeded the maximum retry count of 100"), None]
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
+            _write_with_retry(sink, table, destination="ducklake")
+        assert mock_metrics.errors_total.labels.call_args_list[0].kwargs == {"type": "ducklake_commit_contention"}
+
+    def test_ducklake_wording_does_not_label_ducklake_on_a_hoglake_pod(self):
+        # The DuckLake contention classifier is string-matching, and a
+        # hoglake error is free to contain any of those substrings (a
+        # server-side Postgres error surfacing "duplicate key value", say).
+        # Gate it by destination so a hoglake pod can never raise a
+        # ducklake_commit_contention alert.
+        from pyhoglake import HoglakeError
+
+        sink = _make_sink()
+        sink.write.side_effect = [
+            HoglakeError("duplicate key value violates unique constraint", status_code=500),
+            None,
+        ]
+        table = pa.table({"a": [1]})
+        with patch("millpond.main.time"), patch("millpond.main.metrics") as mock_metrics:
+            _write_with_retry(sink, table, destination="hoglake")
+        assert mock_metrics.errors_total.labels.call_args_list[0].kwargs == {"type": "write_retry"}
+
+
+class TestSinkOwnedRetryPolicy:
+    """The retry budget was inherited from DuckLake, which carries its OWN
+    inner commit-retry loop (default 100), so three outer attempts were
+    never the real budget. Hoglake has none — one request, then raise. A
+    sink may therefore publish its own budget, a Retry-After hint, and a
+    veto on retrying at all."""
+
+    def test_sink_budget_overrides_the_default(self):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "write_retry_budget"])
+        sink.write_retry_budget.return_value = (5, 0.5)
+        sink.write.side_effect = [RuntimeError("boom")] * 4 + [7]
+        with patch("millpond.main.time"), patch("millpond.main.metrics"):
+            assert _write_with_retry(sink, pa.table({"a": [1]})) == 7
+        assert sink.write.call_count == 5
+
+    def test_default_budget_when_the_sink_publishes_none(self):
+        sink = _make_sink()
+        sink.write.side_effect = [RuntimeError("boom")] * 3
+        with patch("millpond.main.time"), patch("millpond.main.metrics"), pytest.raises(RuntimeError):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        assert sink.write.call_count == 3
+
+    def test_non_retryable_failure_is_not_retried(self):
+        # A permanent 422 does not become valid by waiting three seconds.
+        # Crash now so the operator sees it, instead of burning the budget.
+        sink = MagicMock(spec=["write", "reset_caches", "close", "is_retryable"])
+        sink.is_retryable.return_value = False
+        sink.write.side_effect = ValueError("permanently malformed")
+        with patch("millpond.main.time"), patch("millpond.main.metrics"), pytest.raises(ValueError):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        assert sink.write.call_count == 1
+        sink.reset_caches.assert_not_called()
+
+    def test_retry_after_hint_is_a_floor_not_a_replacement(self):
+        # Hoglake answers commit-admission backpressure with
+        # 503 + `Retry-After: 1` — a HARDCODED 1. Letting that replace
+        # the curve collapsed the ladder to one-second steps: the whole
+        # eight-attempt budget spent in about eight seconds against a
+        # convoyed catalog, then a crash, which adds a cold pod to the
+        # convoy. The larger of the two is honoured.
+        sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
+        sink.retry_after_hint.return_value = 1.0
+        sink.write.side_effect = [RuntimeError("503"), RuntimeError("503"), 3]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        slept = [c.args[0] for c in mock_time.sleep.call_args_list]
+        assert 1.0 <= slept[0] <= 1.25
+        assert 2.0 <= slept[1] <= 2.5  # the curve, not the hint
+
+    def test_a_hint_longer_than_the_curve_is_honoured(self):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
+        sink.retry_after_hint.return_value = 9.0
+        sink.write.side_effect = [RuntimeError("503"), 3]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        assert mock_time.sleep.call_args.args[0] >= 9.0
+
+    def test_retry_after_hint_is_clamped(self):
+        # The consume loop is single threaded, so a backoff is also a poll
+        # gap; a hostile or broken header must not park it past liveness.
+        sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
+        sink.retry_after_hint.return_value = 86400.0
+        sink.write.side_effect = [RuntimeError("503"), 3]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        mock_time.sleep.assert_called_once_with(_RETRY_AFTER_MAX_S)
+
+    def test_absent_hint_keeps_exponential_backoff(self):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "retry_after_hint"])
+        sink.retry_after_hint.return_value = None
+        sink.write.side_effect = [RuntimeError("boom"), RuntimeError("boom"), 3]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        slept = [c.args[0] for c in mock_time.sleep.call_args_list]
+        assert 1.0 <= slept[0] <= 1.25
+        assert 2.0 <= slept[1] <= 2.5
+
+    def test_the_ducklake_ladder_is_jittered_too(self):
+        # The jitter lives in the SHARED `_retry_delay`, so it applies to
+        # a sink with none of the optional hooks — the DuckLake shape,
+        # and the deployed one. That is deliberate: DuckLake pods
+        # contend for the same Postgres catalog commit lock and wake in
+        # the same lockstep a 503'd hoglake fleet does. The cost is
+        # bounded to 25% upward, so the ladder is at most 3.75s instead
+        # of 3s; the README's retry table says the same.
+        delays = set()
+        for _ in range(20):
+            sink = _make_sink()
+            sink.write.side_effect = [RuntimeError("boom"), 3]
+            with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+                _write_with_retry(sink, pa.table({"a": [1]}), destination="ducklake")
+            delays.add(mock_time.sleep.call_args.args[0])
+        # Spread, not the bare 1.0 rung repeated.
+        assert len(delays) > 1
+        assert all(1.0 <= d <= 1.25 for d in delays)
+
+    def test_exponential_backoff_is_capped(self):
+        # A long budget must not end in a multi-minute sleep.
+        sink = MagicMock(spec=["write", "reset_caches", "close", "write_retry_budget"])
+        sink.write_retry_budget.return_value = (9, 1.0)
+        sink.write.side_effect = [RuntimeError("boom")] * 8 + [1]
+        with patch("millpond.main.time") as mock_time, patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}))
+        assert max(c.args[0] for c in mock_time.sleep.call_args_list) == _RETRY_AFTER_MAX_S
+
+
+class TestFlushIdentity:
+    """`write_kwargs` carries WHICH flush this is, and the hoglake sink
+    hashes it into the commit's idempotency key. Nothing tested this
+    seam, and everything downstream of it depends on the value being the
+    same on every attempt and on naming the whole row set."""
+
+    def _cfg(self, destination="hoglake"):
+        cfg = MagicMock()
+        cfg.destination = destination
+        return cfg
+
+    def test_offsets_are_flattened_with_both_ends_of_each_range(self):
+        out = _sink_write_kwargs(self._cfg(), {("events", 1): (9, 17), ("events", 0): (30, 41)}, "size")
+        assert out == {"kafka_offsets": (("events", 0, 30, 41), ("events", 1, 9, 17)), "trigger": "size"}
+
+    def test_the_flush_identity_is_order_independent(self):
+        a = _sink_write_kwargs(self._cfg(), {("events", 0): (30, 41), ("events", 1): (9, 17)}, "size")
+        b = _sink_write_kwargs(self._cfg(), {("events", 1): (9, 17), ("events", 0): (30, 41)}, "size")
+        assert a == b
+
+    def test_the_trigger_rides_along(self):
+        # What made this flush happen goes in the hoglake snapshot's
+        # message. It is not part of the identity — the same rows
+        # flushed for a different reason are the same rows — so it is a
+        # second kwarg rather than a fifth element of each quadruple.
+        out = _sink_write_kwargs(self._cfg(), {("events", 0): (30, 41)}, "final")
+        assert out["trigger"] == "final"
+        assert out["kafka_offsets"] == (("events", 0, 30, 41),)
+
+    def test_an_unstated_trigger_is_unknown(self):
+        assert _sink_write_kwargs(self._cfg(), {("events", 0): (30, 41)})["trigger"] == "unknown"
+
+    def test_ducklake_gets_no_identity(self):
+        # Its INSERT sits in a transaction whose outcome the client always
+        # learns; there is no lost-response ambiguity to name away — and
+        # no snapshot message to put the trigger in either.
+        assert _sink_write_kwargs(self._cfg("ducklake"), {("events", 0): (30, 41)}, "size") == {}
+
+    def test_the_same_kwargs_go_to_every_attempt(self):
+        # A retry must be recognizable as the SAME flush. Sending the
+        # identity on the first attempt only turns every retry into an
+        # anonymous (random-key) publication — which is exactly the
+        # duplicate the key exists to prevent.
+        sink = _make_sink()
+        sink.write.side_effect = [RuntimeError("lost"), RuntimeError("lost"), 4]
+        identity = {"kafka_offsets": (("events", 0, 30, 41),)}
+        with patch("millpond.main.time"), patch("millpond.main.metrics"):
+            _write_with_retry(sink, pa.table({"a": [1]}), write_kwargs=identity)
+        assert sink.write.call_count == 3
+        assert all(c.kwargs == identity for c in sink.write.call_args_list)
+
+    def test_flush_hands_the_sink_its_identity(self):
+        sink = _make_sink()
+        sink.write.return_value = 2
+        cfg = MagicMock()
+        cfg.destination = "hoglake"
+        cfg.table_label = "events"
+        cfg.sort_by = None
+        with patch("millpond.main.time"), patch("millpond.main.server"), patch("millpond.main.metrics"):
+            _flush(sink, cfg, MagicMock(), pa.table({"a": [1, 2]}), 100, 2, {("events", 0): (30, 41)}, 1.0)
+        assert sink.write.call_args.kwargs == {
+            "kafka_offsets": (("events", 0, 30, 41),),
+            "trigger": "time",
+        }
+
+    def test_flush_hands_the_sink_the_trigger_it_was_called_with(self):
+        sink = _make_sink()
+        sink.write.return_value = 2
+        cfg = MagicMock()
+        cfg.destination = "hoglake"
+        cfg.table_label = "events"
+        cfg.sort_by = None
+        with patch("millpond.main.time"), patch("millpond.main.server"), patch("millpond.main.metrics"):
+            _flush(
+                sink,
+                cfg,
+                MagicMock(),
+                pa.table({"a": [1, 2]}),
+                100,
+                2,
+                {("events", 0): (30, 41)},
+                1.0,
+                "final",
+            )
+        assert sink.write.call_args.kwargs["trigger"] == "final"
+
+
+class TestOffsetSequencing:
+    """THE at-least-once contract: Kafka offsets commit only after the
+    sink write succeeds. A write failure (through all retries) must
+    leave the offsets uncommitted so a restart replays from Kafka."""
+
+    def _flush_args(self):
+        sink = _make_sink()
+        cfg = MagicMock()
+        cfg.table_label = "events"
+        cfg.sort_by = None
+        kafka = MagicMock()
+        table = pa.table({"a": [1, 2, 3]})
+        sink.write.return_value = table.num_rows
+        offsets = {("topic", 0): (12, 41), ("topic", 2): (0, 7)}
+        return sink, cfg, kafka, table, offsets
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_no_offset_commit_when_write_fails(self, mock_metrics, mock_server, mock_time):
+        sink, cfg, kafka, table, offsets = self._flush_args()
+        sink.write.side_effect = OSError("S3 down")
+        with pytest.raises(OSError):
+            _flush(sink, cfg, kafka, table, 100, 3, offsets, 1.0)
+        # write was retried to exhaustion; commit must never have run.
+        assert sink.write.call_count == 3
+        kafka.commit.assert_not_called()
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_offsets_commit_after_success_with_plus_one(self, mock_metrics, mock_server, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        sink, cfg, kafka, table, offsets = self._flush_args()
+        _flush(sink, cfg, kafka, table, 100, 3, offsets, 1.0)
+        kafka.commit.assert_called_once()
+        kwargs = kafka.commit.call_args.kwargs
+        assert kwargs["asynchronous"] is False
+        committed = {(tp.topic, tp.partition): tp.offset for tp in kwargs["offsets"]}
+        # +1: committed offset is next-to-fetch
+        assert committed == {("topic", 0): 42, ("topic", 2): 8}
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_transient_write_failure_still_commits_exactly_once(self, mock_metrics, mock_server, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        sink, cfg, kafka, table, offsets = self._flush_args()
+        sink.write.side_effect = [OSError("flake"), table.num_rows]
+        _flush(sink, cfg, kafka, table, 100, 3, offsets, 1.0)
+        assert sink.write.call_count == 2
+        kafka.commit.assert_called_once()
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.server")
+    @patch("millpond.main.metrics")
+    def test_commit_happens_after_write_not_before(self, mock_metrics, mock_server, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        sink, cfg, kafka, table, offsets = self._flush_args()
+        order = []
+        sink.write.side_effect = lambda *_a, **_k: order.append("write") or table.num_rows
+        kafka.commit.side_effect = lambda *_a, **_k: order.append("commit")
+        _flush(sink, cfg, kafka, table, 100, 3, offsets, 1.0)
+        assert order == ["write", "commit"]
+
+
+class TestFinalFlushAfterPermanentFailure:
+    """A write the sink judged permanent is tagged on the way out of
+    `_write_with_retry`, and main()'s shutdown path then skips the
+    `final` flush of the same pending batch instead of repeating the
+    refusal."""
+
+    class _Permanent(Exception):
+        pass
+
+    def _sink(self, retryable: bool):
+        sink = MagicMock(spec=["write", "reset_caches", "close", "is_retryable", "write_retry_budget"])
+        sink.write.side_effect = self._Permanent("refused")
+        sink.is_retryable.return_value = retryable
+        sink.write_retry_budget.return_value = (3, 0.0)
+        return sink
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.metrics")
+    def test_a_permanent_failure_is_tagged(self, _metrics, _time):
+        from millpond.main import _is_permanent_write_failure, _write_with_retry
+
+        with pytest.raises(self._Permanent) as excinfo:
+            _write_with_retry(self._sink(retryable=False), pa.table({"a": [1]}), destination="hoglake")
+        assert _is_permanent_write_failure(excinfo.value)
+
+    @patch("millpond.main.time")
+    @patch("millpond.main.metrics")
+    def test_exhausting_the_ladder_is_not(self, _metrics, _time):
+        from millpond.main import _is_permanent_write_failure, _write_with_retry
+
+        with pytest.raises(self._Permanent) as excinfo:
+            _write_with_retry(self._sink(retryable=True), pa.table({"a": [1]}), destination="hoglake")
+        assert not _is_permanent_write_failure(excinfo.value)
+
+    def test_the_decision(self):
+        from millpond.main import _PERMANENT_WRITE_ATTR, _final_flush_decision
+
+        permanent = RuntimeError("refused")
+        setattr(permanent, _PERMANENT_WRITE_ATTR, True)
+        assert _final_flush_decision(5, permanent, started=True) == "skip"
+        assert _final_flush_decision(5, RuntimeError("transient"), started=True) == "flush"
+        assert _final_flush_decision(5, None, started=True) == "flush"
+        assert _final_flush_decision(5, None, started=False) == "none"
+        assert _final_flush_decision(0, permanent, started=True) == "none"
+
+
+_EXIT_PRELUDE = """
+import atexit, logging, sys, time
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+# Stands in for pyarrow's atexit S3 finalization, which never returns
+# with IRSA web-identity credentials and a live S3FileSystem.
+atexit.register(time.sleep, 600)
+"""
+
+
+def _spawn(body: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-c", _EXIT_PRELUDE + textwrap.dedent(body)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+
+class TestRunEntryPoint:
+    """`millpond` (the console script) is `run`: main(), then os._exit, so
+    no atexit hook can hold a terminating pod for its whole grace period."""
+
+    @pytest.mark.parametrize(
+        ("main_body", "code"),
+        [
+            ("return 0", 0),
+            ("raise RuntimeError('loop died')", 1),
+            ("raise KeyboardInterrupt", 130),
+            ("raise SystemExit", 0),
+            ("raise SystemExit(3)", 3),
+            ("raise SystemExit('fatal: bad config')", 1),
+        ],
+    )
+    def test_exits_with_mains_code_without_running_atexit_hooks(self, main_body, code):
+        r = _spawn(f"""
+            from millpond import main as m
+            def fake_main():
+                print("last words")
+                {main_body}
+            m.main = fake_main
+            m.run()
+        """)
+        assert r.returncode == code, r.stderr
+        assert "last words" in r.stdout  # stdout flushed before os._exit
+        if "RuntimeError" in main_body or "KeyboardInterrupt" in main_body:
+            assert "Traceback" in r.stderr
+        if "bad config" in main_body:
+            assert "fatal: bad config" in r.stderr
+
+    def test_a_handler_whose_flush_hangs_is_not_flushed(self):
+        r = _spawn("""
+            class OtlpLike(logging.Handler):
+                def emit(self, record): pass
+                def flush(self): time.sleep(600)
+            logging.getLogger().addHandler(OtlpLike())
+            from millpond import main as m
+            m.main = lambda: 0
+            m.run()
+        """)
+        assert r.returncode == 0, r.stderr
+
+    @pytest.mark.parametrize("error", ["BrokenPipeError", "ValueError"])
+    def test_a_stream_whose_flush_raises_still_exits(self, error):
+        r = _spawn(f"""
+            class Broken:
+                def write(self, s): return len(s)
+                def flush(self): raise {error}("gone")
+            from millpond import main as m
+            m.main = lambda: 0
+            sys.stdout = Broken()
+            m.run()
+        """)
+        assert r.returncode == 0, r.stderr
+
+    def test_python_dash_m_goes_through_run(self):
+        env = {
+            k: v for k, v in os.environ.items() if not k.startswith(("KAFKA_", "MILLPOND_", "HOGLAKE_", "DUCKLAKE_"))
+        }
+        r = _spawn(
+            """
+            import runpy
+            runpy.run_module("millpond.main", run_name="__main__", alter_sys=True)
+            """,
+            env=env,
+        )
+        assert r.returncode == 1, r.stderr
+        assert "Required environment variable KAFKA_TOPIC is not set" in r.stderr
+
+    def test_the_console_script_is_run(self):
+        import tomllib
+
+        with open(Path(__file__).parents[2] / "pyproject.toml", "rb") as f:
+            scripts = tomllib.load(f)["project"]["scripts"]
+        assert scripts["millpond"] == "millpond.main:run"

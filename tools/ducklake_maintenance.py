@@ -30,19 +30,26 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import logging
 import os
+import random
 import re
 import sys
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
 
 import duckdb
-from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+import psycopg
+from prometheus_client import CollectorRegistry, Gauge, pushadd_to_gateway
+from psycopg import sql as pgsql
 
 log = logging.getLogger("maintenance")
 
@@ -155,6 +162,20 @@ def _positive_int(s: str) -> int:
     if n < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
     return n
+
+
+def _nonneg_int(s: str) -> int:
+    n = int(s)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {n}")
+    return n
+
+
+def _positive_float(s: str) -> float:
+    v = float(s)
+    if not v > 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {v}")
+    return v
 
 
 def connect(debug: bool = False) -> duckdb.DuckDBPyConnection:
@@ -740,6 +761,16 @@ def _orphan_stats_predicate(alias: str) -> str:
 
     Kept in lockstep with the `ducklake_stats_rows_orphaned` metric in
     ducklake-metrics-daemon — metric and purge must count the same rows.
+
+    This is NOT `_inline_orphan_predicate`, the file's other definition of
+    "orphaned". Retention is irrelevant here and decisive there. Nothing ever
+    USES a non-live table's stats row: the commit path scans both stats tables
+    in full (that is precisely why orphans tax commits — see
+    purge_orphan_stats) but only consults the rows of tables it is writing,
+    and time travel does not read global stats at all. An inlined-data table
+    by contrast IS read by a time-travel query against a retained snapshot,
+    so there "can any retained snapshot still reach it" is the whole test.
+    Deliberately two predicates, not one helper: different questions.
     """
     return (
         f"NOT EXISTS ("
@@ -1726,7 +1757,7 @@ def _bytes_to_human(stored_value: str) -> str | None:
 
 
 @contextlib.contextmanager
-def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
+def _scoped_target_file_size(conn_getter: Callable[[], duckdb.DuckDBPyConnection | None], value: str):
     """Set target_file_size for the body, restore the prior catalog value on exit.
 
     Reads the prior GLOBAL value before the body runs and restores it in the
@@ -1748,10 +1779,14 @@ def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
       tier-specific value we set during the body.
     """
     _sanitize_setting_value(value)
-    prior_row = conn.execute(
-        f"SELECT value FROM ducklake_options('{ATTACH_NAME}') "
-        f"WHERE option_name = 'target_file_size' AND scope = 'GLOBAL'"
-    ).fetchone()
+    prior_row = (
+        conn_getter()
+        .execute(
+            f"SELECT value FROM ducklake_options('{ATTACH_NAME}') "
+            f"WHERE option_name = 'target_file_size' AND scope = 'GLOBAL'"
+        )
+        .fetchone()
+    )
     # Distinguish three cases so we only warn on a genuine conversion failure
     # (a prior GLOBAL value of 134217728 converts to '128MiB' which equals
     # DEFAULT_TARGET_FILE_SIZE — without this distinction we'd emit a noisy
@@ -1771,12 +1806,22 @@ def _scoped_target_file_size(conn: duckdb.DuckDBPyConnection, value: str):
         else:
             restore = converted
     _sanitize_setting_value(restore)
-    conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{value}')")
+    conn_getter().execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{value}')")
     try:
         yield
     finally:
-        conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{restore}')")
-        log.info("target_file_size restored to %s", restore)
+        # conn_getter (not a bound conn): compact() may replace its connection
+        # mid-run after an instance-fatal error, and the restore must land on
+        # whichever connection is live at exit — or be skipped when none is.
+        current = conn_getter()
+        if current is None:
+            # A skipped restore leaves the tier target set; every tier target
+            # and the default are the same value in practice, and skipping
+            # beats blocking on a wedged instance.
+            log.warning("target_file_size restore skipped: no live connection")
+        else:
+            current.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{restore}')")
+            log.info("target_file_size restored to %s", restore)
 
 
 def _set_compaction_tuning(conn: duckdb.DuckDBPyConnection, threads: int, memory_limit: str) -> None:
@@ -1802,6 +1847,81 @@ def _set_compaction_tuning(conn: duckdb.DuckDBPyConnection, threads: int, memory
         threads,
         memory_limit,
     )
+
+
+# Errors after which the DuckDB instance must be treated as unusable. The
+# per-table continue-on-error contract assumed the connection survives a
+# failed CALL; production wedges (a hive-path compaction assertion followed by
+# total silence — no per-table logs, no heartbeats — until the activeDeadline
+# killed the run) showed an InternalException can leave the instance blocking
+# every later query without raising. Rebuilding the connection is the only
+# safe continuation.
+_INSTANCE_FATAL_ERRORS = (duckdb.InternalException, duckdb.FatalException)
+# One rebuild per run: duckdb memory_limit is per INSTANCE and a wedged
+# instance's buffers may never free (its close can hang), so every additional
+# live instance stacks another memory_limit against the pod cgroup. A second
+# invalidation in one run is systemic poison, not bad luck — stop compacting
+# and let the (exit-0) failure gauges tell the story.
+_MAX_CONNECTION_REBUILDS = 1
+
+# Rebuild count of the last compact() run, exported by main() as the
+# maintenance_compact_connection_rebuilds gauge. Module state rather than a
+# richer compact() return type so the existing int contract (failed tables)
+# and its callers stay untouched.
+_last_compact_rebuilds = 0
+
+
+def _connection_alive(conn: duckdb.DuckDBPyConnection, timeout_s: float = 5.0) -> bool:
+    """Probe the instance from a side thread so a wedged one can't hang us.
+
+    Most InternalExceptions (e.g. the hive-path compaction assertion) leave
+    the instance fully usable; the probe distinguishes those from the
+    production wedge where every later query blocks without raising.
+    """
+    alive: list[bool] = []
+
+    def _probe() -> None:
+        with contextlib.suppress(Exception):
+            conn.execute("SELECT 1").fetchone()
+            alive.append(True)
+
+    prober = threading.Thread(target=_probe, daemon=True)
+    prober.start()
+    prober.join(timeout=timeout_s)
+    return bool(alive)
+
+
+def _quiet_close(conn: duckdb.DuckDBPyConnection) -> None:
+    with contextlib.suppress(Exception):
+        conn.close()
+
+
+def _abandon_connection(conn: duckdb.DuckDBPyConnection) -> None:
+    """Close a possibly-wedged connection without risking a hang.
+
+    close() on an instance that just failed an internal assertion can block on
+    the same internal state that wedged it; run it from a daemon thread with a
+    short grace period and otherwise leak the object — the process is a
+    short-lived cron step.
+    """
+    with contextlib.suppress(Exception):
+        # Cancel any in-flight work first: it materially raises the odds the
+        # close completes, which is what actually frees the instance's buffers
+        # and rolls back its Postgres-side metadata session.
+        conn.interrupt()
+    closer = threading.Thread(target=_quiet_close, args=(conn,), daemon=True)
+    closer.start()
+    closer.join(timeout=5.0)
+    if closer.is_alive():
+        log.warning("abandoned a wedged duckdb connection without close()")
+
+
+def _fresh_compaction_connection(threads: int, memory_limit: str, target: str) -> duckdb.DuckDBPyConnection:
+    conn = connect()
+    _set_compaction_tuning(conn, threads, memory_limit)
+    _sanitize_setting_value(target)
+    conn.execute(f"CALL ducklake_set_option('{ATTACH_NAME}', 'target_file_size', '{target}')")
+    return conn
 
 
 def _rss_bytes() -> int | None:
@@ -1891,7 +2011,7 @@ def _start_heartbeat(conn: duckdb.DuckDBPyConnection, label: str, interval_s: fl
 def _enumerate_compaction_tables(
     conn: duckdb.DuckDBPyConnection, min_b: int | None, max_b: int
 ) -> list[tuple[str, str]]:
-    """Tables with >= 2 live files in the tier's size band, biggest backlog first.
+    """Tables with a MERGEABLE group in the tier's band, biggest backlog first.
 
     Candidate-driven (from ducklake_data_file), NOT information_schema: a
     catalog can carry thousands of live tables (dlt/Fivetran staging) with
@@ -1901,46 +2021,93 @@ def _enumerate_compaction_tables(
     early-alphabet tables (2-file cosmetic merges) eat the global file
     budget every run while the real backlog starved. Observed in prod:
     3,074 live tables, the budget exhausted on five 2-file billing tables,
-    and the 15k-candidate events table never reached. Candidate-count DESC
+    and the 15k-candidate events table never reached. Mergeable-count DESC
     serves the most backlogged table first; ties break by name for
-    determinism. Single-candidate tables can't merge and are excluded.
+    determinism.
+
+    Mergeability is judged per (table, partition values) group, matching the
+    extension's own grouping: merge_adjacent can never combine files from
+    different partitions, so a table whose in-band files are all partition
+    singletons is a guaranteed zero-group no-op. Enumerating those anyway is
+    what kept the compactor grinding an hourly-partitioned import catalog
+    forever (one measured catalog: 86% of 126k tier-1 candidates were
+    partition singletons), holding catalog contention against the tenant's
+    writer with zero merges to show for it. Row-id non-contiguity within a
+    group can still no-op an enumerated table — the caller's zero-group
+    accounting stays.
 
     Catalog-derived names are ordinary-DDL-controlled and get interpolated
     into the per-table CALL statements below, so anything outside the
     conservative identifier shape is skipped LOUDLY rather than quoted
     heroically (same defense as repair-partition-values discovery).
     """
-    where = [
-        "df.end_snapshot IS NULL",
-        "t.end_snapshot IS NULL",
-        "sch.end_snapshot IS NULL",
-        f"df.file_size_bytes < {max_b}",
-        # Mirror the compactor's own selection: merge_adjacent skips any file
-        # carrying live delete files, so counting them here would let an
-        # unmergeable-but-huge table rank first and no-op at the top of every
-        # run (rank inflated by files the extension refuses to touch).
-        (
-            f"NOT EXISTS (SELECT 1 FROM {METADATA_SCHEMA}.ducklake_delete_file dl "
-            "WHERE dl.data_file_id = df.data_file_id AND dl.end_snapshot IS NULL)"
-        ),
-    ]
-    if min_b is not None:
-        where.append(f"df.file_size_bytes >= {min_b}")
-    # NOTE: COUNT(*) >= 2 is per-TABLE; the extension merges per
-    # (partition_id, partition_values) group, so 2 candidates in different
-    # partitions still yield a zero-group no-op CALL. That's a wasted bind
-    # scan, not a correctness issue — do not read >= 2 as a mergeability
-    # guarantee. Zero-group CALLs are counted and logged by the caller.
-    rows = conn.execute(
-        "SELECT sch.schema_name, t.table_name "
-        f"FROM {METADATA_SCHEMA}.ducklake_data_file df "
-        f"JOIN {METADATA_SCHEMA}.ducklake_table t USING (table_id) "
-        f"JOIN {METADATA_SCHEMA}.ducklake_schema sch ON sch.schema_id = t.schema_id "
-        f"WHERE {' AND '.join(where)} "
-        "GROUP BY sch.schema_name, t.table_name "
-        "HAVING COUNT(*) >= 2 "
-        "ORDER BY COUNT(*) DESC, sch.schema_name, t.table_name"
-    ).fetchall()
+
+    def _enumeration_sql(schema: str) -> str:
+        where = [
+            "df.end_snapshot IS NULL",
+            "t.end_snapshot IS NULL",
+            "sch.end_snapshot IS NULL",
+            f"df.file_size_bytes < {max_b}",
+            # Mirror the compactor's own selection: merge_adjacent skips any file
+            # carrying live delete files, so counting them here would let an
+            # unmergeable-but-huge table rank first and no-op at the top of every
+            # run (rank inflated by files the extension refuses to touch).
+            (
+                f"NOT EXISTS (SELECT 1 FROM {schema}.ducklake_delete_file dl "
+                "WHERE dl.data_file_id = df.data_file_id AND dl.end_snapshot IS NULL)"
+            ),
+        ]
+        if min_b is not None:
+            where.append(f"df.file_size_bytes >= {min_b}")
+        return (
+            "WITH band_files AS ("
+            "  SELECT df.table_id, df.data_file_id "
+            f" FROM {schema}.ducklake_data_file df "
+            f" JOIN {schema}.ducklake_table t USING (table_id) "
+            f" JOIN {schema}.ducklake_schema sch ON sch.schema_id = t.schema_id "
+            f" WHERE {' AND '.join(where)} "
+            "), file_groups AS ("
+            "  SELECT bf.table_id, bf.data_file_id, "
+            "         COALESCE(string_agg(fpv.partition_value, '/' ORDER BY fpv.partition_key_index), '') AS pk "
+            f" FROM band_files bf "
+            f" LEFT JOIN {schema}.ducklake_file_partition_value fpv "
+            "    ON fpv.data_file_id = bf.data_file_id AND fpv.table_id = bf.table_id "
+            "  GROUP BY bf.table_id, bf.data_file_id "
+            "), mergeable AS ("
+            "  SELECT table_id, COUNT(*) AS n_mergeable "
+            "  FROM file_groups "
+            "  GROUP BY table_id, pk "
+            "  HAVING COUNT(*) >= 2 "
+            ") "
+            "SELECT sch.schema_name, t.table_name "
+            f"FROM mergeable m "
+            f"JOIN {schema}.ducklake_table t ON t.table_id = m.table_id AND t.end_snapshot IS NULL "
+            f"JOIN {schema}.ducklake_schema sch ON sch.schema_id = t.schema_id AND sch.end_snapshot IS NULL "
+            "GROUP BY sch.schema_name, t.table_name "
+            "ORDER BY SUM(m.n_mergeable) DESC, sch.schema_name, t.table_name"
+        )
+
+    # Server-side first: through the duckdb postgres scanner this query pulls
+    # the ENTIRE file_partition_value table client-side per call (projection
+    # pushdown only — measured), which is tens-to-hundreds of MB per tier on
+    # a megaduck-sized catalog. postgres_query ships the aggregation to the
+    # catalog (the bootstrap indexes cover it) and only (schema, table) rows
+    # cross the wire.
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM postgres_query('{PG_ATTACH_NAME}', "
+            f"{_sql_string_literal(_enumeration_sql(PG_CATALOG_SCHEMA))})"
+        ).fetchall()
+    except duckdb.BinderException as error:
+        # No pg attach: the dev/file-backed lake shape. Expected there; the
+        # local form is identical modulo the schema prefix.
+        log.info("compact: server-side enumeration unavailable (%s); using local metadata attach", error)
+        rows = conn.execute(_enumeration_sql(METADATA_SCHEMA)).fetchall()
+    except duckdb.Error as error:
+        # The pg attach exists but the server-side query failed — every prod
+        # run degrading to the full client-side pull is worth alarming on.
+        log.warning("compact: server-side enumeration failed (%s); using local metadata attach", error)
+        rows = conn.execute(_enumeration_sql(METADATA_SCHEMA)).fetchall()
     tables: list[tuple[str, str]] = []
     for schema_name, table_name in rows:
         # _CATALOG_TABLE_NAME_RE (strict [A-Za-z0-9_]+, fullmatch): these names
@@ -2115,6 +2282,8 @@ def compact(
         candidate_count,
         candidate_bytes,
     )
+    global _last_compact_rebuilds
+    _last_compact_rebuilds = 0
 
     if dry_run:
         return 0
@@ -2137,6 +2306,7 @@ def compact(
     failed: list[str] = []
     table_total = 1
     noop_tables = 0
+    rebuilds = 0
 
     if table:
         # Single-table invocation. Errors propagate raw, exactly as before.
@@ -2145,7 +2315,7 @@ def compact(
         # issue exactly the giant single txn the knob exists to prevent).
         heartbeat = _start_heartbeat(conn, f"compact tier-{tier} merge")
         try:
-            with _scoped_target_file_size(conn, target):
+            with _scoped_target_file_size(lambda: conn, target):
                 remaining = max_compacted_files
                 while remaining > 0:
                     call_cap = remaining if max_outputs_per_call is None else min(max_outputs_per_call, remaining)
@@ -2179,21 +2349,25 @@ def compact(
         tables = _enumerate_compaction_tables(conn, min_b, max_b)
         table_total = len(tables)
         log.info(
-            "compact tier-%d: %d table(s) with >= 2 tier candidates, biggest backlog first",
+            "compact tier-%d: %d table(s) with a mergeable partition group, biggest mergeable backlog first",
             tier,
             table_total,
         )
         if not tables and candidate_count > 0:
             # Candidates exist but no table qualified: every candidate is a
-            # per-table singleton (nothing to merge with — benign), or the
-            # holders were skipped by the identifier gate (per-table WARNs
-            # above say which). INFO, not a failure.
+            # partition singleton (nothing shares its partition values —
+            # benign, however many candidates a table holds), or the holders
+            # were skipped by the identifier gate (per-table WARNs above say
+            # which). INFO, not a failure.
             log.info(
-                "compact tier-%d: %d candidate file(s) but no table has >= 2 — nothing mergeable this run",
+                "compact tier-%d: %d candidate file(s) but none form a >= 2-file partition group — "
+                "nothing mergeable this run",
                 tier,
                 candidate_count,
             )
-        with _scoped_target_file_size(conn, target):
+        conn_dead = [False]
+        abort_run = False
+        with _scoped_target_file_size(lambda: None if conn_dead[0] else conn, target):
             # max_compacted_files stays a GLOBAL budget across the run — the
             # same bound as the old catalog-scope call — so run duration
             # stays predictable. Leftover tables wait for the next cron tick.
@@ -2206,7 +2380,7 @@ def compact(
             # served. Biggest backlog still gets the biggest cut; it just
             # can't take the whole pie.
             remaining = max_compacted_files
-            for schema_name, table_name in tables:
+            for table_index, (schema_name, table_name) in enumerate(tables):
                 if remaining <= 0:
                     log.info(
                         "compact tier-%d: file budget exhausted; remaining tables wait for the next run",
@@ -2274,16 +2448,63 @@ def compact(
                             table_name,
                         )
                         break
+                    except _INSTANCE_FATAL_ERRORS:
+                        failed.append(f"{schema_name}.{table_name}")
+                        heartbeat.set()
+                        if _connection_alive(conn):
+                            # The common case: the error was table-local and
+                            # the instance is fine — keep the long-standing
+                            # continue-on-error contract on the same conn.
+                            log.exception(
+                                "compact tier-%d: %s.%s failed; connection alive, continuing with remaining tables",
+                                tier,
+                                schema_name,
+                                table_name,
+                            )
+                            break
+                        # The production wedge: every later query would block
+                        # without raising, silencing the run until the
+                        # activeDeadline. Abandon the instance; progress
+                        # committed by earlier calls is durable.
+                        rebuilds += 1
+                        log.exception(
+                            "compact tier-%d: %s.%s left the connection unresponsive; rebuilding (%d/%d)",
+                            tier,
+                            schema_name,
+                            table_name,
+                            rebuilds,
+                            _MAX_CONNECTION_REBUILDS,
+                        )
+                        _abandon_connection(conn)
+                        if rebuilds > _MAX_CONNECTION_REBUILDS:
+                            log.error(
+                                "compact tier-%d: connection invalidated %d times in one run; "
+                                "abandoning the remaining tables (they count as failed)",
+                                tier,
+                                rebuilds,
+                            )
+                            conn_dead[0] = True
+                            abort_run = True
+                            break
+                        try:
+                            conn = _fresh_compaction_connection(threads, memory_limit, target)
+                        except Exception:
+                            # Correlated failure is likely (the catalog just
+                            # misbehaved); never let the rebuild's own error
+                            # wedge the run or land the restore on a dead conn.
+                            log.exception(
+                                "compact tier-%d: connection rebuild failed; "
+                                "abandoning the remaining tables (they count as failed)",
+                                tier,
+                            )
+                            conn_dead[0] = True
+                            abort_run = True
+                        break
                     except Exception:
-                        # Continue-on-error relies on the connection SURVIVING
-                        # the failed CALL (verified on duckdb 1.5.2 and 1.5.5,
-                        # even for InternalException, and pinned end-to-end by
-                        # test_compaction_isolation_integration). If a future
-                        # duckdb bump invalidates the instance on INTERNAL
-                        # errors, every table fails, the failure summary +
-                        # gauge spike, and the target_file_size restore raises
-                        # — noisy, not silent. A mid-loop failure keeps the
-                        # progress already committed by earlier calls.
+                        # Non-fatal per-table failure: the connection survives
+                        # the failed CALL and the loop continues on it. A
+                        # mid-loop failure keeps the progress already
+                        # committed by earlier calls.
                         failed.append(f"{schema_name}.{table_name}")
                         log.exception(
                             "compact tier-%d: %s.%s failed; continuing with remaining tables",
@@ -2297,6 +2518,10 @@ def compact(
                     call_idx += 1
                     if max_outputs_per_call is None:
                         break
+                if abort_run:
+                    failed.extend(f"{s}.{t}" for s, t in tables[table_index + 1 :])
+                    break
+    _last_compact_rebuilds = rebuilds
     elapsed = time.monotonic() - t0
 
     # Aggregate result rows (one per output group: schema, table, input_files, output_files)
@@ -2373,6 +2598,1803 @@ def compact_probe(conn: duckdb.DuckDBPyConnection, table: str, max_compacted_fil
         heartbeat.set()
     for row in result:
         log.info("compact-probe: %s", row)
+
+
+# ---------------------------------------------------------------------------
+# drop-partitions / list-droppable-partitions
+#
+# Server-side partition retention for DuckLake: forge the catalog writes of an
+# engine whole-file-drop commit (snapshot row, end_snapshot UPDATE, RELATIVE
+# stats decrement, deleted_from_table conflict token) WITHOUT the engine's
+# full-coverage scan — the fork's OCC conflicts insert-vs-delete at table
+# level and hard-aborts any DELETE whose window overlaps a concurrent insert,
+# so the engine path dies deterministically on high-commit-rate tables.
+# Design, verification trail and hazard list: DROP_PARTITIONS_PLAN.md (v3)
+# and partition-drop-findings.md.
+#
+# Unlike every other op in this file, these two do NOT use the duckdb-attach
+# postgres_execute path: it forces REPEATABLE READ, returns no result sets to
+# the driver, and its duckdb teardown core-dumps after success (observed exit
+# 134 on the compaction jobs). They run on a direct libpq (psycopg) connection
+# — native READ COMMITTED, real RETURNING, no duckdb lifecycle at all.
+# ---------------------------------------------------------------------------
+
+# Catalog versions this op is verified against (fork merge-upstream-2026-08-26).
+# A fork upgrade re-runs the validation protocol before this set moves.
+_DROP_CATALOG_VERSIONS = frozenset({"1.0", "1.1-dev1"})
+_DROP_STATEMENT_TIMEOUT_MS = 10_000
+_DROP_LOCK_TIMEOUT_MS = 5_000
+_DROP_MAX_ATTEMPTS = 50
+# Structural floor: never select files whose begin_snapshot is newer than the
+# newest snapshot older than (cutoff + 48h). Snapshot ids only move forward,
+# so applying it at selection time is safe.
+_DROP_FLOOR_HOURS = 48
+_DROP_MIN_CUTOFF_AGE_DAYS = 7
+# Retryable PG error classes: snapshot PK race (the universal max+1
+# allocation), serialization failure, lock_timeout, statement_timeout (the
+# last burns attempts against the same cap rather than retrying forever), and
+# deadlock (40P01). The engine's FlushDrop locks rows in ascending id order;
+# our leaf selection is ORDER BY data_file_id to match — though the UPDATE's
+# actual lock order is planner-chosen, so the retry, not the ordering, is the
+# real mitigation.
+_DROP_RETRYABLE_SQLSTATES = frozenset({"23505", "40001", "55P03", "57014", "40P01"})
+_DROP_LOCK_ATTEMPTS = 30
+_TIME_TRANSFORMS = ("year", "month", "day", "hour")  # composition order
+_SUPPORTED_TRANSFORMS = frozenset({"identity", *_TIME_TRANSFORMS})
+_NO_GUARD = 2**63 - 1  # begin_snapshot upper bound when the viaduck guard is off
+_SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+class _DropAbort(RuntimeError):
+    """Non-retryable: an assertion or precondition failed. Aborts the RUN."""
+
+
+class _LeafSkip(Exception):
+    """The leaf is not droppable this run (guard-ineligible or vanished). Not an error."""
+
+
+class _LeafOversized(_DropAbort):
+    """Pathological leaf (> --max-files). In --partition mode this aborts the
+    run (the operator explicitly asked for that leaf); the manifest loop
+    catches it, skips the leaf loudly, and continues the campaign."""
+
+
+class _LockContended(Exception):
+    """The maintenance advisory lock is held elsewhere mid-run; retryable
+    within the leaf attempt budget (crons interleave), then the run aborts."""
+
+
+@dataclass
+class _PartitionKey:
+    index: int
+    column_id: int
+    transform: str
+    column_name: str | None
+
+
+@dataclass
+class _PartitionSpec:
+    partition_id: int
+    keys: list[_PartitionKey]  # ordered by partition_key_index
+
+    @property
+    def grain(self) -> str:
+        return "hour" if any(k.transform == "hour" for k in self.keys) else "day"
+
+    def address(self, key: _PartitionKey) -> str:
+        """The name a leaf tuple uses for this key: identity keys by column
+        name, time keys by transform name (their source column is irrelevant
+        to the operator)."""
+        if key.transform == "identity":
+            return str(key.column_name)
+        return key.transform
+
+
+@dataclass
+class _LeafFile:
+    data_file_id: int
+    record_count: int
+    file_size_bytes: int
+    begin_snapshot: int
+
+
+@dataclass
+class _Leaf:
+    partition: str  # canonical "k=v,..." in spec order (display only)
+    values: dict[str, str]  # tuple address -> stored fpv value (round-trips exactly)
+    part_ts: datetime
+    files: list[_LeafFile] = field(default_factory=list)
+    oversized: bool = False
+
+    @property
+    def rows(self) -> int:
+        return sum(f.record_count for f in self.files)
+
+    @property
+    def bytes(self) -> int:
+        return sum(f.file_size_bytes for f in self.files)
+
+    @property
+    def max_begin_snapshot(self) -> int:
+        return max(f.begin_snapshot for f in self.files)
+
+
+def _pg_direct_connect(application_name: str = "millpond-drop-partitions") -> psycopg.Connection:
+    """Direct libpq connection to the catalog database (same DUCKLAKE_RDS_*
+    env vars as the duckdb ATTACH path). autocommit=True; the drop path opens
+    explicit short transactions with conn.transaction().
+
+    statement_timeout covers the autocommit-phase reads (guard/selection/lock)
+    — the drop txn overrides it with SET LOCAL. TCP keepalives bound a
+    half-open socket to ~90s instead of the kernel-default hours (a zombie
+    would otherwise hold the advisory lock and defeat --max-seconds)."""
+    conninfo = (
+        f"host={_escape_libpq(_require('DUCKLAKE_RDS_HOST'))} "
+        f"port={_escape_libpq(os.environ.get('DUCKLAKE_RDS_PORT', '5432'))} "
+        f"dbname={_escape_libpq(os.environ.get('DUCKLAKE_RDS_DATABASE', 'ducklake'))} "
+        f"user={_escape_libpq(os.environ.get('DUCKLAKE_RDS_USERNAME', 'ducklake'))} "
+        f"password={_escape_libpq(_require('DUCKLAKE_RDS_PASSWORD'))} "
+        f"application_name={_escape_libpq(application_name)} "
+        f"keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=3 "
+        # 10-min session budget covers the driver-phase whole-table reads
+        # (enumeration pivot, unageable anti-join); the drop txn overrides it
+        # with SET LOCAL 10s.
+        f"options='-c statement_timeout=600000'"
+    )
+    return psycopg.connect(conninfo, autocommit=True, connect_timeout=10)
+
+
+def _resolve_table_id(pg: psycopg.Connection, schema_table: str) -> tuple[int, str, str]:
+    """Resolve schema.table -> table_id. Bare table_ids are refused (a
+    fat-fingered id is the worst possible outcome); the name resolution is
+    cross-checked for exactly one live row."""
+    parts = schema_table.split(".")
+    if len(parts) != 2 or not all(parts):
+        raise _DropAbort(f"--table must be schema.table (e.g. main.events_nrt), got {schema_table!r}")
+    schema_name, table_name = parts
+    rows = pg.execute(
+        f"SELECT t.table_id FROM {PG_CATALOG_SCHEMA}.ducklake_table t "
+        f"JOIN {PG_CATALOG_SCHEMA}.ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL "
+        f"WHERE s.schema_name = %s AND t.table_name = %s AND t.end_snapshot IS NULL",
+        (schema_name, table_name),
+    ).fetchall()
+    if len(rows) != 1:
+        raise _DropAbort(f"table {schema_table!r}: expected exactly 1 live catalog row, found {len(rows)}")
+    return rows[0][0], schema_name, table_name
+
+
+def _resolve_live_spec(pg: psycopg.Connection, table_id: int) -> _PartitionSpec:
+    """The table's LIVE partition spec: key indexes are per-spec-epoch via
+    data_file.partition_id, so every selection pins the live partition_id and
+    old-spec files are handled explicitly (never silently mis-bucketed)."""
+    s = PG_CATALOG_SCHEMA
+    rows = pg.execute(
+        f"SELECT partition_id FROM {s}.ducklake_partition_info WHERE table_id = %s AND end_snapshot IS NULL",
+        (table_id,),
+    ).fetchall()
+    if not rows:
+        raise _DropAbort(f"table_id={table_id} has no live partition spec (not a partitioned table?)")
+    if len(rows) > 1:
+        raise _DropAbort(f"table_id={table_id}: {len(rows)} live partition specs — catalog corruption")
+    partition_id = rows[0][0]
+    cols = pg.execute(
+        f"SELECT pc.partition_key_index, pc.column_id, pc.transform, c.column_name "
+        f"FROM {s}.ducklake_partition_column pc "
+        f"LEFT JOIN {s}.ducklake_column c "
+        f"  ON c.table_id = pc.table_id AND c.column_id = pc.column_id AND c.end_snapshot IS NULL "
+        f"WHERE pc.table_id = %s AND pc.partition_id = %s "
+        f"ORDER BY pc.partition_key_index",
+        (table_id, partition_id),
+    ).fetchall()
+    keys = [_PartitionKey(index=r[0], column_id=r[1], transform=r[2], column_name=r[3]) for r in cols]
+    if {k.index for k in keys} != set(range(len(keys))):
+        raise _DropAbort(f"table_id={table_id}: non-contiguous partition key indexes {[k.index for k in keys]}")
+    for k in keys:
+        if k.transform not in _SUPPORTED_TRANSFORMS:
+            raise _DropAbort(
+                f"table_id={table_id}: unsupported partition transform {k.transform!r} at key {k.index} "
+                "(only identity/year/month/day/hour are composable by this tool)"
+            )
+        if k.transform == "identity" and not k.column_name:
+            raise _DropAbort(f"table_id={table_id}: identity key {k.index} has no live column name")
+    transforms = {k.transform for k in keys}
+    for required in ("year", "month", "day"):
+        if required not in transforms:
+            raise _DropAbort(
+                f"table_id={table_id}: spec has no {required!r} time transform — "
+                "drop-partitions requires a time-partitioned table"
+            )
+    # Tuple addressing ambiguity: an identity column literally named 'year'
+    # etc. would collide with a time-transform address.
+    seen: set[str] = set()
+    for k in keys:
+        name = k.column_name if k.transform == "identity" else k.transform
+        if name in seen:
+            raise _DropAbort(f"table_id={table_id}: ambiguous partition tuple address {name!r}")
+        seen.add(name)
+    return _PartitionSpec(partition_id=partition_id, keys=keys)
+
+
+def _tuple_from_values(spec: _PartitionSpec, name_to_value: dict) -> dict[int, str]:
+    """Validate an address->value mapping against the spec -> {key_index: value}.
+    Must cover exactly the spec's keys; time-key values must be integers.
+    JSON manifests may carry real ints for time keys — those coerce via str;
+    anything else (floats, lists, …) is rejected."""
+    by_name = {spec.address(k): k for k in spec.keys}
+    out: dict[int, str] = {}
+    for name, value in name_to_value.items():
+        if name not in by_name:
+            raise _DropAbort(f"partition tuple key {name!r} not in spec {sorted(by_name)}")
+        k = by_name[name]
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = str(value)
+        if not isinstance(value, str):
+            raise _DropAbort(f"partition tuple key {name!r}: expected string/int value, got {type(value).__name__}")
+        if k.transform in _TIME_TRANSFORMS:
+            if not re.fullmatch(r"-?[0-9]{1,9}", value):
+                raise _DropAbort(f"time key {name!r} must be an integer, got {value!r}")
+        elif not value or re.search(r"[,\s=]", value):
+            raise _DropAbort(f"identity key {name!r}: illegal value {value!r}")
+        out[k.index] = value
+    missing = [name for name, k in by_name.items() if k.index not in out]
+    if missing:
+        raise _DropAbort(f"partition tuple missing keys {missing} (spec requires {sorted(by_name)})")
+    return out
+
+
+def _parse_partition_tuple(spec: _PartitionSpec, text: str) -> dict[int, str]:
+    """Parse 'team_id=2,year=2026,month=8,day=1,hour=13' -> {key_index: value}."""
+    name_to_value: dict[str, str] = {}
+    for part in text.split(","):
+        name, sep, value = part.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            raise _DropAbort(f"malformed partition tuple component {part!r} in {text!r}")
+        if name in name_to_value:
+            raise _DropAbort(f"partition tuple repeats key {name!r}")
+        name_to_value[name] = value
+    return _tuple_from_values(spec, name_to_value)
+
+
+def _canonical_leaf_str(spec: _PartitionSpec, values: dict[int, str]) -> str:
+    return ",".join(f"{spec.address(k)}={values[k.index]}" for k in spec.keys)
+
+
+def _compose_part_ts(spec: _PartitionSpec, values: dict[int, str | None]) -> datetime | None:
+    """Compose the partition instant from the spec's time-transform keys.
+
+    Python-side composition, deliberately NOT make_timestamptz in SQL: a CASE
+    guard cannot safely exclude invalid day-of-month combinations (SQL reorders
+    AND terms), so SQL composition can raise mid-enumeration; datetime() is
+    total under try/except and carries the same explicit-UTC, never-string-
+    comparison semantics the plan mandates."""
+    raw: dict[str, int] = {}
+    for t in _TIME_TRANSFORMS:
+        key = next((k for k in spec.keys if k.transform == t), None)
+        if key is None:
+            continue
+        v = values.get(key.index)
+        if v is None:
+            return None
+        try:
+            raw[t] = int(v)
+        except (TypeError, ValueError):
+            return None
+    try:
+        return datetime(raw["year"], raw["month"], raw["day"], raw.get("hour", 0), tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _check_cutoff(cutoff: datetime, grain: str, force_young: bool) -> None:
+    """Grain alignment + the young-cutoff refusal (shared by CLI and manifest
+    cutoffs)."""
+    aligned = cutoff.replace(minute=0, second=0, microsecond=0)
+    if grain == "day":
+        aligned = aligned.replace(hour=0)
+    if aligned != cutoff:
+        raise _DropAbort(f"cutoff {cutoff.isoformat()} is not aligned to the spec's {grain} grain")
+    age = datetime.now(UTC) - cutoff
+    if age < timedelta(days=_DROP_MIN_CUTOFF_AGE_DAYS) and not force_young:
+        raise _DropAbort(
+            f"cutoff {cutoff.isoformat()} is only {age.days}d old (< {_DROP_MIN_CUTOFF_AGE_DAYS}d); "
+            "pass --force-young-cutoff to override"
+        )
+
+
+def _resolve_cutoff(args: argparse.Namespace, grain: str) -> datetime:
+    """Exactly one of --cutoff / --retention-days; grain-aligned; refuses
+    cutoffs younger than 7 days without --force-young-cutoff."""
+    if args.cutoff and args.retention_days is not None:
+        raise _DropAbort("pass exactly one of --cutoff / --retention-days, not both")
+    if args.cutoff:
+        try:
+            cutoff = datetime.fromisoformat(args.cutoff)
+        except ValueError as e:
+            raise _DropAbort(f"--cutoff {args.cutoff!r} is not ISO 8601: {e}") from e
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        cutoff = cutoff.astimezone(UTC)
+    elif args.retention_days is not None:
+        # Computed cutoffs are truncated to the grain (explicit --cutoff
+        # values are NOT: misalignment there is an operator error to refuse).
+        cutoff = datetime.now(UTC) - timedelta(days=args.retention_days)
+        cutoff = cutoff.replace(minute=0, second=0, microsecond=0)
+        if grain == "day":
+            cutoff = cutoff.replace(hour=0)
+    else:
+        raise _DropAbort("one of --cutoff / --retention-days is required")
+    _check_cutoff(cutoff, grain, args.force_young_cutoff)
+    return cutoff
+
+
+def _floor_snapshot(pg: psycopg.Connection, cutoff: datetime) -> int:
+    """Structural floor: files with begin_snapshot NEWER than this are never
+    selected (young writes in old partitions survive).
+
+    Primary: newest snapshot older than (cutoff + 48h). But the megaduck
+    expire cron runs with 3-day retention, so no snapshot row that old
+    survives — the max() is NULL. Fallback: min(surviving snapshot_id) - 1,
+    i.e. the expiry horizon becomes the effective floor (~3d of write-time
+    protection instead of 12d; the cursor guard is the primary protection,
+    this is defense-in-depth). A NULL min means an empty catalog: fail
+    closed."""
+    s = PG_CATALOG_SCHEMA
+    row = pg.execute(
+        f"SELECT max(snapshot_id) FROM {s}.ducklake_snapshot WHERE snapshot_time < %s",
+        (cutoff + timedelta(hours=_DROP_FLOOR_HOURS),),
+    ).fetchone()
+    if row is not None and row[0] is not None:
+        return row[0]
+    row = pg.execute(f"SELECT min(snapshot_id) FROM {s}.ducklake_snapshot").fetchone()
+    if row is None or row[0] is None:
+        raise _DropAbort("floor: ducklake_snapshot is empty — refusing to derive a floor on an empty catalog")
+    floor = row[0] - 1
+    log.warning(
+        "floor: no snapshot older than cutoff+%dh survives expiry; using min(surviving)-1=%d "
+        "(expiry horizon is the effective floor, not retention-%dh)",
+        _DROP_FLOOR_HOURS,
+        floor,
+        _DROP_FLOOR_HOURS,
+    )
+    return floor
+
+
+@dataclass
+class _Guard:
+    snapshot_id: int  # min cursor; files with begin_snapshot >= this are ineligible
+    cursor_rows: int
+    oldest_cursor_time: datetime | None
+    overridden: bool
+
+
+def _cursor_guard(
+    pg: psycopg.Connection, state_schema: str, state_table: str, floor_time: datetime, allow_override: bool
+) -> _Guard:
+    """Min over ALL rows of viaduck's durable cursor store (direct SQL — never
+    scraped gauges: flush-failure rewinds move cursors backward below a sampled
+    value). Run-level abort when any consumer lags past the floor — that, not
+    the guard value, is the actual loss condition."""
+    for name, value in (("viaduck-state-schema", state_schema), ("viaduck-state-table", state_table)):
+        if not _SAFE_IDENTIFIER_RE.match(value):
+            raise _DropAbort(f"--{name} {value!r} is not a safe identifier")
+    qualified = f"{state_schema}.{state_table}"
+    try:
+        rows = pg.execute(
+            f"SELECT v.destination_id, v.instance_id, v.last_snapshot_id, s.snapshot_time "
+            f"FROM {qualified} v LEFT JOIN {PG_CATALOG_SCHEMA}.ducklake_snapshot s "
+            f"ON s.snapshot_id = v.last_snapshot_id"
+        ).fetchall()
+    except psycopg.errors.UndefinedTable:
+        rows = None
+
+    if not rows:
+        if not allow_override:
+            why = f"{qualified} does not exist" if rows is None else f"{qualified} has no cursor rows"
+            raise _DropAbort(
+                f"viaduck cursor guard: {why} — refusing to drop unguarded. "
+                "Fix the --viaduck-state-* arguments or pass --no-viaduck-guard."
+            )
+        log.warning("--no-viaduck-guard: cursor store unreadable/empty (%s); dropping UNGUARDED", qualified)
+        return _Guard(snapshot_id=_NO_GUARD, cursor_rows=0, oldest_cursor_time=None, overridden=True)
+
+    # Lag check: a cursor whose snapshot row is gone (expired) or older than
+    # the floor is >= (retention - 48h) behind — dropping could destroy rows it
+    # has not consumed. This aborts the RUN regardless of the guard value.
+    # A NULL last_snapshot_id (never-committed row) counts as lagging.
+    lagging = [(d, i, ls, ts) for d, i, ls, ts in rows if ls is None or ts is None or ts < floor_time]
+    guard = min((ls for _, _, ls, _ in rows if ls is not None), default=0)
+    oldest = min((ts for _, _, _, ts in rows if ts is not None), default=None)
+    if lagging and not allow_override:
+        worst = ", ".join(f"{d}/{i}@{ls}" for d, i, ls, _ in lagging[:5])
+        raise _DropAbort(
+            f"viaduck cursor lag beyond (cutoff + {_DROP_FLOOR_HOURS}h) on {len(lagging)} cursor row(s): "
+            f"{worst} — that is the actual loss condition; aborting. "
+            "--no-viaduck-guard prints and overrides."
+        )
+    if allow_override:
+        log.warning(
+            "--no-viaduck-guard override: min_cursor=%d oldest_cursor_time=%s lagging_rows=%d%s",
+            guard,
+            oldest,
+            len(lagging),
+            " (WOULD HAVE ABORTED)" if lagging else "",
+        )
+    return _Guard(snapshot_id=guard, cursor_rows=len(rows), oldest_cursor_time=oldest, overridden=allow_override)
+
+
+def _enumeration_sql(spec: _PartitionSpec) -> str:
+    """One aggregated fpv pass over the table (bitmap via the fpv table_id
+    index), pivoted to one row per data_file_id, joined to LIVE data files.
+    Not partition_id-filtered: old-spec live files must be SEEN so they fail
+    loud instead of silently never dropping."""
+    s = PG_CATALOG_SCHEMA
+    pivoted = ", ".join(
+        f"max(CASE WHEN fpv.partition_key_index = {k.index} THEN fpv.partition_value END) AS k{k.index}"
+        for k in spec.keys
+    )
+    cols = ", ".join(f"p.k{k.index}" for k in spec.keys)
+    return f"""
+SELECT p.data_file_id, {cols}, p.fpv_rows, p.fpv_keys,
+       df.record_count, df.file_size_bytes, df.begin_snapshot, df.partition_id
+FROM (
+  SELECT fpv.data_file_id, {pivoted},
+         count(*) AS fpv_rows, count(DISTINCT fpv.partition_key_index) AS fpv_keys
+  FROM {s}.ducklake_file_partition_value fpv
+  WHERE fpv.table_id = %s
+  GROUP BY fpv.data_file_id
+) p
+JOIN {s}.ducklake_data_file df ON df.data_file_id = p.data_file_id
+WHERE df.table_id = %s AND df.end_snapshot IS NULL
+"""
+
+
+def _classify_enumeration(
+    rows: list[tuple],
+    spec: _PartitionSpec,
+    cutoff: datetime,
+    floor_snap: int,
+    max_files: int,
+    max_rot: int,
+) -> tuple[list[_Leaf], dict]:
+    """Pure classification of enumeration rows -> leaf manifest.
+
+    Per file: fpv sanity (exactly the spec's key set, one value each, time
+    values composable) else rot-excluded; partition_id != live spec fails the
+    RUN when the file is provably in (or unprovably out of) the candidate
+    window; structural floor excludes young stragglers per-file. Returns
+    (leaves oldest-first, diagnostics)."""
+    n_keys = len(spec.keys)
+    rot = 0
+    rot_samples: list[int] = []
+    floored = 0
+    old_spec_blocking: list[tuple[int, str]] = []
+    buckets: dict[tuple[str, ...], _Leaf] = {}
+    for row in rows:
+        data_file_id = row[0]
+        values = {k.index: row[1 + i] for i, k in enumerate(spec.keys)}
+        fpv_rows, fpv_keys = row[1 + len(spec.keys)], row[2 + len(spec.keys)]
+        record_count, file_size_bytes, begin_snapshot, partition_id = row[-4:]
+        sane = fpv_rows == n_keys and fpv_keys == n_keys and all(v is not None for v in values.values())
+        part_ts = _compose_part_ts(spec, values) if sane else None
+        if partition_id != spec.partition_id:
+            # Old-spec file: never droppable by us (its fpv key semantics
+            # differ). Abort the run unless it is PROVABLY outside the
+            # candidate window — "can't compose its time" is not proof.
+            if part_ts is None or part_ts < cutoff:
+                old_spec_blocking.append((data_file_id, str(part_ts)))
+            else:
+                log.debug("old-spec file %d provably >= cutoff (%s); ignoring", data_file_id, part_ts)
+            continue
+        if not sane or part_ts is None:
+            rot += 1
+            if len(rot_samples) < 10:
+                rot_samples.append(data_file_id)
+            continue
+        if part_ts >= cutoff:
+            continue  # leaf above the retention cutoff — not a candidate
+        if begin_snapshot > floor_snap:
+            floored += 1
+            continue
+        bucket_key = tuple(str(values[k.index]) for k in spec.keys)
+        leaf = buckets.get(bucket_key)
+        if leaf is None:
+            leaf = buckets[bucket_key] = _Leaf(
+                partition=_canonical_leaf_str(spec, values),
+                values={spec.address(k): str(values[k.index]) for k in spec.keys},
+                part_ts=part_ts,
+            )
+        leaf.files.append(
+            _LeafFile(
+                data_file_id=data_file_id,
+                record_count=record_count or 0,
+                file_size_bytes=file_size_bytes or 0,
+                begin_snapshot=begin_snapshot,
+            )
+        )
+    if old_spec_blocking:
+        raise _DropAbort(
+            f"{len(old_spec_blocking)} live file(s) on a NON-LIVE partition spec are in/unverifiable in the "
+            f"candidate window (e.g. {old_spec_blocking[:3]}). Refusing to mis-bucket old-spec data — "
+            "run repair-partition-values (see runbook) and retry."
+        )
+    if rot > max_rot:
+        raise _DropAbort(
+            f"{rot} fpv-rot file(s) (samples {rot_samples}) exceed --max-rot {max_rot}; "
+            "run repair-partition-values (see runbook) and retry"
+        )
+    leaves = sorted(buckets.values(), key=lambda lf: (lf.part_ts, lf.partition))
+    for leaf in leaves:
+        if len(leaf.files) > max_files:
+            leaf.oversized = True
+    diagnostics = {"rot_files": rot, "rot_samples": rot_samples, "floored_files": floored}
+    return leaves, diagnostics
+
+
+def _assert_no_unageable_files(pg: psycopg.Connection, table_id: int) -> None:
+    """Live files with NO fpv rows at all (unpartitioned-era residue or
+    catalog rot): the fpv-pivot enumeration never sees them, so they would
+    linger forever without a word — and with partition_id == live spec they
+    would not even trip the old-spec check. Fail closed: the operator runs
+    repair-partition-values (which backfills partition_id/fpv) first."""
+    s = PG_CATALOG_SCHEMA
+    n = pg.execute(
+        f"SELECT count(*) FROM {s}.ducklake_data_file df "
+        f"WHERE df.table_id = %s AND df.end_snapshot IS NULL "
+        f"AND NOT EXISTS (SELECT 1 FROM {s}.ducklake_file_partition_value f WHERE f.data_file_id = df.data_file_id)",
+        (table_id,),
+    ).fetchone()[0]
+    if n:
+        samples = pg.execute(
+            f"SELECT df.data_file_id FROM {s}.ducklake_data_file df "
+            f"WHERE df.table_id = %s AND df.end_snapshot IS NULL "
+            f"AND NOT EXISTS ("
+            f"  SELECT 1 FROM {s}.ducklake_file_partition_value f WHERE f.data_file_id = df.data_file_id"
+            f") LIMIT 5",
+            (table_id,),
+        ).fetchall()
+        raise _DropAbort(
+            f"{n} live file(s) have NO partition values at all (e.g. ids {[r[0] for r in samples]}): "
+            "invisible to retention and undroppable by this tool. Run repair-partition-values (see runbook) and retry."
+        )
+
+
+def _leaf_selection_sql(spec: _PartitionSpec) -> str:
+    """Fresh per-leaf selection by fully-resolved tuple: live, live-spec,
+    below the structural floor, exactly the spec's fpv key set (no dups, no
+    extras), one EXISTS per key. Indexed lookups only."""
+    s = PG_CATALOG_SCHEMA
+    exists = " AND ".join(
+        f"EXISTS (SELECT 1 FROM {s}.ducklake_file_partition_value f{k.index} "
+        f"WHERE f{k.index}.data_file_id = df.data_file_id "
+        f"AND f{k.index}.partition_key_index = {k.index} AND f{k.index}.partition_value = %s)"
+        for k in spec.keys
+    )
+    return f"""
+SELECT df.data_file_id, df.record_count, df.file_size_bytes, df.begin_snapshot
+FROM {s}.ducklake_data_file df
+WHERE df.table_id = %s AND df.end_snapshot IS NULL AND df.partition_id = %s
+  AND df.begin_snapshot <= %s
+  AND (SELECT count(*) FROM {s}.ducklake_file_partition_value fx WHERE fx.data_file_id = df.data_file_id) = %s
+  AND {exists}
+ORDER BY df.data_file_id
+"""
+
+
+def _select_leaf_files(
+    pg: psycopg.Connection,
+    table_id: int,
+    spec: _PartitionSpec,
+    tuple_map: dict[int, str],
+    floor_snap: int,
+    max_files: int,
+) -> list[_LeafFile]:
+    params = (table_id, spec.partition_id, floor_snap, len(spec.keys)) + tuple(tuple_map[k.index] for k in spec.keys)
+    rows = pg.execute(_leaf_selection_sql(spec), params).fetchall()
+    files = [
+        _LeafFile(data_file_id=r[0], record_count=r[1] or 0, file_size_bytes=r[2] or 0, begin_snapshot=r[3])
+        for r in rows
+    ]
+    if len(files) > max_files:
+        raise _LeafOversized(f"pathological leaf: {len(files)} files > --max-files {max_files}; refusing to drop")
+    return files
+
+
+def _old_spec_leaf_check(
+    pg: psycopg.Connection, table_id: int, spec: _PartitionSpec, tuple_map: dict[int, str]
+) -> None:
+    """A bare --partition invocation skips enumeration, so re-run the old-spec
+    guard scoped to this tuple: any live file on a DIFFERENT partition_id whose
+    fpv rows match the tuple under the live key indexes is a mis-bucketing
+    hazard — fail loud."""
+    s = PG_CATALOG_SCHEMA
+    exists = " AND ".join(
+        f"EXISTS (SELECT 1 FROM {s}.ducklake_file_partition_value f{k.index} "
+        f"WHERE f{k.index}.data_file_id = df.data_file_id "
+        f"AND f{k.index}.partition_key_index = {k.index} AND f{k.index}.partition_value = %s)"
+        for k in spec.keys
+    )
+    row = pg.execute(
+        f"SELECT count(*) FROM {s}.ducklake_data_file df "
+        f"WHERE df.table_id = %s AND df.end_snapshot IS NULL AND df.partition_id IS DISTINCT FROM %s AND {exists}",
+        (table_id, spec.partition_id) + tuple(tuple_map[k.index] for k in spec.keys),
+    ).fetchone()
+    if row[0]:
+        raise _DropAbort(
+            f"{row[0]} live file(s) match the tuple but sit on a NON-LIVE partition spec "
+            f"(partition_id != {spec.partition_id}) — run repair-partition-values, never mis-bucket"
+        )
+
+
+def _assert_catalog_version(cur: psycopg.Cursor) -> None:
+    rows = cur.execute(f"SELECT value FROM {PG_CATALOG_SCHEMA}.ducklake_metadata WHERE key = 'version'").fetchall()
+    if len(rows) != 1 or rows[0][0] not in _DROP_CATALOG_VERSIONS:
+        raise _DropAbort(
+            f"catalog version pin: expected exactly one ducklake_metadata version row in "
+            f"{sorted(_DROP_CATALOG_VERSIONS)}, got {[r[0] for r in rows]} — re-validate the fork before moving the pin"
+        )
+
+
+def _guard_predicate(guard_sql: str | None) -> str:
+    """The cursor guard as a SELF-FRESHENING subquery evaluated in the same
+    READ COMMITTED statement snapshot as the rows it gates — a flush-failure
+    rewind (cursor moves BACKWARD) between driver pre-check and this statement
+    is caught here, not by a frozen scalar (M2/H1). None = --no-viaduck-guard."""
+    if guard_sql is None:
+        return "TRUE"
+    return f"begin_snapshot < (SELECT min(last_snapshot_id) FROM {guard_sql})"
+
+
+def _drop_leaf_txn(
+    pg: psycopg.Connection,
+    table_id: int,
+    leaf_files: list[_LeafFile],
+    guard_sql: str | None,
+    message: str,
+    check_isolation: bool,
+) -> dict:
+    """One leaf drop = one short transaction = one forged engine commit.
+
+    Order: version pin -> baseline read -> delete-vector assertion -> snapshot
+    INSERT (the PK race; next_file_id = baseline + 1 busts the per-process
+    stats ObjectCache — F1) -> file UPDATE (per-row liveness + the cursor
+    guard as an in-statement subquery) -> skipped-id classification (M1
+    tolerance) -> RELATIVE stats decrement from RETURNING sums -> conflict
+    token."""
+    ids = [f.data_file_id for f in leaf_files]
+    s = PG_CATALOG_SCHEMA
+    guard_pred = _guard_predicate(guard_sql)
+    with conn_transaction(pg) as cur:
+        cur.execute(f"SET LOCAL statement_timeout = '{_DROP_STATEMENT_TIMEOUT_MS}'")
+        cur.execute(f"SET LOCAL lock_timeout = '{_DROP_LOCK_TIMEOUT_MS}'")
+        if check_isolation:
+            iso = cur.execute("SHOW transaction_isolation").fetchone()[0]
+            if iso != "read committed":
+                raise _DropAbort(f"expected READ COMMITTED, got {iso!r}")
+        _assert_catalog_version(cur)
+        n_dv = cur.execute(
+            f"SELECT count(*) FROM {s}.ducklake_delete_file "
+            f"WHERE table_id = %s AND end_snapshot IS NULL AND data_file_id = ANY(%s)",
+            (table_id, ids),
+        ).fetchone()[0]
+        if n_dv:
+            raise _DropAbort(f"{n_dv} LIVE delete vector(s) reference leaf files — refusing to orphan them")
+        base = cur.execute(
+            f"SELECT snapshot_id, schema_version, next_catalog_id, next_file_id "
+            f"FROM {s}.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1"
+        ).fetchone()
+        if base is None:
+            raise _DropAbort("empty catalog: no rows in ducklake_snapshot")
+        snap = base[0] + 1
+        cur.execute(
+            f"INSERT INTO {s}.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, "
+            f"next_catalog_id, next_file_id) VALUES (%s, clock_timestamp(), %s, %s, %s)",
+            (snap, base[1], base[2], base[3] + 1),
+        )
+        updated = cur.execute(
+            f"UPDATE {s}.ducklake_data_file SET end_snapshot = %s "
+            f"WHERE data_file_id = ANY(%s) AND end_snapshot IS NULL AND {guard_pred} "
+            f"RETURNING data_file_id, record_count, file_size_bytes",
+            (snap, ids),
+        ).fetchall()
+        returned = {r[0] for r in updated}
+        skipped = [i for i in ids if i not in returned]
+        ended_concurrently = 0
+        if skipped:
+            info = cur.execute(
+                f"SELECT data_file_id, end_snapshot, begin_snapshot, ({guard_pred}) AS eligible "
+                f"FROM {s}.ducklake_data_file WHERE data_file_id = ANY(%s)",
+                (skipped,),
+            ).fetchall()
+            still_live_eligible = [r[0] for r in info if r[1] is None and r[3]]
+            still_live_ineligible = [r[0] for r in info if r[1] is None and not r[3]]
+            if still_live_eligible:
+                # Under READ COMMITTED the classification runs on a FRESHER
+                # snapshot than the UPDATE: a cursor that ADVANCED in between
+                # makes a correct guard-skip read eligible here. Re-check once
+                # after a beat; abort only if it persists (a real miss).
+                time.sleep(0.05)
+                info2 = cur.execute(
+                    f"SELECT data_file_id FROM {s}.ducklake_data_file "
+                    f"WHERE data_file_id = ANY(%s) AND end_snapshot IS NULL AND ({guard_pred})",
+                    (still_live_eligible,),
+                ).fetchall()
+                if info2:
+                    raise _DropAbort(
+                        f"UPDATE missed {len(info2)} row(s) it should have hit (still live AND guard-eligible "
+                        f"on recheck): {still_live_eligible[:5]} — tool bug, aborting"
+                    )
+                raise _LeafSkip("transient eligibility read on a skipped member (cursor advance mid-txn)")
+            if still_live_ineligible:
+                # The guard rewound (flush failure) between the driver
+                # pre-check and this txn: whole-leaf skip, not partial drop.
+                raise _LeafSkip(f"{len(still_live_ineligible)} member(s) became guard-ineligible mid-txn")
+            ended_concurrently = len(skipped)
+        if not updated:
+            raise _LeafSkip("leaf vanished: every member was ended concurrently (compaction)")
+        # Rewind verification: the guard subquery and the row locks share the
+        # UPDATE's statement snapshot, but a rewind committed BETWEEN that
+        # snapshot and now would have ended files the rewound consumer hasn't
+        # read. Fresh-statement check narrows the exposure to sub-ms; anything
+        # tighter needs the engine's conflict tokens (a rewind emits none).
+        if guard_sql is not None:
+            rewound = cur.execute(
+                f"SELECT count(*) FROM {s}.ducklake_data_file "
+                f"WHERE data_file_id = ANY(%s) AND end_snapshot = %s AND NOT ({guard_pred})",
+                (ids, snap),
+            ).fetchone()[0]
+            if rewound:
+                raise _LeafSkip(f"cursor rewound across {rewound} ended member(s) mid-drop — rolled back, retry later")
+        rows_delta = sum(r[1] or 0 for r in updated)
+        bytes_delta = sum(r[2] or 0 for r in updated)
+        stats_rows = cur.execute(
+            f"UPDATE {s}.ducklake_table_stats "
+            f"SET record_count = record_count - %s, file_size_bytes = file_size_bytes - %s "
+            f"WHERE table_id = %s AND record_count >= %s AND file_size_bytes >= %s AND record_count - %s > 0 "
+            f"RETURNING record_count",
+            (rows_delta, bytes_delta, table_id, rows_delta, bytes_delta, rows_delta),
+        ).fetchall()
+        if len(stats_rows) != 1:
+            diag = cur.execute(
+                f"SELECT record_count, file_size_bytes FROM {s}.ducklake_table_stats WHERE table_id = %s",
+                (table_id,),
+            ).fetchall()
+            raise _DropAbort(
+                f"stats assertion failed: expected exactly 1 row update, got {len(stats_rows)} "
+                f"(decrement rows={rows_delta} bytes={bytes_delta}; current stats rows: {diag})"
+            )
+        cur.execute(
+            f"INSERT INTO {s}.ducklake_snapshot_changes (snapshot_id, changes_made, author, commit_message) "
+            f"VALUES (%s, %s, 'drop-partitions', %s)",
+            (snap, f"deleted_from_table:{table_id}", message),
+        )
+    return {
+        "snapshot_id": snap,
+        "files": len(updated),
+        "rows": rows_delta,
+        "bytes": bytes_delta,
+        "ended_concurrently": ended_concurrently,
+    }
+
+
+@contextlib.contextmanager
+def conn_transaction(pg: psycopg.Connection):
+    """Explicit short transaction on the autocommit connection, yielding a
+    cursor; commit on clean exit, rollback on exception."""
+    with pg.transaction():
+        cur = pg.cursor()
+        try:
+            yield cur
+            cur.close()
+        except BaseException:
+            cur.close()
+            raise
+
+
+def _is_retryable_pg_error(exc: BaseException) -> bool:
+    return getattr(exc, "sqlstate", None) in _DROP_RETRYABLE_SQLSTATES
+
+
+def _lock_refresh(pg: psycopg.Connection) -> None:
+    """(Re)acquire the maintenance advisory lock for this leaf. Session-scoped
+    and REFCOUNTED, so reset to a clean state with unlock_all() first; a
+    dropped pg session loses the lock silently, which is why this runs per
+    leaf, not per run."""
+    pg.execute("SELECT pg_advisory_unlock_all()")
+    acquired = pg.execute(f"SELECT pg_try_advisory_lock({ADVISORY_LOCK_KEY_SQL})").fetchone()[0]
+    if not acquired:
+        raise _LockContended("another maintenance session holds the advisory lock")
+
+
+def _drop_leaf_with_retries(
+    pg_holder: dict,
+    table_id: int,
+    leaf_files: list[_LeafFile],
+    guard_sql: str | None,
+    message: str,
+    check_isolation: bool,
+    metrics: dict,
+    leaf: str = "?",
+    deadline: float | None = None,
+) -> dict:
+    """Retry wrapper: the whole short txn re-runs on retryable PG errors with
+    jittered backoff; cap _DROP_MAX_ATTEMPTS per leaf, then abort the run.
+
+    Retry classes: whitelisted sqlstates (23505 PK race / 40001 / 55P03 /
+    57014 / 40P01 deadlock — full rollback makes the drop idempotent) AND any
+    OperationalError/InterfaceError (connection loss, failover, admin
+    termination — broader than the whitelist on purpose; the txn re-verifies
+    everything on the next attempt). Connection loss reconnects and re-takes
+    the advisory lock on the next attempt (a dropped session loses the lock
+    silently). Lock contention gets its own budget (_DROP_LOCK_ATTEMPTS):
+    expire/cleanup crons can hold the lock for minutes."""
+    attempt = 0
+    lock_attempts = 0
+    need_iso_check = check_isolation
+    while True:
+        attempt += 1
+        if attempt > _DROP_MAX_ATTEMPTS:
+            raise _DropAbort(f"exceeded {_DROP_MAX_ATTEMPTS} attempts on one leaf — aborting the run")
+        if deadline is not None and time.monotonic() > deadline:
+            raise _DropAbort("wall-clock budget exhausted mid-leaf — aborting the run")
+        try:
+            pg = pg_holder["conn"]
+            if pg.closed:
+                log.warning("pg connection lost; reconnecting")
+                pg_holder["conn"] = pg = _pg_direct_connect()
+                need_iso_check = True  # new session: re-assert its isolation once
+            _lock_refresh(pg)
+            t0 = time.monotonic()
+            result = _drop_leaf_txn(pg, table_id, leaf_files, guard_sql, message, need_iso_check)
+            result["txn_ms"] = (time.monotonic() - t0) * 1000
+            result["attempts"] = attempt
+            return result
+        except (_LeafSkip, _DropAbort):
+            raise
+        except _LockContended as exc:
+            lock_attempts += 1
+            if lock_attempts > _DROP_LOCK_ATTEMPTS:
+                raise _DropAbort(
+                    f"advisory lock contended for {_DROP_LOCK_ATTEMPTS} consecutive attempts on one leaf "
+                    "— aborting the run (a long expire/cleanup is holding it; reschedule)"
+                ) from exc
+            metrics["retries"] += 1
+            sleep = min(8.0, random.uniform(2.0, 5.0) * (1 + lock_attempts / 10))
+            log.warning("leaf %s lock contended (attempt %d): %s; sleeping %.1fs", leaf, lock_attempts, exc, sleep)
+            time.sleep(sleep)
+            continue
+        except psycopg.Error as exc:
+            if _is_retryable_pg_error(exc) or isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)):
+                metrics["retries"] += 1
+                sleep = min(2.0, random.uniform(0.05, 0.15) * (1.5 ** min(attempt, 8)))
+                log.warning(
+                    "leaf %s attempt %d retryable (sqlstate=%s: %s); sleeping %.2fs",
+                    leaf,
+                    attempt,
+                    getattr(exc, "sqlstate", None),
+                    exc,
+                    sleep,
+                )
+                time.sleep(sleep)
+                continue
+            raise
+        finally:
+            pg = pg_holder.get("conn")
+            if pg is not None and not pg.closed:
+                with contextlib.suppress(Exception):
+                    pg.execute("SELECT pg_advisory_unlock_all()")
+
+
+def _load_manifest(path: str) -> dict:
+    try:
+        with open(path) as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise _DropAbort(f"cannot read manifest {path!r}: {e}") from e
+    if manifest.get("tool") != "list-droppable-partitions" or manifest.get("manifest_version") != 1:
+        raise _DropAbort(f"{path!r} is not a list-droppable-partitions v1 manifest")
+    missing = [k for k in ("table", "cutoff", "leaves") if k not in manifest]
+    if missing:
+        raise _DropAbort(f"manifest {path!r} is missing keys {missing}")
+    return manifest
+
+
+def list_droppable_partitions(args: argparse.Namespace, gauges: dict) -> None:
+    """Read-only enumeration: emit the leaf manifest (JSON) for every leaf
+    wholly below the cutoff. Never writes; never takes the advisory lock."""
+    with _pg_direct_connect() as pg:
+        table_id, schema_name, table_name = _resolve_table_id(pg, args.table)
+        spec = _resolve_live_spec(pg, table_id)
+        cutoff = _resolve_cutoff(args, spec.grain)
+        floor_snap = _floor_snapshot(pg, cutoff)
+        log.info(
+            "list-droppable-partitions: table=%s table_id=%d partition_id=%d cutoff=%s floor_snapshot=%d",
+            args.table,
+            table_id,
+            spec.partition_id,
+            cutoff.isoformat(),
+            floor_snap,
+        )
+        rows = pg.execute(_enumeration_sql(spec), (table_id, table_id)).fetchall()
+        _assert_no_unageable_files(pg, table_id)
+        leaves, diag = _classify_enumeration(rows, spec, cutoff, floor_snap, args.max_files, args.max_rot)
+    manifest = {
+        "tool": "list-droppable-partitions",
+        "manifest_version": 1,
+        "table": args.table,
+        "table_id": table_id,
+        "partition_id": spec.partition_id,
+        "spec": [f"{k.index}:{spec.address(k)}(column={k.column_name})" for k in spec.keys],
+        "cutoff": cutoff.isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
+        "floor_snapshot": floor_snap,
+        "leaves": [
+            {
+                "partition": leaf.partition,
+                "values": leaf.values,
+                "partition_ts": leaf.part_ts.isoformat(),
+                "files": len(leaf.files),
+                "rows": leaf.rows,
+                "bytes": leaf.bytes,
+                "max_begin_snapshot": leaf.max_begin_snapshot,
+                "oversized": leaf.oversized,
+                # The drop side re-selects by tuple (fresher); id lists are
+                # audit-only and huge at campaign scale — opt-in.
+                **({"file_ids": [f.data_file_id for f in leaf.files]} if args.with_file_ids else {}),
+            }
+            for leaf in leaves
+        ],
+        "diagnostics": diag,
+    }
+    out = json.dumps(manifest, indent=1)
+    oversized = [lf.partition for lf in leaves if lf.oversized]
+    log.info(
+        "enumeration: %d droppable leaves (%d files, %d rows, %d bytes); rot=%d floored=%d oversized=%s",
+        len(leaves),
+        sum(len(lf.files) for lf in leaves),
+        sum(lf.rows for lf in leaves),
+        sum(lf.bytes for lf in leaves),
+        diag["rot_files"],
+        diag["floored_files"],
+        oversized or "none",
+    )
+    gauges["excluded_rot"].labels(table=args.table).set(diag["rot_files"])
+    if args.out:
+        # Atomic write: a concurrent manifest reader must never see a
+        # truncated JSON (fail-closed, but needlessly).
+        tmp = Path(args.out).with_suffix(".tmp")
+        tmp.write_text(out + "\n")
+        os.replace(tmp, args.out)
+        log.info("manifest written to %s", args.out)
+    else:
+        print(out)
+
+
+def drop_partitions(args: argparse.Namespace, gauges: dict) -> None:
+    """Drop partition leaves, one forged OCC commit per leaf. Dry-run by
+    default; --execute writes. Leaf sources: --partition (one fully-resolved
+    tuple) or --manifest (list-droppable-partitions output, oldest first)."""
+    if bool(args.partition) == bool(args.manifest):
+        raise _DropAbort("exactly one of --partition / --manifest is required")
+    if args.manifest and (args.cutoff or args.retention_days is not None):
+        raise _DropAbort("--manifest supplies the cutoff; --cutoff/--retention-days are refused with it")
+    metrics = {
+        "retries": 0,
+        "aborts": 0,
+        "files_dropped": 0,
+        "leaves_dropped": 0,
+        "leaves_skipped": 0,
+        "skipped_files": 0,
+    }
+    holder: dict = {"conn": None}
+    t0 = time.monotonic()
+    run_clean = False
+    try:
+        holder["conn"] = _pg_direct_connect()
+        pg = holder["conn"]
+        table_id, schema_name, table_name = _resolve_table_id(pg, args.table)
+        spec = _resolve_live_spec(pg, table_id)
+        _assert_no_unageable_files(pg, table_id)
+        # The viaduck state identifiers get interpolated into SQL (in-txn guard
+        # subquery) — validate once up front, not just inside _cursor_guard.
+        for value in (args.viaduck_state_schema, args.viaduck_state_table):
+            if not _SAFE_IDENTIFIER_RE.match(value):
+                raise _DropAbort(f"viaduck state identifier {value!r} is not a safe identifier")
+        guard_sql = None if args.no_viaduck_guard else f"{args.viaduck_state_schema}.{args.viaduck_state_table}"
+
+        # Build the leaf work list. In manifest mode the cutoff comes from the
+        # manifest (stale manifests only get MORE conservative); in
+        # --partition mode from the CLI. The floor snapshot is derived once per
+        # RUN (monotonic — a stale floor is strictly more conservative); the
+        # cursor guard is re-read per leaf AND bound as an in-statement
+        # subquery. Selection is advisory; everything re-verifies in-txn.
+        work: list[tuple[str, dict[int, str]]] = []  # (canonical partition str, tuple_map)
+        if args.manifest:
+            manifest = _load_manifest(args.manifest)
+            if manifest["table"] != args.table:
+                raise _DropAbort(f"manifest table {manifest['table']!r} != --table {args.table!r}")
+            if manifest.get("table_id") != table_id or manifest.get("partition_id") != spec.partition_id:
+                raise _DropAbort(
+                    f"manifest table_id/partition_id ({manifest.get('table_id')}/{manifest.get('partition_id')}) "
+                    f"!= live ({table_id}/{spec.partition_id}) — table recreated or spec changed mid-campaign"
+                )
+            try:
+                cutoff = datetime.fromisoformat(manifest["cutoff"])
+            except ValueError as e:
+                raise _DropAbort(f"manifest cutoff {manifest['cutoff']!r} unparseable: {e}") from e
+            if cutoff.tzinfo is None:  # hand-built manifest: naive means UTC (never host-local)
+                cutoff = cutoff.replace(tzinfo=UTC)
+            cutoff = cutoff.astimezone(UTC)
+            _check_cutoff(cutoff, spec.grain, args.force_young_cutoff)
+            for entry in manifest["leaves"]:
+                work.append((entry["partition"], _tuple_from_values(spec, entry["values"])))
+        else:
+            cutoff = _resolve_cutoff(args, spec.grain)
+            tuple_map = _parse_partition_tuple(spec, args.partition)
+            part_ts = _compose_part_ts(spec, tuple_map)
+            if part_ts is None or part_ts >= cutoff:
+                raise _DropAbort(f"partition {args.partition!r} composes to {part_ts} — not below cutoff {cutoff}")
+            _old_spec_leaf_check(pg, table_id, spec, tuple_map)
+            work.append((_canonical_leaf_str(spec, tuple_map), tuple_map))
+        floor_snap = _floor_snapshot(pg, cutoff)
+        floor_time = cutoff + timedelta(hours=_DROP_FLOOR_HOURS)
+        log.info(
+            "drop-partitions: table=%s table_id=%d partition_id=%d cutoff=%s floor_snapshot=%d execute=%s leaves=%d",
+            args.table,
+            table_id,
+            spec.partition_id,
+            cutoff.isoformat(),
+            floor_snap,
+            args.execute,
+            len(work),
+        )
+
+        first_txn = True
+        for partition, tuple_map in work:
+            pg = holder["conn"]
+            if time.monotonic() - t0 > args.max_seconds:
+                log.warning("wall-clock budget %ds exhausted; stopping with leaves remaining", args.max_seconds)
+                break
+            # The enumeration invariant must hold on the mutating path too —
+            # re-verify per leaf (a stale or hand-built manifest is advisory).
+            part_ts = _compose_part_ts(spec, tuple_map)
+            if part_ts is None or part_ts >= cutoff:
+                log.info("leaf %s SKIPPED: no longer below the cutoff (or uncomposable)", partition)
+                metrics["leaves_skipped"] += 1
+                continue
+            guard = _cursor_guard(
+                pg, args.viaduck_state_schema, args.viaduck_state_table, floor_time, args.no_viaduck_guard
+            )
+            try:
+                leaf_files = _select_leaf_files(pg, table_id, spec, tuple_map, floor_snap, args.max_files)
+            except _LeafOversized as oversized:
+                if not args.manifest:
+                    raise  # single-leaf invocation: the operator asked for THIS leaf — abort
+                log.warning("leaf %s SKIPPED (oversized, needs manual review): %s", partition, oversized)
+                metrics["leaves_skipped"] += 1
+                continue
+            if not leaf_files:
+                log.info("leaf %s: nothing live below the cutoff — skipping", partition)
+                metrics["leaves_skipped"] += 1
+                continue
+            guard_blocked = [f.data_file_id for f in leaf_files if f.begin_snapshot >= guard.snapshot_id]
+            if guard_blocked:
+                log.info(
+                    "leaf %s SKIPPED: %d/%d members guard-ineligible (begin_snapshot >= cursor guard %d); "
+                    "it ages into eligibility",
+                    partition,
+                    len(guard_blocked),
+                    len(leaf_files),
+                    guard.snapshot_id,
+                )
+                metrics["leaves_skipped"] += 1
+                continue
+            if not args.execute:
+                log.info(
+                    "leaf %s: DRY-RUN would drop files=%d rows=%d bytes=%d (guard=%d cursors=%d oldest_cursor=%s)",
+                    partition,
+                    len(leaf_files),
+                    sum(f.record_count for f in leaf_files),
+                    sum(f.file_size_bytes for f in leaf_files),
+                    guard.snapshot_id,
+                    guard.cursor_rows,
+                    guard.oldest_cursor_time,
+                )
+                continue
+            message = (
+                f"drop-partitions table={schema_name}.{table_name} leaf={partition} "
+                f"campaign={args.campaign or '-'} files={len(leaf_files)}"
+            )
+            try:
+                result = _drop_leaf_with_retries(
+                    holder,
+                    table_id,
+                    leaf_files,
+                    guard_sql,
+                    message,
+                    first_txn,
+                    metrics,
+                    leaf=partition,
+                    deadline=t0 + args.max_seconds,
+                )
+            except _LeafSkip as skip:
+                log.info("leaf %s SKIPPED in-txn: %s", partition, skip)
+                metrics["leaves_skipped"] += 1
+                continue
+            first_txn = False
+            metrics["files_dropped"] += result["files"]
+            metrics["leaves_dropped"] += 1
+            metrics["skipped_files"] += result["ended_concurrently"]
+            log.info(
+                "leaf %s DROPPED: snapshot=%d files=%d rows=%d bytes=%d ended_concurrently=%d attempts=%d txn_ms=%.0f",
+                partition,
+                result["snapshot_id"],
+                result["files"],
+                result["rows"],
+                result["bytes"],
+                result["ended_concurrently"],
+                result["attempts"],
+                result["txn_ms"],
+            )
+            time.sleep(args.pace_ms / 1000.0)
+        run_clean = True
+    except _DropAbort:
+        metrics["aborts"] += 1
+        raise
+    except Exception:
+        # Non-_DropAbort propagation (psycopg failures, bugs): still an abort
+        # for the metric, exit code comes from main().
+        metrics["aborts"] += 1
+        raise
+    finally:
+        if holder["conn"] is not None:
+            with contextlib.suppress(Exception):
+                holder["conn"].close()
+        if args.execute:
+            # Dry-runs leave NO metric footprint: pushadd POST replaces
+            # same-name+label series, so a manual dry-run would otherwise
+            # zero the cron's counters and — worst — refresh
+            # last_success_timestamp, masking a wedged --execute cron.
+            gauges["files_dropped"].labels(table=args.table).set(metrics["files_dropped"])
+            gauges["leaves_dropped"].labels(table=args.table).set(metrics["leaves_dropped"])
+            gauges["leaves_skipped"].labels(table=args.table).set(metrics["leaves_skipped"])
+            gauges["retries"].labels(table=args.table).set(metrics["retries"])
+            gauges["aborts"].labels(table=args.table).set(metrics["aborts"])
+            gauges["skipped_files"].labels(table=args.table).set(metrics["skipped_files"])
+            # "success" = the run completed cleanly, even if every leaf
+            # skipped (a healthy all-skipped day must not read as staleness).
+            if run_clean:
+                gauges["last_success"].labels(table=args.table).set(time.time())
+    log.info(
+        "drop-partitions done: leaves_dropped=%d leaves_skipped=%d files_dropped=%d execute=%s",
+        metrics["leaves_dropped"],
+        metrics["leaves_skipped"],
+        metrics["files_dropped"],
+        args.execute,
+    )
+
+
+# ---------------------------------------------------------------------------
+# drop-orphan-inline-tables: inlined-data tables of dropped DuckLake tables
+# ---------------------------------------------------------------------------
+# DuckLake (Postgres catalog) creates one Postgres table per (table,
+# schema_version) for data inlining, `public.ducklake_inlined_data_<table_id>_
+# <schema_version>`, registered in `ducklake_inlined_data_tables`. DuckLake's
+# own GC (DropEmptySupersededInlinedTables) only drops superseded-and-empty
+# ones, not the inlined tables of a DROPPED parent table; once nothing
+# retained can reach the parent, nothing reaps them. Catalogs with
+# DROP+CREATE-per-sync churn have accumulated them without bound in
+# production, and every one adds rows to pg_class / pg_attribute / pg_type.
+#
+# That bloat is what makes this op necessary AND why it must not use the
+# DuckLake ATTACH: DuckDB's ATTACH runs a full Postgres system-catalog scan
+# (pg_class x pg_attribute x pg_type x pg_description). On a catalog with
+# ~230k orphaned inlined tables (~18.7M pg_attribute rows) that scan spilled
+# ~1.5GB per session, ran for ~10 minutes and OOMed 4Gi DuckDB processes, so
+# every ATTACH-based recipe failed before doing anything. This op runs on the
+# direct libpq connection (`_DIRECT_PG_COMMANDS`) and never touches duckdb.
+
+_INLINE_TABLE_NAME_RE = re.compile(r"ducklake_inlined_data_[0-9]+_[0-9]+")  # used with fullmatch()
+_DROP_INLINE_DEFAULT_BATCH_SIZE = 500
+# Shared lock-table entries one `LOCK TABLE ... ACCESS EXCLUSIVE` + `DROP
+# TABLE` of an inlined table holds until COMMIT, MEASURED off pg_locks on
+# 16.15 / 17.10 / 18.6 (identical on all three): 5 = three locktype=relation
+# entries (the heap, its TOAST heap, the TOAST index) + two locktype=object
+# entries on pg_type for the composite rowtype and its array type, which
+# AcquireDeletionLock takes. A heap with no varlena column (hence no TOAST)
+# takes 3; one index would make it 6. The row updates the drop makes in
+# pg_class / pg_attribute / pg_depend take no lock-table entry at all.
+#
+# This constant is the DENOMINATOR of the cap, so UNDERestimating it inflates
+# the cap: a conservative estimate is a HIGH one. 5 is the measured value for
+# exactly the shape this op drops (inlined tables always carry varlena
+# columns and never carry indexes).
+#
+#   capacity  = max_locks_per_transaction * (max_connections + max_prepared_transactions)
+#   batch_cap = floor(capacity * _DROP_INLINE_LOCK_TABLE_SHARE / _DROP_INLINE_ENTRIES_PER_DROP)
+#
+# `capacity` is the lock table's documented FLOOR, not its total: Postgres
+# sizes the table max_locks_per_transaction * (MaxBackends +
+# max_prepared_transactions) where MaxBackends = max_connections +
+# autovacuum workers + 1 + max_worker_processes + max_wal_senders, and the
+# underlying hash table is not fixed-size (measurement fit ~10x the
+# documented count before 53200). So the quarter-share below is slack on top
+# of an already pessimistic number.
+#
+# Where this bites: a stock / CNPG-default server (64 * (100 + 0) = 6400)
+# gets a cap of 320, BELOW the 500 default, so the derivation governs there.
+# It does NOT govern the production targets: RDS's default max_connections is
+# LEAST(DBInstanceClassMemory/9531392, 5000), i.e. ~1,800 on a db.r7g.large
+# and 5,000 on a 2xlarge, so the raw cap lands at 7,200-20,000 and
+# _DROP_INLINE_MAX_BATCH_SIZE (2000, = 10,000 entries, well inside a stock
+# server's whole documented table by itself) is what actually governs. Read
+# the two as: the ceiling bounds prod, the derivation bounds small servers.
+_DROP_INLINE_LOCK_TABLE_SHARE = 0.25
+_DROP_INLINE_ENTRIES_PER_DROP = 5
+_DROP_INLINE_MAX_BATCH_SIZE = 2000
+# Floor for the server-derived cap and for the 53200 halving: 10 drops is ~50
+# lock entries, inside any usable configuration, and a run has to keep making
+# progress instead of converging on a zero-row batch. NOTE the floor is only
+# reachable ACROSS batches — within one batch _DROP_INLINE_MAX_ATTEMPTS caps
+# the halving chain (500 -> 250 -> 125 -> 62 -> 31, then fatal).
+_DROP_INLINE_MIN_BATCH_SIZE = 10
+# Consecutive retry-free batches after which a shrunken batch size doubles
+# again (never above the size the run started with). Without this a few
+# transient 53200s would hold a multi-hour run at a fraction of its size
+# forever: three of them take 500 to 62.
+_DROP_INLINE_REGROW_AFTER_BATCHES = 10
+# Per-batch txn bounds. lock_timeout is short on purpose: a table someone still
+# holds a lock on is not worth waiting for (the batch rolls back and retries).
+_DROP_INLINE_STATEMENT_TIMEOUT = "120s"
+_DROP_INLINE_LOCK_TIMEOUT = "5s"
+_DROP_INLINE_MAX_ATTEMPTS = 5
+_DROP_INLINE_OUT_OF_SHARED_MEMORY = "53200"
+# drop-partitions' retryable classes plus 42P01 (undefined_table): an inlined
+# table dropped by a concurrent session between our selection and our LOCK.
+# The retry re-selects, sees it gone from pg_class, and only deletes the row.
+# Plus 53200: retried with the batch halved, because a run that has been
+# dropping for hours must not die fatally on a transient shortage caused by
+# other sessions. 53200 is the GENERIC out_of_memory, not a lock-table-specific
+# code — a palloc failure in the registry DELETE's unnest() reports it too, and
+# a smaller batch is the right response to that as well. A lock table that is
+# STILL full after _DROP_INLINE_MAX_ATTEMPTS halvings is not something a cron
+# should paper over, so that case stays fatal. 53100 (disk full), 53300 (too
+# many connections) and 53400 (configuration limit exceeded) are deliberately
+# NOT retryable: a smaller batch does not help any of them.
+_DROP_INLINE_RETRYABLE_SQLSTATES = _DROP_RETRYABLE_SQLSTATES | {"42P01", _DROP_INLINE_OUT_OF_SHARED_MEMORY}
+
+# Module-level so tests can monkeypatch the run-budget clock without touching
+# the `time` module everything else in this file uses.
+_monotonic = time.monotonic
+
+# The GUCs the per-batch lock budget is derived from. Read on the direct
+# connection at the start of a run; the integration test runs this same SQL to
+# predict the effective batch size the op logs.
+_INLINE_LOCK_GUC_SQL = (
+    "SELECT current_setting('max_locks_per_transaction')::int, "
+    "current_setting('max_connections')::int, "
+    "current_setting('max_prepared_transactions')::int"
+)
+
+
+@dataclass(frozen=True)
+class _InlineLockBudget:
+    """How many orphans one batch may drop, derived from the server's GUCs."""
+
+    requested: int
+    max_locks_per_transaction: int
+    max_connections: int
+    max_prepared_transactions: int
+    capacity: int  # total shared lock-table entries on this server
+    cap: int  # rows per batch this server allows (clamped to MIN/MAX)
+    batch_size: int  # effective: min(requested, cap)
+
+    @property
+    def lowered(self) -> bool:
+        return self.batch_size < self.requested
+
+
+def _inline_lock_budget(
+    requested: int, max_locks_per_transaction: int, max_connections: int, max_prepared_transactions: int
+) -> _InlineLockBudget:
+    """Pure cap arithmetic; see the ENTRIES_PER_DROP comment for the derivation."""
+    capacity = max_locks_per_transaction * (max_connections + max_prepared_transactions)
+    cap = int(capacity * _DROP_INLINE_LOCK_TABLE_SHARE / _DROP_INLINE_ENTRIES_PER_DROP)
+    cap = max(_DROP_INLINE_MIN_BATCH_SIZE, min(cap, _DROP_INLINE_MAX_BATCH_SIZE))
+    return _InlineLockBudget(
+        requested=requested,
+        max_locks_per_transaction=max_locks_per_transaction,
+        max_connections=max_connections,
+        max_prepared_transactions=max_prepared_transactions,
+        capacity=capacity,
+        cap=cap,
+        batch_size=min(requested, cap),
+    )
+
+
+def _read_inline_lock_budget(pg: psycopg.Connection, requested: int) -> _InlineLockBudget:
+    return _inline_lock_budget(requested, *pg.execute(_INLINE_LOCK_GUC_SQL).fetchone())
+
+
+def _inline_orphan_predicate(alias: str) -> str:
+    """WHERE fragment: the registry row's table has no `ducklake_table` row
+    reachable from any retained snapshot.
+
+    Kept in lockstep with the `ducklake_unreachable_inline_tables` metric in
+    tools/ducklake_metrics.py (same range-overlap predicate: a table version
+    is reachable if begin_snapshot <= max(snapshot_id) and it was not ended
+    at or before min(snapshot_id)). The overlap test is a superset of "truly
+    visible from some retained snapshot", so it can only under-count orphans,
+    never flag a reachable table. The integration test asserts metric and
+    predicate count the same rows.
+
+    Orphanhood is permanent: table_ids are never reused, there is no undrop,
+    and snapshot expiry only shrinks the retained range. So a row selected as
+    orphaned stays orphaned for the rest of the transaction. The bounds are
+    evaluated per statement, i.e. re-evaluated for every batch.
+
+    This is NOT `_orphan_stats_predicate`, the file's other definition of
+    "orphaned": that one calls any dropped table's stats rows orphaned and
+    ignores retention entirely, which is correct there because the commit
+    path reads only LIVE tables' stats. Here retention is the whole test — a
+    time-travel read of a retained snapshot can still read this table's
+    inlined rows, so a table version reachable from one must survive.
+    Deliberately two predicates, not one helper: different questions.
+    """
+    s = PG_CATALOG_SCHEMA
+    return (
+        f"NOT EXISTS ("
+        f"SELECT 1 FROM {s}.ducklake_table t "
+        f"WHERE t.table_id = {alias}.table_id "
+        f"AND t.begin_snapshot <= (SELECT MAX(snapshot_id) FROM {s}.ducklake_snapshot) "
+        f"AND (t.end_snapshot IS NULL "
+        f"OR t.end_snapshot > (SELECT MIN(snapshot_id) FROM {s}.ducklake_snapshot))"
+        f")"
+    )
+
+
+def _inline_orphan_counts_sql() -> str:
+    """(registry_rows, orphaned, orphaned_present_in_pg_class)."""
+    s = PG_CATALOG_SCHEMA
+    return (
+        f"SELECT "
+        f"(SELECT COUNT(*) FROM {s}.ducklake_inlined_data_tables), "
+        f"COUNT(*), "
+        f"COUNT(c.oid) "
+        f"FROM {s}.ducklake_inlined_data_tables idt "
+        f"LEFT JOIN pg_catalog.pg_class c "
+        f"ON c.relname = idt.table_name AND c.relnamespace = '{s}'::regnamespace "
+        f"WHERE {_inline_orphan_predicate('idt')}"
+    )
+
+
+def _inline_orphan_batch_sql(for_update: bool) -> str:
+    """Next keyset page of orphaned registry rows after (table_id,
+    schema_version) = (%s, %s), with whether the table exists in pg_class.
+
+    Keyset, not plain LIMIT: rows we skip (non-empty, bad name, row-locked)
+    stay in the registry, and a plain LIMIT would reselect them forever.
+    FOR UPDATE OF idt SKIP LOCKED: a concurrent DuckLake GC deleting the same
+    registry row is skipped this run rather than waited on."""
+    s = PG_CATALOG_SCHEMA
+    return (
+        f"SELECT idt.table_id, idt.schema_version, idt.table_name, c.oid IS NOT NULL "
+        f"FROM {s}.ducklake_inlined_data_tables idt "
+        f"LEFT JOIN pg_catalog.pg_class c "
+        f"ON c.relname = idt.table_name AND c.relnamespace = '{s}'::regnamespace "
+        f"WHERE (idt.table_id, idt.schema_version) > (%s, %s) "
+        f"AND {_inline_orphan_predicate('idt')} "
+        f"ORDER BY idt.table_id, idt.schema_version "
+        f"LIMIT %s" + (" FOR UPDATE OF idt SKIP LOCKED" if for_update else "")
+    )
+
+
+def _inline_table_has_rows(cur: psycopg.Cursor, table_name: str) -> bool:
+    """True if the table holds at least one row (any row, live or not in
+    DuckLake's begin/end_snapshot sense).
+
+    Deliberately NOT pg_class.reltuples: it is a planner estimate refreshed
+    only by VACUUM / ANALYZE / CREATE INDEX — -1 on a never-vacuumed table and
+    0 on a table that received rows after its last analyze. `SELECT 1 ...
+    LIMIT 1` is exact and cheap: an empty heap has zero pages, so the scan
+    ends immediately; a non-empty one stops at the first visible tuple. In
+    execute mode the caller holds ACCESS EXCLUSIVE on the table first, so no
+    writer can insert between this check and the DROP."""
+    query = pgsql.SQL("SELECT 1 FROM {} LIMIT 1").format(pgsql.Identifier(PG_CATALOG_SCHEMA, table_name))
+    return cur.execute(query).fetchone() is not None
+
+
+@dataclass
+class _InlineBatchResult:
+    truncated: bool = False  # stopped mid-page on the run deadline (P7)
+    rows: int = 0  # registry rows selected this batch
+    dropped: int = 0  # Postgres tables dropped
+    registry_deleted: int = 0  # registry rows deleted (dropped + already-missing tables)
+    missing: int = 0  # orphan registry rows whose table was already gone
+    skipped_nonempty: int = 0
+    skipped_invalid: int = 0
+    last_key: tuple[int, int] | None = None
+
+
+def _drop_inline_batch(
+    pg: psycopg.Connection,
+    after: tuple[int, int],
+    batch_size: int,
+    dry_run: bool,
+    deadline: float | None = None,
+) -> _InlineBatchResult:
+    """One batch in ONE transaction: select orphans, (lock, check, drop) each
+    present table, delete the matching registry rows, commit. Dry-run reads
+    the same page and checks emptiness without locking or writing.
+
+    `deadline` (a _monotonic() reading) bounds the batch from the INSIDE,
+    which the per-statement settings cannot: statement_timeout applies to one
+    statement and a batch issues roughly 1 + 3*batch_size + 1 of them, and
+    PG 16 has no transaction_timeout. Reaching it stops the loop from taking
+    NEW rows; the row in flight finishes, the registry rows for everything
+    processed are deleted, and the transaction commits, so a truncated batch
+    is still all-or-nothing for what it touched. `last_key` is then the last
+    row actually processed (the caller resumes there) and `truncated` tells
+    the caller to stop. Absent a deadline the batch's own bound is ~3 round
+    trips per row plus at most one _DROP_INLINE_LOCK_TIMEOUT wait, which
+    aborts the batch rather than extending it."""
+    res = _InlineBatchResult()
+    with conn_transaction(pg) as cur:
+        if not dry_run:
+            cur.execute(f"SET LOCAL statement_timeout = '{_DROP_INLINE_STATEMENT_TIMEOUT}'")
+            cur.execute(f"SET LOCAL lock_timeout = '{_DROP_INLINE_LOCK_TIMEOUT}'")
+        rows = cur.execute(_inline_orphan_batch_sql(for_update=not dry_run), (*after, batch_size)).fetchall()
+        res.rows = len(rows)
+        to_delete: list[tuple[int, int, str]] = []
+        for table_id, schema_version, table_name, present in rows:
+            if deadline is not None and res.last_key is not None and _monotonic() >= deadline:
+                # Take no new row; commit what this transaction already did.
+                # `last_key is not None` guarantees forward progress: a budget
+                # already spent when the batch starts still processes one row,
+                # so a run can never consume a cron tick doing nothing.
+                res.truncated = True
+                break
+            res.last_key = (table_id, schema_version)
+            if not isinstance(table_name, str) or not _INLINE_TABLE_NAME_RE.fullmatch(table_name):
+                # Never DROP a name we did not expect; the registry row stays
+                # so the anomaly remains visible in the metric. This check is
+                # deliberately BEFORE the LOCK TABLE below: an unexpected name
+                # must not cost an ACCESS EXCLUSIVE lock on whatever relation
+                # it happens to be, on this run or any of the runs that will
+                # re-select it forever.
+                log.warning(
+                    "drop-orphan-inline-tables: skipping registry row table_id=%s schema_version=%s: "
+                    "unexpected table_name %r",
+                    table_id,
+                    schema_version,
+                    table_name,
+                )
+                res.skipped_invalid += 1
+                continue
+            if present:
+                ident = pgsql.Identifier(PG_CATALOG_SCHEMA, table_name)
+                if not dry_run:
+                    cur.execute(pgsql.SQL("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE").format(ident))
+                if _inline_table_has_rows(cur, table_name):
+                    log.warning(
+                        "drop-orphan-inline-tables: skipping non-empty orphan %s.%s (table_id=%s)",
+                        PG_CATALOG_SCHEMA,
+                        table_name,
+                        table_id,
+                    )
+                    res.skipped_nonempty += 1
+                    continue
+                if not dry_run:
+                    cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}").format(ident))
+                res.dropped += 1
+            else:
+                res.missing += 1
+            to_delete.append((table_id, schema_version, table_name))
+        if res.truncated:
+            # `rows` means the work this batch took on, so a deadline-truncated
+            # batch does not report rows it never looked at as selected.
+            res.rows = res.dropped + res.missing + res.skipped_nonempty + res.skipped_invalid
+        if to_delete and not dry_run:
+            cur.execute(
+                f"DELETE FROM {PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables idt "
+                f"USING unnest(%s::bigint[], %s::bigint[], %s::text[]) AS d(table_id, schema_version, table_name) "
+                f"WHERE idt.table_id = d.table_id AND idt.schema_version = d.schema_version "
+                f"AND idt.table_name = d.table_name",
+                ([r[0] for r in to_delete], [r[1] for r in to_delete], [r[2] for r in to_delete]),
+            )
+            res.registry_deleted = cur.rowcount
+    return res
+
+
+def drop_orphan_inline_tables(
+    dry_run: bool,
+    batch_size: int,
+    max_batches: int | None,
+    gauges: dict,
+    pg: psycopg.Connection | None = None,
+    run_budget_s: float | None = None,
+) -> None:
+    """Drop the inlined-data tables (and registry rows) of DuckLake tables no
+    retained snapshot can reach. See the section header for why this exists
+    and why it runs on a direct libpq connection.
+
+    Safety:
+      - Takes the maintenance advisory lock (execute mode) so it cannot race
+        expire / cleanup / compaction. Like every maintenance op it does NOT
+        serialize against ingest writers; the per-batch predicate and the
+        row locks below are what make that safe.
+      - One transaction per batch: DROP TABLE and the registry DELETE commit
+        together, so the registry never points at a dropped table and a
+        dropped table is never left registered.
+      - Non-empty orphans are skipped and counted, never dropped.
+      - No VACUUM FULL: it takes ACCESS EXCLUSIVE on system catalogs and would
+        stall every catalog session. Plain autovacuum reuses the freed
+        pg_class / pg_attribute space for new rows.
+
+    Bounds:
+      - batch_size is an upper bound only. The effective size is derived from
+        the server's lock-table GUCs (see _inline_lock_budget) and halved for
+        the rest of the run on SQLSTATE 53200.
+      - run_budget_s bounds the wall clock. A 230k-row backlog at 500 per
+        batch is ~460 transactions, and the advisory lock is held for all of
+        them, so expire / cleanup / compaction wait behind an unbounded run.
+        The budget is enforced both between batches and INSIDE one (see
+        _drop_inline_batch's `deadline`), and a run that stops on it is a
+        success, not a failure: keyset paging restarts from the orphan
+        predicate rather than a saved cursor, so the next cron tick picks the
+        backlog up where this one left it.
+      - That convergence covers DROPPABLE rows only. Rows skipped as non-empty
+        or as unexpected names are never deleted, so every run re-selects them
+        from the head of the registry, and they consume batch capacity (and,
+        for non-empty ones, an ACCESS EXCLUSIVE lock) on every tick. Under a
+        budget a large enough stuck set can spend the whole budget on rows
+        that will never drop — which is why the run logs the skipped share and
+        the metric keeps counting them.
+    """
+    owned = pg is None
+    if owned:
+        pg = _pg_direct_connect("millpond-drop-orphan-inline-tables")
+    total = _InlineBatchResult()
+    batches = 0
+    retries = 0
+    budget_exhausted = False
+    started = _monotonic()
+    # One deadline for the whole run: the between-batch check and the
+    # inside-the-batch check (and the retry backoff) all read it.
+    deadline = None if run_budget_s is None else started + run_budget_s
+    try:
+        budget = _read_inline_lock_budget(pg, batch_size)
+        # Mutable run state, not a constant: a 53200 retry halves it below.
+        batch_size = budget.batch_size
+        log.info(
+            "drop-orphan-inline-tables: lock budget: max_locks_per_transaction=%d max_connections=%d "
+            "max_prepared_transactions=%d capacity=%d entries_per_drop=%d share=%.2f batch_cap=%d "
+            "batch_size=%d requested=%d",
+            budget.max_locks_per_transaction,
+            budget.max_connections,
+            budget.max_prepared_transactions,
+            budget.capacity,
+            _DROP_INLINE_ENTRIES_PER_DROP,
+            _DROP_INLINE_LOCK_TABLE_SHARE,
+            budget.cap,
+            budget.batch_size,
+            budget.requested,
+        )
+        if budget.lowered:
+            # INFO, not WARN: on a server whose GUCs produce a cap below the
+            # requested size this fires on every run (dry-runs included) and
+            # nothing is wrong. WARN is reserved for the 53200 halving.
+            log.info(
+                "drop-orphan-inline-tables: --batch-size %d lowered to %d: this server's shared lock table "
+                "holds at least %d entries and one DROP holds ~%d of them until commit",
+                budget.requested,
+                budget.batch_size,
+                budget.capacity,
+                _DROP_INLINE_ENTRIES_PER_DROP,
+            )
+        registry = pg.execute(
+            f"SELECT to_regclass('{PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables') IS NOT NULL"
+        ).fetchone()[0]
+        if not registry:
+            log.info("drop-orphan-inline-tables: no ducklake_inlined_data_tables registry; nothing to do")
+            return
+        snapshots = pg.execute(f"SELECT COUNT(*) FROM {PG_CATALOG_SCHEMA}.ducklake_snapshot").fetchone()[0]
+        if snapshots == 0:
+            # MIN/MAX would be NULL and the predicate would call every table
+            # orphaned. A catalog without snapshots is not one to touch.
+            raise RuntimeError("drop-orphan-inline-tables: ducklake_snapshot is empty; refusing to run")
+
+        registry_rows, orphaned, orphaned_present = pg.execute(_inline_orphan_counts_sql()).fetchone()
+        log.info(
+            "drop-orphan-inline-tables: registry_rows=%d orphaned=%d orphaned_present_in_pg_class=%d "
+            "(dry_run=%s, batch_size=%d, max_batches=%s, run_budget_s=%s)",
+            registry_rows,
+            orphaned,
+            orphaned_present,
+            dry_run,
+            batch_size,
+            max_batches,
+            run_budget_s,
+        )
+        if orphaned == 0:
+            if not dry_run:
+                gauges["remaining"].set(0)
+            return
+
+        if not dry_run:
+            _lock_refresh(pg)
+            log.info("Acquired advisory lock %s", ADVISORY_LOCK_KEY_SQL)
+
+        after = (-1, -1)
+        clean_batches = 0
+        while max_batches is None or batches < max_batches:
+            attempt = 0
+            res = None
+            while True:
+                attempt += 1
+                try:
+                    res = _drop_inline_batch(pg, after, batch_size, dry_run, deadline)
+                    break
+                except psycopg.Error as exc:
+                    if not _is_retryable_inline_error(exc) or attempt >= _DROP_INLINE_MAX_ATTEMPTS:
+                        raise
+                    retries += 1
+                    log.warning(
+                        "drop-orphan-inline-tables: batch after %s failed (attempt %d/%d, sqlstate=%s); retrying",
+                        after,
+                        attempt,
+                        _DROP_INLINE_MAX_ATTEMPTS,
+                        exc.sqlstate,
+                    )
+                    if exc.sqlstate == _DROP_INLINE_OUT_OF_SHARED_MEMORY:
+                        # Retrying at the same size would hit the same wall, so
+                        # shrink for the rest of the run (other retryable
+                        # classes keep the size). The outer min() keeps this a
+                        # shrink — an operator who asked for fewer rows than
+                        # the floor keeps theirs.
+                        halved = min(batch_size, max(_DROP_INLINE_MIN_BATCH_SIZE, batch_size // 2))
+                        log.warning(
+                            "drop-orphan-inline-tables: out of shared memory (53200): batch size %d -> %d "
+                            "for the rest of the run (floor %d, fatal after attempt %d)",
+                            batch_size,
+                            halved,
+                            _DROP_INLINE_MIN_BATCH_SIZE,
+                            _DROP_INLINE_MAX_ATTEMPTS,
+                        )
+                        batch_size = halved
+                    if deadline is not None and _monotonic() >= deadline:
+                        # The backoff sleeps (up to ~30s each) are elapsed time
+                        # too; do not spend budget we no longer have.
+                        log.warning(
+                            "drop-orphan-inline-tables: run budget reached while backing off from "
+                            "sqlstate=%s; abandoning this batch instead of retrying",
+                            exc.sqlstate,
+                        )
+                        break
+                    time.sleep(min(2**attempt, 30) * (0.5 + random.random()))
+            if res is None:  # gave up mid-retry on the budget
+                budget_exhausted = True
+                break
+            if res.rows == 0:
+                budget_exhausted = res.truncated
+                break
+            batches += 1
+            clean_batches = clean_batches + 1 if attempt == 1 else 0
+            if res.last_key is not None:
+                after = res.last_key
+            total.rows += res.rows
+            total.dropped += res.dropped
+            total.registry_deleted += res.registry_deleted
+            total.missing += res.missing
+            total.skipped_nonempty += res.skipped_nonempty
+            total.skipped_invalid += res.skipped_invalid
+            log.info(
+                "drop-orphan-inline-tables: batch %d: selected=%d %s=%d already_missing=%d registry_deleted=%d "
+                "skipped_nonempty=%d skipped_invalid_name=%d truncated=%s last_key=%s",
+                batches,
+                res.rows,
+                "would_drop" if dry_run else "dropped",
+                res.dropped,
+                res.missing,
+                res.registry_deleted,
+                res.skipped_nonempty,
+                res.skipped_invalid,
+                res.truncated,
+                after,
+            )
+            if res.truncated:
+                budget_exhausted = True
+                break
+            if res.rows < batch_size:
+                break
+            if deadline is not None and _monotonic() >= deadline:
+                budget_exhausted = True
+                break
+            if clean_batches >= _DROP_INLINE_REGROW_AFTER_BATCHES and batch_size < budget.batch_size:
+                regrown = min(budget.batch_size, batch_size * 2)
+                log.info(
+                    "drop-orphan-inline-tables: %d clean batches: batch size %d -> %d (ceiling %d, the size "
+                    "this run started with)",
+                    clean_batches,
+                    batch_size,
+                    regrown,
+                    budget.batch_size,
+                )
+                batch_size = regrown
+                clean_batches = 0
+
+        remaining = pg.execute(
+            f"SELECT COUNT(*) FROM {PG_CATALOG_SCHEMA}.ducklake_inlined_data_tables idt "
+            f"WHERE {_inline_orphan_predicate('idt')}"
+        ).fetchone()[0]
+    finally:
+        if owned:
+            with contextlib.suppress(Exception):
+                pg.close()
+        elif not dry_run:
+            # The advisory lock is SESSION-scoped and the caller keeps the
+            # session, so closing is not an option and letting go is not
+            # optional: the next op on that connection would self-deadlock.
+            with contextlib.suppress(Exception):
+                pg.execute("SELECT pg_advisory_unlock_all()")
+
+    skipped = total.skipped_nonempty + total.skipped_invalid
+    log.info(
+        "drop-orphan-inline-tables done: dry_run=%s batches=%d selected=%d %s=%d already_missing=%d "
+        "registry_deleted=%d skipped_nonempty=%d skipped_invalid_name=%d skipped_share=%.1f%% retries=%d "
+        "batch_size_start=%d batch_size_final=%d remaining_orphans=%d",
+        dry_run,
+        batches,
+        total.rows,
+        "would_drop" if dry_run else "dropped",
+        total.dropped,
+        total.missing,
+        total.registry_deleted,
+        total.skipped_nonempty,
+        total.skipped_invalid,
+        100.0 * skipped / total.rows if total.rows else 0.0,
+        retries,
+        budget.batch_size,
+        batch_size,
+        remaining,
+    )
+    if skipped and total.rows and skipped == total.rows:
+        # Every row this run touched is stuck: the budget (and every future
+        # run's) is being spent re-walking rows that will never drop.
+        log.warning(
+            "drop-orphan-inline-tables: all %d selected rows were skipped (non-empty or unexpected name); "
+            "these are re-selected from the head of the registry by every run and never converge",
+            total.rows,
+        )
+    if budget_exhausted:
+        log.warning(
+            "drop-orphan-inline-tables: budget_exhausted=true run_budget_s=%s batches=%d remaining_orphans=%d; "
+            "stopping cleanly so the rest of the maintenance chain gets the advisory lock. The next run "
+            "resumes from the orphan predicate (keyset paging, no saved cursor), so the backlog converges "
+            "across cron ticks",
+            run_budget_s,
+            batches,
+            remaining,
+        )
+    if not dry_run:
+        gauges["dropped"].set(total.dropped)
+        gauges["skipped_nonempty"].set(total.skipped_nonempty)
+        gauges["remaining"].set(remaining)
+        gauges["budget_exhausted"].set(1 if budget_exhausted else 0)
+        if total.dropped:
+            log.info(
+                "drop-orphan-inline-tables: pg_class / pg_attribute / pg_type keep their dead tuples until "
+                "autovacuum runs; plain autovacuum reuses that space for new rows. This tool never runs "
+                "VACUUM FULL (it takes ACCESS EXCLUSIVE on the system catalogs). To shrink them on disk, run "
+                "VACUUM FULL pg_catalog.pg_attribute (and pg_class, pg_type) manually in a quiet window."
+            )
+
+
+def _is_retryable_inline_error(exc: BaseException) -> bool:
+    return getattr(exc, "sqlstate", None) in _DROP_INLINE_RETRYABLE_SQLSTATES
+
+
+_DIRECT_PG_COMMANDS = frozenset({"drop-partitions", "list-droppable-partitions", "drop-orphan-inline-tables"})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2567,13 +4589,141 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--table", required=True)
     p.add_argument("--max-compacted-files", type=_positive_int, default=2)
 
+    # list-droppable-partitions (read-only; direct libpq, no duckdb lifecycle)
+    p = sub.add_parser(
+        "list-droppable-partitions",
+        help="Enumerate droppable partition leaves below the cutoff (read-only), emit a JSON manifest",
+    )
+    p.add_argument("--table", required=True, help="schema.table (e.g. main.events_nrt); bare table_id refused")
+    p.add_argument("--cutoff", default="", help="ISO 8601; partitions strictly older are droppable")
+    p.add_argument("--retention-days", type=_positive_int, default=None, help="Alternative to --cutoff: now - N days")
+    p.add_argument(
+        "--max-files",
+        type=_positive_int,
+        default=_positive_int(os.environ.get("DROP_PARTITIONS_MAX_FILES", "10000")),
+        help="Per-leaf sanity ceiling; oversized leaves are marked and the drop aborts on them",
+    )
+    p.add_argument(
+        "--max-rot",
+        type=int,
+        default=int(os.environ.get("DROP_PARTITIONS_MAX_ROT", "0")),
+        help="Tolerated fpv-rot file count before the run aborts (default 0 = any rot aborts)",
+    )
+    p.add_argument("--force-young-cutoff", action="store_true", help="Allow cutoffs younger than 7 days")
+    p.add_argument("--out", default="", help="Manifest output path (default: stdout)")
+    p.add_argument(
+        "--with-file-ids",
+        action="store_true",
+        help="Embed per-leaf file-id lists in the manifest (audit detail; large at campaign scale)",
+    )
+
+    # drop-partitions (direct libpq, no duckdb lifecycle; dry-run default)
+    p = sub.add_parser(
+        "drop-partitions",
+        help="Drop partition leaves via forged engine commits (dry-run unless --execute)",
+    )
+    p.add_argument("--table", required=True, help="schema.table (e.g. main.events_nrt); bare table_id refused")
+    p.add_argument(
+        "--partition",
+        default="",
+        help="One fully-resolved leaf tuple, e.g. team_id=2,year=2026,month=8,day=1,hour=13",
+    )
+    p.add_argument(
+        "--manifest", default="", help="list-droppable-partitions JSON manifest; loops its leaves oldest-first"
+    )
+    p.add_argument("--cutoff", default="", help="ISO 8601 (--partition mode only; manifest mode uses the manifest's)")
+    p.add_argument("--retention-days", type=_positive_int, default=None, help="Alternative to --cutoff: now - N days")
+    p.add_argument("--execute", action="store_true", help="Actually write (default: dry-run)")
+    p.add_argument(
+        "--max-files",
+        type=_positive_int,
+        default=_positive_int(os.environ.get("DROP_PARTITIONS_MAX_FILES", "10000")),
+        help="Per-leaf sanity ceiling (abort on a pathological leaf)",
+    )
+    p.add_argument(
+        "--no-viaduck-guard",
+        action="store_true",
+        help="Drop without the viaduck cursor guard; prints the lag numbers it overrides",
+    )
+    p.add_argument("--viaduck-state-schema", default=os.environ.get("VIADUCK_STATE_SCHEMA", "viaduck"))
+    p.add_argument("--viaduck-state-table", default=os.environ.get("VIADUCK_STATE_TABLE", "viaduck_state"))
+    p.add_argument("--force-young-cutoff", action="store_true", help="Allow cutoffs younger than 7 days")
+    p.add_argument(
+        "--pace-ms",
+        type=_nonneg_int,
+        default=_nonneg_int(os.environ.get("DROP_PARTITIONS_PACE_MS", "250")),
+        help="Sleep between leaf drops so expire/cleanup crons interleave",
+    )
+    p.add_argument(
+        "--max-seconds",
+        type=_positive_int,
+        default=_positive_int(os.environ.get("DROP_PARTITIONS_MAX_SECONDS", "3300")),
+        help="Wall-clock budget per invocation",
+    )
+    p.add_argument(
+        "--campaign", default=os.environ.get("CAMPAIGN", ""), help="Campaign id embedded in the commit message"
+    )
+
+    # drop-orphan-inline-tables (direct libpq, no duckdb lifecycle — must work
+    # when the DuckLake ATTACH itself cannot complete)
+    p = sub.add_parser(
+        "drop-orphan-inline-tables",
+        help="Drop inlined-data tables (and registry rows) of DuckLake tables no retained snapshot can reach",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=_DROP_INLINE_DEFAULT_BATCH_SIZE,
+        help=(
+            f"Upper bound on orphaned registry rows per transaction (default "
+            f"{_DROP_INLINE_DEFAULT_BATCH_SIZE}, absolute max {_DROP_INLINE_MAX_BATCH_SIZE}, which is what "
+            "governs an RDS-sized server). The effective size is derived from the server at run time: a "
+            "quarter of max_locks_per_transaction * (max_connections + max_prepared_transactions), divided "
+            f"by the {_DROP_INLINE_ENTRIES_PER_DROP} shared lock-table entries each DROP of an inlined "
+            "table holds until commit (measured) — a stock server caps at 320. A lower value than "
+            "requested is used and logged. SQLSTATE 53200 ('out of shared memory') is retried with the "
+            f"size halved for the rest of the run, which within ONE batch means at most "
+            f"{_DROP_INLINE_MAX_ATTEMPTS} attempts (500/250/125/62/31) and then a FATAL exit — a lock "
+            f"table still full after that is a catalog problem a cron must not paper over. The "
+            f"{_DROP_INLINE_MIN_BATCH_SIZE}-row floor and the re-growth after "
+            f"{_DROP_INLINE_REGROW_AFTER_BATCHES} clean batches apply across batches"
+        ),
+    )
+    p.add_argument(
+        "--max-batches",
+        type=_positive_int,
+        default=None,
+        help="Stop after this many batches (default: until no orphans remain)",
+    )
+    p.add_argument(
+        "--run-budget-s",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Wall-clock budget in seconds (default: unbounded; pass 'inf' to say unbounded "
+            "explicitly, e.g. from a wrapper that always sets the flag). Enforced between batches AND "
+            "inside one: the row in flight finishes, its registry rows commit, and the run stops cleanly "
+            "and exits 0. Bounds how long the maintenance advisory lock is held in a recipe chain. The "
+            "next run resumes from the orphan predicate (keyset paging, no saved cursor), so a budgeted "
+            "backlog of DROPPABLE rows converges across runs; rows skipped as non-empty or oddly named "
+            "are re-walked every run and never converge"
+        ),
+    )
+    p.add_argument("--dry-run", action="store_true", help="Report counts and walk the batches without DDL/DML")
+
     return parser
 
 
 def _push(registry: CollectorRegistry, pushgateway: str) -> None:
-    """Push metrics to the pushgateway, logging but not raising on failure."""
+    """Push metrics to the pushgateway, logging but not raising on failure.
+
+    pushadd (POST), NOT push (PUT): every maintenance cron shares
+    job="ducklake-maintenance" with no grouping key, and a PUT replaces the
+    ENTIRE job group — the 15-minute compaction cron would delete the daily
+    drop-partitions' series minutes after they were pushed. POST replaces only
+    series with identical name+labels, so sibling ops' gauges survive."""
     try:
-        push_to_gateway(pushgateway, job="ducklake-maintenance", registry=registry)
+        pushadd_to_gateway(pushgateway, job="ducklake-maintenance", registry=registry)
     except Exception:
         log.exception("Failed to push metrics to %s", pushgateway)
 
@@ -2607,13 +4757,103 @@ def main(argv: list[str] | None = None) -> None:
         ["tier"],
         registry=registry,
     )
+    # A rebuild means the duckdb instance wedged mid-run and the tool
+    # recovered — a fork-bug signal worth alerting on at >= 1, distinct from
+    # ordinary per-table failures.
+    compact_connection_rebuilds = Gauge(
+        "maintenance_compact_connection_rebuilds",
+        "DuckDB instance invalidations handled (rebuilt or abandoned) in the last compact run",
+        ["tier"],
+        registry=registry,
+    )
+    # drop-partitions gauges: per-RUN values (the pushgateway convention here —
+    # successive pushes overwrite). alerts key on aborts and on
+    # last_success_timestamp going stale for the daily cron.
+    drop_gauges = {
+        "files_dropped": Gauge(
+            "maintenance_drop_files_dropped_total",
+            "Files ended by drop-partitions in this run",
+            ["table"],
+            registry=registry,
+        ),
+        "leaves_dropped": Gauge(
+            "maintenance_drop_leaves_dropped_total",
+            "Partition leaves dropped in this run",
+            ["table"],
+            registry=registry,
+        ),
+        "leaves_skipped": Gauge(
+            "maintenance_drop_leaves_skipped_total",
+            "Leaves skipped this run (guard-ineligible / vanished / empty)",
+            ["table"],
+            registry=registry,
+        ),
+        "retries": Gauge(
+            "maintenance_drop_retries_total",
+            "Retryable PG errors and advisory-lock contention waits absorbed this run",
+            ["table"],
+            registry=registry,
+        ),
+        "aborts": Gauge("maintenance_drop_aborts_total", "Non-retryable aborts this run", ["table"], registry=registry),
+        "skipped_files": Gauge(
+            "maintenance_drop_skipped_files_total",
+            "Leaf members ended concurrently (compaction interleave), skipped mid-leaf",
+            ["table"],
+            registry=registry,
+        ),
+        "excluded_rot": Gauge(
+            "maintenance_drop_excluded_rot_files", "fpv-rot files excluded from selection", ["table"], registry=registry
+        ),
+        "last_success": Gauge(
+            "maintenance_drop_last_success_timestamp",
+            "Unix timestamp of the last cleanly-completed drop-partitions run (execute mode only)",
+            ["table"],
+            registry=registry,
+        ),
+    }
+    # drop-orphan-inline-tables gauges are unlabeled, so they are registered
+    # ONLY for an execute run of that command. An unlabeled gauge always
+    # exports a sample: registered unconditionally, every other cron's pushadd
+    # (and any manual dry-run) would overwrite the last real values with 0.
+    inline_registry = (
+        registry if args.command == "drop-orphan-inline-tables" and not getattr(args, "dry_run", False) else None
+    )
+    inline_gauges = {
+        "dropped": Gauge(
+            "maintenance_inline_orphans_dropped_total",
+            "Orphaned DuckLake inlined-data tables dropped by drop-orphan-inline-tables in this run",
+            registry=inline_registry,
+        ),
+        "skipped_nonempty": Gauge(
+            "maintenance_inline_orphans_skipped_nonempty_total",
+            "Orphaned inlined-data tables skipped this run because they still hold rows",
+            registry=inline_registry,
+        ),
+        "remaining": Gauge(
+            "maintenance_inline_orphans_remaining",
+            "Orphaned inlined-data registry rows left after the last drop-orphan-inline-tables run",
+            registry=inline_registry,
+        ),
+        "budget_exhausted": Gauge(
+            "maintenance_inline_orphans_budget_exhausted",
+            "1 if the last drop-orphan-inline-tables run stopped on its --run-budget-s, else 0",
+            registry=inline_registry,
+        ),
+    }
     operation = args.command
     if hasattr(args, "days") and args.days < 1:
         parser.error("--days must be >= 1")
-    if getattr(args, "batch_size", None) is not None and args.batch_size > _EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE:
+    if args.command == "expire-snapshots" and args.batch_size > _EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE:
         parser.error(
             f"--batch-size must be <= {_EXPIRE_SNAPSHOTS_MAX_BATCH_SIZE}: the id list is interpolated "
             "into every batch statement, and huge batches produce multi-MB SQL and giant NOT-IN lists"
+        )
+    if args.command == "drop-orphan-inline-tables" and args.batch_size > _DROP_INLINE_MAX_BATCH_SIZE:
+        parser.error(
+            f"--batch-size must be <= {_DROP_INLINE_MAX_BATCH_SIZE}: every DROP in a batch holds "
+            "AccessExclusiveLock until commit, and the shared lock table is bounded by "
+            "max_locks_per_transaction * (max_connections + max_prepared_transactions). This is the "
+            "absolute ceiling only; the run derives its own, usually lower, cap from those GUCs"
         )
 
     start_time.labels(operation=operation).set(time.time())
@@ -2623,9 +4863,25 @@ def main(argv: list[str] | None = None) -> None:
     t0 = time.monotonic()
     status = "success"
     conn = None
-    conn = connect(debug=args.debug)
+    # drop-partitions / list-droppable-partitions / drop-orphan-inline-tables
+    # run on a direct libpq connection and never touch duckdb (see the
+    # section headers above them).
+    if args.command not in _DIRECT_PG_COMMANDS:
+        conn = connect(debug=args.debug)
     try:
         match args.command:
+            case "list-droppable-partitions":
+                list_droppable_partitions(args, drop_gauges)
+            case "drop-partitions":
+                drop_partitions(args, drop_gauges)
+            case "drop-orphan-inline-tables":
+                drop_orphan_inline_tables(
+                    args.dry_run,
+                    args.batch_size,
+                    args.max_batches,
+                    inline_gauges,
+                    run_budget_s=args.run_budget_s,
+                )
             case "expire":
                 expire(conn, args.days, args.dry_run)
             case "expire-snapshots":
@@ -2668,6 +4924,7 @@ def main(argv: list[str] | None = None) -> None:
                     max_outputs_per_call=args.max_outputs_per_call,
                 )
                 compact_tables_failed.labels(tier=str(args.tier)).set(n_failed)
+                compact_connection_rebuilds.labels(tier=str(args.tier)).set(_last_compact_rebuilds)
             case "compact-probe":
                 compact_probe(conn, args.table, args.max_compacted_files)
     except Exception:
@@ -2677,10 +4934,15 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         elapsed = time.monotonic() - t0
         duration.labels(operation=operation, status=status).set(elapsed)
-        if conn is not None:
-            conn.close()
+        # Push BEFORE close: closing a wedged instance can block, and the
+        # metrics for a completed run must not be hostage to teardown.
         if pushgateway:
             _push(registry, pushgateway)
+        if conn is not None:
+            # Guarded close: after a mid-run rebuild this is the abandoned
+            # original (compact() owns the fresh one; process exit reaps it),
+            # and its close may hang on the wedged instance state.
+            _abandon_connection(conn)
         log.info("Operation %s finished: status=%s duration=%.1fs", operation, status, elapsed)
 
 

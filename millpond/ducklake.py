@@ -9,9 +9,10 @@ import orjson
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from millpond import metrics, schema
+from millpond import arrow_converter, metrics, schema
 from millpond.config import Config
 from millpond.schema import variant_column_name
+from millpond.sink import check_reserved_collision
 
 log = logging.getLogger(__name__)
 
@@ -22,30 +23,15 @@ _SETTING_VALUE_RE = re.compile(r"^[a-zA-Z0-9_.:/\-@+=]+$")
 # expressions commonly derive them, and tables were created under a
 # regime that reserved them — accepting them now would silently change
 # collision behavior for replayed data.
+#
+# The collision check itself lives on the sink seam
+# (sink.check_reserved_collision) and is shared with the hoglake
+# backend; it stays deliberately fatal, unlike the non-fatal VARIANT
+# companion drops in _drop_protected_columns — silently dropping a
+# payload `_inserted_at` would re-stamp replayed data and change its
+# partition placement, which the reserved-columns contract predating
+# dual-write chose to surface loudly.
 RESERVED_COLUMNS: frozenset[str] = frozenset({"_inserted_at", "year", "month", "day", "hour"})
-
-
-def check_reserved_collision(batch_schema: pa.Schema, reserved: frozenset[str]) -> None:
-    """Raise early on source-schema collision with reserved metadata columns.
-
-    `_inserted_at` is appended at write time (with `year/month/day/hour`
-    reserved alongside it). If a source column has the same name, the
-    append step explodes deep in the stack (duplicate column on the
-    post-write projection). Catch it at the top of `write()` with a
-    clear message instead.
-
-    Deliberately fatal, unlike the non-fatal VARIANT companion drops in
-    _drop_protected_columns: silently dropping a payload `_inserted_at` would
-    re-stamp replayed data and change its partition placement, which the
-    reserved-columns contract predating dual-write chose to surface loudly.
-    """
-    collisions = sorted(name for name in batch_schema.names if name in reserved)
-    if collisions:
-        raise ValueError(
-            f"Source schema column(s) {collisions!r} collide with "
-            f"DuckLake-reserved metadata column names; rename them "
-            f"upstream or filter them out before write()."
-        )
 
 
 def _drop_protected_columns(batch: pa.Table, protected_lower: frozenset[str] | set[str]) -> pa.Table:
@@ -311,6 +297,14 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     """Initialize DuckDB with httpfs and ducklake, attach the catalog."""
     conn = duckdb.connect(cfg.ducklake_connection)
 
+    # Pin the session timezone: the partition transforms
+    # (year/month/day/hour on the TIMESTAMPTZ _inserted_at) bind the SESSION
+    # timezone at write time, so partition values are UTC only if the session
+    # is. Today that holds merely de-facto (slim base image, no TZ config);
+    # pin it so a base-image or env change can never silently re-bucket every
+    # partition (drop-partitions composes partition times as UTC).
+    conn.execute("SET TimeZone = 'UTC'")
+
     # S3 config from env vars
     for key in (
         "DUCKDB_S3_ENDPOINT",
@@ -341,6 +335,20 @@ def connect(cfg: Config) -> duckdb.DuckDBPyConnection:
     # `ducklake_snapshot_pkey` duplicate-key violations. Loaded from
     # DUCKLAKE_MAX_RETRY_COUNT env (default 100).
     conn.execute(f"SET ducklake_max_retry_count = {int(cfg.ducklake_max_retry_count)}")
+    # And the wait between them (see Config.ducklake_retry_wait_ms):
+    # DuckLake's default 1.5x backoff is uncapped and sleeps past the
+    # liveness deadline after ~20 retries.
+    conn.execute(f"SET ducklake_retry_wait_ms = {int(cfg.ducklake_retry_wait_ms)}")
+    conn.execute(f"SET ducklake_retry_backoff = {float(cfg.ducklake_retry_backoff)}")
+
+    # Optional memory cap (DUCKDB_MEMORY_LIMIT). Without it DuckDB budgets
+    # ~80% of the cgroup limit and races the Arrow pending buffer for RSS
+    # during the partitioned INSERT; with it DuckDB spills to the temp dir
+    # next to the on-disk database file. Requires a file-backed
+    # ducklake_connection (the k8s chart uses /tmp/duck.db on a writable
+    # emptyDir) — with :memory: there is no adjacent temp dir to spill to.
+    if cfg.duckdb_memory_limit is not None:
+        conn.execute(f"SET memory_limit = '{_sanitize_setting_value(cfg.duckdb_memory_limit)}'")
 
     # Build a libpq connection string for DuckLake.
     # The 'postgres:' prefix tells DuckLake to use the Postgres extension
@@ -458,6 +466,65 @@ def _ensure_table(
     tables_ensured.add(table_name)
 
 
+# Columns already warned about for the VARCHAR-batch/UUID-column rewrite, so a
+# permanent config/table mismatch logs once per column per pod lifetime rather
+# than once per flush. The metric is the always-on signal.
+_uuid_realign_warned: set[str] = set()
+
+
+def _align_uuid_columns(batch: pa.Table, schema_mgr: schema.SchemaManager) -> pa.Table:
+    """Parse plain-text batch columns whose LIVE DuckLake column is UUID.
+
+    The DuckLake half of the two-way uuid/string handling (the hoglake half is
+    `HoglakeSink._rewrite_column`). It covers the rollback direction, and only
+    that one:
+
+    * live UUID, batch VARCHAR — an operator REMOVING `<col>:uuid` from
+      MILLPOND_TYPED_COLUMNS, or one pod on a mixed fleet that has not taken
+      the new config yet. DuckDB's implicit VARCHAR->UUID cast on INSERT is
+      all-or-nothing: one unparseable value raises `ConversionException` for
+      the WHOLE insert, deterministically, on every retry, so the offsets
+      never commit and the restart re-consumes the same batch forever. It also
+      refuses `urn:uuid:...`, which `arrow_converter.uuid_bytes` accepts — so
+      the two disagree about what a UUID is even on clean data.
+    * live VARCHAR, batch `pa.uuid()` — the other direction needs nothing
+      here. DuckDB casts UUID->VARCHAR natively and losslessly on INSERT, and
+      the rows land as canonical text. It costs one refused
+      `ALTER ... SET DATA TYPE UUID` per flush (DuckLake's evolution is
+      widening-only and this is not a widening), logged and counted on
+      `errors_total{type="schema"}` like any other pinned-vs-live mismatch.
+
+    `coerce_typed_columns` does the parse, so the nulling of unparseable
+    values and the `columns_coerced_total` / `errors_total{type=
+    "column_coercion"}` accounting are the SAME code the pin itself runs —
+    there is no second opinion about which strings are UUIDs. On top of that,
+    each rewritten column bumps `errors_total{type="schema"}` every flush,
+    because a batch that disagrees with its table is a schema event whether or
+    not any value failed to parse.
+    """
+    live_uuid = schema_mgr.live_uuid_column_names()
+    if not live_uuid:
+        return batch
+    targets = tuple(
+        (field.name, "uuid")
+        for field in batch.schema
+        if field.name.lower() in live_uuid and (pa.types.is_string(field.type) or pa.types.is_large_string(field.type))
+    )
+    if not targets:
+        return batch
+    for name, _ in targets:
+        if name not in _uuid_realign_warned:
+            log.warning(
+                "Column %r arrives as text but the live DuckLake column is UUID; parsing it to "
+                "UUID for this and every following flush. DuckDB's own VARCHAR->UUID cast would "
+                "fail the whole INSERT on one unparseable value.",
+                name,
+            )
+            _uuid_realign_warned.add(name)
+        metrics.errors_total.labels(type="schema").inc()
+    return arrow_converter.coerce_typed_columns(batch, targets)
+
+
 def write(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
@@ -483,7 +550,7 @@ def write(
     Payload fields named like dual-write targets are stripped non-fatally so a
     poison key cannot crash-loop the partition or poison the table as VARCHAR.
     """
-    check_reserved_collision(batch.schema, RESERVED_COLUMNS)
+    check_reserved_collision(batch.schema, RESERVED_COLUMNS, "DuckLake")
     if variant_columns and schema_mgr is None:
         # Dual-write requires SchemaManager for ADD COLUMN + type checks.
         # DuckLakeSink always supplies one; module-level callers that enable
@@ -518,6 +585,9 @@ def write(
     _ensure_table(conn, table_name, batch, tables_ensured, partition_by, schema_name)
     ready_sources: tuple[str, ...] | None = None
     if schema_mgr is not None:
+        # BEFORE evolve: parsing the column here means evolve sees UUID == UUID
+        # and issues no ALTER at all, so the insert is a plain typed append.
+        batch = _align_uuid_columns(batch, schema_mgr)
         schema_mgr.evolve(batch.schema)
         if variant_columns:
             ready = schema_mgr.ensure_variant_columns(variant_columns, set(batch.schema.names))

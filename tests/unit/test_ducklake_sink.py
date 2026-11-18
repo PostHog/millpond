@@ -108,3 +108,27 @@ class TestDuckLakeSinkClose:
             sink = DuckLakeSink(_ducklake_cfg())
             sink.close()
             mock_conn.close.assert_called_once()
+
+
+class TestDuckLakeSinkTakesNoFlushIdentity:
+    """The hoglake sink takes per-call keywords (`kafka_offsets`, and now
+    `trigger`, which it writes into the snapshot's commit message). This
+    one takes the batch alone, and `main._sink_write_kwargs` sends it
+    nothing — a DuckLake pod must be unaffected by either keyword.
+    """
+
+    def test_write_accepts_the_batch_alone(self):
+        import inspect
+
+        params = list(inspect.signature(DuckLakeSink.write).parameters)
+        assert params == ["self", "batch"]
+
+    def test_an_unexpected_keyword_would_be_a_type_error(self):
+        # Stated rather than assumed: if this ever stops raising, the
+        # sink grew a silent **kwargs and a typo in the seam would pass
+        # unnoticed.
+        with patch("millpond.ducklake.connect") as mock_connect, patch("millpond.ducklake.schema.SchemaManager"):
+            mock_connect.return_value = MagicMock(name="conn")
+            sink = DuckLakeSink(_ducklake_cfg())
+            with pytest.raises(TypeError):
+                sink.write(MagicMock(), trigger="size")

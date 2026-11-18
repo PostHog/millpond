@@ -1,4 +1,7 @@
 import logging
+import math
+from collections.abc import Collection
+from decimal import Decimal
 
 import orjson
 import pyarrow as pa
@@ -93,11 +96,77 @@ def _build_schema(records: list[dict]) -> pa.Schema:
     return pa.schema(fields)
 
 
+def json_text(value: object) -> str:
+    """One non-string value as the JSON text a hoglake `variant` column's
+    encoder reads back as the same value. The one place that decides it,
+    for the converter (variant-bound columns, `_jsonify_json_text_columns`)
+    and the sink (`hoglake._json_text_column`) alike.
+
+    orjson, with two deliberate departures from `str()` and from pyarrow's
+    string cast: a bool is `true`, not `True` (which is not JSON and would
+    be an `invalid_json` null); and a float keeps its point — `2.0` is
+    `2.0`, where pyarrow's cast renders `2`, which the encoder reads as an
+    INTEGER and then cannot put in a declared `double` leaf (it falls back
+    to `value`). NaN and the infinities, which JSON does not have, are
+    written as the literals `NaN` / `Infinity` / `-Infinity` so that
+    pyhoglake refuses the row as `non_finite_number` — counted, SQL NULL
+    under MILLPOND_HOGLAKE_VARIANT_ON_INVALID=null, a failed flush under
+    `raise` — rather than orjson's own rendering of them as `null`, which
+    would silently turn a bad number into a Variant null. A Decimal (a
+    decimal column the sink hands over) is its plain digits, a JSON number
+    rather than the quoted string `default=str` would make of it;
+    `default=str` covers what else orjson does not serialize natively.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return orjson.dumps(value, default=str).decode()
+
+
+def _jsonify_json_text_columns(records: list[dict], json_text_columns: Collection[str]) -> list[dict]:
+    """Every non-string value in a `json_text_columns` column becomes its
+    JSON text (`json_text`), strings kept as they are, so those columns
+    leave the converter STRING-typed on every poll.
+
+    These are the hoglake sink's live `variant` columns
+    (`HoglakeSink.json_text_columns`), whose text pyhoglake parses as JSON.
+    ALL non-string values, not only the mixed-type ones: a poll in which
+    every record carried a bool for the column would otherwise infer a
+    bool column, and `pa.concat_tables(promote_options="default")` in
+    main.py refuses to join it to the string column the next poll infers —
+    before the sink ever sees either. Nested values were already made JSON
+    text by `_flatten_nested_to_json`. Records are only copied when a
+    value changes.
+    """
+    if not json_text_columns:
+        return records
+    out = []
+    changed = False
+    for record in records:
+        needs = [k for k in json_text_columns if k in record and record[k] is not None and type(record[k]) is not str]
+        if not needs:
+            out.append(record)
+            continue
+        new_record = dict(record)
+        for k in needs:
+            new_record[k] = json_text(new_record[k])
+        out.append(new_record)
+        changed = True
+    return out if changed else records
+
+
 def _stringify_mixed_type_values(records: list[dict], schema: pa.Schema) -> list[dict]:
     """Coerce values to strings for fields where the inferred type doesn't match all values.
 
     JSON data from heterogeneous sources can have the same key as bool in one
     record and string in another. Rather than crash, stringify mismatched values.
+
+    `str()`, as always: Python's `True`, `1.5`, `50`. A column the hoglake
+    sink names as a live `variant` column never reaches this as a mixed
+    column — `_jsonify_json_text_columns` has already made every one of its
+    values JSON text — so DuckLake columns and hoglake string columns keep
+    the form they have always had.
     """
     # Build a map of field name -> expected Python types for the inferred Arrow type
     type_checks: dict[str, type | tuple[type, ...]] = {}
@@ -133,6 +202,36 @@ def _stringify_mixed_type_values(records: list[dict], schema: pa.Schema) -> list
                 new_record[k] = str(new_record[k])
         patched.append(new_record)
     return patched
+
+
+def _floatify_integers_in_float_fields(records: list[dict], schema: pa.Schema) -> list[dict]:
+    """Cast int values to float for fields the schema types as floating.
+
+    JSON producers emit whole floats as integers. PyArrow accepts an int in
+    a double column only when the conversion is exact; an integer above
+    2**53 makes ``pa.Table.from_pylist`` raise ``ArrowInvalid`` and the
+    batch crashes before any column coercion runs. Python ``float()`` is
+    deliberately lossy here — these fields are floating-point measures, so
+    nearest-double is the wanted semantics. Records are only copied when a
+    cast is needed.
+    """
+    float_fields = {f.name for f in schema if pa.types.is_floating(f.type)}
+    if not float_fields:
+        return records
+
+    out = []
+    changed = False
+    for record in records:
+        needs = [k for k in float_fields if type(record.get(k)) is int]
+        if not needs:
+            out.append(record)
+            continue
+        new_record = dict(record)
+        for k in needs:
+            new_record[k] = float(new_record[k])
+        out.append(new_record)
+        changed = True
+    return out if changed else records
 
 
 def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
@@ -179,11 +278,159 @@ def _flatten_nested_to_json(records: list[dict]) -> list[dict]:
 # ISO-8601 parser accepts the space separator and 0/3/6 fractional digits the
 # Node/ClickHouse producers emit — see rust `ClickHouseEvent` in
 # `rust/common/types/src/event.rs`), then stamp it UTC with `assume_timezone`.
+#
+# uuid is the one target whose Arrow type is an EXTENSION type rather than a
+# plain one. The events topic carries `uuid` and `person_id` as UUID strings
+# (ClickHouse `UUID`); both destinations have a real UUID type for them, and
+# `pa.uuid()` — pyarrow's canonical uuid extension type, an extension over
+# `fixed_size_binary(16)` holding the 16 big-endian bytes — is the ONE wire
+# form that lands correctly on both:
+#   - hoglake: pyhoglake maps `fixed_size_binary(16)` to its `uuid` column type
+#     and accepts `pa.uuid()` as the same thing (pyhoglake `types.py`
+#     `arrow_type_to_coltype`);
+#   - DuckLake: DuckDB reads an Arrow `pa.uuid()` column as native `UUID`. A
+#     plain `pa.binary(16)` lands as `BLOB` there instead — silently, because
+#     the bytes are identical — which is why the coercer emits the extension
+#     type and adopts a bare `binary(16)` into it rather than passing it
+#     through.
+# The extension type also carries to parquet: pyarrow stamps
+# FIXED_LEN_BYTE_ARRAY(16) + `LogicalTypeAnnotation.uuidType()` for `pa.uuid()`
+# and no annotation at all for `pa.binary(16)`, and that annotation is what an
+# Iceberg reader binds a uuid column through — the Trino hoglake connector
+# among them. It survives all the way into the uploaded object on the hoglake
+# path too, since the pyhoglake >= 1.3.0 pin: the schema `HoglakeSink._prepare`
+# casts to names `pa.uuid()` for a uuid column, so this column passes through
+# unchanged (tests/unit/test_hoglake.py::TestUuidColumnWireForm).
 _TIMESTAMPTZ = pa.timestamp("us", tz="UTC")
+
+#: The `uuid` target's Arrow type. Public: main.py compares filter/sort columns
+#: against it, and hoglake.py recognises it when degrading against a live
+#: `string` column.
+UUID_TYPE = pa.uuid()
+UUID_STORAGE_TYPE = pa.binary(16)
+
+_URN_PREFIX = "urn:uuid:"
 
 
 def _to_timestamptz(col):
     return pc.assume_timezone(col.cast(pa.timestamp("us")), "UTC")
+
+
+def uuid_bytes(value: object) -> bytes:
+    """The 16 big-endian bytes of one UUID string. Raises `ValueError` otherwise.
+
+    The accepted shapes are ENUMERATED, deliberately narrower than
+    `uuid.UUID`'s grammar:
+
+      * canonical 8-4-4-4-12 hex, either case;
+      * 32 hex digits with no separators;
+      * either of those wrapped in `{...}`, or prefixed with `urn:uuid:`.
+
+    `uuid.UUID` was the fallback here and had to go: it strips `urn:` and
+    `uuid:` from ANYWHERE in the string, removes EVERY hyphen wherever it
+    sits, and hands what is left to `int(text, 16)` — which itself accepts a
+    `0x` prefix, a leading sign and PEP 515 underscores — so it silently
+    remaps values that are not UUIDs at all into plausible-looking ones
+    nobody can trace back (measured on CPython 3.13:
+    `0x0123456789abcdef0123456789abcd` becomes
+    `00012345-6789-abcd-ef01-23456789abcd`). A producer emitting one of those
+    is a defect worth a NULL and an
+    `errors_total{type="column_coercion"}`, not a made-up identifier.
+
+    Two things this deliberately does NOT do:
+
+      * It does not validate RFC 4122 variant/version bits. ClickHouse `UUID`
+        is an opaque 128-bit value and PostHog writes v4 and v7 both; rejecting
+        a "wrong" variant would drop real data.
+      * The `urn:uuid:` prefix is matched case-SENSITIVELY (`URN:UUID:` is
+        refused). The hex digits themselves are case-insensitive.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"not a UUID string: {type(value).__name__}")
+    text = value
+    if text.startswith(_URN_PREFIX):
+        text = text[len(_URN_PREFIX) :]
+    elif len(text) >= 2 and text[0] == "{" and text[-1] == "}":
+        text = text[1:-1]
+    if len(text) == 36:
+        # Hyphens at exactly the canonical offsets. An extra hyphen INSIDE a
+        # group survives this check and is caught by the length test below,
+        # because `replace` takes it out too and the result comes up short.
+        if text[8] != "-" or text[13] != "-" or text[18] != "-" or text[23] != "-":
+            raise ValueError(f"not a UUID: {value!r}")
+        text = text.replace("-", "")
+    if len(text) != 32:
+        raise ValueError(f"not a UUID: {value!r}")
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        raise ValueError(f"not a UUID: {value!r}") from None
+    if len(raw) != 16:
+        # `bytes.fromhex` skips ASCII whitespace, so "aabb ... ccdd" with two
+        # internal spaces is 32 characters and decodes to 15 bytes. This is the
+        # only guard against that silent short decode.
+        raise ValueError(f"not a UUID: {value!r}")
+    return raw
+
+
+def uuid_text(raw: object) -> str:
+    """Canonical hyphenated text for 16 big-endian UUID bytes.
+
+    The inverse of `uuid_bytes` for the shapes that round-trip, and the
+    rendering used wherever a uuid column's VALUE has to be human-readable
+    again: the `filter_matched_total` label, and the restringify degradation
+    in hoglake.py when the live column is `string`.
+    """
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) != 16:
+        raise ValueError(f"not 16 UUID bytes: {raw!r}")
+    hexed = bytes(raw).hex()
+    return f"{hexed[0:8]}-{hexed[8:12]}-{hexed[12:16]}-{hexed[16:20]}-{hexed[20:32]}"
+
+
+def _to_uuid(col):
+    """Coerce a column of UUID strings to `pa.uuid()`.
+
+    Already-`pa.uuid()` is returned untouched (the registry skips that case
+    before we get here; the guard keeps `_coerce_or_null`'s per-value retry
+    honest). A binary column whose values are already the 16 bytes —
+    `fixed_size_binary(16)`, or a variable-width `binary`/`large_binary` that
+    happens to hold 16-byte values — is adopted rather than re-parsed; the
+    fixed-width case is zero-copy, the variable-width one is one Arrow cast
+    that raises for any other width (and `_coerce_or_null` then nulls exactly
+    the wrong-width values).
+
+    Strings are decoded value-by-value: pyarrow compute has no hex-decode
+    kernel, so there is no vectorized route to the bytes. Measured at ~11.8 ms
+    per 27k-row column (~0.44 us/value; ~23 ms for the events pair
+    `uuid` + `person_id`) against a ~60 s flush interval — under
+    `_apply_sort`'s 50-200 ms per flush and far under the flush budget at both
+    the ~1.1k rec/s dev rate and 30k+ in prod. A bulk "join every value, one
+    `bytes.fromhex`, slice the buffer" variant measured 7.2 ms — 18% for a
+    decode that misaligns silently when two values' lengths compensate, so it
+    is not worth the correctness surface. `_coerce_or_null`'s per-value
+    fallback costs ~134 ms for a 27k-row batch that contains any unparseable
+    value; that is the cold path, and it is a batch that is already anomalous.
+    """
+    if col.type == UUID_TYPE:
+        return col
+    if pa.types.is_fixed_size_binary(col.type) and col.type.byte_width == 16:
+        storage = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
+        return pa.ExtensionArray.from_storage(UUID_TYPE, storage)
+    if pa.types.is_binary(col.type) or pa.types.is_large_binary(col.type):
+        storage = col.cast(UUID_STORAGE_TYPE)
+        if isinstance(storage, pa.ChunkedArray):
+            storage = storage.combine_chunks()
+        return pa.ExtensionArray.from_storage(UUID_TYPE, storage)
+    try:
+        decoded = [None if v is None else uuid_bytes(v) for v in col.to_pylist()]
+    except ValueError as e:
+        # The registry's contract is that a coercer signals an unconvertible
+        # value with an Arrow error; `_coerce_or_null` then nulls exactly the
+        # bad values via its per-value pass. `uuid_bytes` raises ValueError for
+        # a bad string AND for a non-string source column, so one arm covers
+        # both — translate rather than let it escape to the consume path.
+        raise pa.ArrowInvalid(str(e)) from e
+    return pa.ExtensionArray.from_storage(UUID_TYPE, pa.array(decoded, type=UUID_STORAGE_TYPE))
 
 
 _COERCERS: dict[str, tuple[pa.DataType, object]] = {
@@ -192,6 +439,7 @@ _COERCERS: dict[str, tuple[pa.DataType, object]] = {
     "double": (pa.float64(), lambda col: col.cast(pa.float64())),
     "boolean": (pa.bool_(), lambda col: col.cast(pa.bool_())),
     "varchar": (pa.string(), lambda col: col.cast(pa.string())),
+    "uuid": (UUID_TYPE, _to_uuid),
 }
 
 # Public allowlist for config validation (single source of truth).
@@ -213,11 +461,18 @@ def _coerce_or_null(col, coercer, arrow_type: pa.DataType) -> tuple[object, int]
     fallback batch are concatenated. Leaving the column as its source type would
     move the crash there instead of avoiding it. The per-value pass is a cold path
     — it runs only for a batch that actually contains an unparseable value.
+
+    An extension target (``uuid``) is rebuilt through its STORAGE type. The
+    per-value ``as_py()`` of an extension scalar is the logical Python object
+    (``uuid.UUID``), which ``pa.array`` has no way to lay back out; the storage
+    scalar is the 16 bytes, which it does.
     """
     try:
         return coercer(col), 0
     except (pa.ArrowInvalid, pa.ArrowTypeError):
         src_type = col.type
+        extension = arrow_type if isinstance(arrow_type, pa.BaseExtensionType) else None
+        build_type = extension.storage_type if extension is not None else arrow_type
         out: list = []
         failed = 0
         for v in col.to_pylist():
@@ -225,11 +480,16 @@ def _coerce_or_null(col, coercer, arrow_type: pa.DataType) -> tuple[object, int]
                 out.append(None)
                 continue
             try:
-                out.append(coercer(pa.array([v], type=src_type))[0].as_py())
+                one = coercer(pa.array([v], type=src_type))
             except (pa.ArrowInvalid, pa.ArrowTypeError):
                 out.append(None)
                 failed += 1
-        return pa.array(out, type=arrow_type), failed
+                continue
+            out.append((one.storage if extension is not None else one)[0].as_py())
+        built = pa.array(out, type=build_type)
+        if extension is not None:
+            built = pa.ExtensionArray.from_storage(extension, built)
+        return built, failed
 
 
 def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], ...]) -> pa.Table:
@@ -290,17 +550,74 @@ def coerce_typed_columns(table: pa.Table, typed_columns: tuple[tuple[str, str], 
     return pa.table(dict(zip([f.name for f in new_fields], new_columns)), schema=pa.schema(new_fields))
 
 
-def convert(messages: list[bytes]) -> pa.Table | None:
+# The LZ4 frame magic number (0x184D2204, little-endian). WarpStream pipelines
+# that repartition clickhouse_events_json (team_split_ws,
+# team_event_partitioned_ws in posthog-cloud-infra) write LZ4-framed values,
+# because WarpStream bills writes and storage on uncompressed bytes and the
+# framed value is what it sees. No JSON document starts with byte 0x04, so the
+# check cannot misread a plain value.
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+
+# The largest decompressed LZ4-framed value. Capture caps a produced event at
+# 10 MiB, so no real event comes near it; it bounds what one value can expand to
+# (the consumer's queue and flush limits count compressed bytes).
+MAX_DECODED_VALUE_BYTES = 32 * 1024 * 1024
+_DECODE_CHUNK_BYTES = 1024 * 1024
+
+
+class OversizedValueError(Exception):
+    """An LZ4-framed value decompresses past the limit."""
+
+
+def _decode_value(raw: bytes, limit: int | None = None) -> bytes:
+    """The JSON bytes of a message value: an LZ4-framed value is decompressed,
+    any other value is returned unchanged.
+
+    pyarrow's streaming reader handles frames without a content-size field,
+    which is what Bento's lz4 codec writes. The one-shot `pa.decompress`
+    needs the decompressed size up front. Reads in chunks and stops past
+    `limit` (default `MAX_DECODED_VALUE_BYTES`) with OversizedValueError.
+    Raises OSError on a corrupt frame.
+    """
+    if raw[:4] != _LZ4_FRAME_MAGIC:
+        return raw
+    if limit is None:
+        limit = MAX_DECODED_VALUE_BYTES
+    stream = pa.CompressedInputStream(pa.BufferReader(raw), "lz4")
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := stream.read(min(_DECODE_CHUNK_BYTES, limit + 1 - total)):
+        total += len(chunk)
+        if total > limit:
+            raise OversizedValueError(f"decompresses past {limit} bytes")
+        chunks.append(chunk)
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+
+def convert(messages: list[bytes], json_text_columns: Collection[str] = ()) -> pa.Table | None:
     """Convert raw Kafka message values to an Arrow table.
 
-    Parses JSON via orjson, builds a PyArrow table using the union of all keys
+    Decompresses LZ4-framed values (see `_decode_value`), then parses JSON via
+    orjson, builds a PyArrow table using the union of all keys
     across all records, normalizes numeric types, and handles mixed-type fields
     by coercing to string. Nested dicts/lists are serialized to JSON strings.
+
+    `json_text_columns` names columns whose every non-string value must be
+    JSON text rather than `str()` or an inferred bool/number column (see
+    `_jsonify_json_text_columns`): the hoglake sink's live variant columns.
+    Empty for DuckLake.
 
     Returns None if no valid records were parsed.
     """
     records = []
     for raw in messages:
+        try:
+            raw = _decode_value(raw)
+        except (OSError, OversizedValueError) as e:
+            # Counted with the unparseable values (records_skipped_total
+            # reason=json_parse): the caller counts every value convert drops.
+            log.warning("Skipping undecodable LZ4-framed value (%d bytes): %s", len(raw), e)
+            continue
         try:
             parsed = orjson.loads(raw)
         except orjson.JSONDecodeError:
@@ -315,11 +632,13 @@ def convert(messages: list[bytes]) -> pa.Table | None:
         return None
 
     records = _flatten_nested_to_json(records)
+    records = _jsonify_json_text_columns(records, json_text_columns)
     schema = _build_schema(records)
     patched = _stringify_mixed_type_values(records, schema)
     if patched is not records:
         # Mixed types were found and coerced — re-infer schema with string types
         schema = _build_schema(patched)
+    patched = _floatify_integers_in_float_fields(patched, schema)
     table = pa.Table.from_pylist(patched, schema=schema)
     table = _normalize_numeric_types(table)
     table = _drop_null_typed_columns(table)

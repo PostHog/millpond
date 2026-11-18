@@ -11,7 +11,8 @@ log = logging.getLogger(__name__)
 class _HealthState:
     """Tracks recency of poll and flush for health checks."""
 
-    def __init__(self, max_poll_age_s: float = 300):
+    # Allow slow writes to finish while staying below Kafka's 600s max poll interval.
+    def __init__(self, max_poll_age_s: float = 480):
         self.max_poll_age_s = max_poll_age_s
         self._last_poll: float = 0
         self._last_flush: float = 0
@@ -104,6 +105,12 @@ def _make_handler():
 
 
 def start(port: int = 8000) -> HTTPServer:
+    """Start the metrics/health HTTP server on `port`.
+
+    The caller supplies the port; `main()` passes `cfg.http_port`, which
+    is where MILLPOND_HTTP_PORT is parsed and validated. Nothing here
+    reads the environment — a knob that bypasses config.py is invisible
+    to the startup config log and to any caller holding a Config."""
     server = HTTPServer(("", port), _make_handler())
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

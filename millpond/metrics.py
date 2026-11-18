@@ -69,6 +69,53 @@ _flush_size_records = Histogram(
     ["pipeline", "broker_source"],
     buckets=[100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000],
 )
+# Objects written per flush, and the rows inside each one. FANOUT, not
+# volume: the hoglake sink writes one parquet object per distinct
+# partition tuple in a flush (`hoglake._partition_groups`), so a flush
+# whose rows scatter across N old day partitions costs N objects however
+# few rows each holds. `flush_size_records` says how much landed; these
+# two say how many pieces it landed in and how small they are — which is
+# the compaction-debt shape, and the pair to graph against
+# MILLPOND_FLUSH_SIZE when sizing a flush. Before them the number existed
+# only as `files=` in the snapshot's own commit message, where no query
+# can reach it.
+#
+# Powers of two to 2048 because the question is an ORDER OF MAGNITUDE of
+# fanout (is this flush writing ten objects or a thousand), and because
+# the late-arrival tail that drives it moves by doublings rather than by
+# percentages. The rows ladder keeps `flush_size_records`' 1-2-5 shape but
+# starts at 1: the population worth resolving is the dozens-of-rows
+# objects a month-late tail produces, not the one big current-partition
+# object beside them.
+#
+# ONE OBSERVATION PER OBJECT on `flush_file_rows` — up to a few hundred
+# per flush, which is a bucket search each and nothing next to the
+# parquet encode that produced them. The cheaper shapes (a mean, a min)
+# cannot answer "what share of the objects are tiny", which is the whole
+# question.
+#
+# NO COUNTER accompanies them, deliberately. Files per hour is
+# `rate(millpond_flush_files_sum[...])` — a histogram's `_sum` is a
+# counter of the observed quantity, and its `_count` a counter of the
+# flushes — and the same number already has a counter of its own in
+# `hoglake_files_written_total`, incremented on the same line. A third
+# series for it would be a third thing to keep in agreement.
+#
+# Hoglake destinations only. The DuckLake sink hands DuckDB an INSERT and
+# the engine chooses the file layout, so millpond never learns a file
+# count there; these stay unobserved rather than report a wrong one.
+_flush_files = Histogram(
+    "millpond_flush_files",
+    "Objects (parquet files) written per flush",
+    ["pipeline", "broker_source"],
+    buckets=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+)
+_flush_file_rows = Histogram(
+    "millpond_flush_file_rows",
+    "Rows per object written, observed once per object",
+    ["pipeline", "broker_source"],
+    buckets=[1, 5, 10, 25, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000],
+)
 
 # --- Include-values source (see include_values.py for semantics) ---
 
@@ -216,6 +263,238 @@ _variant_write_fallback_total = Counter(
     "Flushes written string-only after the VARIANT projection failed",
     ["pipeline", "broker_source"],
 )
+# Hoglake destination only: what pyhoglake's encoder did with the rows of
+# the destination's live `variant` columns, read off the `VariantReport`
+# of each `prepare_append_tables` (hoglake._observe_variant_*). Named as
+# millrace names the same counts (millrace/main.py's `variant_families`),
+# so one dashboard reads both.
+#
+# BOOKED ONCE PER PUBLISHED FLUSH, at the commit, not per prepare: a
+# commit the server refuses as `ddl_since_read_snapshot` is REBUILT, and
+# the rebuild re-encodes the same rows with a fresh report. Booking per
+# prepare counted them twice. The encode-time histogram and the codec
+# counters below are the exception — they are costs the attempt really
+# spent, so they are booked per prepare.
+#
+# `rows_total` and `invalid_total` count COLUMN-ROWS summed over every
+# variant column of the flush — pyhoglake fills one report per prepare
+# and does not split rows or invalid reasons by column — so a table with
+# seven variant columns books seven per row. `outcome`: `encoded` (a
+# Variant value, a JSON `null` included), `sql_null` (the source was SQL
+# NULL: the key was absent, or another writer's column), `invalid` (the
+# text could not be encoded and landed as SQL NULL under
+# MILLPOND_HOGLAKE_VARIANT_ON_INVALID=null; under `raise` the flush
+# failed and nothing is booked). `reason` is the encoder's closed
+# vocabulary (`pyhoglake.variant.InvalidReason`: `invalid_json`,
+# `duplicate_key`, `non_finite_number`, `integer_out_of_range`,
+# `invalid_unicode`, `nesting_too_deep`, ...).
+_variant_rows_total = Counter(
+    "millpond_variant_rows_total",
+    "Variant column-rows encoded for hoglake, by outcome (encoded|sql_null|invalid)",
+    ["pipeline", "broker_source", "outcome"],
+)
+_variant_invalid_total = Counter(
+    "millpond_variant_invalid_total",
+    "Variant column-rows that could not be encoded and landed as SQL NULL, by the encoder's reason",
+    ["pipeline", "broker_source", "reason"],
+)
+# Per DECLARED path of each variant column: how well the column's
+# shredding declaration fits the data. `typed` went to the path's
+# `typed_value` leaf; `fallback` stayed in `value` because its type did
+# not match (a string under an int64, an int under a double); and
+# `variant_null` is a present JSON null, counted apart so an often-null key
+# does not read as a mismatch. A missing key is in none of them. Labels
+# come from the catalog's declaration (at most 1000 paths per column,
+# changed only by DDL — `set_variant_shredding`), never from a payload
+# key, so the series set is bounded by the table. A rising `fallback`
+# share on a path means the declaration is wrong for the data and the
+# column's declaration needs changing.
+_variant_values_total = Counter(
+    "millpond_variant_values_total",
+    "Variant values per declared shredding path, by where they landed (typed|fallback|variant_null)",
+    ["pipeline", "broker_source", "column", "path", "outcome"],
+)
+# Wall seconds pyhoglake's encoder spent per PREPARE (one observation per
+# attempt, a rebuild included), across every group and variant column,
+# apart from the parquet write and the uploads: the encode's own share of
+# the flush pause. `backend` is the codec in use (`native` for the Rust
+# pyhoglake-variant-codec, `python` for the reference encoder, `unknown`
+# if pyhoglake stopped saying), fixed per process by
+# PYHOGLAKE_VARIANT_CODEC. Buckets are sized for the whales writer's
+# 2 GiB / ~155k-row flush (~13.8 KB/row, seven variant columns): the
+# Rust codec at ~27 us/row on an M4 and ~50-65 us/row on prod's Graviton
+# is ~4-10 s, the Python encoder at 6-10x that is ~50-85 s on the M4 and
+# several minutes on prod, and the top bucket is the 480 s liveness
+# deadline itself, so an encode that would have been fatal is visible as
+# one rather than lost in +Inf. The low end still resolves a
+# time-triggered trickle.
+_variant_encode_seconds = Histogram(
+    "millpond_variant_encode_seconds",
+    "Wall seconds per prepare spent encoding variant columns, by codec backend",
+    ["pipeline", "broker_source", "backend"],
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120, 240, 480],
+)
+# Transitional, while pyhoglake carries both codecs. Four counters off
+# pyhoglake's `_variant_backend` process counters (`ENCODE_FALLBACKS`,
+# `DECODE_FALLBACKS`, `ROUTED`, `SHADOWED`), synced after every prepare,
+# with the same names and labels as millrace's so one dashboard reads
+# both pipelines; every label set is pre-created at 0 when the sink is
+# built so `increase()` sees a pod's first.
+#
+# `codec_fallback_total`: encode calls whose Rust result was not used and
+# Python encoded again (`mismatch`, `type`, `panic`, `shadow_mismatch`).
+# The output is correct either way; nonzero is a codec bug report for
+# hoglake, and the CPU of the call twice.
+_variant_codec_fallback_total = Counter(
+    "millpond_variant_codec_fallback_total",
+    "Variant encodes Python redid for the Rust codec, by reason, per process (transitional)",
+    ["pipeline", "broker_source", "reason"],
+)
+# `codec_decode_fallback_total`: storage reads where the Python codec's
+# verdict replaced the Rust codec's (`mismatch`, `panic`). The sink never
+# reads storage itself, but pyhoglake checks every Rust-encoded chunk
+# with `structure_fault` before using it, which is a read.
+_variant_codec_decode_fallback_total = Counter(
+    "millpond_variant_codec_decode_fallback_total",
+    "Variant storage reads the Python codec decided where the Rust codec disagreed or panicked, "
+    "by reason, per process (transitional)",
+    ["pipeline", "broker_source", "reason"],
+)
+# `codec_routed_to_python_total`: THE SILENT-PYTHON SIGNAL. Under
+# PYHOGLAKE_VARIANT_CODEC=auto a call the Rust codec does not take goes
+# to Python without a fallback being counted: `encode` for `unavailable`
+# (no importable wheel), `plan` (a declaration it does not take) or
+# `not_utf8`; `decode` for `unavailable` or `storage`. The process-level
+# `backend` label says `native` the whole time. A nonzero rate here on a
+# `native` pod is a pod paying the Python encoder's CPU per call.
+_variant_codec_routed_to_python_total = Counter(
+    "millpond_variant_codec_routed_to_python_total",
+    "Variant encodes and storage reads PYHOGLAKE_VARIANT_CODEC=auto gave the Python codec, "
+    "by op and reason, per process (transitional)",
+    ["pipeline", "broker_source", "op", "reason"],
+)
+# The shadow (PYHOGLAKE_VARIANT_SHADOW): how many calls and rows the
+# Python encoder re-encoded to compare, and the wall seconds it spent
+# doing so (NOT in `encode_seconds`; pure CPU on the flush thread).
+_variant_shadow_calls_total = Counter(
+    "millpond_variant_shadow_calls_total",
+    "Variant encodes PYHOGLAKE_VARIANT_SHADOW compared, per process; "
+    "codec_fallback reason shadow_mismatch counts the ones that differed (transitional)",
+    ["pipeline", "broker_source"],
+)
+_variant_shadow_rows_total = Counter(
+    "millpond_variant_shadow_rows_total",
+    "Variant rows PYHOGLAKE_VARIANT_SHADOW encoded in Python again and compared, per process (transitional)",
+    ["pipeline", "broker_source"],
+)
+_variant_shadow_seconds_total = Counter(
+    "millpond_variant_shadow_seconds_total",
+    "Seconds PYHOGLAKE_VARIANT_SHADOW spent encoding variant columns in Python again, per prepare (transitional)",
+    ["pipeline", "broker_source"],
+)
+# Invalid rows nested past a JSON parser's recursion bound, whose verdict
+# is the Python codec's. Not a fallback (nothing is encoded twice) and a
+# hostile row can cause one, so it is counted apart.
+_variant_codec_recursion_bound_rows_total = Counter(
+    "millpond_variant_codec_recursion_bound_rows_total",
+    "Invalid variant rows past a JSON parser's recursion bound, whose verdict is the Python codec's, "
+    "per prepare (transitional)",
+    ["pipeline", "broker_source"],
+)
+# The codec this process encodes variant columns with, as a labelled 1,
+# so a dashboard can `sum by (backend)` the fleet without scraping logs.
+_variant_codec_info = Gauge(
+    "millpond_variant_codec_info",
+    "The codec encoding variant columns: native (Rust) or python (PYHOGLAKE_VARIANT_CODEC; transitional)",
+    ["pipeline", "broker_source", "backend"],
+)
+# Hoglake destination only: parquet files registered per append commit.
+# Partitioned fanout writes one file per partition tuple per flush, so
+# this is the compaction-debt feed rate on the hoglake side. Stays at
+# zero for ducklake destinations (additive — no existing series change).
+_hoglake_files_written_total = Counter(
+    "millpond_hoglake_files_written_total",
+    "Parquet files registered with the hoglake catalog",
+    ["pipeline", "broker_source"],
+)
+# Hoglake destination only: commits that went out more than once. Two
+# outcomes, and the difference is the whole story:
+#
+#   outcome="replayed" — this process re-sent an uncertain commit (a lost
+#     response, a reset, a 503) and got a 200. The server either answered
+#     from its receipt or applied it then; either way the rows published
+#     exactly once and the retry did its job. This is the IN-PROCESS
+#     guarantee working, and it was previously invisible — a resolved
+#     replay was indistinguishable from a first publish.
+#
+#   outcome="already_published" — a NEW process rebuilt a flush whose
+#     boundary matched one already in the lake (same table incarnation,
+#     same complete offset range), so the server refused the rebuilt
+#     payload against its receipt and millpond published nothing. The pod
+#     died after a commit applied and before the offsets committed, and
+#     the replayed boundary happened to repeat. This is a duplicate that
+#     did NOT happen, not a guarantee: the boundary is not reproducible
+#     in general, so the SAME crash with a boundary that shifts by one
+#     record duplicates instead. A rising rate means pods are dying
+#     mid-flush; a flat zero does not mean no duplicates.
+_hoglake_commit_replays_total = Counter(
+    "millpond_hoglake_commit_replays_total",
+    "Hoglake commits sent more than once, by how the resend resolved",
+    ["pipeline", "broker_source", "outcome"],
+)
+# Hoglake destination only: parquet objects millpond uploaded and never
+# registered. Hoglake's cleanup reclaims only files the SERVER queued
+# for removal (snapshot expiry, table drop, compaction staging) — client
+# uploads are not in that set and no server-side reclamation exists for
+# them, so these objects are billed storage until an operator deletes
+# them. millpond logs the full object URI of every one it counts, and
+# those URIs are the unit of cleanup.
+#
+# NOT the `{idempotency_key}/` prefix they share, which earlier revisions
+# of this comment named as the sweep target. Object names are
+# `{uuid4}-{index}.parquet`, so a retry under the SAME key writes fresh
+# names beside the old ones: an operator who sweeps the prefix after a
+# later attempt succeeded deletes live, committed files.
+#
+# The count is exact for every path. A commit the server refuses
+# (409/422), a rebuilt flush the receipt declines, a payload superseded
+# by the next flush and a payload still unpublished at close() all have
+# the prepared payload in hand, so the files are known to be in object
+# storage and to number len(files). A flush that fails INSIDE prepare is
+# no longer the exception it once was: pyhoglake>=1.1.1 stamps
+# `uploaded_files`/`uploaded_uris` on whatever it raises, so millpond
+# books the uploads that really completed instead of deducing a number
+# from which failure it is looking at. Retries do not inflate any of it
+# — a held payload is re-sent, not re-uploaded.
+#
+# Two caveats survive, both in the same direction (an UNDERCOUNT, never
+# a phantom):
+#
+#   * The file a prepare failed ON is in neither number. Its upload may
+#     never have opened, or may have closed badly over a TRUNCATED
+#     object that really is in storage. The warning that carries the
+#     URIs says so; treat that one file as possibly present.
+#   * The stamp is best effort at the source — an older pyhoglake does
+#     not set it, and pyhoglake suppresses the AttributeError from an
+#     exception type whose __slots__ refuse it. millpond reads it with a
+#     getattr default of 0, so either case books nothing rather than
+#     raising over a live object-store failure.
+#
+# And, as before, nothing can count the orphan a SIGKILL leaves between
+# the upload and the commit.
+# `reason` is the call site that abandoned them, from a fixed set — one
+# per `_count_orphans` caller in hoglake.py: `prepare_failed`,
+# `commit_refused`, `ddl_since_read_snapshot`, `table_recreated`,
+# `read_snapshot_expired`, `already_published`, `superseded`,
+# `shutdown`. Unlabeled, every one of those funneled into a single
+# number and the only way to tell a routine shutdown orphan from a
+# re-spec quietly refusing every flush was to read the logs. Summing
+# over `reason` reproduces the old series exactly.
+_hoglake_orphaned_files_total = Counter(
+    "millpond_hoglake_orphaned_files_total",
+    "Parquet objects uploaded to the lake but never registered in a commit",
+    ["pipeline", "broker_source", "reason"],
+)
 
 # librdkafka internal stats (via statistics.interval.ms callback)
 _rdkafka_replyq = Gauge(
@@ -256,6 +535,8 @@ flush_duration_seconds = _flush_duration_seconds
 arrow_conversion_seconds = _arrow_conversion_seconds
 flush_size_bytes = _flush_size_bytes
 flush_size_records = _flush_size_records
+flush_files = _flush_files
+flush_file_rows = _flush_file_rows
 pending_bytes = _pending_bytes
 buffer_fullness = _buffer_fullness
 consume_batch_size_current = _consume_batch_size_current
@@ -268,6 +549,21 @@ columns_coerced_total = _columns_coerced_total
 variant_companion_columns_dropped_total = _variant_companion_columns_dropped_total
 variant_write_fallback_total = _variant_write_fallback_total
 variant_values_coerced_total = _variant_values_coerced_total
+variant_rows_total = _variant_rows_total
+variant_invalid_total = _variant_invalid_total
+variant_values_total = _variant_values_total
+variant_encode_seconds = _variant_encode_seconds
+variant_codec_fallback_total = _variant_codec_fallback_total
+variant_codec_decode_fallback_total = _variant_codec_decode_fallback_total
+variant_codec_routed_to_python_total = _variant_codec_routed_to_python_total
+variant_shadow_calls_total = _variant_shadow_calls_total
+variant_shadow_rows_total = _variant_shadow_rows_total
+variant_shadow_seconds_total = _variant_shadow_seconds_total
+variant_codec_recursion_bound_rows_total = _variant_codec_recursion_bound_rows_total
+variant_codec_info = _variant_codec_info
+hoglake_files_written_total = _hoglake_files_written_total
+hoglake_commit_replays_total = _hoglake_commit_replays_total
+hoglake_orphaned_files_total = _hoglake_orphaned_files_total
 include_values_size = _include_values_size
 include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds
 include_values_pending_removals = _include_values_pending_removals
@@ -292,10 +588,16 @@ def init(pipeline: str, broker_source: str = ""):
     global records_skipped_total, errors_total
     global flush_duration_seconds, arrow_conversion_seconds
     global flush_size_bytes, flush_size_records
+    global flush_files, flush_file_rows
     global pending_bytes, buffer_fullness, consume_batch_size_current, consumer_lag, last_committed_offset
     global schema_columns_added_total, schema_columns_widened_total, sort_skipped_total
     global columns_coerced_total, variant_companion_columns_dropped_total
-    global variant_write_fallback_total, variant_values_coerced_total
+    global variant_write_fallback_total, variant_values_coerced_total, hoglake_files_written_total
+    global variant_rows_total, variant_invalid_total, variant_values_total
+    global variant_encode_seconds, variant_codec_fallback_total, variant_codec_decode_fallback_total
+    global variant_codec_routed_to_python_total, variant_shadow_calls_total, variant_shadow_rows_total
+    global variant_shadow_seconds_total, variant_codec_recursion_bound_rows_total, variant_codec_info
+    global hoglake_commit_replays_total, hoglake_orphaned_files_total
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
@@ -329,6 +631,8 @@ def init(pipeline: str, broker_source: str = ""):
     arrow_conversion_seconds = _arrow_conversion_seconds.labels(pipeline=pipeline, broker_source=bs)
     flush_size_bytes = _flush_size_bytes.labels(pipeline=pipeline, broker_source=bs)
     flush_size_records = _flush_size_records.labels(pipeline=pipeline, broker_source=bs)
+    flush_files = _flush_files.labels(pipeline=pipeline, broker_source=bs)
+    flush_file_rows = _flush_file_rows.labels(pipeline=pipeline, broker_source=bs)
     include_values_size = _include_values_size.labels(pipeline=pipeline, broker_source=bs)
     include_values_last_success_timestamp_seconds = _include_values_last_success_timestamp_seconds.labels(
         pipeline=pipeline, broker_source=bs
@@ -348,7 +652,24 @@ def init(pipeline: str, broker_source: str = ""):
         pipeline=pipeline, broker_source=bs
     )
     variant_write_fallback_total = _variant_write_fallback_total.labels(pipeline=pipeline, broker_source=bs)
+    hoglake_files_written_total = _hoglake_files_written_total.labels(pipeline=pipeline, broker_source=bs)
+    hoglake_commit_replays_total = _AutoCommonLabels(_hoglake_commit_replays_total, pipeline, bs)
+    hoglake_orphaned_files_total = _AutoCommonLabels(_hoglake_orphaned_files_total, pipeline, bs)
     variant_values_coerced_total = _variant_values_coerced_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_rows_total = _AutoCommonLabels(_variant_rows_total, pipeline, bs)
+    variant_invalid_total = _AutoCommonLabels(_variant_invalid_total, pipeline, bs)
+    variant_values_total = _AutoCommonLabels(_variant_values_total, pipeline, bs)
+    variant_encode_seconds = _AutoCommonLabels(_variant_encode_seconds, pipeline, bs)
+    variant_codec_fallback_total = _AutoCommonLabels(_variant_codec_fallback_total, pipeline, bs)
+    variant_codec_decode_fallback_total = _AutoCommonLabels(_variant_codec_decode_fallback_total, pipeline, bs)
+    variant_codec_routed_to_python_total = _AutoCommonLabels(_variant_codec_routed_to_python_total, pipeline, bs)
+    variant_shadow_calls_total = _variant_shadow_calls_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_shadow_rows_total = _variant_shadow_rows_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_shadow_seconds_total = _variant_shadow_seconds_total.labels(pipeline=pipeline, broker_source=bs)
+    variant_codec_recursion_bound_rows_total = _variant_codec_recursion_bound_rows_total.labels(
+        pipeline=pipeline, broker_source=bs
+    )
+    variant_codec_info = _AutoCommonLabels(_variant_codec_info, pipeline, bs)
     rdkafka_replyq = _rdkafka_replyq.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_cnt = _rdkafka_msg_cnt.labels(pipeline=pipeline, broker_source=bs)
     rdkafka_msg_size = _rdkafka_msg_size.labels(pipeline=pipeline, broker_source=bs)
