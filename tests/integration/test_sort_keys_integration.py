@@ -7,7 +7,6 @@ row-group pruning then skips most of a file for team_id-filtered queries.
 """
 
 import ducklake_maintenance
-import pytest
 
 
 def _sort_exprs(conn, table_name):
@@ -44,7 +43,7 @@ def test_ensure_sort_keys_applies_and_is_idempotent(ducklake_conn):
 def test_ensure_sort_keys_updates_changed_key(ducklake_conn):
     conn = ducklake_conn
     conn.execute("CREATE TABLE lake.main.t (team_id BIGINT, ts VARCHAR)")
-    conn.execute(f"ALTER TABLE lake.main.t SET SORTED BY (ts)")
+    conn.execute("ALTER TABLE lake.main.t SET SORTED BY (ts)")
 
     applied = ducklake_maintenance.ensure_sort_keys(conn, sort_keys={("main", "t"): ["team_id"]}, dry_run=False)
     assert applied == [("main", "t")]

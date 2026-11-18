@@ -2196,7 +2196,12 @@ def ensure_sort_keys(
     for (schema_name, table_name), columns in sorted(wanted.items()):
         existing = current.get((schema_name, table_name))
         if existing == columns:
-            log.info("ensure-sort-keys: %s.%s already sorted by (%s), skipping", schema_name, table_name, ", ".join(columns))
+            log.info(
+                "ensure-sort-keys: %s.%s already sorted by (%s), skipping",
+                schema_name,
+                table_name,
+                ", ".join(columns),
+            )
             continue
         key_sql = ", ".join(f'"{c}"' if not c.isidentifier() else c for c in columns)
         log.info(
