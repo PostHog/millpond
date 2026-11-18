@@ -103,3 +103,77 @@ def test_init_bound_the_public_name(public, raw):
     bound = getattr(metrics, public)
     assert bound is not getattr(metrics, raw)
     bound.observe(1)  # would raise ValueError on the raw metric
+
+
+# The hoglake phase pair: the two remote phases of one flush, so main.py's
+# `flush_duration_seconds` decomposes. Semantics on the metrics themselves.
+_PHASES = (metrics._hoglake_prepare_seconds, metrics._hoglake_commit_seconds)
+
+
+def test_prepare_seconds_resolves_the_whales_flush():
+    # Chosen for the whales flush (2 GiB, ~155k rows, 4-10 s of encode
+    # plus the uploads): the 10-60 s span is where its quantiles live
+    # and gets 15 and 45 beside the 1-2-5 steps; the top is the 480 s
+    # liveness deadline so a fatal attempt is visible as one rather than
+    # lost in +Inf; nothing under 0.1 s uploads anything.
+    assert _buckets(metrics._hoglake_prepare_seconds) == [
+        0.1,
+        0.25,
+        0.5,
+        1,
+        2.5,
+        5,
+        10,
+        15,
+        20,
+        30,
+        45,
+        60,
+        120,
+        240,
+        480,
+        math.inf,
+    ]
+
+
+def test_commit_seconds_resolves_the_lock_round_trip():
+    # A deferred-stats commit is a lock acquisition and a file-list
+    # insert; an inline-stats one on a wide flush is tens of seconds
+    # under the lock. The ladder has to tell 50 ms from 250 ms at the
+    # bottom and stop at the write timeout rather than the liveness
+    # deadline, since past 60 s the transport has the floor.
+    assert _buckets(metrics._hoglake_commit_seconds) == [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, math.inf]
+
+
+def test_the_prepare_histogram_carries_the_flush_family_labels_plus_result():
+    # `result` is the one label of its own: `ok` returned, `failed`
+    # raised. Both outcomes, so the series covers the same attempts
+    # `variant_encode_seconds` does.
+    assert _label_names(metrics._hoglake_prepare_seconds) == _label_names(metrics._flush_duration_seconds) | {"result"}
+
+
+def test_the_commit_histogram_carries_the_flush_family_labels():
+    assert _label_names(metrics._hoglake_commit_seconds) == _label_names(metrics._flush_duration_seconds)
+
+
+@pytest.mark.parametrize(
+    ("metric", "name"),
+    [
+        (metrics._hoglake_prepare_seconds, "millpond_hoglake_prepare_seconds"),
+        (metrics._hoglake_commit_seconds, "millpond_hoglake_commit_seconds"),
+    ],
+)
+def test_the_phase_histogram_names(metric, name):
+    assert [family.name for family in metric.collect()] == [name]
+
+
+def test_init_bound_the_phase_histograms():
+    # Same trap as the fanout pair: a histogram added to the module and
+    # forgotten in `init()` keeps the raw metric as its public name and
+    # raises "missing label values" on the first flush, in production.
+    # The prepare is label-wrapped (`result` is the call site's), the
+    # commit pre-bound.
+    assert metrics.hoglake_prepare_seconds is not metrics._hoglake_prepare_seconds
+    metrics.hoglake_prepare_seconds.labels(result="ok").observe(1)
+    assert metrics.hoglake_commit_seconds is not metrics._hoglake_commit_seconds
+    metrics.hoglake_commit_seconds.observe(1)

@@ -417,6 +417,75 @@ _hoglake_files_written_total = Counter(
     "Parquet files registered with the hoglake catalog",
     ["pipeline", "broker_source"],
 )
+# Hoglake destination only: the two remote phases of one flush, each
+# timed around the pyhoglake call that is it, so `flush_duration_seconds`
+# (main.py's whole `sink.write`) decomposes. THIS COMMENT IS THE ONE
+# EXPLANATION; hoglake.py and the README point here.
+#
+# `prepare_seconds` is one `prepare_append_tables`: pyhoglake's pre-flight
+# (a `_prepared_read` GET of the table — after an invalidation, and once
+# per half-retention when the cached read ages out — and the
+# filesystem / put-client construction on a cold writer), the variant
+# encode, the parquet encode of every partition group and the concurrent
+# uploads. `variant_encode_seconds` is the encode's share, observed from
+# the same attempt, so `prepare_sum - encode_sum` is the parquet write
+# plus the uploads plus that pre-flight. BOTH OUTCOMES, by `result`:
+# `ok` is a call that returned, `failed` one that raised, timed to the
+# exception (an upload that hit the client's deadline observes the
+# deadline). Failed attempts are in it because `variant_encode_seconds`
+# is booked on a failed prepare too — the encode had run before the
+# upload failed — and a success-only prepare would make the difference
+# read low, or negative, for exactly the flushes worth looking at. Sum
+# over `result` to compare the two; read `result="ok"` alone for the cost
+# of a flush that landed. A `ddl_since_read_snapshot` rebuild observes
+# once per attempt, because each attempt encoded and uploaded; so does
+# the alignment self-heal (`_prepare_with_self_heal`: one `failed`, one
+# `ok`). Not observed at all: an empty batch, and a flush whose every
+# group was unplaceable under the object prefix — `prepare_append_tables`
+# is never called for either.
+#
+# `commit_seconds` is one `commit_prepared` the server answered 200: the
+# registration round trip under the per-catalog commit lock. SUCCESS
+# ONLY, no `result` label: a refusal (409/422) is a judgement, not a
+# registration, and `errors_total` / `hoglake_orphaned_files_total{reason}`
+# already carry it. A send RE-SENT after an uncertain outcome and
+# answered 200 is observed — it spent the time whether the server applied
+# it or answered from its receipt — and
+# `hoglake_commit_replays_total{outcome="replayed"}` counts those.
+#
+# The REMAINDER, `flush_duration - prepare - commit`, is therefore not
+# only millpond's local work (resolve, evolve, align, null-fill, cast,
+# partition split) and the retry loop's backoff: it also holds every
+# commit send that did NOT land — transport failures, refusals, the
+# already-published 422 — none of which `commit_seconds` observes. And
+# `flush_duration_seconds` itself is observed only when `sink.write`
+# returned to main.py, so a flush that exhausted its retries is in
+# `prepare_seconds{result="failed"}` and nowhere in the whole-write
+# histogram.
+#
+# Buckets. The prepare ladder is chosen for the whales flush: 2 GiB /
+# ~155k rows, measured at 4-10 s of encode native plus the uploads, so
+# the 10-60 s span is where its quantiles live and gets 15 and 45 beside
+# the 1-2-5 steps; the top is the 480 s liveness deadline, so an attempt
+# that would have been fatal is visible as one rather than lost in +Inf.
+# Nothing under 0.1 s uploads anything. The commit ladder is shorter: a
+# deferred-stats commit is a lock acquisition and a file-list insert, an
+# inline-stats one on a wide, heavily partitioned flush is tens of
+# seconds under the lock, and past 60 s the write timeout has the floor.
+_hoglake_prepare_seconds = Histogram(
+    "millpond_hoglake_prepare_seconds",
+    "Wall seconds of one prepare_append_tables (pre-flight, variant encode, parquet encode, uploads), "
+    "by result: ok returned, failed raised and is timed to the exception; a rebuild observes each attempt",
+    ["pipeline", "broker_source", "result"],
+    buckets=[0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 20, 30, 45, 60, 120, 240, 480],
+)
+_hoglake_commit_seconds = Histogram(
+    "millpond_hoglake_commit_seconds",
+    "Wall seconds of one commit_prepared the server answered 200: the registration round trip "
+    "(success only; a replayed send that lands is observed, a refusal is not)",
+    ["pipeline", "broker_source"],
+    buckets=[0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60],
+)
 # Hoglake destination only: commits that went out more than once. Two
 # outcomes, and the difference is the whole story:
 #
@@ -562,6 +631,8 @@ variant_shadow_seconds_total = _variant_shadow_seconds_total
 variant_codec_recursion_bound_rows_total = _variant_codec_recursion_bound_rows_total
 variant_codec_info = _variant_codec_info
 hoglake_files_written_total = _hoglake_files_written_total
+hoglake_prepare_seconds = _hoglake_prepare_seconds
+hoglake_commit_seconds = _hoglake_commit_seconds
 hoglake_commit_replays_total = _hoglake_commit_replays_total
 hoglake_orphaned_files_total = _hoglake_orphaned_files_total
 include_values_size = _include_values_size
@@ -598,6 +669,7 @@ def init(pipeline: str, broker_source: str = ""):
     global variant_codec_routed_to_python_total, variant_shadow_calls_total, variant_shadow_rows_total
     global variant_shadow_seconds_total, variant_codec_recursion_bound_rows_total, variant_codec_info
     global hoglake_commit_replays_total, hoglake_orphaned_files_total
+    global hoglake_prepare_seconds, hoglake_commit_seconds
     global include_values_size, include_values_last_success_timestamp_seconds
     global include_values_pending_removals, include_values_poll_failures_total
     global include_values_refused_total, include_values_changes_total, include_values_mode
@@ -653,6 +725,8 @@ def init(pipeline: str, broker_source: str = ""):
     )
     variant_write_fallback_total = _variant_write_fallback_total.labels(pipeline=pipeline, broker_source=bs)
     hoglake_files_written_total = _hoglake_files_written_total.labels(pipeline=pipeline, broker_source=bs)
+    hoglake_prepare_seconds = _AutoCommonLabels(_hoglake_prepare_seconds, pipeline, bs)
+    hoglake_commit_seconds = _hoglake_commit_seconds.labels(pipeline=pipeline, broker_source=bs)
     hoglake_commit_replays_total = _AutoCommonLabels(_hoglake_commit_replays_total, pipeline, bs)
     hoglake_orphaned_files_total = _AutoCommonLabels(_hoglake_orphaned_files_total, pipeline, bs)
     variant_values_coerced_total = _variant_values_coerced_total.labels(pipeline=pipeline, broker_source=bs)

@@ -2526,6 +2526,347 @@ class TestFlushFanoutMetrics:
         assert self._rows_per_object(mock_metrics) == [9]
 
 
+def _clock_phases(s, table, catalog, *, prepare_s: float, commit_s: float) -> dict:
+    """Drive the sink's clock from the two pyhoglake calls it times:
+    `prepare_append_tables` advances it by `prepare_s` BEFORE answering
+    (or raising), `commit_prepared` by `commit_s`. Everything else sees a
+    frozen clock, so an observation is exactly one call's worth and a
+    phase that was not observed has nothing to hide behind. Call it
+    AFTER the test has set either mock's `side_effect`; both wrappers
+    delegate to what they found. Returns the clock, `{"t": seconds}`, so
+    a test can spend time elsewhere and prove it was not observed."""
+    clock = {"t": 1000.0}
+    s._monotonic = lambda: clock["t"]
+    # The configured MOCKS are what is delegated to, not their
+    # `side_effect`s, so a side effect that is an exception instance or
+    # an answer list keeps the semantics MagicMock gives it.
+    inner_prepare = table.prepare_append_tables
+    inner_commit = catalog.commit_prepared
+
+    def prepare(*args, **kwargs):
+        clock["t"] += prepare_s
+        return inner_prepare(*args, **kwargs)
+
+    def commit(*args, **kwargs):
+        clock["t"] += commit_s
+        return inner_commit(*args, **kwargs)
+
+    table.prepare_append_tables = MagicMock(side_effect=prepare)
+    catalog.commit_prepared = MagicMock(side_effect=commit)
+    return clock
+
+
+def _observed(mock_metrics, metric: str) -> list[float]:
+    """The histogram's observations in order, rounded past the float
+    noise a `1000.0 + 0.1 - 1000.0` fake clock leaves."""
+    return [round(call.args[0], 6) for call in getattr(mock_metrics, metric).observe.call_args_list]
+
+
+def _prepare_observed(mock_metrics) -> list[tuple[str, float]]:
+    """`(result, seconds)` per `hoglake_prepare_seconds` observation, in
+    order, read off the mock's call log: each `.labels(result=...)` is
+    followed by the `.observe()` on the child it returned."""
+    out: list[tuple[str, float]] = []
+    result = None
+    for name, args, kwargs in mock_metrics.hoglake_prepare_seconds.mock_calls:
+        if name == "labels":
+            result = kwargs["result"]
+        elif name == "labels().observe":
+            out.append((result, round(args[0], 6)))
+    return out
+
+
+class TestPhaseTimings:
+    """`millpond_hoglake_prepare_seconds{result}` and
+    `millpond_hoglake_commit_seconds`: the two remote phases of a flush,
+    timed around the pyhoglake call that is each one. The semantics are
+    on the metrics in metrics.py; in short, the prepare is observed per
+    attempt under `result="ok"|"failed"` (so it covers the same attempts
+    `variant_encode_seconds` does), the commit only when the server
+    answered 200.
+    """
+
+    OFFSETS = (("events", 0, 30, 41),)
+    DDL = DdlSinceReadSnapshotError(
+        "ddl_since_read_snapshot",
+        status_code=409,
+        detail="concurrent DDL since snapshot 41 on table(s): analytics.events",
+        tables=("analytics.events",),
+        read_snapshot=41,
+    )
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_published_flush_observes_each_phase_once(self, mock_metrics):
+        s, client, catalog, ns, table = _sink()
+        _clock_phases(s, table, catalog, prepare_s=7.5, commit_s=0.25)
+        assert s.write(_rows(3), kafka_offsets=self.OFFSETS) == 3
+        assert _prepare_observed(mock_metrics) == [("ok", 7.5)]
+        assert _observed(mock_metrics, "hoglake_commit_seconds") == [0.25]
+
+    @patch("millpond.hoglake.metrics")
+    def test_the_prepare_is_timed_around_the_pyhoglake_call_alone(self, mock_metrics):
+        # The partition split runs before the call and is NOT in the
+        # observation. Pinned by spending 100 s of clock inside
+        # `_partition_groups`: a timer that moved earlier in `_prepare`
+        # would observe 102, not 2. What millpond spends locally is the
+        # difference against main.py's `flush_duration_seconds`, and
+        # folding it in here would hide it.
+        cfg = _cfg(hoglake_partition_by=(("team_id", "identity", None),))
+        s, client, catalog, ns, table = _sink(cfg, partition_spec=_spec(("team_id", "identity")))
+        clock = _clock_phases(s, table, catalog, prepare_s=2.0, commit_s=0.5)
+        real_groups = hoglake._partition_groups
+
+        def slow_groups(*args, **kwargs):
+            clock["t"] += 100.0
+            return real_groups(*args, **kwargs)
+
+        with patch("millpond.hoglake._partition_groups", side_effect=slow_groups) as grouped:
+            s.write(pa.table({"uuid": ["a", "b", "c"], "team_id": [1, 2, 3]}), kafka_offsets=self.OFFSETS)
+        grouped.assert_called_once()
+        assert _prepare_observed(mock_metrics) == [("ok", 2.0)]
+        assert _observed(mock_metrics, "hoglake_commit_seconds") == [0.5]
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_table_without_variant_columns_observes_both_phases(self, mock_metrics):
+        # The phase timings are the flush's, not the variant encode's:
+        # a plain string table pays the parquet encode and the uploads
+        # too. The VARIANT series stay silent for it (asserted under
+        # TestVariantColumns); these two do not.
+        s, client, catalog, ns, table = _sink()
+        assert not any(c.type == "variant" for c in table.state.columns)
+        _clock_phases(s, table, catalog, prepare_s=1.0, commit_s=0.1)
+        s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert _prepare_observed(mock_metrics) == [("ok", 1.0)]
+        assert _observed(mock_metrics, "hoglake_commit_seconds") == [0.1]
+        mock_metrics.variant_encode_seconds.labels.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_variant_table_observes_the_prepare_beside_the_encode(self, mock_metrics):
+        # Same attempt, two clocks: pyhoglake's `encode_seconds` is the
+        # encoder's share, the sink's `prepare_seconds` is the whole
+        # call. The dashboard subtracts the sums; here the whole must be
+        # at least the part, and both are observed exactly once.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        _clock_phases(s, table, catalog, prepare_s=3.0, commit_s=0.2)
+        assert s.write(_variant_batch(), kafka_offsets=self.OFFSETS) == 3
+        assert _prepare_observed(mock_metrics) == [("ok", 3.0)]
+        encode = mock_metrics.variant_encode_seconds.labels.return_value.observe
+        assert encode.call_count == 1
+        assert 0 < encode.call_args.args[0] <= 3.0
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_failed_prepare_observes_the_attempt_as_failed_and_no_commit(self, mock_metrics):
+        # The upload ran for 40 s before the object store gave up. The
+        # attempt is observed as `failed`, timed to the exception —
+        # `variant_encode_seconds` is booked for a failed prepare too,
+        # and the two must describe the same attempts or their
+        # difference reads low. No commit was sent.
+        s, client, catalog, ns, table = _sink()
+        table.prepare_append_tables.side_effect = HoglakeError("object store is unreachable", status_code=503)
+        _clock_phases(s, table, catalog, prepare_s=40.0, commit_s=0.1)
+        with pytest.raises(HoglakeError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert _prepare_observed(mock_metrics) == [("failed", 40.0)]
+        mock_metrics.hoglake_commit_seconds.observe.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_failed_variant_prepare_books_the_encode_and_the_failed_attempt_together(self, mock_metrics):
+        # The asymmetry the `result` label exists to close: the encode
+        # ran (and is observed) before the upload failed, so the failed
+        # attempt's wall time must be observed beside it.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        encoded = table.prepare_append_tables.side_effect
+
+        def encode_then_fail(*args, **kwargs):
+            encoded(*args, **kwargs)
+            raise _stamped(HoglakeError("object store is unreachable", status_code=503), 0)
+
+        table.prepare_append_tables.side_effect = encode_then_fail
+        _clock_phases(s, table, catalog, prepare_s=12.0, commit_s=0.1)
+        with pytest.raises(HoglakeError):
+            s.write(_variant_batch(), kafka_offsets=self.OFFSETS)
+        assert _prepare_observed(mock_metrics) == [("failed", 12.0)]
+        assert mock_metrics.variant_encode_seconds.labels.return_value.observe.call_count == 1
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_alignment_self_heal_observes_both_attempts(self, mock_metrics):
+        # `_prepare_with_self_heal`: pyhoglake's pre-flight refuses the
+        # first prepare's columns, the sink re-reads and null-fills, the
+        # second returns. Two calls, two observations — `failed` then
+        # `ok`, each timed to its own call — and one commit.
+        s, client, catalog, ns, table = _sink()
+        fake = table.prepare_append_tables.side_effect
+        calls = {"n": 0}
+
+        def refuse_once(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _stamped(ValidationError("prepared Parquet columns differ from destination", status_code=422), 0)
+            return fake(*args, **kwargs)
+
+        table.prepare_append_tables.side_effect = refuse_once
+        _clock_phases(s, table, catalog, prepare_s=1.5, commit_s=0.3)
+        assert s.write(_rows(3), kafka_offsets=self.OFFSETS) == 3
+        assert table.prepare_append_tables.call_count == 2
+        assert _prepare_observed(mock_metrics) == [("failed", 1.5), ("ok", 1.5)]
+        assert _observed(mock_metrics, "hoglake_commit_seconds") == [0.3]
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_refused_commit_observes_the_prepare_but_not_the_commit(self, mock_metrics):
+        # The upload happened and cost what it cost; the registration
+        # was judged and refused. One phase is a fact about this process,
+        # the other is a 422 the retry loop and the orphan counter own.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError("validation", status_code=422, detail="nope")
+        _clock_phases(s, table, catalog, prepare_s=4.0, commit_s=0.3)
+        with pytest.raises(ValidationError):
+            s.write(_rows(2), kafka_offsets=self.OFFSETS)
+        assert _prepare_observed(mock_metrics) == [("ok", 4.0)]
+        mock_metrics.hoglake_commit_seconds.observe.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_already_published_range_does_not_observe_the_commit(self, mock_metrics):
+        # A receipt refused the rebuilt payload: this process registered
+        # nothing. Its prepare is still observed — the encode and the
+        # upload ran, and they are what the sizing question is about.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = ValidationError(
+            "validation",
+            status_code=422,
+            detail="idempotency_key reused with a different request",
+        )
+        _clock_phases(s, table, catalog, prepare_s=4.0, commit_s=0.3)
+        assert s.write(_rows(5), kafka_offsets=self.OFFSETS) == 0
+        assert _prepare_observed(mock_metrics) == [("ok", 4.0)]
+        mock_metrics.hoglake_commit_seconds.observe.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_replayed_commit_observes_the_send_that_landed(self, mock_metrics):
+        # An uncertain transport failure re-sends the held payload. One
+        # prepare, two sends: the first spent 30 s hearing nothing and is
+        # not observed (it did not land); the second is, whether the
+        # server applied it or answered from its receipt.
+        # `hoglake_commit_replays_total` is what says it was a replay.
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [
+            httpx.ReadTimeout("no response"),
+            MagicMock(snapshot_id=8, schema_version=1),
+        ]
+        _clock_phases(s, table, catalog, prepare_s=5.0, commit_s=30.0)
+        with pytest.raises(httpx.ReadTimeout):
+            s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        assert _prepare_observed(mock_metrics) == [("ok", 5.0)]
+        mock_metrics.hoglake_commit_seconds.observe.assert_not_called()
+        s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        assert table.prepare_append_tables.call_count == 1
+        assert _prepare_observed(mock_metrics) == [("ok", 5.0)]
+        assert _observed(mock_metrics, "hoglake_commit_seconds") == [30.0]
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_ddl_rebuild_observes_each_prepare_and_the_one_commit(self, mock_metrics):
+        # Refused as `ddl_since_read_snapshot`, the payload is dropped and
+        # the retry re-encodes and re-uploads: two prepares, each paid for,
+        # each observed as `ok` (each RETURNED; the refusal was the
+        # commit's). The commit that landed is the second send, and the
+        # only one observed — the row counts are booked once for the same
+        # reason (TestVariantBookkeeping).
+        s, client, catalog, ns, table = _sink()
+        catalog.commit_prepared.side_effect = [self.DDL, MagicMock(snapshot_id=8, schema_version=1)]
+        _clock_phases(s, table, catalog, prepare_s=6.0, commit_s=0.4)
+        with pytest.raises(hoglake.HoglakeSinkError):
+            s.write(_rows(3), kafka_offsets=self.OFFSETS)
+        s.reset_caches()
+        assert s.write(_rows(3), kafka_offsets=self.OFFSETS) == 3
+        assert table.prepare_append_tables.call_count == 2
+        assert _prepare_observed(mock_metrics) == [("ok", 6.0), ("ok", 6.0)]
+        assert _observed(mock_metrics, "hoglake_commit_seconds") == [0.4]
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_empty_batch_observes_nothing(self, mock_metrics):
+        # `write()` returns before anything is resolved or prepared: a
+        # zero-row commit would be a 422 the retry loop could never clear.
+        s, client, catalog, ns, table = _sink()
+        _clock_phases(s, table, catalog, prepare_s=1.0, commit_s=1.0)
+        assert s.write(pa.table({"uuid": pa.array([], pa.string()), "team_id": pa.array([], pa.int64())})) == 0
+        table.prepare_append_tables.assert_not_called()
+        assert _prepare_observed(mock_metrics) == []
+        mock_metrics.hoglake_commit_seconds.observe.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_an_all_unplaceable_flush_observes_nothing(self, mock_metrics):
+        # Every group's object-prefix value names no prefix (D3):
+        # `_prepare` returns None before the timer starts, nothing is
+        # encoded, uploaded or committed.
+        s, client, catalog, ns, table = _prefixed_sink()
+        _clock_phases(s, table, catalog, prepare_s=1.0, commit_s=1.0)
+        batch = pa.table({"uuid": ["a", "b", "c"], "team_id": pa.array([None, -5, None], pa.int64())})
+        assert s.write(batch, kafka_offsets=self.OFFSETS) == 0
+        table.prepare_append_tables.assert_not_called()
+        assert _prepare_observed(mock_metrics) == []
+        mock_metrics.hoglake_commit_seconds.observe.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_metrics_failure_after_the_upload_does_not_orphan_it(self, mock_metrics, caplog):
+        # The observation runs after the objects are in the lake. Raising
+        # from it would leave them with no payload to register and no
+        # orphan count, and the retry loop would call the TypeError
+        # transient — so it is logged and the flush publishes.
+        s, client, catalog, ns, table = _sink()
+        mock_metrics.hoglake_prepare_seconds.labels.return_value.observe.side_effect = TypeError("metrics broke")
+        with caplog.at_level(logging.ERROR, logger="millpond.hoglake"):
+            assert s.write(_rows(3), kafka_offsets=self.OFFSETS) == 3
+        catalog.commit_prepared.assert_called_once()
+        assert _orphans(mock_metrics) == []
+        assert s._prepared is None
+        assert sum(1 for r in caplog.records if "Could not book the prepare time" in r.message) == 1
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_metrics_failure_on_a_failed_prepare_does_not_replace_the_error(self, mock_metrics, caplog):
+        # The failed-path observation runs inside the `except` arm, after
+        # the orphans are counted and before the encode booking and the
+        # re-raise. A TypeError escaping from it would REPLACE the 503 —
+        # the retry loop would see a metrics bug instead of a retryable
+        # object-store failure — and skip the encode booking under it.
+        # So: the HoglakeError propagates, the orphans and the encode
+        # are booked, and the failure is one error log line.
+        s, client, catalog, ns, table = _sink(columns=_VARIANT_COLUMNS)
+        _wire_real_encode(table)
+        encoded = table.prepare_append_tables.side_effect
+
+        def encode_then_fail(*args, **kwargs):
+            encoded(*args, **kwargs)
+            raise _stamped(HoglakeError("object store is unreachable", status_code=503), 2)
+
+        table.prepare_append_tables.side_effect = encode_then_fail
+        mock_metrics.hoglake_prepare_seconds.labels.return_value.observe.side_effect = TypeError("metrics broke")
+        with caplog.at_level(logging.ERROR, logger="millpond.hoglake"):
+            with pytest.raises(HoglakeError, match="object store is unreachable"):
+                s.write(_variant_batch(), kafka_offsets=self.OFFSETS)
+        mock_metrics.hoglake_prepare_seconds.labels.assert_called_once_with(result="failed")
+        assert _orphans(mock_metrics) == [("prepare_failed", 2)]
+        assert mock_metrics.variant_encode_seconds.labels.return_value.observe.call_count == 1
+        assert sum(1 for r in caplog.records if "Could not book the prepare time of a failed prepare" in r.message) == 1
+        catalog.commit_prepared.assert_not_called()
+
+    @patch("millpond.hoglake.metrics")
+    def test_a_metrics_failure_after_a_landed_commit_does_not_resend_it(self, mock_metrics, caplog):
+        # The commit returned 200. A raise from the observation would
+        # leave the payload held; main.py would re-send it, the server
+        # would answer from its receipt, and the flush would book a
+        # `replayed` it never had. So: logged, rows returned, one send,
+        # no replay counted, payload cleared.
+        s, client, catalog, ns, table = _sink()
+        mock_metrics.hoglake_commit_seconds.observe.side_effect = TypeError("metrics broke")
+        with caplog.at_level(logging.ERROR, logger="millpond.hoglake"):
+            assert s.write(_rows(3), kafka_offsets=self.OFFSETS) == 3
+        catalog.commit_prepared.assert_called_once()
+        mock_metrics.hoglake_commit_replays_total.labels.assert_not_called()
+        assert s._prepared is None
+        assert sum(1 for r in caplog.records if "Could not book the commit time" in r.message) == 1
+
+
 class TestIdempotentPublication:
     """A commit whose response is lost is indistinguishable from one that
     never happened. The key that makes the retry a REPLAY names the

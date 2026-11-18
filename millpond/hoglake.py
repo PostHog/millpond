@@ -2382,6 +2382,12 @@ class HoglakeSink:
             stats=self._stats,
             kafka_offsets=facts.kafka_offsets,
         )
+        # Timed around the pyhoglake call alone, for
+        # `hoglake_prepare_seconds` — both outcomes, under `result`; the
+        # local work above (null-fill, cast, partition split) is outside
+        # it, in main.py's whole-write histogram. The semantics are
+        # written up once, on the metric in metrics.py.
+        prepare_started = self._monotonic()
         try:
             payload = table.prepare_append_tables(
                 [(part, partition_values) for partition_values, part in groups],
@@ -2415,6 +2421,7 @@ class HoglakeSink:
                 variant_report=report,
             )
         except Exception as e:
+            prepare_seconds = self._monotonic() - prepare_started
             # ONE arm, because there is now one question and pyhoglake
             # answers it. Since 1.1.1 every exception leaving
             # `prepare_append_files` / `prepare_append_tables` carries
@@ -2467,6 +2474,12 @@ class HoglakeSink:
             # codec counters (routes, fallbacks) are booked here too,
             # under the same guard as on the success path. The ROW
             # counts are not: they are booked when a payload publishes.
+            # The attempt's whole wall time goes with them, as `failed`,
+            # so that prepare and encode describe the same attempts.
+            try:
+                metrics.hoglake_prepare_seconds.labels(result="failed").observe(prepare_seconds)
+            except Exception:  # noqa: BLE001 - a metric, never the error being raised
+                log.exception("Could not book the prepare time of a failed prepare")
             if any(c.type == "variant" for c in info.columns):
                 try:
                     self._observe_variant_encode(report)
@@ -2485,6 +2498,7 @@ class HoglakeSink:
                     f"(the `variant-codec` extra) or set PYHOGLAKE_VARIANT_CODEC=auto. Not retried."
                 ) from e
             raise
+        prepare_seconds = self._monotonic() - prepare_started
         # `read_snapshot` STAYS ON THE PAYLOAD, and it is the conflict
         # basis the whole zero-read flush rests on: `prepare_append_*`
         # binds it to the snapshot the cached `TableInfo` was resolved
@@ -2520,11 +2534,18 @@ class HoglakeSink:
         # booking per prepare counted them twice. Held on the sink
         # beside the payload; `_clear_prepared` drops both.
         #
-        # Both guarded, because both run AFTER the upload: a metrics
+        # All guarded, because all run AFTER the upload: a metrics
         # failure raised from here would leave the objects just uploaded
         # with no payload to register them and no orphan count — the
         # exact gap `_count_orphans` exists to close — and the retry
         # loop would call the TypeError transient.
+        try:
+            # Per attempt, variant table or not: every prepare that
+            # returned encoded and uploaded a flush's worth of parquet,
+            # and a rebuild did it again.
+            metrics.hoglake_prepare_seconds.labels(result="ok").observe(prepare_seconds)
+        except Exception:  # noqa: BLE001 - a metric, never an orphaned upload
+            log.exception("Could not book the prepare time of this flush; the upload is unaffected")
         has_variant = any(c.type == "variant" for c in info.columns)
         self._prepared_variant = report if has_variant else None
         if has_variant:
@@ -2746,6 +2767,10 @@ class HoglakeSink:
         files = payload["appends"][0]["files"]
         self._prepared_sends += 1
         replayed = self._prepared_sends > 1
+        # For `hoglake_commit_seconds`: the server's registration round
+        # trip, observed only when it answered 200. Semantics on the
+        # metric in metrics.py.
+        commit_started = self._monotonic()
         try:
             # `table=` whenever the sink still holds the handle the
             # payload was prepared from: pyhoglake then invalidates THAT
@@ -2808,6 +2833,14 @@ class HoglakeSink:
             if _is_answered_refusal(e):
                 self._discard_prepared(f"the server refused the commit with a {e.status_code}", reason="commit_refused")
             raise
+        # Guarded: the commit LANDED. A raise from here would leave the
+        # payload held, main.py would re-send it, the server would answer
+        # from its receipt, and the flush would book a `replayed` it
+        # never had.
+        try:
+            metrics.hoglake_commit_seconds.observe(self._monotonic() - commit_started)
+        except Exception:  # noqa: BLE001 - a metric, never a landed commit
+            log.exception("Could not book the commit time of this flush; the commit landed")
         # A landed commit proves the layout the sink writes is the one the
         # server enforces, so a later object-prefix refusal gets its own
         # one rebuild rather than inheriting this flush's verdict.
