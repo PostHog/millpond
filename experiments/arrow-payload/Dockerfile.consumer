@@ -1,0 +1,141 @@
+# syntax=docker/dockerfile:1.7
+#
+# Arrow-IPC-on-Kafka consumer image.
+#
+# Build context: experiments/arrow-payload/  (see docker-compose.yaml)
+#
+# Pinned versions:
+#   - Base:        debian:bookworm-slim (Debian 12)
+#   - librdkafka:  1.9.2-1+deb12u1      (from Debian 12 main; satisfies our use — we only need
+#                                        the high-level consumer API, which has been stable since 1.x)
+#   - Apache Arrow: 18.x                (installed via the official apache-arrow-apt-source package;
+#                                        Debian default repos do not ship libarrow)
+#   - DuckDB:      v1.4.0                (matches parent Dockerfile: `duckdb-cli>=1.4,<1.5`)
+#
+# Why Arrow 18 and not 19: 18.x is the latest release with a stable `libarrow1800` runtime
+# package name in the Arrow APT repo at the time of writing. Bump to 19 once we've verified
+# the runtime package naming on apt.apache.org/arrow.
+
+# -----------------------------------------------------------------------------
+# Stage 1: builder
+# -----------------------------------------------------------------------------
+FROM debian:bookworm-slim AS builder
+
+# TARGETARCH is automatically populated by buildx (amd64 / arm64). We use it
+# to pick the matching DuckDB precompiled release. Apple Silicon hosts MUST
+# build arm64 here — building amd64 under Rosetta would invalidate any
+# throughput numbers this PoC produces.
+ARG TARGETARCH
+ARG ARROW_VERSION=18.1.0
+ARG ARROW_SO=1801
+ARG DUCKDB_VERSION=1.4.0
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base build deps.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      pkg-config \
+      git \
+      ca-certificates \
+      wget \
+      unzip \
+      lsb-release \
+      gnupg \
+      librdkafka-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Apache Arrow C++ via the official Arrow APT repo.
+# See https://arrow.apache.org/install/ — the `apache-arrow-apt-source` .deb drops
+# a signed sources.list entry into /etc/apt/sources.list.d/.
+RUN wget -qO /tmp/apache-arrow-apt-source.deb \
+      "https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb" \
+    && apt-get install -y --no-install-recommends /tmp/apache-arrow-apt-source.deb \
+    && rm /tmp/apache-arrow-apt-source.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         "libarrow-dev=${ARROW_VERSION}-1" \
+    && rm -rf /var/lib/apt/lists/*
+
+# DuckDB C/C++ headers + shared library (precompiled upstream release).
+# Pick the right zip per host arch — DuckDB ships amd64 and aarch64 builds.
+RUN case "${TARGETARCH}" in \
+        amd64) DUCKDB_ARCH=linux-amd64 ;; \
+        arm64) DUCKDB_ARCH=linux-arm64 ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && wget -qO /tmp/libduckdb.zip \
+        "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-${DUCKDB_ARCH}.zip" \
+    && unzip -o /tmp/libduckdb.zip -d /tmp/libduckdb \
+    && install -m 0644 /tmp/libduckdb/duckdb.h /usr/local/include/duckdb.h \
+    && install -m 0644 /tmp/libduckdb/duckdb.hpp /usr/local/include/duckdb.hpp \
+    && install -m 0755 /tmp/libduckdb/libduckdb.so /usr/local/lib/libduckdb.so \
+    && ldconfig \
+    && rm -rf /tmp/libduckdb /tmp/libduckdb.zip
+
+# Pre-install DuckDB extensions so the consumer's runtime LOAD has no network
+# dependency. Mirrors parent project's Dockerfile pattern. We grab the matching
+# DuckDB CLI release, run INSTALL into /root/.duckdb, and stage the extensions
+# directory for the runtime stage to copy.
+RUN case "${TARGETARCH}" in \
+        amd64) DUCKDB_ARCH=linux-amd64 ;; \
+        arm64) DUCKDB_ARCH=linux-arm64 ;; \
+    esac \
+    && wget -qO /tmp/duckdb_cli.zip \
+        "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-${DUCKDB_ARCH}.zip" \
+    && unzip -o /tmp/duckdb_cli.zip -d /tmp/duckdb_cli \
+    && install -m 0755 /tmp/duckdb_cli/duckdb /usr/local/bin/duckdb \
+    && /usr/local/bin/duckdb -c "INSTALL httpfs; INSTALL ducklake; INSTALL postgres;" \
+    && rm -rf /tmp/duckdb_cli /tmp/duckdb_cli.zip
+
+# Build the consumer.
+# NOTE: build context is experiments/arrow-payload/, so this COPY grabs the consumer/ subdir.
+WORKDIR /build
+COPY consumer/ /build/
+RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build -j"$(nproc)"
+
+# -----------------------------------------------------------------------------
+# Stage 2: runtime
+# -----------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+ARG ARROW_VERSION=18.1.0
+ARG ARROW_SO=1801
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Arrow runtime via the same APT repo as the builder, then the small
+# set of runtime libraries the consumer binary links against.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      wget \
+      lsb-release \
+      gnupg \
+    && wget -qO /tmp/apache-arrow-apt-source.deb \
+        "https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb" \
+    && apt-get install -y --no-install-recommends /tmp/apache-arrow-apt-source.deb \
+    && rm /tmp/apache-arrow-apt-source.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         librdkafka1 \
+         "libarrow${ARROW_SO}=${ARROW_VERSION}-1" \
+    && apt-get purge -y --auto-remove wget lsb-release gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# DuckDB shared library (headers not needed at runtime).
+COPY --from=builder /usr/local/lib/libduckdb.so /usr/local/lib/libduckdb.so
+RUN ldconfig
+
+# Consumer binary.
+COPY --from=builder /build/build/arrow-consumer /usr/local/bin/arrow-consumer
+
+# DuckDB extensions baked in at build time. The consumer process runs as root
+# in this image (PoC; matches simplicity, not parent-stack non-root norms),
+# so extensions land in /root/.duckdb where the consumer's LOAD statements
+# expect them. The consumer issues `LOAD httpfs/ducklake/postgres` at startup
+# and these pre-installed extensions are picked up without any network call.
+COPY --from=builder /root/.duckdb /root/.duckdb
+
+ENTRYPOINT ["/usr/local/bin/arrow-consumer"]
