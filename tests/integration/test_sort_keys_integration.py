@@ -59,6 +59,25 @@ def test_ensure_sort_keys_dry_run_changes_nothing(ducklake_conn):
     assert _sort_exprs(conn, "t") == []
 
 
+def test_ensure_sort_keys_skips_a_table_the_catalog_does_not_have(ducklake_conn):
+    conn = ducklake_conn
+    conn.execute("CREATE TABLE lake.main.t (team_id BIGINT, ts VARCHAR)")
+
+    sort_keys = {("main", "t"): ["team_id"], ("main", "absent"): ["team_id"]}
+    applied = ducklake_maintenance.ensure_sort_keys(conn, sort_keys=sort_keys, dry_run=False)
+    assert applied == [("main", "t")]
+    assert _sort_exprs(conn, "t") == [(0, "team_id", "ASC")]
+
+
+def test_ensure_sort_keys_skips_a_dropped_table(ducklake_conn):
+    conn = ducklake_conn
+    conn.execute("CREATE TABLE lake.main.t (team_id BIGINT, ts VARCHAR)")
+    conn.execute("DROP TABLE lake.main.t")
+
+    applied = ducklake_maintenance.ensure_sort_keys(conn, sort_keys={("main", "t"): ["team_id"]}, dry_run=False)
+    assert applied == []
+
+
 def test_sort_keys_cover_megaduck_tables():
     """The canonical set must name (schema, table) pairs of the megaduck tenant tables."""
     expected = {

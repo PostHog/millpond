@@ -2179,6 +2179,19 @@ def _current_sort_keys(conn: duckdb.DuckDBPyConnection) -> dict[tuple[str, str],
     return current
 
 
+def _live_tables(conn: duckdb.DuckDBPyConnection) -> set[tuple[str, str]]:
+    """(schema, table) of every live table in the catalog."""
+    rows = conn.execute(
+        f"""
+        SELECT sch.schema_name, t.table_name
+        FROM {METADATA_SCHEMA}.ducklake_table t
+        JOIN {METADATA_SCHEMA}.ducklake_schema sch ON sch.schema_id = t.schema_id
+        WHERE t.end_snapshot IS NULL AND sch.end_snapshot IS NULL
+        """
+    ).fetchall()
+    return {(schema_name, table_name) for schema_name, table_name in rows}
+
+
 def ensure_sort_keys(
     conn: duckdb.DuckDBPyConnection,
     sort_keys: dict[tuple[str, str], list[str]] | None = None,
@@ -2188,12 +2201,18 @@ def ensure_sort_keys(
 
     A table whose current sort key already matches is skipped; a table with a
     different sort key is re-set (SET SORTED BY replaces the sort spec).
+    A table the catalog does not have is skipped, so the routine is safe to
+    run against a catalog that holds only some of the canonical tables.
     Dry-run reports what would change without touching the catalog.
     """
     wanted = SORT_KEYS if sort_keys is None else sort_keys
     current = _current_sort_keys(conn)
+    live = _live_tables(conn)
     applied: list[tuple[str, str]] = []
     for (schema_name, table_name), columns in sorted(wanted.items()):
+        if (schema_name, table_name) not in live:
+            log.info("ensure-sort-keys: %s.%s is not in this catalog, skipping", schema_name, table_name)
+            continue
         existing = current.get((schema_name, table_name))
         if existing == columns:
             log.info(
@@ -2216,9 +2235,7 @@ def ensure_sort_keys(
             if existing:
                 # SET SORTED BY appends a new sort spec; it does not end the old one.
                 conn.execute(f'ALTER TABLE {ATTACH_NAME}."{schema_name}"."{table_name}" RESET SORTED BY')
-            conn.execute(
-                f'ALTER TABLE {ATTACH_NAME}."{schema_name}"."{table_name}" SET SORTED BY ({key_sql})'
-            )
+            conn.execute(f'ALTER TABLE {ATTACH_NAME}."{schema_name}"."{table_name}" SET SORTED BY ({key_sql})')
         applied.append((schema_name, table_name))
     return applied
 
