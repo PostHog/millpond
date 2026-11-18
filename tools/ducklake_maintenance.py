@@ -2137,8 +2137,9 @@ def _merge_adjacent_call(schema_name: str | None, table_name: str, args: list[st
 
 
 # Canonical DuckLake sort keys: (schema, table) -> sort columns. Applied to
-# megaduck on 2026-08-19; the cron keeps them in place (and applies them to
-# any catalog the routine runs against). The DuckLake extension sorts new
+# megaduck on 2026-08-19. Nothing schedules this routine yet: run the
+# `ensure-sort-keys` recipe by hand, or add it to the maintenance job's
+# recipe list to keep the keys in place. The DuckLake extension sorts new
 # writes per file and honors the sort in compaction merges, so parquet
 # row-group min/max stats become tight for the tenant column — the
 # ClickHouse reader's row-group pruning then skips most of a file for
